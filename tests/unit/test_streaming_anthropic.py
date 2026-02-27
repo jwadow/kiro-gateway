@@ -682,12 +682,11 @@ class TestCollectAnthropicResponse:
         print("Action: Collecting Anthropic response...")
         
         with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
-            with patch('kiro.streaming_anthropic.count_message_tokens', return_value=10):
-                with patch('kiro.streaming_anthropic.count_tokens', return_value=5):
-                    result = await collect_anthropic_response(
-                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
-                        request_messages=[{"role": "user", "content": "Hi"}]
-                    )
+            with patch('kiro.streaming_anthropic.count_tokens', return_value=5):
+                result = await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
+                    prompt_tokens=10
+                )
         
         print(f"Usage: {result['usage']}")
         assert "input_tokens" in result["usage"]
@@ -1082,36 +1081,32 @@ class TestStreamingAnthropicContextUsage:
         print("✓ Tokens calculated from context usage")
     
     @pytest.mark.asyncio
-    async def test_uses_request_messages_for_input_tokens(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_uses_prompt_tokens_for_input_tokens(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Uses request messages for input token count.
-        Goal: Verify input tokens are counted from request.
+        What it does: Uses pre-counted prompt_tokens for input token count.
+        Goal: Verify input tokens are passed through from prompt_tokens param.
         """
         print("Setup: Mock stream...")
-        
+
         async def mock_parse_kiro_stream(*args, **kwargs):
             yield KiroEvent(type="content", content="Hello")
-        
-        request_messages = [
-            {"role": "user", "content": "Hi there!"}
-        ]
-        
-        print("Action: Streaming to Anthropic format with request messages...")
+
+        print("Action: Streaming to Anthropic format with prompt_tokens...")
         events = []
-        
+
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                with patch('kiro.streaming_anthropic.count_message_tokens', return_value=10) as mock_count:
-                    async for event in stream_kiro_to_anthropic(
-                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
-                        request_messages=request_messages
-                    ):
-                        events.append(event)
-                    
-                    # Verify count_message_tokens was called
-                    mock_count.assert_called_once_with(request_messages, apply_claude_correction=False)
-        
-        print("✓ Request messages used for input token count")
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
+                    prompt_tokens=42
+                ):
+                    events.append(event)
+
+        # Check message_start has the prompt_tokens as input_tokens
+        message_start = json.loads(events[0].split("data: ")[1])
+        assert message_start["message"]["usage"]["input_tokens"] == 42
+
+        print("✓ prompt_tokens used for input token count")
 
 
 # ==================================================================================================
@@ -1362,44 +1357,42 @@ class TestStreamWithFirstTokenRetryAnthropic:
         print("✓ Anthropic-formatted error raised on HTTP error")
     
     @pytest.mark.asyncio
-    async def test_passes_request_messages_to_stream(self, mock_model_cache, mock_auth_manager):
+    async def test_passes_prompt_tokens_to_stream(self, mock_model_cache, mock_auth_manager):
         """
-        What it does: Passes request_messages to underlying stream function.
+        What it does: Passes prompt_tokens to underlying stream function.
         Goal: Verify token counting parameters are forwarded.
         """
-        print("Setup: Mock request with messages...")
-        
+        print("Setup: Mock request with prompt_tokens...")
+
         mock_response = AsyncMock()
         mock_response.status_code = 200
         mock_response.aclose = AsyncMock()
-        
+
         async def mock_make_request():
             return mock_response
-        
+
         captured_kwargs = {}
-        
+
         async def mock_stream_kiro_to_anthropic(*args, **kwargs):
             captured_kwargs.update(kwargs)
             yield "event: message_start\ndata: {}\n\n"
             yield "event: message_stop\ndata: {}\n\n"
-        
-        request_messages = [{"role": "user", "content": "Hello"}]
-        
-        print("Action: Streaming with request_messages...")
-        
+
+        print("Action: Streaming with prompt_tokens...")
+
         with patch('kiro.streaming_anthropic.stream_kiro_to_anthropic', mock_stream_kiro_to_anthropic):
             async for chunk in stream_with_first_token_retry_anthropic(
                 make_request=mock_make_request,
                 model="claude-sonnet-4",
                 model_cache=mock_model_cache,
                 auth_manager=mock_auth_manager,
-                request_messages=request_messages
+                prompt_tokens=42
             ):
                 pass
-        
+
         print(f"Captured kwargs: {captured_kwargs}")
-        assert captured_kwargs.get("request_messages") == request_messages
-        print("✓ request_messages passed to stream function")
+        assert captured_kwargs.get("prompt_tokens") == 42
+        print("✓ prompt_tokens passed to stream function")
     
     @pytest.mark.asyncio
     async def test_uses_configured_max_retries(self, mock_model_cache, mock_auth_manager):

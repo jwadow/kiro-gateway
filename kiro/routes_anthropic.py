@@ -50,7 +50,7 @@ from kiro.streaming_anthropic import (
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
-from kiro.tokenizer import count_tools_tokens
+from kiro.tokenizer import count_tokens
 
 # Import debug_logger
 try:
@@ -298,10 +298,11 @@ async def messages(
         shared_client = request.app.state.http_client
         http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
     
-    # Prepare data for token counting
-    # Convert Pydantic models to dicts for tokenizer
-    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-    tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+    # Count prompt tokens from the full Kiro payload (system prompt + messages + tools)
+    kiro_payload_prompt_tokens = count_tokens(
+        kiro_request_body.decode('utf-8', errors='ignore'),
+        apply_claude_correction=False
+    )
     
     try:
         # Make request to Kiro API (for both streaming and non-streaming modes)
@@ -368,7 +369,7 @@ async def messages(
                         request_data.model,
                         model_cache,
                         auth_manager,
-                        request_messages=messages_for_tokenizer
+                        prompt_tokens=kiro_payload_prompt_tokens
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -415,7 +416,7 @@ async def messages(
                 request_data.model,
                 model_cache,
                 auth_manager,
-                request_messages=messages_for_tokenizer
+                prompt_tokens=kiro_payload_prompt_tokens
             )
             
             await http_client.close()
