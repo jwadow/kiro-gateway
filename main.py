@@ -39,6 +39,7 @@ Usage:
 Priority: CLI args > Environment variables > Default values
 """
 
+from __future__ import annotations
 import argparse
 import logging
 import sys
@@ -366,8 +367,7 @@ async def lifespan(app: FastAPI):
         list_models_url = f"{app.state.auth_manager.q_host}/ListAvailableModels"
         logger.debug(f"Fetching models from: {list_models_url}")
         
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
+        response = await app.state.http_client.get(
                 list_models_url,
                 headers=headers,
                 params=params
