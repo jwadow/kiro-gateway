@@ -50,7 +50,7 @@ from kiro.streaming_anthropic import (
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
-from kiro.tokenizer import count_tools_tokens
+from kiro.tokenizer import count_tokens, count_tools_tokens
 
 # Import debug_logger
 try:
@@ -450,3 +450,55 @@ async def messages(
                 }
             }
         )
+
+
+@router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_anthropic_api_key)])
+async def count_tokens_endpoint(
+    request: Request,
+    request_data: AnthropicMessagesRequest,
+):
+    """
+    Anthropic Count Tokens API endpoint.
+
+    Returns estimated token count for the given request payload.
+    Used by Claude Code to decide when to trigger conversation compaction.
+
+    Builds the full Kiro payload and counts tokens on the serialized JSON,
+    consistent with the token counting approach used in the messages endpoint.
+    """
+    logger.info(f"Request to /v1/messages/count_tokens (model={request_data.model}, messages={len(request_data.messages)})")
+
+    auth_manager: KiroAuthManager = request.app.state.auth_manager
+
+    # Build Kiro payload (same as messages endpoint)
+    conversation_id = generate_conversation_id()
+    profile_arn_for_payload = ""
+    if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+        profile_arn_for_payload = auth_manager.profile_arn
+
+    try:
+        kiro_payload = anthropic_to_kiro(
+            request_data,
+            conversation_id,
+            profile_arn_for_payload
+        )
+    except ValueError as e:
+        logger.error(f"Conversion error in count_tokens: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": str(e)
+                }
+            }
+        )
+
+    # Count tokens from the full serialized Kiro payload (same as messages endpoint)
+    kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2)
+    input_tokens = count_tokens(kiro_request_body, apply_claude_correction=False)
+
+    logger.info(f"Token count estimate: {input_tokens} (payload size: {len(kiro_request_body)} chars)")
+
+    return JSONResponse(content={"input_tokens": input_tokens})
