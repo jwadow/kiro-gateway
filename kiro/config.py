@@ -442,6 +442,23 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_
 
 
 # ==================================================================================================
+# Working Directory Context Injection
+# ==================================================================================================
+
+# Enable working directory context injection into system prompt.
+# When enabled, the gateway extracts working directory from tool result error messages
+# and injects it into the system prompt to help the model understand its current context.
+#
+# This helps prevent errors like:
+# - cd: PublicVersion/DownAria-API: No such file or directory
+# When the model is already in that directory but doesn't know it.
+#
+# Default: true (enabled) - improves context awareness
+_INJECT_WORKING_DIR_RAW: str = os.getenv("INJECT_WORKING_DIR", "").lower()
+INJECT_WORKING_DIR: bool = _INJECT_WORKING_DIR_RAW not in ("false", "0", "no", "disabled", "off")
+
+
+# ==================================================================================================
 # Application Version
 # ==================================================================================================
 
