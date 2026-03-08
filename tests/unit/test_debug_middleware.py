@@ -5,7 +5,11 @@ Unit tests for DebugLoggerMiddleware.
 Tests debug logging initialization at the middleware level.
 """
 
+import asyncio
+
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from unittest.mock import AsyncMock, MagicMock, patch
 from starlette.requests import Request
 from starlette.responses import Response
@@ -344,6 +348,89 @@ class TestDebugLoggerMiddlewareResponsePassthrough:
                 print(f"Comparing response: Expected {expected_response}, Got {actual_response}")
                 assert actual_response == expected_response
                 assert actual_response.status_code == 200
+
+
+class TestDebugLoggerMiddlewareRequestBodyPreservation:
+    """Tests for preserving request bodies for downstream handlers."""
+
+    @pytest.mark.asyncio
+    async def test_preserves_request_body_for_downstream_handler(self):
+        """
+        What it does: Verifies that the middleware does not consume the request body.
+        Purpose: Ensure downstream FastAPI handlers can still parse JSON bodies.
+        """
+        print("Setup: Creating FastAPI app with DebugLoggerMiddleware...")
+
+        with patch('kiro.debug_middleware.DEBUG_MODE', 'all'):
+            from kiro.debug_middleware import DebugLoggerMiddleware
+
+            app = FastAPI()
+            app.add_middleware(DebugLoggerMiddleware)
+
+            @app.post("/v1/chat/completions")
+            async def chat_completions(payload: dict):
+                return payload
+
+            with patch('kiro.debug_logger.debug_logger') as mock_logger:
+                async with AsyncClient(
+                    transport=ASGITransport(app=app),
+                    base_url="http://test"
+                ) as client:
+                    print("Action: Sending JSON request through middleware...")
+                    response = await asyncio.wait_for(
+                        client.post(
+                            "/v1/chat/completions",
+                            json={"model": "test", "messages": [{"role": "user", "content": "ping"}]},
+                        ),
+                        timeout=1.0,
+                    )
+
+            print("Verifying downstream handler received the full JSON body...")
+            assert response.status_code == 200
+            assert response.json() == {
+                "model": "test",
+                "messages": [{"role": "user", "content": "ping"}],
+            }
+            mock_logger.prepare_new_request.assert_called_once()
+            mock_logger.log_request_body.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_preserves_empty_request_body_for_downstream_handler(self):
+        """
+        What it does: Verifies that empty request bodies do not hang downstream handlers.
+        Purpose: Ensure the middleware replays EOF semantics even for empty bodies.
+        """
+        print("Setup: Creating FastAPI app for empty body request...")
+
+        with patch('kiro.debug_middleware.DEBUG_MODE', 'all'):
+            from kiro.debug_middleware import DebugLoggerMiddleware
+
+            app = FastAPI()
+            app.add_middleware(DebugLoggerMiddleware)
+
+            @app.post("/v1/chat/completions")
+            async def chat_completions(request: Request):
+                return {"body": (await request.body()).decode("utf-8")}
+
+            with patch('kiro.debug_logger.debug_logger') as mock_logger:
+                async with AsyncClient(
+                    transport=ASGITransport(app=app),
+                    base_url="http://test"
+                ) as client:
+                    print("Action: Sending empty request body through middleware...")
+                    response = await asyncio.wait_for(
+                        client.post(
+                            "/v1/chat/completions",
+                            content=b"",
+                        ),
+                        timeout=1.0,
+                    )
+
+            print("Verifying downstream handler completed without hanging...")
+            assert response.status_code == 200
+            assert response.json() == {"body": ""}
+            mock_logger.prepare_new_request.assert_called_once()
+            mock_logger.log_request_body.assert_not_called()
 
 
 class TestLoggedEndpointsConstant:

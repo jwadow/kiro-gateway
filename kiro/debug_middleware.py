@@ -37,6 +37,7 @@ Flush/discard operations are handled by:
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.types import Message
 from loguru import logger
 
 from kiro.config import DEBUG_MODE
@@ -103,6 +104,28 @@ class DebugLoggerMiddleware(BaseHTTPMiddleware):
             body = await request.body()
             if body:
                 debug_logger.log_request_body(body)
+
+            receive_consumed = False
+
+            async def receive() -> Message:
+                """Replay the cached request body exactly once for downstream consumers."""
+                nonlocal receive_consumed
+
+                if not receive_consumed:
+                    receive_consumed = True
+                    return {
+                        "type": "http.request",
+                        "body": body,
+                        "more_body": False,
+                    }
+
+                return {
+                    "type": "http.request",
+                    "body": b"",
+                    "more_body": False,
+                }
+
+            request._receive = receive
         except Exception as e:
             logger.warning(f"Failed to read request body for debug logging: {e}")
         
