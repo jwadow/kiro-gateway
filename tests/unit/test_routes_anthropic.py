@@ -640,6 +640,52 @@ class TestMessagesToolUse:
         print(f"Status: {response.status_code}")
         assert response.status_code != 422
 
+    def test_accepts_tool_reference_in_tool_result_content(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies tool_reference blocks in tool_result content are accepted.
+        Purpose: Ensure deferred-tools payloads pass request validation.
+        """
+        print("Action: POST /v1/messages with tool_reference in tool_result...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "Use deferred tools"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_456",
+                                "name": "ListMcpResourcesTool",
+                                "input": {}
+                            }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call_456",
+                                "cache_control": {"type": "ephemeral"},
+                                "content": [
+                                    {"type": "tool_reference", "tool_name": "Read"},
+                                    {"type": "tool_reference", "tool_name": "Glob"}
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
+
 
 # =============================================================================
 # Tests for /v1/messages optional parameters

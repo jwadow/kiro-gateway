@@ -480,6 +480,31 @@ class TestExtractToolResultsFromAnthropicContent:
         print(f"Result: {result}")
         assert result[0]["content"] == "List result"
 
+    def test_handles_tool_reference_list_content_in_tool_result(self):
+        """
+        What it does: Verifies handling of tool_reference list content in tool_result.
+        Purpose: Ensure deferred-tool references are preserved as readable text.
+        """
+        print("Setup: Tool result with tool_reference content...")
+        content = [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_123",
+                "content": [
+                    {"type": "tool_reference", "tool_name": "Read"},
+                    {"type": "tool_reference", "tool_name": "Glob"},
+                ],
+            }
+        ]
+
+        print("Action: Extracting tool results...")
+        result = extract_tool_results_from_anthropic_content(content)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert "[tool_reference: Read]" in result[0]["content"]
+        assert "[tool_reference: Glob]" in result[0]["content"]
+
     def test_skips_tool_result_without_tool_use_id(self):
         """
         What it does: Verifies that tool_result without tool_use_id is skipped.

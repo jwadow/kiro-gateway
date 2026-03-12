@@ -279,6 +279,26 @@ class TestExtractTextContent:
         print(f"Comparing result: Expected 'Before toolAfter tool', Got '{result}'")
         assert result == "Before toolAfter tool"
 
+    def test_extracts_tool_reference_blocks_as_text_markers(self):
+        """
+        What it does: Verifies tool_reference blocks are converted to readable text markers.
+        Purpose: Ensure deferred-tool references are preserved instead of being dropped.
+        """
+        from kiro.models_anthropic import ToolReferenceContentBlock
+
+        print("Setup: Mixed tool_reference dict and Pydantic blocks...")
+        content = [
+            {"type": "tool_reference", "tool_name": "Read"},
+            ToolReferenceContentBlock(type="tool_reference", tool_name="Glob"),
+        ]
+
+        print("Action: Extracting text...")
+        result = extract_text_content(content)
+
+        print(f"Result: '{result}'")
+        assert "[tool_reference: Read]" in result
+        assert "[tool_reference: Glob]" in result
+
 
 # ==================================================================================================
 # Tests for extract_images_from_content (Issue #30 fix)

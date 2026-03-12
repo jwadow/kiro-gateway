@@ -21,6 +21,7 @@ from kiro.models_anthropic import (
     ThinkingContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
+    ToolReferenceContentBlock,
     # Image models
     Base64ImageSource,
     URLImageSource,
@@ -385,6 +386,19 @@ class TestContentBlockUnion:
         print(f"Result: {block}")
         print(f"Comparing type: Expected 'tool_result', Got '{block.type}'")
         assert block.type == "tool_result"
+
+    def test_accepts_tool_reference_content_block(self):
+        """
+        What it does: Verifies ContentBlock accepts ToolReferenceContentBlock.
+        Purpose: Ensure union supports deferred tool reference blocks.
+        """
+        print("Setup: Creating ToolReferenceContentBlock...")
+        block: ContentBlock = ToolReferenceContentBlock(tool_name="Read")
+
+        print(f"Result: {block}")
+        print(f"Comparing type: Expected 'tool_reference', Got '{block.type}'")
+        assert block.type == "tool_reference"
+        assert block.tool_name == "Read"
 
 
 # ==================================================================================================
@@ -949,6 +963,26 @@ class TestToolResultContentBlock:
         print(f"Comparing content type: Expected list, Got {type(block.content)}")
         assert isinstance(block.content, list)
         assert len(block.content) == 2
+
+    def test_accepts_tool_reference_list_content(self):
+        """
+        What it does: Verifies tool_reference blocks are accepted in tool_result content.
+        Purpose: Ensure deferred-tool format does not fail request validation.
+        """
+        print("Setup: Creating ToolResultContentBlock with tool_reference list...")
+        block = ToolResultContentBlock(
+            tool_use_id="call_1",
+            content=[
+                {"type": "tool_reference", "tool_name": "Read"},
+                {"type": "tool_reference", "tool_name": "Glob"},
+            ],
+        )
+
+        print(f"Comparing content type: Expected list, Got {type(block.content)}")
+        assert isinstance(block.content, list)
+        assert len(block.content) == 2
+        assert block.content[0].type == "tool_reference"
+        assert block.content[0].tool_name == "Read"
     
     def test_is_error_field(self):
         """

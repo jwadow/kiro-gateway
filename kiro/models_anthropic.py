@@ -83,15 +83,39 @@ class ToolResultContentBlock(BaseModel):
     Tool result content block in Anthropic format.
 
     Represents the result of a tool call, sent by the user.
-    Tool results can contain text, images, or a mix of both.
+    Tool results can contain text, images, tool references, or a mix of them.
     """
 
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
     content: Optional[
-        Union[str, List[Union["TextContentBlock", "ImageContentBlock"]]]
+        Union[
+            str,
+            List[
+                Union[
+                    "TextContentBlock",
+                    "ImageContentBlock",
+                    "ToolReferenceContentBlock",
+                    Dict[str, Any],
+                ]
+            ],
+        ]
     ] = None
     is_error: Optional[bool] = None
+
+
+class ToolReferenceContentBlock(BaseModel):
+    """
+    Tool reference content block in Anthropic-compatible format.
+
+    Some clients (for example Claude Code deferred-tools mode) can include
+    tool_reference blocks inside tool_result.content.
+    """
+
+    type: Literal["tool_reference"] = "tool_reference"
+    tool_name: str
+
+    model_config = {"extra": "allow"}
 
 
 # ==================================================================================================
@@ -153,6 +177,7 @@ ContentBlock = Union[
     ImageContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
+    ToolReferenceContentBlock,
 ]
 
 

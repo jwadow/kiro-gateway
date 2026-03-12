@@ -109,6 +109,7 @@ def extract_text_content(content: Any) -> str:
     Supports multiple content formats used by different APIs:
     - String: "Hello, world!"
     - List of content blocks: [{"type": "text", "text": "Hello"}]
+    - Tool references: {"type": "tool_reference", "tool_name": "Read"}
     - None: empty message
     
     Args:
@@ -138,11 +139,23 @@ def extract_text_content(content: Any) -> str:
                     continue
                 if item.get("type") == "text":
                     text_parts.append(item.get("text", ""))
+                elif item.get("type") == "tool_reference":
+                    tool_name = item.get("tool_name", "")
+                    if tool_name:
+                        text_parts.append(f"[tool_reference: {tool_name}]")
+                    else:
+                        text_parts.append("[tool_reference]")
                 elif "text" in item:
                     text_parts.append(item["text"])
             elif hasattr(item, "text"):
                 # Handle Pydantic models like TextContentBlock
                 text_parts.append(getattr(item, "text", ""))
+            elif getattr(item, "type", None) == "tool_reference":
+                tool_name = getattr(item, "tool_name", "")
+                if tool_name:
+                    text_parts.append(f"[tool_reference: {tool_name}]")
+                else:
+                    text_parts.append("[tool_reference]")
             elif isinstance(item, str):
                 text_parts.append(item)
         return "".join(text_parts)
