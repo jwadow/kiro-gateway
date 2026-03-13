@@ -197,7 +197,7 @@ docker run -d \
 # Mount kiro-cli database
 docker run -d \
   -p 8000:8000 \
-  -v ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro \
+  -v ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli \
   -e KIRO_CLI_DB_FILE=/home/kiro/.local/share/kiro-cli/data.sqlite3 \
   -e PROXY_API_KEY="your-secret-key" \
   --name kiro-gateway \

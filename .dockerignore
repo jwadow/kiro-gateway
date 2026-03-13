@@ -58,6 +58,9 @@ manual_api_test.py
 # CI/CD
 .clabot
 
+# Cache (e.g. trivy.db from security scans)
+.cache/
+
 # Misc
 *.log
 .crush

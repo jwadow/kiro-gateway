@@ -49,7 +49,7 @@ services:
       
       # Mount kiro-cli database (if using KIRO_CLI_DB_FILE)
       # Uncomment and adjust path as needed:
-      # - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro
+      # - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
       
       # Mount debug logs directory (optional, for debugging)
       - ./debug_logs:/app/debug_logs
