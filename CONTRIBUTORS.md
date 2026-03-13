@@ -14,3 +14,4 @@ Thank you to all the contributors who have helped improve this project!
 - [@PAzter1101](https://github.com/PAzter1101) — Docker containerization with CI/CD (#55)
 - [@Ry-DS](https://github.com/Ry-DS) — Images in tool results support for Anthropic MCP servers (#57)
 - [@saaj](https://github.com/saaj) — Regional endpoint fix for eu-central-1 and other non-us-east-1 regions (#58)
+- [@Logesh-waran2003](https://github.com/Logesh-waran2003) — Fix kiro-cli volume mount and Docker image size (#97)
