@@ -430,6 +430,7 @@ VPN_PROXY_URL=192.168.1.100:8080
 | `/` | GET | 健康检查 |
 | `/health` | GET | 详细健康检查 |
 | `/v1/models` | GET | 列出可用模型 |
+| `/v1/usage` | GET | 当前 Kiro 套餐与用量限制 |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
 
@@ -454,6 +455,30 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 > **注意：** 将 `my-super-secret-password-123` 替换为您在 `.env` 文件中设置的 `PROXY_API_KEY`。
+
+</details>
+
+<details>
+<summary>📊 查询用量限制</summary>
+
+```bash
+curl "http://localhost:8000/v1/usage" \
+  -H "Authorization: Bearer my-super-secret-password-123"
+```
+
+该端点会代理 CodeWhisperer Runtime 的 `GetUsageLimits`，并原样返回上游 JSON。
+
+默认查询参数：
+- `origin=AI_EDITOR`
+- `resource_type=AGENTIC_REQUEST`
+- `is_email_required=true`
+
+自定义参数示例：
+
+```bash
+curl "http://localhost:8000/v1/usage?origin=AI_EDITOR&resource_type=AGENTIC_REQUEST&is_email_required=false" \
+  -H "Authorization: Bearer my-super-secret-password-123"
+```
 
 </details>
 

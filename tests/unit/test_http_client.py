@@ -212,6 +212,51 @@ class TestKiroHttpClientRequestWithRetry:
         print("Verification: Response received...")
         assert response.status_code == 200
         mock_client.request.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_successful_get_request_passes_query_params(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies GET requests forward query params to httpx.
+        Purpose: Ensure runtime endpoints like getUsageLimits can use request_with_retry.
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+
+        captured_kwargs = {}
+
+        async def capture_request(method, url, params=None, json=None, headers=None):
+            captured_kwargs["method"] = method
+            captured_kwargs["url"] = url
+            captured_kwargs["params"] = params
+            captured_kwargs["json"] = json
+            captured_kwargs["headers"] = headers
+            return mock_response
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=capture_request)
+
+        print("Action: Executing GET request with query params...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                response = await http_client.request_with_retry(
+                    "GET",
+                    "https://api.example.com/getUsageLimits",
+                    params={"origin": "AI_EDITOR", "resourceType": "AGENTIC_REQUEST"},
+                )
+
+        print("Verification: Query params passed to request()...")
+        assert response.status_code == 200
+        assert captured_kwargs["method"] == "GET"
+        assert captured_kwargs["url"] == "https://api.example.com/getUsageLimits"
+        assert captured_kwargs["params"] == {
+            "origin": "AI_EDITOR",
+            "resourceType": "AGENTIC_REQUEST",
+        }
+        assert captured_kwargs["json"] is None
     
     @pytest.mark.asyncio
     async def test_403_triggers_token_refresh(self, mock_auth_manager_for_http):
@@ -1046,7 +1091,7 @@ class TestKiroHttpClientConnectionCloseHeader:
         mock_request = Mock()
         captured_headers = {}
         
-        def capture_build_request(method, url, json, headers):
+        def capture_build_request(method, url, params=None, json=None, headers=None):
             captured_headers.update(headers)
             return mock_request
         
@@ -1086,7 +1131,7 @@ class TestKiroHttpClientConnectionCloseHeader:
         
         captured_headers = {}
         
-        async def capture_request(method, url, json, headers):
+        async def capture_request(method, url, params=None, json=None, headers=None):
             captured_headers.update(headers)
             return mock_response
         
@@ -1124,7 +1169,7 @@ class TestKiroHttpClientConnectionCloseHeader:
         mock_request = Mock()
         captured_headers = {}
         
-        def capture_build_request(method, url, json, headers):
+        def capture_build_request(method, url, params=None, json=None, headers=None):
             captured_headers.update(headers)
             return mock_request
         
@@ -1156,3 +1201,45 @@ class TestKiroHttpClientConnectionCloseHeader:
         assert captured_headers["X-Custom-Header"] == "custom_value"
         assert captured_headers["Connection"] == "close"
         assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_streaming_request_passes_query_params_to_build_request(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies streaming requests pass query params to build_request.
+        Purpose: Ensure query-based streaming endpoints remain supported.
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+
+        mock_request = Mock()
+        captured_params = {}
+
+        def capture_build_request(method, url, params=None, json=None, headers=None):
+            captured_params["method"] = method
+            captured_params["url"] = url
+            captured_params["params"] = params
+            return mock_request
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.build_request = Mock(side_effect=capture_build_request)
+        mock_client.send = AsyncMock(return_value=mock_response)
+
+        print("Action: Executing streaming GET request with query params...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={"Authorization": "Bearer test"}):
+                response = await http_client.request_with_retry(
+                    "GET",
+                    "https://api.example.com/stream",
+                    params={"cursor": "abc123"},
+                    stream=True,
+                )
+
+        print("Verification: Query params passed to build_request()...")
+        assert response.status_code == 200
+        assert captured_params["method"] == "GET"
+        assert captured_params["url"] == "https://api.example.com/stream"
+        assert captured_params["params"] == {"cursor": "abc123"}

@@ -8,6 +8,7 @@ Tests the following endpoints:
 - GET / - Root endpoint
 - GET /health - Health check
 - GET /v1/models - List available models
+- GET /v1/usage - Current Kiro usage and plan limits
 - POST /v1/chat/completions - Chat completions
 
 For Anthropic API tests, see test_routes_anthropic.py.
@@ -378,6 +379,106 @@ class TestModelsEndpoint:
         
         for model in response.json()["data"]:
             assert model["owned_by"] == "anthropic"
+
+
+# =============================================================================
+# Tests for usage endpoint (/v1/usage)
+# =============================================================================
+
+class TestUsageEndpoint:
+    """Tests for the GET /v1/usage endpoint."""
+
+    def test_usage_requires_authentication(self, test_client):
+        """
+        What it does: Verifies usage endpoint requires authentication.
+        Purpose: Ensure usage data is protected.
+        """
+        print("Action: GET /v1/usage without auth...")
+        response = test_client.get("/v1/usage")
+
+        print(f"Response: {response.status_code} {response.json()}")
+        assert response.status_code == 401
+
+    @patch("kiro.routes_openai.fetch_usage_limits", new_callable=AsyncMock)
+    def test_usage_returns_service_payload(
+        self,
+        mock_fetch_usage_limits,
+        test_client,
+        valid_proxy_api_key,
+    ):
+        """
+        What it does: Verifies usage endpoint returns service payload unchanged.
+        Purpose: Preserve upstream GetUsageLimits shape.
+        """
+        mock_fetch_usage_limits.return_value = {
+            "subscriptionInfo": {"subscriptionTitle": "KIRO PRO"},
+            "usageBreakdownList": [],
+        }
+
+        print("Action: GET /v1/usage with valid auth...")
+        response = test_client.get(
+            "/v1/usage",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        )
+
+        print(f"Response: {response.json()}")
+        assert response.status_code == 200
+        assert response.json()["subscriptionInfo"]["subscriptionTitle"] == "KIRO PRO"
+        mock_fetch_usage_limits.assert_awaited_once()
+
+    @patch("kiro.routes_openai.fetch_usage_limits", new_callable=AsyncMock)
+    def test_usage_forwards_query_parameters(
+        self,
+        mock_fetch_usage_limits,
+        test_client,
+        valid_proxy_api_key,
+    ):
+        """
+        What it does: Verifies route forwards query parameters to usage service.
+        Purpose: Keep usage endpoint configurable without duplicating service logic.
+        """
+        mock_fetch_usage_limits.return_value = {"usageBreakdownList": []}
+
+        print("Action: GET /v1/usage with custom query params...")
+        response = test_client.get(
+            "/v1/usage",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            params={
+                "origin": "CUSTOM_ORIGIN",
+                "resource_type": "CUSTOM_RESOURCE",
+                "is_email_required": "false",
+            },
+        )
+
+        print(f"Response: {response.json()}")
+        assert response.status_code == 200
+        _, kwargs = mock_fetch_usage_limits.await_args
+        assert kwargs["origin"] == "CUSTOM_ORIGIN"
+        assert kwargs["resource_type"] == "CUSTOM_RESOURCE"
+        assert kwargs["is_email_required"] is False
+
+    @patch("kiro.routes_openai.fetch_usage_limits", new_callable=AsyncMock)
+    def test_usage_returns_400_for_invalid_arguments(
+        self,
+        mock_fetch_usage_limits,
+        test_client,
+        valid_proxy_api_key,
+    ):
+        """
+        What it does: Verifies route converts ValueError into HTTP 400.
+        Purpose: Return user-friendly validation errors for usage endpoint input.
+        """
+        mock_fetch_usage_limits.side_effect = ValueError("origin must not be empty")
+
+        print("Action: GET /v1/usage with service ValueError...")
+        response = test_client.get(
+            "/v1/usage",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        )
+
+        print(f"Response: {response.status_code} {response.json()}")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "origin must not be empty"
 
 
 # =============================================================================
@@ -813,6 +914,17 @@ class TestRouterIntegration:
         
         print(f"Found routes: {routes}")
         assert "/v1/models" in routes
+
+    def test_router_has_usage_endpoint(self):
+        """
+        What it does: Verifies usage endpoint is registered.
+        Purpose: Ensure endpoint is available.
+        """
+        print("Checking: Router endpoints...")
+        routes = [route.path for route in router.routes]
+
+        print(f"Found routes: {routes}")
+        assert "/v1/usage" in routes
     
     def test_router_has_chat_completions_endpoint(self):
         """
@@ -863,6 +975,19 @@ class TestRouterIntegration:
                 assert "GET" in route.methods
                 return
         pytest.fail("Models endpoint not found")
+
+    def test_usage_endpoint_uses_get_method(self):
+        """
+        What it does: Verifies usage endpoint uses GET method.
+        Purpose: Ensure correct HTTP method.
+        """
+        print("Checking: HTTP methods...")
+        for route in router.routes:
+            if route.path == "/v1/usage":
+                print(f"Route /v1/usage methods: {route.methods}")
+                assert "GET" in route.methods
+                return
+        pytest.fail("Usage endpoint not found")
     
     def test_chat_completions_endpoint_uses_post_method(self):
         """

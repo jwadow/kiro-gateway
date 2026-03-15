@@ -430,6 +430,7 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 | `/` | GET | Health check |
 | `/health` | GET | Detailed health check |
 | `/v1/models` | GET | List available models |
+| `/v1/usage` | GET | Current Kiro plan and usage limits |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
 
@@ -454,6 +455,30 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 > **Note:** Replace `my-super-secret-password-123` with the `PROXY_API_KEY` you set in your `.env` file.
+
+</details>
+
+<details>
+<summary>📊 Check Usage Limits</summary>
+
+```bash
+curl "http://localhost:8000/v1/usage" \
+  -H "Authorization: Bearer my-super-secret-password-123"
+```
+
+The endpoint proxies CodeWhisperer Runtime `GetUsageLimits` and returns the raw upstream JSON.
+
+Default query parameters:
+- `origin=AI_EDITOR`
+- `resource_type=AGENTIC_REQUEST`
+- `is_email_required=true`
+
+Custom example:
+
+```bash
+curl "http://localhost:8000/v1/usage?origin=AI_EDITOR&resource_type=AGENTIC_REQUEST&is_email_required=false" \
+  -H "Authorization: Bearer my-super-secret-password-123"
+```
 
 </details>
 

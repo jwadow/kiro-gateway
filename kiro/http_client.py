@@ -31,7 +31,7 @@ with connection pooling for better resource management.
 """
 
 import asyncio
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -170,8 +170,9 @@ class KiroHttpClient:
         self,
         method: str,
         url: str,
-        json_data: dict,
-        stream: bool = False
+        json_data: Optional[dict[str, Any]] = None,
+        stream: bool = False,
+        params: Optional[dict[str, Any]] = None,
     ) -> httpx.Response:
         """
         Executes an HTTP request with retry logic.
@@ -188,9 +189,10 @@ class KiroHttpClient:
         Args:
             method: HTTP method (GET, POST, etc.)
             url: Request URL
-            json_data: Request body (JSON)
+            json_data: Optional request body (JSON)
             stream: Use streaming (default False)
-        
+            params: Optional query parameters
+
         Returns:
             httpx.Response with successful response
         
@@ -214,12 +216,24 @@ class KiroHttpClient:
                 if stream:
                     # Prevent CLOSE_WAIT connection leak (issue #38)
                     headers["Connection"] = "close"
-                    req = client.build_request(method, url, json=json_data, headers=headers)
+                    req = client.build_request(
+                        method,
+                        url,
+                        params=params,
+                        json=json_data,
+                        headers=headers,
+                    )
                     logger.debug("Sending request to Kiro API...")
                     response = await client.send(req, stream=True)
                 else:
                     logger.debug("Sending request to Kiro API...")
-                    response = await client.request(method, url, json=json_data, headers=headers)
+                    response = await client.request(
+                        method,
+                        url,
+                        params=params,
+                        json=json_data,
+                        headers=headers,
+                    )
                 
                 # Check status
                 if response.status_code == 200:

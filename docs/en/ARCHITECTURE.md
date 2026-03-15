@@ -385,6 +385,7 @@ Supports async context manager (`async with`).
 | `/` | GET | Health check (status, message, version) |
 | `/health` | GET | Detailed health check (status, timestamp, version) |
 | `/v1/models` | GET | List of available models (requires API key) |
+| `/v1/usage` | GET | Current Kiro plan and usage limits (requires API key) |
 | `/v1/chat/completions` | POST | Chat completions (requires API key) |
 
 **Authentication:** Bearer token in `Authorization` header
@@ -666,9 +667,17 @@ TOOL_DESCRIPTION_MAX_LENGTH="10000"
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/v1/models` | GET | List of available models |
+| `/v1/usage` | GET | Current Kiro plan and usage limits |
 | `/v1/chat/completions` | POST | Chat completions (streaming/non-streaming) |
 
 **Authentication:** `Authorization: Bearer {PROXY_API_KEY}`
+
+`/v1/usage` proxies CodeWhisperer Runtime `GetUsageLimits` using:
+- `origin=AI_EDITOR` by default
+- `resource_type=AGENTIC_REQUEST` by default
+- `is_email_required=true` by default
+
+The route also accepts those values as query parameters when callers need to override them.
 
 ### 7.3 Anthropic-compatible Endpoints
 

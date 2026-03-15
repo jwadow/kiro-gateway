@@ -23,6 +23,7 @@ FastAPI routes for Kiro Gateway.
 Contains all API endpoints:
 - / and /health: Health check
 - /v1/models: Models list
+- /v1/usage: Current Kiro usage and plan limits
 - /v1/chat/completions: Chat completions
 """
 
@@ -49,6 +50,7 @@ from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
+from kiro.runtime_usage import fetch_usage_limits
 from kiro.utils import generate_conversation_id
 
 # Import debug_logger
@@ -148,6 +150,48 @@ async def get_models(request: Request):
     ]
     
     return ModelList(data=openai_models)
+
+
+@router.get("/v1/usage", dependencies=[Depends(verify_api_key)])
+async def get_usage(
+    request: Request,
+    origin: str = "AI_EDITOR",
+    resource_type: str = "AGENTIC_REQUEST",
+    is_email_required: bool = True,
+):
+    """
+    Return current Kiro usage and plan limits.
+
+    Args:
+        request: FastAPI Request for accessing app.state
+        origin: Upstream runtime origin query parameter
+        resource_type: Upstream runtime resource type query parameter
+        is_email_required: Whether upstream should include user email
+
+    Returns:
+        Raw JSON payload from CodeWhisperer Runtime GetUsageLimits
+
+    Raises:
+        HTTPException: On authentication, validation, network, or upstream errors
+    """
+    logger.info(
+        "Request to /v1/usage "
+        f"(origin={origin}, resource_type={resource_type}, include_email={is_email_required})"
+    )
+
+    auth_manager: KiroAuthManager = request.app.state.auth_manager
+    shared_client = request.app.state.http_client
+
+    try:
+        return await fetch_usage_limits(
+            auth_manager=auth_manager,
+            shared_client=shared_client,
+            origin=origin,
+            resource_type=resource_type,
+            is_email_required=is_email_required,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])

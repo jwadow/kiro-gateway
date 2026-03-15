@@ -303,6 +303,41 @@ class TestModelsEndpointIntegration:
         print("Caching works correctly")
 
 
+class TestUsageEndpointIntegration:
+    """Integration tests for /v1/usage endpoint."""
+
+    @patch("kiro.routes_openai.fetch_usage_limits", new_callable=AsyncMock)
+    def test_usage_requires_auth_and_returns_payload(
+        self,
+        mock_fetch_usage_limits,
+        test_client,
+        valid_proxy_api_key,
+    ):
+        """
+        What it does: Checks authentication and successful payload flow for /v1/usage.
+        Goal: Ensure the gateway exposes GetUsageLimits through a protected endpoint.
+        """
+        print("Step 1: Request /v1/usage without authorization...")
+        unauthorized = test_client.get("/v1/usage")
+        assert unauthorized.status_code == 401
+
+        mock_fetch_usage_limits.return_value = {
+            "subscriptionInfo": {"subscriptionTitle": "KIRO PRO"},
+            "usageBreakdownList": [{"usageLimit": 1000}],
+        }
+
+        print("Step 2: Request /v1/usage with valid authorization...")
+        authorized = test_client.get(
+            "/v1/usage",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        )
+
+        assert authorized.status_code == 200
+        assert authorized.json()["subscriptionInfo"]["subscriptionTitle"] == "KIRO PRO"
+        assert authorized.json()["usageBreakdownList"][0]["usageLimit"] == 1000
+        print(f"Usage payload: {authorized.json()}")
+
+
 class TestStreamingFlagHandling:
     """Integration tests for stream flag handling."""
     
