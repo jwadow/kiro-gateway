@@ -169,7 +169,7 @@ async def get_usage(
         is_email_required: Whether upstream should include user email
 
     Returns:
-        Raw JSON payload from CodeWhisperer Runtime GetUsageLimits
+        Upstream GetUsageLimits payload plus a derived `usageSummary` block
 
     Raises:
         HTTPException: On authentication, validation, network, or upstream errors

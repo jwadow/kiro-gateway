@@ -466,7 +466,9 @@ curl "http://localhost:8000/v1/usage" \
   -H "Authorization: Bearer my-super-secret-password-123"
 ```
 
-该端点会代理 CodeWhisperer Runtime 的 `GetUsageLimits`，并原样返回上游 JSON。
+该端点会代理 CodeWhisperer Runtime 的 `GetUsageLimits`，保留上游原始 JSON，
+并额外补充一个 `usageSummary` 摘要字段，方便直接读取重置时间、主额度用量和
+Free trial 用量等关键信息。
 
 默认查询参数：
 - `origin=AI_EDITOR`

@@ -466,7 +466,9 @@ curl "http://localhost:8000/v1/usage" \
   -H "Authorization: Bearer my-super-secret-password-123"
 ```
 
-The endpoint proxies CodeWhisperer Runtime `GetUsageLimits` and returns the raw upstream JSON.
+The endpoint proxies CodeWhisperer Runtime `GetUsageLimits`, preserves the upstream JSON,
+and adds a derived `usageSummary` block with normalized key fields such as reset time,
+primary quota usage, and free trial usage.
 
 Default query parameters:
 - `origin=AI_EDITOR`

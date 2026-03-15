@@ -679,6 +679,10 @@ TOOL_DESCRIPTION_MAX_LENGTH="10000"
 
 The route also accepts those values as query parameters when callers need to override them.
 
+The gateway preserves the upstream response body and adds a derived `usageSummary`
+block so clients can read normalized reset/free-trial values without parsing the
+nested runtime payload shape.
+
 ### 7.3 Anthropic-compatible Endpoints
 
 | Endpoint | Method | Description |

@@ -413,6 +413,15 @@ class TestUsageEndpoint:
         mock_fetch_usage_limits.return_value = {
             "subscriptionInfo": {"subscriptionTitle": "KIRO PRO"},
             "usageBreakdownList": [],
+            "usageSummary": {
+                "resetAt": "2026-04-01T00:00:00Z",
+                "primaryLimit": 1000,
+                "primaryUsed": 0.0,
+                "primaryUnit": "INVOCATIONS",
+                "freeTrialLimit": 500,
+                "freeTrialUsed": 330.11,
+                "freeTrialExpiresAt": "2026-04-11T14:15:32.340Z",
+            },
         }
 
         print("Action: GET /v1/usage with valid auth...")
@@ -424,6 +433,8 @@ class TestUsageEndpoint:
         print(f"Response: {response.json()}")
         assert response.status_code == 200
         assert response.json()["subscriptionInfo"]["subscriptionTitle"] == "KIRO PRO"
+        assert response.json()["usageSummary"]["primaryLimit"] == 1000
+        assert response.json()["usageSummary"]["freeTrialUsed"] == 330.11
         mock_fetch_usage_limits.assert_awaited_once()
 
     @patch("kiro.routes_openai.fetch_usage_limits", new_callable=AsyncMock)

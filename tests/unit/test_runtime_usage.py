@@ -12,7 +12,11 @@ import pytest
 from fastapi import HTTPException
 
 from kiro.auth import AuthType
-from kiro.runtime_usage import build_usage_limits_params, fetch_usage_limits
+from kiro.runtime_usage import (
+    build_usage_limits_params,
+    build_usage_summary,
+    fetch_usage_limits,
+)
 
 
 @pytest.fixture
@@ -76,14 +80,27 @@ class TestFetchUsageLimits:
     @patch("kiro.runtime_usage.KiroHttpClient")
     async def test_returns_usage_payload(self, mock_http_client_class, mock_usage_auth_manager):
         """
-        What it does: Verifies successful upstream payload is returned unchanged.
-        Purpose: Preserve transparency for usage responses.
+        What it does: Verifies successful upstream payload is returned with a derived summary.
+        Purpose: Preserve transparency while exposing stable usage fields.
         """
         mock_response = Mock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
             "subscriptionInfo": {"subscriptionTitle": "KIRO PRO"},
-            "usageBreakdownList": [],
+            "usageBreakdownList": [
+                {
+                    "resourceType": "CREDIT",
+                    "usageLimit": 1000,
+                    "currentUsageWithPrecision": 0.0,
+                    "unit": "INVOCATIONS",
+                    "nextDateReset": 1775001600.0,
+                    "freeTrialInfo": {
+                        "usageLimit": 500,
+                        "currentUsageWithPrecision": 330.11,
+                        "freeTrialExpiry": 1775916932.34,
+                    },
+                }
+            ],
         }
 
         mock_client = AsyncMock()
@@ -100,6 +117,15 @@ class TestFetchUsageLimits:
 
         print(f"Result: {payload}")
         assert payload["subscriptionInfo"]["subscriptionTitle"] == "KIRO PRO"
+        assert payload["usageSummary"] == {
+            "resetAt": "2026-04-01T00:00:00Z",
+            "primaryLimit": 1000,
+            "primaryUsed": 0.0,
+            "primaryUnit": "INVOCATIONS",
+            "freeTrialLimit": 500,
+            "freeTrialUsed": 330.11,
+            "freeTrialExpiresAt": "2026-04-11T14:15:32.340Z",
+        }
         mock_client.request_with_retry.assert_awaited_once_with(
             "GET",
             "https://q.us-east-1.amazonaws.com/getUsageLimits",
@@ -168,3 +194,63 @@ class TestFetchUsageLimits:
         print(f"Error response: {exc_info.value.detail}")
         assert exc_info.value.status_code == 502
         assert "invalid JSON" in exc_info.value.detail
+
+
+class TestBuildUsageSummary:
+    """Tests for derived usage summary generation."""
+
+    def test_builds_summary_from_usage_breakdown_list(self):
+        """
+        What it does: Verifies the gateway derives stable summary fields.
+        Purpose: Expose the key usage values clients need without losing raw payload data.
+        """
+        payload = {
+            "nextDateReset": 1775001600.0,
+            "usageBreakdownList": [
+                {
+                    "resourceType": "CREDIT",
+                    "usageLimit": 1000,
+                    "currentUsageWithPrecision": 0.0,
+                    "unit": "INVOCATIONS",
+                    "nextDateReset": 1775001600.0,
+                    "freeTrialInfo": {
+                        "usageLimit": 500,
+                        "currentUsageWithPrecision": 330.11,
+                        "freeTrialExpiry": 1775916932.34,
+                    },
+                }
+            ],
+        }
+
+        print("Action: Building usage summary from upstream payload...")
+        summary = build_usage_summary(payload)
+
+        print(f"Summary: {summary}")
+        assert summary == {
+            "resetAt": "2026-04-01T00:00:00Z",
+            "primaryLimit": 1000,
+            "primaryUsed": 0.0,
+            "primaryUnit": "INVOCATIONS",
+            "freeTrialLimit": 500,
+            "freeTrialUsed": 330.11,
+            "freeTrialExpiresAt": "2026-04-11T14:15:32.340Z",
+        }
+
+    def test_handles_missing_breakdown_data(self):
+        """
+        What it does: Verifies missing upstream fields degrade gracefully.
+        Purpose: Keep response shape stable even when upstream omits usage data.
+        """
+        print("Action: Building usage summary from incomplete payload...")
+        summary = build_usage_summary({})
+
+        print(f"Summary: {summary}")
+        assert summary == {
+            "resetAt": None,
+            "primaryLimit": None,
+            "primaryUsed": None,
+            "primaryUnit": None,
+            "freeTrialLimit": None,
+            "freeTrialUsed": None,
+            "freeTrialExpiresAt": None,
+        }
