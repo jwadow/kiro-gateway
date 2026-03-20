@@ -400,6 +400,14 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if key == "additionalProperties":
             continue
         
+        # Skip $schema - Kiro API doesn't support it
+        if key == "$schema":
+            continue
+        
+        # Skip properties if empty - Kiro API doesn't support empty properties
+        if key == "properties" and isinstance(value, dict) and len(value) == 0:
+            continue
+        
         # Recursively process nested objects
         if key == "properties" and isinstance(value, dict):
             result[key] = {

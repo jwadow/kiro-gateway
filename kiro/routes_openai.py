@@ -24,6 +24,7 @@ Contains all API endpoints:
 - / and /health: Health check
 - /v1/models: Models list
 - /v1/chat/completions: Chat completions
+- /v1/responses: Responses API (OpenAI-compatible)
 """
 
 import json
@@ -42,11 +43,12 @@ from kiro.models_openai import (
     OpenAIModel,
     ModelList,
     ChatCompletionRequest,
+    ResponseRequest,
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
-from kiro.converters_openai import build_kiro_payload
+from kiro.converters_openai import build_kiro_payload, build_kiro_payload_for_response
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
@@ -148,6 +150,186 @@ async def get_models(request: Request):
     ]
     
     return ModelList(data=openai_models)
+
+
+@router.post("/v1/responses", dependencies=[Depends(verify_api_key)])
+async def responses(request: Request, request_data: ResponseRequest):
+    """
+    Responses endpoint - compatible with OpenAI API.
+    
+    Accepts requests in OpenAI Responses API format (with 'input' instead of 'messages')
+    and translates them to Kiro API.
+    
+    Args:
+        request: FastAPI Request for accessing app.state
+        request_data: Request in OpenAI ResponseRequest format
+    
+    Returns:
+        JSONResponse with response data
+    """
+    logger.info(f"Request to /v1/responses (model={request_data.model})")
+    logger.info(f"Request body: {request_data.model_dump_json()}")
+    logger.info(f"Input messages: {len(request_data.input)}")
+    logger.info(f"Has tools: {request_data.tools is not None}")
+    logger.info(f"Temperature: {request_data.temperature}")
+    logger.info(f"Stream: {request_data.stream}")
+    
+    auth_manager: KiroAuthManager = request.app.state.auth_manager
+    model_cache: ModelInfoCache = request.app.state.model_cache
+    
+    # Generate conversation ID for Kiro API
+    conversation_id = generate_conversation_id()
+    
+    # Build payload for Kiro - use input instead of messages
+    profile_arn_for_payload = ""
+    if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+        profile_arn_for_payload = auth_manager.profile_arn
+    
+    try:
+        kiro_payload = build_kiro_payload_for_response(
+            request_data,
+            conversation_id,
+            profile_arn_for_payload
+        )
+        logger.info(f"Kiro payload built: {len(str(kiro_payload))} chars")
+        logger.info(f"Kiro payload model_id: {kiro_payload.get('modelId', 'N/A')}")
+        logger.info(f"Kiro payload has tools: {'tools' in kiro_payload}")
+    except ValueError as e:
+        logger.error(f"Failed to build kiro payload: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    # Create HTTP client
+    url = f"{auth_manager.api_host}/generateAssistantResponse"
+    logger.debug(f"Kiro API URL: {url}")
+    
+    shared_client = request.app.state.http_client
+    http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+    
+    try:
+        response = await http_client.request_with_retry(
+            "POST",
+            url,
+            kiro_payload,
+            stream=True
+        )
+        
+        logger.info(f"Kiro API response status: {response.status_code}")
+        
+        if response.status_code != 200:
+            try:
+                error_content = await response.aread()
+            except Exception:
+                error_content = b"Unknown error"
+            
+            await http_client.close()
+            error_text = error_content.decode('utf-8', errors='replace')
+            
+            logger.error(f"Kiro API error response: {error_text[:500]}")
+            
+            error_message = error_text
+            try:
+                error_json = json.loads(error_text)
+                from kiro.kiro_errors import enhance_kiro_error
+                error_info = enhance_kiro_error(error_json)
+                error_message = error_info.user_message
+                logger.debug(f"Original Kiro error: {error_info.original_message}")
+            except (json.JSONDecodeError, KeyError):
+                pass
+            
+            logger.warning(
+                f"HTTP {response.status_code} - POST /v1/responses - {error_message[:100]}"
+            )
+            
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "error": {
+                        "message": error_message,
+                        "type": "kiro_api_error",
+                        "code": response.status_code
+                    }
+                }
+            )
+        
+        # Collect streaming response (Kiro API returns streaming even for non-streaming requests)
+        chat_completion = await collect_stream_response(
+            http_client.client,
+            response,
+            request_data.model,
+            model_cache,
+            auth_manager,
+            request_messages=[msg.model_dump() for msg in request_data.input],
+            request_tools=[t.model_dump() for t in request_data.tools] if request_data.tools else None
+        )
+        
+        await http_client.close()
+        logger.info("HTTP 200 - POST /v1/responses - completed")
+        
+        # Convert ChatCompletion format to Responses API format
+        output_text = chat_completion.get("choices", [{}])[0].get("message", {}).get("content", "")
+        
+        if isinstance(output_text, str):
+            content_blocks = [{"type": "output_text", "text": output_text, "annotations": [], "logprobs": []}]
+        else:
+            content_blocks = output_text if output_text else [{"type": "output_text", "text": "", "annotations": [], "logprobs": []}]
+
+        response_id = chat_completion.get("id", conversation_id)
+        model_name = chat_completion.get("model", request_data.model)
+        created_at = int(datetime.now(timezone.utc).timestamp())
+        usage = chat_completion.get("usage", {})
+
+        responses_response = {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "model": model_name,
+            "output": [
+                {
+                    "id": conversation_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": content_blocks if isinstance(content_blocks, list) else [],
+                    "status": "completed"
+                }
+            ],
+            "usage": usage,
+            "status": "completed"
+        }
+
+        # Check if streaming was requested
+        stream_requested = getattr(request_data, 'stream', False)
+        if stream_requested:
+            logger.info("Returning streaming SSE response")
+            async def sse_generator():
+                # response.created
+                yield f"data: {json.dumps({'type': 'response.created', 'response': {**responses_response, 'output': [], 'status': 'in_progress'}})}\n\n"
+                # response.output_item.added
+                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': 0, 'item': {'id': conversation_id, 'type': 'message', 'role': 'assistant', 'content': [], 'status': 'in_progress'}})}\n\n"
+                # response.output_text.delta
+                full_text = content_blocks[0].get("text", "") if content_blocks else ""
+                yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': 0, 'content_index': 0, 'delta': full_text})}\n\n"
+                # response.output_text.done
+                yield f"data: {json.dumps({'type': 'response.output_text.done', 'output_index': 0, 'content_index': 0, 'text': full_text})}\n\n"
+                # response.output_item.done
+                yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': responses_response['output'][0]})}\n\n"
+                # response.completed
+                yield f"data: {json.dumps({'type': 'response.completed', 'response': responses_response})}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+        logger.info(f"Responses API response: {json.dumps(responses_response, indent=2)}")
+        logger.info("Returning JSONResponse with Responses API format")
+        return JSONResponse(content=responses_response)
+    
+    except HTTPException as e:
+        await http_client.close()
+        logger.error(f"HTTP {e.status_code} - POST /v1/responses - {e.detail}")
+        raise
+    except Exception as e:
+        await http_client.close()
+        logger.error(f"Internal error: {e}", exc_info=True)
+        logger.error(f"HTTP 500 - POST /v1/responses - {str(e)[:100]}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])

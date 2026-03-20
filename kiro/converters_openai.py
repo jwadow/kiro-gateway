@@ -35,7 +35,7 @@ from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import get_model_id_for_kiro
-from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
+from kiro.models_openai import ChatMessage, ChatCompletionRequest, ResponseRequest, Tool
 
 # Import from core - reuse shared logic
 from kiro.converters_core import (
@@ -279,10 +279,12 @@ def convert_openai_tools_to_unified(tools: Optional[List[Tool]]) -> Optional[Lis
             ))
         # Flat format compatibility (Cursor-style)
         elif tool.name is not None:
+            # Use input_schema, or fall back to extra 'parameters' field (n8n-style)
+            schema = tool.input_schema or (tool.model_extra or {}).get("parameters")
             unified_tools.append(UnifiedTool(
                 name=tool.name,
                 description=tool.description,
-                input_schema=tool.input_schema
+                input_schema=schema
             ))
         # Skip invalid tools
         else:
@@ -332,6 +334,52 @@ def build_kiro_payload(
         f"Converting OpenAI request: model={request_data.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}"
+    )
+    
+    # Use core function to build payload
+    result = core_build_kiro_payload(
+        messages=unified_messages,
+        system_prompt=system_prompt,
+        model_id=model_id,
+        tools=unified_tools,
+        conversation_id=conversation_id,
+        profile_arn=profile_arn,
+        inject_thinking=True
+    )
+    
+    return result.payload
+
+
+def build_kiro_payload_for_response(
+    request_data: ResponseRequest,
+    conversation_id: str,
+    profile_arn: str
+) -> dict:
+    """
+    Builds complete payload for Kiro API from OpenAI ResponseRequest.
+    
+    Similar to build_kiro_payload but uses 'input' instead of 'messages'.
+    
+    Args:
+        request_data: Request in OpenAI ResponseRequest format
+        conversation_id: Unique conversation ID
+        profile_arn: AWS CodeWhisperer profile ARN
+    
+    Returns:
+        Payload dictionary for POST request to Kiro API
+    """
+    # Convert input (instead of messages) to unified format
+    system_prompt, unified_messages = convert_openai_messages_to_unified(request_data.input)
+    
+    # Convert tools to unified format
+    unified_tools = convert_openai_tools_to_unified(request_data.tools)
+    
+    # Get model ID for Kiro API
+    model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
+    
+    logger.debug(
+        f"Converting OpenAI ResponseRequest: model={request_data.model} -> {model_id}, "
+        f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}"
     )
     
     # Use core function to build payload

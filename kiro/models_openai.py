@@ -180,6 +180,41 @@ class ChatCompletionRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class ResponseRequest(BaseModel):
+    """
+    Request for response generation in OpenAI Responses API format.
+    
+    Similar to ChatCompletionRequest but uses 'input' instead of 'messages'.
+    
+    Attributes:
+        model: Model ID for generation
+        input: List of input messages
+        instructions: System instructions
+        tools: List of available tools
+        temperature: Generation temperature (0-2)
+        top_p: Top-p sampling
+        max_output_tokens: Maximum output tokens
+        truncation: Truncation strategy
+        n: Number of response variants
+        stop: Stop sequences
+        parallel_tool_calls: Whether to allow parallel tool calls
+    """
+    model: str
+    input: Annotated[List[ChatMessage], Field(min_length=1)]
+    instructions: Optional[List[Dict[str, Any]]] = None
+    tools: Optional[List[Tool]] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_output_tokens: Optional[int] = None
+    truncation: Optional[str] = None
+    n: Optional[int] = 1
+    stop: Optional[Union[str, List[str]]] = None
+    parallel_tool_calls: Optional[bool] = None
+    stream: Optional[bool] = False
+    
+    model_config = {"extra": "allow"}
+
+
 # ==================================================================================================
 # Models for responses
 # ==================================================================================================
