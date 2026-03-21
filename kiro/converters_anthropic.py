@@ -369,7 +369,7 @@ def convert_anthropic_tools(
             tool_type = getattr(tool, "type", None)
 
         # Skip built-in server tools (no input_schema) — Kiro API can't handle them
-        if not input_schema:
+        if input_schema is None:
             logger.debug(f"Skipping server tool '{name or tool_type}' (no input_schema)")
             continue
 

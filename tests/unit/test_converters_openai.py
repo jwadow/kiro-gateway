@@ -680,7 +680,7 @@ class TestBuildKiroPayload:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "arn:aws:test")
+        result = build_kiro_payload(request, "conv-123", "arn:aws:test").payload
         
         print(f"Result: {result}")
         assert "conversationState" in result
@@ -703,7 +703,7 @@ class TestBuildKiroPayload:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
@@ -726,7 +726,7 @@ class TestBuildKiroPayload:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         assert "history" in result["conversationState"]
@@ -747,7 +747,7 @@ class TestBuildKiroPayload:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
@@ -785,7 +785,7 @@ class TestBuildKiroPayload:
         print("Action: Building payload (with fake reasoning and truncation recovery disabled)...")
         with patch('kiro.converters_core.FAKE_REASONING_ENABLED', False):
             with patch('kiro.config.TRUNCATION_RECOVERY', False):
-                result = build_kiro_payload(request, "conv-123", "")
+                result = build_kiro_payload(request, "conv-123", "").payload
 
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
@@ -807,7 +807,7 @@ class TestBuildKiroPayload:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         model_id = result["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
@@ -835,7 +835,7 @@ class TestBuildKiroPayload:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         context = result["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
@@ -880,7 +880,7 @@ class TestBuildKiroPayload:
         print("Action: Building payload with FAKE_REASONING_ENABLED=True...")
         with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
             with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = build_kiro_payload(request, "conv-123", "")
+                result = build_kiro_payload(request, "conv-123", "").payload
         
         current_msg = result["conversationState"]["currentMessage"]["userInputMessage"]
         content = current_msg["content"]
@@ -907,7 +907,7 @@ class TestBuildKiroPayload:
         print("Action: Building payload with FAKE_REASONING_ENABLED=True...")
         with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
             with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = build_kiro_payload(request, "conv-123", "")
+                result = build_kiro_payload(request, "conv-123", "").payload
         
         current_msg = result["conversationState"]["currentMessage"]["userInputMessage"]
         content = current_msg["content"]
@@ -1045,7 +1045,7 @@ class TestToolDescriptionHandling:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         print("Checking that description is replaced with placeholder...")
@@ -1073,7 +1073,7 @@ class TestToolDescriptionHandling:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         print("Checking that description is replaced with placeholder...")
@@ -1101,7 +1101,7 @@ class TestToolDescriptionHandling:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         print("Checking that description is replaced with placeholder...")
@@ -1129,7 +1129,7 @@ class TestToolDescriptionHandling:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         print("Checking that description is preserved...")
@@ -1162,7 +1162,7 @@ class TestToolDescriptionHandling:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         print("Checking that parameters are sanitized...")
@@ -1212,7 +1212,7 @@ class TestToolDescriptionHandling:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        result = build_kiro_payload(request, "conv-123", "").payload
         
         print(f"Result: {result}")
         print("Checking descriptions...")
@@ -1284,7 +1284,7 @@ class TestBuildKiroPayloadToolCallsIntegration:
         )
         
         print("Action: Building Kiro payload...")
-        result = build_kiro_payload(request, "conv-123", "arn:aws:test")
+        result = build_kiro_payload(request, "conv-123", "arn:aws:test").payload
         
         print(f"Result: {result}")
         
@@ -1351,7 +1351,7 @@ class TestBuildKiroPayloadToolCallsIntegration:
         
         print("Action: Building payload...")
         with patch('kiro.converters_core.TOOL_DESCRIPTION_MAX_LENGTH', 10000):
-            result = build_kiro_payload(request, "conv-123", "")
+            result = build_kiro_payload(request, "conv-123", "").payload
         
         print("Checking that system prompt contains tool documentation...")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]

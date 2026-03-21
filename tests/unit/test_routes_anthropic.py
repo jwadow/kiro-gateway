@@ -266,8 +266,8 @@ class TestMessagesValidation:
     
     def test_validates_missing_max_tokens(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies missing max_tokens field is rejected.
-        Purpose: Ensure max_tokens is required (Anthropic API requirement).
+        What it does: Verifies missing max_tokens defaults to 4096.
+        Purpose: Ensure max_tokens is optional (needed for count_tokens endpoint).
         """
         print("Action: POST /v1/messages without max_tokens...")
         response = test_client.post(
@@ -280,7 +280,8 @@ class TestMessagesValidation:
         )
         
         print(f"Status: {response.status_code}")
-        assert response.status_code == 422
+        # Should not be 422 — max_tokens defaults to 4096
+        assert response.status_code != 422
     
     def test_validates_missing_messages(self, test_client, valid_proxy_api_key):
         """

@@ -1461,7 +1461,7 @@ class TestAnthropicToKiro:
             return_value="claude-sonnet-4.5",
         ):
             with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
-                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test").payload
 
         print(f"Result: {result}")
         assert "conversationState" in result
@@ -1489,7 +1489,7 @@ class TestAnthropicToKiro:
             return_value="claude-sonnet-4.5",
         ):
             with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
-                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test").payload
 
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"][
@@ -1526,7 +1526,7 @@ class TestAnthropicToKiro:
             return_value="claude-sonnet-4.5",
         ):
             with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
-                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test").payload
 
         print(f"Result: {result}")
         context = result["conversationState"]["currentMessage"]["userInputMessage"].get(
@@ -1559,7 +1559,7 @@ class TestAnthropicToKiro:
             return_value="claude-sonnet-4.5",
         ):
             with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
-                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test").payload
 
         print(f"Result: {result}")
         history = result["conversationState"].get("history", [])
@@ -1621,7 +1621,7 @@ class TestAnthropicToKiro:
             return_value="claude-sonnet-4.5",
         ):
             with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
-                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test").payload
 
         print(f"Result: {result}")
 
@@ -1677,7 +1677,7 @@ class TestAnthropicToKiro:
         ):
             with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
                 with patch("kiro.converters_core.FAKE_REASONING_MAX_TOKENS", 4000):
-                    result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+                    result = anthropic_to_kiro(request, "conv-123", "arn:aws:test").payload
 
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"][
@@ -1727,7 +1727,7 @@ class TestAnthropicToKiro:
         ):
             with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
                 with patch("kiro.converters_core.FAKE_REASONING_MAX_TOKENS", 4000):
-                    result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+                    result = anthropic_to_kiro(request, "conv-123", "arn:aws:test").payload
 
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"][

@@ -1012,33 +1012,24 @@ class TestAnthropicTool:
         print(f"Comparing input_schema: Got {tool.input_schema}")
         assert "properties" in tool.input_schema
     
-    def test_requires_name(self):
+    def test_name_is_optional_for_server_tools(self):
         """
-        What it does: Verifies that name is required.
-        Purpose: Ensure validation fails without name.
+        What it does: Verifies that name is optional (server tools use type instead).
+        Purpose: Ensure server tools like web_search can be created without name.
         """
-        print("Setup: Attempting to create AnthropicTool without name...")
-        
-        print("Action: Creating model (should raise ValidationError)...")
-        with pytest.raises(ValidationError) as exc_info:
-            AnthropicTool(input_schema={})
-        
-        print(f"ValidationError raised: {exc_info.value}")
-        assert "name" in str(exc_info.value)
+        print("Setup: Creating AnthropicTool without name (server tool)...")
+        tool = AnthropicTool(type="web_search_20250305", input_schema=None)
+        assert tool.name is None
+        assert tool.type == "web_search_20250305"
     
-    def test_requires_input_schema(self):
+    def test_input_schema_is_optional_for_server_tools(self):
         """
-        What it does: Verifies that input_schema is required.
-        Purpose: Ensure validation fails without input_schema.
+        What it does: Verifies that input_schema is optional (server tools don't have it).
+        Purpose: Ensure server tools can be created without input_schema.
         """
-        print("Setup: Attempting to create AnthropicTool without input_schema...")
-        
-        print("Action: Creating model (should raise ValidationError)...")
-        with pytest.raises(ValidationError) as exc_info:
-            AnthropicTool(name="test")
-        
-        print(f"ValidationError raised: {exc_info.value}")
-        assert "input_schema" in str(exc_info.value)
+        print("Setup: Creating AnthropicTool without input_schema (server tool)...")
+        tool = AnthropicTool(type="code_execution_20250522", name="code_execution")
+        assert tool.input_schema is None
     
     def test_description_is_optional(self):
         """
