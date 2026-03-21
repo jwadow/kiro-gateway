@@ -298,6 +298,20 @@ DEFAULT_MAX_INPUT_TOKENS: int = 200000
 TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", "10000"))
 
 # ==================================================================================================
+# Tool Schema Compression
+# ==================================================================================================
+
+# Strip verbose fields (description, title, examples, $comment) from tool input schemas.
+# Reduces token usage significantly when many MCP tools are present.
+# Default: true (enabled)
+KIRO_COMPRESS_TOOL_SCHEMAS: bool = os.getenv("KIRO_COMPRESS_TOOL_SCHEMAS", "true").lower() in ("true", "1", "yes")
+
+# Maximum characters for tool descriptions. Longer descriptions are truncated.
+# Set to 0 to disable truncation.
+# Default: 200
+KIRO_TOOL_DESC_MAX_CHARS: int = int(os.getenv("KIRO_TOOL_DESC_MAX_CHARS", "200"))
+
+# ==================================================================================================
 # Truncation Recovery Settings
 # ==================================================================================================
 

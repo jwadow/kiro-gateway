@@ -533,9 +533,52 @@ def validate_tool_names(tools: Optional[List[UnifiedTool]]) -> None:
         )
 
 
+def compress_json_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strips verbose fields from JSON Schema properties recursively.
+
+    Removes description, title, examples, $comment, and markdownDescription,
+    keeping only structural fields needed for tool call generation.
+
+    Args:
+        schema: JSON Schema dictionary to compress.
+
+    Returns:
+        New dictionary with verbose fields removed.
+    """
+    if not schema:
+        return {}
+
+    STRIP_KEYS = {"description", "title", "examples", "$comment", "markdownDescription"}
+    result = {}
+
+    for key, value in schema.items():
+        if key in STRIP_KEYS:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            result[key] = {
+                pn: compress_json_schema(pv) if isinstance(pv, dict) else pv
+                for pn, pv in value.items()
+            }
+        elif isinstance(value, dict):
+            result[key] = compress_json_schema(value)
+        elif isinstance(value, list):
+            result[key] = [
+                compress_json_schema(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+        else:
+            result[key] = value
+
+    return result
+
+
 def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dict[str, Any]]:
     """
     Converts unified tools to Kiro API format.
+    
+    Optionally compresses tool schemas and truncates descriptions
+    based on KIRO_COMPRESS_TOOL_SCHEMAS and KIRO_TOOL_DESC_MAX_CHARS config.
     
     Args:
         tools: List of tools in unified format
@@ -543,6 +586,8 @@ def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dic
     Returns:
         List of tools in Kiro toolSpecification format
     """
+    from kiro.config import KIRO_COMPRESS_TOOL_SCHEMAS, KIRO_TOOL_DESC_MAX_CHARS
+
     if not tools:
         return []
     
@@ -550,12 +595,20 @@ def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dic
     for tool in tools:
         # Sanitize parameters from fields that Kiro API doesn't accept
         sanitized_params = sanitize_json_schema(tool.input_schema)
+
+        # Optionally compress schema to reduce token usage
+        if KIRO_COMPRESS_TOOL_SCHEMAS:
+            sanitized_params = compress_json_schema(sanitized_params)
         
         # Kiro API requires non-empty description
         description = tool.description
         if not description or not description.strip():
             description = f"Tool: {tool.name}"
             logger.debug(f"Tool '{tool.name}' has empty description, using placeholder")
+
+        # Optionally truncate long descriptions
+        if KIRO_TOOL_DESC_MAX_CHARS and description and len(description) > KIRO_TOOL_DESC_MAX_CHARS:
+            description = description[:KIRO_TOOL_DESC_MAX_CHARS] + "..."
         
         kiro_tools.append({
             "toolSpecification": {
