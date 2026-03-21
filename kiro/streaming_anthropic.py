@@ -461,22 +461,36 @@ async def stream_kiro_to_anthropic(
         # Calculate output tokens
         output_tokens = count_tokens(full_content + full_thinking_content)
 
-        # input_tokens already set from pre-counted prompt_tokens (full Kiro payload).
-        # Don't override with contextUsagePercentage — it's unreliable.
+        # Override input_tokens with Kiro-derived value if available.
+        # The local estimate undercounts because Kiro adds ~2K tokens of server-side
+        # system prompt that the gateway can't see. Using context_usage_percentage
+        # gives the real value, which clients need for accurate context management.
+        if context_usage_percentage is not None and context_usage_percentage > 0:
+            max_input = model_cache.get_max_input_tokens(model)
+            kiro_total = int((context_usage_percentage / 100) * max_input)
+            kiro_input = max(0, kiro_total - output_tokens)
+            logger.info(
+                f"[Token usage] local_estimate={input_tokens}, "
+                f"kiro_derived={kiro_input} (context_usage={context_usage_percentage:.2f}%)"
+            )
+            input_tokens = kiro_input
         
         # Determine stop reason
         stop_reason = "tool_use" if tool_blocks else "end_turn"
         
         # Send message_delta with stop_reason and usage
+        # Include input_tokens so clients get the accurate Kiro-derived count
+        # (message_start had the local estimate before context_usage was available)
+        delta_usage = {"output_tokens": output_tokens}
+        if context_usage_percentage is not None:
+            delta_usage["input_tokens"] = input_tokens
         yield format_sse_event("message_delta", {
             "type": "message_delta",
             "delta": {
                 "stop_reason": stop_reason,
                 "stop_sequence": None
             },
-            "usage": {
-                "output_tokens": output_tokens
-            }
+            "usage": delta_usage
         })
         
         # Send message_stop
@@ -620,8 +634,11 @@ async def collect_anthropic_response(
     # Calculate output tokens
     output_tokens = count_tokens(result.content + result.thinking_content)
     
-    # input_tokens already set from pre-counted prompt_tokens (full Kiro payload).
-    # Don't override with contextUsagePercentage — it's unreliable.
+    # Override input_tokens with Kiro-derived value if available
+    if result.context_usage_percentage is not None and result.context_usage_percentage > 0:
+        max_input = model_cache.get_max_input_tokens(model)
+        kiro_total = int((result.context_usage_percentage / 100) * max_input)
+        input_tokens = max(0, kiro_total - output_tokens)
     
     # Determine stop reason
     stop_reason = "tool_use" if result.tool_calls else "end_turn"

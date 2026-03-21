@@ -276,6 +276,10 @@ MODEL_CACHE_TTL: int = 3600
 # Default maximum number of input tokens
 DEFAULT_MAX_INPUT_TOKENS: int = 200000
 
+# Kiro API adds an internal system prompt (~2000 tokens) that the gateway can't see.
+# This offset is added to local token estimates so clients get accurate context usage.
+KIRO_PROMPT_OVERHEAD_TOKENS: int = int(os.getenv("KIRO_PROMPT_OVERHEAD_TOKENS", "2000"))
+
 # ==================================================================================================
 # Tool Description Handling (Kiro API Limitations)
 # ==================================================================================================

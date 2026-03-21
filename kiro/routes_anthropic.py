@@ -301,10 +301,12 @@ async def messages(
         http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
     
     # Count prompt tokens from the full Kiro payload (system prompt + messages + tools)
+    # Add KIRO_PROMPT_OVERHEAD_TOKENS to account for Kiro's internal system prompt
+    from kiro.config import KIRO_PROMPT_OVERHEAD_TOKENS
     kiro_payload_prompt_tokens = count_tokens(
         kiro_request_body.decode('utf-8', errors='ignore'),
         apply_claude_correction=False
-    )
+    ) + KIRO_PROMPT_OVERHEAD_TOKENS
     
     try:
         # Make request to Kiro API (for both streaming and non-streaming modes)
@@ -501,10 +503,12 @@ async def count_tokens_endpoint(
         )
 
     # Count tokens from the full serialized Kiro payload (same as messages endpoint)
+    # Add KIRO_PROMPT_OVERHEAD_TOKENS to account for Kiro's internal system prompt
+    from kiro.config import KIRO_PROMPT_OVERHEAD_TOKENS
     kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2)
-    input_tokens = count_tokens(kiro_request_body, apply_claude_correction=False)
+    input_tokens = count_tokens(kiro_request_body, apply_claude_correction=False) + KIRO_PROMPT_OVERHEAD_TOKENS
 
-    logger.info(f"Token count estimate: {input_tokens} (payload size: {len(kiro_request_body)} chars)")
+    logger.info(f"Token count estimate: {input_tokens} (payload size: {len(kiro_request_body)} chars, overhead: {KIRO_PROMPT_OVERHEAD_TOKENS})")
 
     return JSONResponse(content={
         "input_tokens": input_tokens,
