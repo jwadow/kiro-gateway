@@ -637,8 +637,9 @@ class KiroAuthManager:
         Used by kiro-cli which authenticates via AWS IAM Identity Center.
         
         Strategy: Try with current in-memory token first. If it fails with 400
-        (invalid_request - token was invalidated by kiro-cli re-login), reload
-        credentials from SQLite and retry once.
+        (invalid_request - token was invalidated by kiro-cli re-login) or 401
+        (invalid_client - device registration rotated by kiro-cli re-login),
+        reload all credentials from SQLite and retry once.
         
         This approach handles both scenarios:
         1. Container successfully refreshed token (uses in-memory token)
@@ -656,9 +657,11 @@ class KiroAuthManager:
         try:
             await self._do_aws_sso_oidc_refresh()
         except httpx.HTTPStatusError as e:
-            # 400 = invalid_request, likely stale token after kiro-cli re-login
-            if e.response.status_code == 400 and self._sqlite_db:
-                logger.warning("Token refresh failed with 400, reloading credentials from SQLite and retrying...")
+            # 400 = invalid_grant (stale refresh_token)
+            # 401 = invalid_client (stale client_secret after kiro-cli re-login)
+            # Both are recoverable by reloading all credentials from SQLite
+            if e.response.status_code in (400, 401) and self._sqlite_db:
+                logger.warning(f"Token refresh failed with {e.response.status_code}, reloading credentials from SQLite and retrying...")
                 self._load_credentials_from_sqlite(self._sqlite_db)
                 await self._do_aws_sso_oidc_refresh()
             else:
@@ -795,7 +798,7 @@ class KiroAuthManager:
             except httpx.HTTPStatusError as e:
                 # Graceful degradation for SQLite mode when refresh fails twice
                 # This happens when kiro-cli refreshed tokens in memory without persisting
-                if e.response.status_code == 400 and self._sqlite_db:
+                if e.response.status_code in (400, 401) and self._sqlite_db:
                     logger.warning(
                         "Token refresh failed with 400 after SQLite reload. "
                         "This may happen if kiro-cli refreshed tokens in memory without persisting."

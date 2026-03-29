@@ -1596,8 +1596,8 @@ class TestKiroAuthManagerSsoRegionSeparation:
         self, mock_aws_sso_oidc_token_response
     ):
         """
-        What it does: Verifies that non-400 errors are not retried.
-        Purpose: Ensure only 400 (invalid_request) triggers SQLite reload.
+        What it does: Verifies that non-retryable errors (e.g. 500) are not retried.
+        Purpose: Ensure only 400/401 triggers SQLite reload.
         """
         print("Setup: Creating KiroAuthManager...")
         manager = KiroAuthManager(
@@ -1687,6 +1687,71 @@ class TestKiroAuthManagerSsoRegionSeparation:
 
 
 # =============================================================================
+
+    @pytest.mark.asyncio
+    async def test_refresh_token_aws_sso_oidc_retries_on_401_invalid_client(
+        self, mock_aws_sso_oidc_token_response
+    ):
+        """
+        What it does: Verifies that 401 (invalid_client) triggers SQLite reload and retry.
+        Purpose: When kiro-cli re-login rotates device registration (client_id/client_secret),
+        the gateway should reload from SQLite and retry instead of failing permanently.
+        """
+        print("Setup: Creating KiroAuthManager with stale client credentials...")
+        manager = KiroAuthManager(
+            refresh_token="test_refresh",
+            client_id="old_client_id",
+            client_secret="old_client_secret"
+        )
+        manager._sqlite_db = "/fake/path/data.sqlite3"
+
+        call_count = 0
+
+        print("Setup: Mocking HTTP client - 401 first, then 200...")
+        mock_error_response = AsyncMock()
+        mock_error_response.status_code = 401
+        mock_error_response.text = '{"error":"invalid_client","error_description":"Invalid client secret provided"}'
+        mock_error_response.json = Mock(return_value={"error": "invalid_client", "error_description": "Invalid client secret provided"})
+        mock_error_response.raise_for_status = Mock(
+            side_effect=httpx.HTTPStatusError(
+                "401 Unauthorized",
+                request=Mock(),
+                response=mock_error_response
+            )
+        )
+
+        mock_success_response = AsyncMock()
+        mock_success_response.status_code = 200
+        mock_success_response.json = Mock(return_value=mock_aws_sso_oidc_token_response())
+        mock_success_response.raise_for_status = Mock()
+
+        async def side_effect_post(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return mock_error_response
+            return mock_success_response
+
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(side_effect=side_effect_post)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            with patch.object(manager, '_load_credentials_from_sqlite') as mock_load:
+                print("Action: Calling _refresh_token_aws_sso_oidc...")
+                await manager._refresh_token_aws_sso_oidc()
+
+                print("Verification: Two requests were made (retry on 401)...")
+                assert call_count == 2
+
+                print("Verification: SQLite was reloaded on 401...")
+                mock_load.assert_called_once()
+
+                print("Verification: Token was updated from successful retry...")
+                assert manager._access_token == "new_aws_sso_access_token"
+
 # Tests for is_token_expired() method
 # =============================================================================
 
