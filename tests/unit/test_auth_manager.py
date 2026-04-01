@@ -47,24 +47,27 @@ class TestKiroAuthManagerInitialization:
     
     def test_initialization_sets_correct_urls_for_region(self):
         """
-        What it does: Verifies URL formation based on region.
-        Purpose: Ensure URLs are dynamically formed with the correct region.
+        What it does: Verifies URL formation based on region and api_region.
+        Purpose: Ensure SSO refresh URL uses region, and API hosts use api_region.
         """
-        print("Setup: Creating KiroAuthManager with region eu-west-1...")
+        print("Setup: Creating KiroAuthManager with region=eu-west-1, api_region=eu-central-1...")
         manager = KiroAuthManager(
             refresh_token="test_token",
-            region="eu-west-1"
+            region="eu-west-1",
+            api_region="eu-central-1",
         )
-        
-        print("Verification: URLs contain correct region...")
+
+        print("Verification: refresh_url uses SSO region (eu-west-1)...")
         print(f"Comparing refresh_url: Expected 'eu-west-1' in URL, Got '{manager._refresh_url}'")
         assert "eu-west-1" in manager._refresh_url
-        
-        print(f"Comparing api_host: Expected 'eu-west-1' in URL, Got '{manager._api_host}'")
-        assert "eu-west-1" in manager._api_host
-        
-        print(f"Comparing q_host: Expected 'eu-west-1' in URL, Got '{manager._q_host}'")
-        assert "eu-west-1" in manager._q_host
+
+        print("Verification: api_host uses api_region (eu-central-1)...")
+        print(f"Comparing api_host: Expected 'eu-central-1' in URL, Got '{manager._api_host}'")
+        assert "eu-central-1" in manager._api_host
+
+        print("Verification: q_host uses api_region (eu-central-1)...")
+        print(f"Comparing q_host: Expected 'eu-central-1' in URL, Got '{manager._q_host}'")
+        assert "eu-central-1" in manager._q_host
     
     def test_initialization_generates_fingerprint(self):
         """
@@ -1684,6 +1687,89 @@ class TestKiroAuthManagerSsoRegionSeparation:
             
             print("Verification: Only one request was made...")
             assert mock_client.post.call_count == 1
+
+
+# =============================================================================
+# Tests for KIRO_API_REGION separation from KIRO_REGION (Issue: q.{region}.amazonaws.com
+# only exists in specific regions, while SSO region can be anything)
+# =============================================================================
+
+class TestKiroAuthManagerApiRegionSeparation:
+    """Tests for KIRO_API_REGION separation from KIRO_REGION.
+
+    Background: q.amazonaws.com endpoints only exist in specific regions (e.g., us-east-1).
+    Users with SSO in regions like us-east-2 would get DNS failures if we used their
+    SSO region for the Q API endpoint. KIRO_API_REGION lets them configure these separately.
+    """
+
+    def test_api_host_uses_api_region_not_sso_region(self):
+        """
+        What it does: Verifies api_host uses api_region, not the SSO region.
+        Purpose: Ensure Q API calls go to a valid endpoint even when SSO is in a
+                 region that has no q.amazonaws.com endpoint (e.g., us-east-2).
+        """
+        print("Setup: Creating KiroAuthManager with sso_region=us-east-2, api_region=us-east-1...")
+        manager = KiroAuthManager(
+            refresh_token="test_token",
+            region="us-east-2",      # SSO region (e.g., org SSO is in us-east-2)
+            api_region="us-east-1",  # Q API region (q.us-east-1.amazonaws.com exists)
+        )
+
+        print("Verification: api_host uses api_region (us-east-1)...")
+        print(f"api_host: {manager._api_host}")
+        assert "us-east-1" in manager._api_host
+        assert "us-east-2" not in manager._api_host
+
+        print("Verification: q_host uses api_region (us-east-1)...")
+        print(f"q_host: {manager._q_host}")
+        assert "us-east-1" in manager._q_host
+        assert "us-east-2" not in manager._q_host
+
+    def test_refresh_url_uses_sso_region_not_api_region(self):
+        """
+        What it does: Verifies refresh_url uses the SSO region, not api_region.
+        Purpose: Ensure Kiro Desktop token refresh goes to the correct regional endpoint.
+        """
+        print("Setup: Creating KiroAuthManager with sso_region=us-east-2, api_region=us-east-1...")
+        manager = KiroAuthManager(
+            refresh_token="test_token",
+            region="us-east-2",
+            api_region="us-east-1",
+        )
+
+        print("Verification: _refresh_url uses SSO region (us-east-2)...")
+        print(f"_refresh_url: {manager._refresh_url}")
+        assert "us-east-2" in manager._refresh_url
+        assert "us-east-1" not in manager._refresh_url
+
+    def test_api_region_defaults_to_us_east_1(self):
+        """
+        What it does: Verifies api_region defaults to us-east-1 when not specified.
+        Purpose: Ensure backward compatibility — existing users need no config change.
+        """
+        print("Setup: Creating KiroAuthManager without api_region param...")
+        manager = KiroAuthManager(refresh_token="test_token")
+
+        print("Verification: api_host defaults to us-east-1...")
+        assert "us-east-1" in manager._api_host
+        assert "us-east-1" in manager._q_host
+
+    def test_api_region_can_be_set_independently(self):
+        """
+        What it does: Verifies api_region can be any valid Q API region.
+        Purpose: Support users whose Q API region differs from us-east-1.
+        """
+        print("Setup: Creating KiroAuthManager with api_region=eu-central-1...")
+        manager = KiroAuthManager(
+            refresh_token="test_token",
+            region="us-east-1",
+            api_region="eu-central-1",
+        )
+
+        print("Verification: api_host uses eu-central-1...")
+        assert "eu-central-1" in manager._api_host
+        assert "eu-central-1" in manager._q_host
+        assert "us-east-1" not in manager._api_host
 
 
 # =============================================================================

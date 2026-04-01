@@ -54,6 +54,7 @@ from kiro.model_resolver import ModelResolver, normalize_model_name, get_model_i
 from kiro.config import (
     PROXY_API_KEY,
     REGION,
+    API_REGION,
     HIDDEN_MODELS,
     APP_VERSION,
 )
@@ -105,6 +106,7 @@ __all__ = [
     # Configuration
     "PROXY_API_KEY",
     "REGION",
+    "API_REGION",
     "HIDDEN_MODELS",
     "APP_VERSION",
     

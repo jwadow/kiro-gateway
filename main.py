@@ -59,6 +59,7 @@ from kiro.config import (
     REFRESH_TOKEN,
     PROFILE_ARN,
     REGION,
+    API_REGION,
     KIRO_CREDS_FILE,
     KIRO_CLI_DB_FILE,
     PROXY_API_KEY,
@@ -341,6 +342,7 @@ async def lifespan(app: FastAPI):
         refresh_token=REFRESH_TOKEN,
         profile_arn=PROFILE_ARN,
         region=REGION,
+        api_region=API_REGION,
         creds_file=KIRO_CREDS_FILE if KIRO_CREDS_FILE else None,
         sqlite_db=KIRO_CLI_DB_FILE if KIRO_CLI_DB_FILE else None,
     )

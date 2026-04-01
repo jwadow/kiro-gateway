@@ -130,8 +130,17 @@ REFRESH_TOKEN: str = os.getenv("REFRESH_TOKEN", "")
 # Profile ARN for AWS CodeWhisperer
 PROFILE_ARN: str = os.getenv("PROFILE_ARN", "")
 
-# AWS region (default us-east-1)
+# AWS SSO/auth region (default us-east-1)
+# Used for OIDC token refresh endpoint (e.g., https://oidc.{region}.amazonaws.com/token)
+# May differ from API region — set this to match your SSO provider's region
 REGION: str = os.getenv("KIRO_REGION", "us-east-1")
+
+# AWS Q API region (default us-east-1)
+# Used for the Q Developer API endpoint (e.g., https://q.{region}.amazonaws.com)
+# Note: q.amazonaws.com endpoints only exist in specific regions. If your SSO region
+# (KIRO_REGION) differs from your Q API region, set KIRO_API_REGION explicitly.
+# See supported regions: https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/regions.html
+API_REGION: str = os.getenv("KIRO_API_REGION", "us-east-1")
 
 # Path to credentials file (optional, alternative to .env)
 # Read directly from .env to avoid escape sequence issues on Windows

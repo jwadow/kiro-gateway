@@ -118,6 +118,7 @@ class KiroAuthManager:
         refresh_token: Optional[str] = None,
         profile_arn: Optional[str] = None,
         region: str = "us-east-1",
+        api_region: str = "us-east-1",
         creds_file: Optional[str] = None,
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
@@ -129,7 +130,11 @@ class KiroAuthManager:
         Args:
             refresh_token: Refresh token for obtaining access token
             profile_arn: AWS CodeWhisperer profile ARN
-            region: AWS region (default: us-east-1)
+            region: AWS SSO/auth region used for OIDC token refresh endpoint (default: us-east-1)
+            api_region: AWS Q Developer API region for endpoint URL construction (default: us-east-1).
+                        Separate from ``region`` because q.amazonaws.com only exists in certain
+                        regions. Set via ``KIRO_API_REGION`` env var when your SSO region
+                        (``KIRO_REGION``) differs from the Q API region.
             creds_file: Path to JSON file with credentials (optional)
             client_id: OAuth client ID (for AWS SSO OIDC, optional)
             client_secret: OAuth client secret (for AWS SSO OIDC, optional)
@@ -161,13 +166,15 @@ class KiroAuthManager:
         # Auth type will be determined after loading credentials
         self._auth_type: AuthType = AuthType.KIRO_DESKTOP
         
-        # Dynamic URLs based on region
+        # Dynamic URLs based on regions
+        # SSO/auth region: used for OIDC token refresh endpoint
         self._refresh_url = get_kiro_refresh_url(region)
-        self._api_host = get_kiro_api_host(region)
-        self._q_host = get_kiro_q_host(region)
+        # API region: used for Q Developer API endpoint (separate from SSO region)
+        self._api_host = get_kiro_api_host(api_region)
+        self._q_host = get_kiro_q_host(api_region)
         
         # Log initialized endpoints for diagnostics (helps with DNS issues like #58)
-        logger.info(f"Auth manager initialized: region={region}, api_host={self._api_host}, q_host={self._q_host}")
+        logger.info(f"Auth manager initialized: sso_region={region}, api_region={api_region}, api_host={self._api_host}, q_host={self._q_host}")
         
         # Fingerprint for User-Agent
         self._fingerprint = get_machine_fingerprint()
