@@ -296,6 +296,33 @@ def convert_openai_tools_to_unified(tools: Optional[List[Tool]]) -> Optional[Lis
 # Main Entry Point
 # ==================================================================================================
 
+def _wants_json_response(request_data: ChatCompletionRequest) -> bool:
+    """
+    Check if the request has response_format with type 'json_object'.
+    
+    Since ChatCompletionRequest uses extra='allow', response_format
+    is accepted but not explicitly modeled. We check it dynamically.
+    """
+    rf = getattr(request_data, "response_format", None)
+    if rf is None:
+        return False
+    if isinstance(rf, dict):
+        return rf.get("type") == "json_object"
+    # Pydantic model or other object
+    return getattr(rf, "type", None) == "json_object"
+
+
+JSON_SYSTEM_PROMPT_ADDITION = (
+    "\n\n---\n"
+    "# Response Format: JSON\n\n"
+    "The caller has requested JSON output (response_format: json_object).\n"
+    "You MUST respond with raw, valid JSON only.\n"
+    "Do NOT wrap the response in markdown code blocks (```json ... ``` or ``` ... ```).\n"
+    "Do NOT add any text before or after the JSON.\n"
+    "The response must be parseable by JSON.parse() directly."
+)
+
+
 def build_kiro_payload(
     request_data: ChatCompletionRequest,
     conversation_id: str,
@@ -323,6 +350,11 @@ def build_kiro_payload(
     
     # Convert tools to unified format
     unified_tools = convert_openai_tools_to_unified(request_data.tools)
+    
+    # If response_format is json_object, inject JSON instruction into system prompt
+    if _wants_json_response(request_data):
+        system_prompt = (system_prompt + JSON_SYSTEM_PROMPT_ADDITION) if system_prompt else JSON_SYSTEM_PROMPT_ADDITION.strip()
+        logger.info("response_format=json_object detected, injecting JSON system prompt")
     
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid

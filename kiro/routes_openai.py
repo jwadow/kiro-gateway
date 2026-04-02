@@ -46,8 +46,9 @@ from kiro.models_openai import (
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
-from kiro.converters_openai import build_kiro_payload
+from kiro.converters_openai import build_kiro_payload, _wants_json_response
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
+from kiro.json_response_format import strip_markdown_json_wrapper
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 
@@ -392,6 +393,17 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             )
             
             await http_client.close()
+            
+            # Strip markdown JSON wrapper if response_format is json_object
+            if _wants_json_response(request_data):
+                try:
+                    content = openai_response["choices"][0]["message"]["content"]
+                    stripped = strip_markdown_json_wrapper(content)
+                    if stripped != content:
+                        openai_response["choices"][0]["message"]["content"] = stripped
+                        logger.info("Stripped markdown JSON wrapper from non-streaming response")
+                except (KeyError, IndexError):
+                    pass
             
             # Log access log for non-streaming success
             logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
