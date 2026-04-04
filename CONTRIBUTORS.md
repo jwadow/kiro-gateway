@@ -14,3 +14,4 @@ Thank you to all the contributors who have helped improve this project!
 - [@PAzter1101](https://github.com/PAzter1101) — Docker containerization with CI/CD (#55)
 - [@Ry-DS](https://github.com/Ry-DS) — Images in tool results support for Anthropic MCP servers (#57)
 - [@saaj](https://github.com/saaj) — Regional endpoint fix for eu-central-1 and other non-us-east-1 regions (#58)
+- [@lukasBlckIT](https://github.com/lukasBlckIT) — response_format json_object support (#123)
