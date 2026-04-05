@@ -18,27 +18,12 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 """
-Kiro Gateway — backward-compatible entry point.
+Kiro Gateway — ``python -m kiro`` support.
 
-This module re-exports the FastAPI ``app`` from ``kiro.app`` so that
-``uvicorn main:app`` continues to work. Running ``python main.py``
-delegates to ``kiro.cli.main()``.
-
-Usage:
-    # Using uvicorn directly
-    uvicorn main:app --host 0.0.0.0 --port 8000
-
-    # Using python directly
-    python main.py
-    python main.py --port 9000
-
-For new installations, prefer:
-    kiro-gateway
-    kiro-gateway --port 9000
+Allows running the gateway via ``python -m kiro`` as an alternative
+to the ``kiro-gateway`` console script.
 """
 
-from kiro.app import app  # noqa: F401 — re-exported for uvicorn main:app
+from kiro.cli import main
 
-if __name__ == "__main__":
-    from kiro.cli import main
-    main()
+main()

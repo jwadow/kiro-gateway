@@ -21,7 +21,7 @@ class TestParseCliArgs:
         Purpose: Ensure that None indicates "use env or default" in priority resolution.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with no arguments...")
         with patch.object(sys, 'argv', ['main.py']):
@@ -39,7 +39,7 @@ class TestParseCliArgs:
         Purpose: Ensure long form --port works.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with --port 9000...")
         with patch.object(sys, 'argv', ['main.py', '--port', '9000']):
@@ -55,7 +55,7 @@ class TestParseCliArgs:
         Purpose: Ensure short form -p works.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with -p 8080...")
         with patch.object(sys, 'argv', ['main.py', '-p', '8080']):
@@ -71,7 +71,7 @@ class TestParseCliArgs:
         Purpose: Ensure long form --host works.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with --host 127.0.0.1...")
         with patch.object(sys, 'argv', ['main.py', '--host', '127.0.0.1']):
@@ -87,7 +87,7 @@ class TestParseCliArgs:
         Purpose: Ensure short form -H works.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with -H 192.168.1.1...")
         with patch.object(sys, 'argv', ['main.py', '-H', '192.168.1.1']):
@@ -103,7 +103,7 @@ class TestParseCliArgs:
         Purpose: Ensure both arguments work simultaneously.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with --host 0.0.0.0 --port 3000...")
         with patch.object(sys, 'argv', ['main.py', '--host', '0.0.0.0', '--port', '3000']):
@@ -120,7 +120,7 @@ class TestParseCliArgs:
         Purpose: Ensure short forms work simultaneously.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with -H 127.0.0.1 -p 5000...")
         with patch.object(sys, 'argv', ['main.py', '-H', '127.0.0.1', '-p', '5000']):
@@ -141,17 +141,17 @@ class TestResolveServerConfig:
         Purpose: Ensure CLI args override environment variables.
         """
         print("Setup: Importing resolve_server_config...")
-        from main import resolve_server_config
+        from kiro.cli import resolve_server_config
         
         print("Setup: Creating args with host=127.0.0.1, port=9000...")
         args = argparse.Namespace(host="127.0.0.1", port=9000)
         
         print("Action: Calling resolve_server_config with CLI args...")
         # Even if env vars are set, CLI should win
-        with patch('main.SERVER_HOST', '0.0.0.0'), \
-             patch('main.SERVER_PORT', 8000), \
-             patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
-             patch('main.DEFAULT_SERVER_PORT', 8000):
+        with patch('kiro.cli.SERVER_HOST', '0.0.0.0'), \
+             patch('kiro.cli.SERVER_PORT', 8000), \
+             patch('kiro.cli.DEFAULT_SERVER_HOST', '0.0.0.0'), \
+             patch('kiro.cli.DEFAULT_SERVER_PORT', 8000):
             host, port = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
@@ -166,17 +166,17 @@ class TestResolveServerConfig:
         Purpose: Ensure env vars are used when CLI args are not provided.
         """
         print("Setup: Importing resolve_server_config...")
-        from main import resolve_server_config
+        from kiro.cli import resolve_server_config
         
         print("Setup: Creating args with host=None, port=None (no CLI args)...")
         args = argparse.Namespace(host=None, port=None)
         
         print("Action: Calling resolve_server_config with env vars set...")
         # SERVER_HOST and SERVER_PORT are different from defaults
-        with patch('main.SERVER_HOST', '192.168.1.100'), \
-             patch('main.SERVER_PORT', 3000), \
-             patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
-             patch('main.DEFAULT_SERVER_PORT', 8000):
+        with patch('kiro.cli.SERVER_HOST', '192.168.1.100'), \
+             patch('kiro.cli.SERVER_PORT', 3000), \
+             patch('kiro.cli.DEFAULT_SERVER_HOST', '0.0.0.0'), \
+             patch('kiro.cli.DEFAULT_SERVER_PORT', 8000):
             host, port = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
@@ -191,17 +191,17 @@ class TestResolveServerConfig:
         Purpose: Ensure default values work correctly.
         """
         print("Setup: Importing resolve_server_config...")
-        from main import resolve_server_config
+        from kiro.cli import resolve_server_config
         
         print("Setup: Creating args with host=None, port=None...")
         args = argparse.Namespace(host=None, port=None)
         
         print("Action: Calling resolve_server_config with defaults...")
         # SERVER_HOST and SERVER_PORT equal to defaults (no env override)
-        with patch('main.SERVER_HOST', '0.0.0.0'), \
-             patch('main.SERVER_PORT', 8000), \
-             patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
-             patch('main.DEFAULT_SERVER_PORT', 8000):
+        with patch('kiro.cli.SERVER_HOST', '0.0.0.0'), \
+             patch('kiro.cli.SERVER_PORT', 8000), \
+             patch('kiro.cli.DEFAULT_SERVER_HOST', '0.0.0.0'), \
+             patch('kiro.cli.DEFAULT_SERVER_PORT', 8000):
             host, port = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
@@ -216,16 +216,16 @@ class TestResolveServerConfig:
         Purpose: Ensure each argument is resolved independently.
         """
         print("Setup: Importing resolve_server_config...")
-        from main import resolve_server_config
+        from kiro.cli import resolve_server_config
         
         print("Setup: Creating args with host='127.0.0.1', port=None...")
         args = argparse.Namespace(host="127.0.0.1", port=None)
         
         print("Action: Calling resolve_server_config...")
-        with patch('main.SERVER_HOST', '0.0.0.0'), \
-             patch('main.SERVER_PORT', 9000), \
-             patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
-             patch('main.DEFAULT_SERVER_PORT', 8000):
+        with patch('kiro.cli.SERVER_HOST', '0.0.0.0'), \
+             patch('kiro.cli.SERVER_PORT', 9000), \
+             patch('kiro.cli.DEFAULT_SERVER_HOST', '0.0.0.0'), \
+             patch('kiro.cli.DEFAULT_SERVER_PORT', 8000):
             host, port = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
@@ -240,16 +240,16 @@ class TestResolveServerConfig:
         Purpose: Ensure each argument is resolved independently.
         """
         print("Setup: Importing resolve_server_config...")
-        from main import resolve_server_config
+        from kiro.cli import resolve_server_config
         
         print("Setup: Creating args with host=None, port=5000...")
         args = argparse.Namespace(host=None, port=5000)
         
         print("Action: Calling resolve_server_config...")
-        with patch('main.SERVER_HOST', '192.168.1.1'), \
-             patch('main.SERVER_PORT', 8000), \
-             patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
-             patch('main.DEFAULT_SERVER_PORT', 8000):
+        with patch('kiro.cli.SERVER_HOST', '192.168.1.1'), \
+             patch('kiro.cli.SERVER_PORT', 8000), \
+             patch('kiro.cli.DEFAULT_SERVER_HOST', '0.0.0.0'), \
+             patch('kiro.cli.DEFAULT_SERVER_PORT', 8000):
             host, port = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
@@ -268,7 +268,7 @@ class TestPrintStartupBanner:
         Purpose: Ensure URL is displayed to user.
         """
         print("Setup: Importing print_startup_banner...")
-        from main import print_startup_banner
+        from kiro.cli import print_startup_banner
         
         print("Action: Calling print_startup_banner('0.0.0.0', 8000)...")
         print_startup_banner("0.0.0.0", 8000)
@@ -285,7 +285,7 @@ class TestPrintStartupBanner:
         Purpose: Ensure custom port is displayed correctly.
         """
         print("Setup: Importing print_startup_banner...")
-        from main import print_startup_banner
+        from kiro.cli import print_startup_banner
         
         print("Action: Calling print_startup_banner('127.0.0.1', 9000)...")
         print_startup_banner("127.0.0.1", 9000)
@@ -301,7 +301,7 @@ class TestPrintStartupBanner:
         Purpose: Ensure /docs endpoint is mentioned.
         """
         print("Setup: Importing print_startup_banner...")
-        from main import print_startup_banner
+        from kiro.cli import print_startup_banner
         
         print("Action: Calling print_startup_banner('0.0.0.0', 8000)...")
         print_startup_banner("0.0.0.0", 8000)
@@ -317,7 +317,7 @@ class TestPrintStartupBanner:
         Purpose: Ensure /health endpoint is mentioned.
         """
         print("Setup: Importing print_startup_banner...")
-        from main import print_startup_banner
+        from kiro.cli import print_startup_banner
         
         print("Action: Calling print_startup_banner('0.0.0.0', 8000)...")
         print_startup_banner("0.0.0.0", 8000)
@@ -337,7 +337,7 @@ class TestCliHelp:
         Purpose: Ensure help is informative.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with --help...")
         with patch.object(sys, 'argv', ['main.py', '--help']):
@@ -354,7 +354,7 @@ class TestCliHelp:
         Purpose: Ensure host option is documented.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with --help...")
         with patch.object(sys, 'argv', ['main.py', '--help']):
@@ -378,7 +378,7 @@ class TestCliVersion:
         Purpose: Ensure version flag works correctly.
         """
         print("Setup: Importing parse_cli_args...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         
         print("Action: Calling parse_cli_args with --version...")
         with patch.object(sys, 'argv', ['main.py', '--version']):
@@ -394,7 +394,7 @@ class TestCliVersion:
         Purpose: Ensure version is displayed.
         """
         print("Setup: Importing parse_cli_args and APP_VERSION...")
-        from main import parse_cli_args
+        from kiro.cli import parse_cli_args
         from kiro.config import APP_VERSION
         
         print("Action: Calling parse_cli_args with --version...")

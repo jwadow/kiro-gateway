@@ -6,6 +6,10 @@
 .vscode/
 .idea/
 .shard/
+.claude/
+
+# Dev docs
+.dev/
 
 # Python
 __pycache__/
