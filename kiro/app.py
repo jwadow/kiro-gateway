@@ -205,11 +205,15 @@ def _print_config_errors(errors: list[str]) -> None:
     logger.error("")
 
 
-def validate_configuration() -> bool:
+def validate_configuration(silent: bool = False) -> bool:
     """Validate that required configuration is present.
 
     Checks that at least one credential source is configured:
     REFRESH_TOKEN, KIRO_CREDS_FILE, or KIRO_CLI_DB_FILE.
+
+    Args:
+        silent: If True, suppress error output. Useful when the caller
+                will handle the failure itself (e.g. launch a setup wizard).
 
     Returns:
         True if configuration is valid, False otherwise.
@@ -252,7 +256,8 @@ def validate_configuration() -> bool:
         )
 
     if errors:
-        _print_config_errors(errors)
+        if not silent:
+            _print_config_errors(errors)
         return False
 
     return True

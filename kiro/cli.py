@@ -336,7 +336,7 @@ def main() -> None:
         return
 
     # Server startup flow: validate credentials, run wizard if missing
-    if not validate_configuration():
+    if not validate_configuration(silent=True):
         print()
         print(f"  {_YELLOW}No credentials found. Starting setup wizard...{_RESET}")
         print()

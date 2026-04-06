@@ -33,9 +33,10 @@ Usage:
 """
 
 import os
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Optional, Protocol
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -64,6 +65,60 @@ class CredentialType(StrEnum):
     CREDS_FILE = "creds_file"
     REFRESH_TOKEN = "refresh_token"
     CLI_DB = "cli_db"
+
+
+@dataclass
+class DetectedCredential:
+    """A credential source found automatically on the local system.
+
+    Attributes:
+        type: The credential type (always CLI_DB for auto-detected sources).
+        path: Absolute path to the detected file.
+        label: Human-readable description shown to the user.
+    """
+
+    type: CredentialType
+    path: Path
+    label: str
+
+
+# Known SQLite database paths to probe during auto-detection.
+# Ordered by likelihood: kiro-cli first, then amazon-q, then macOS variant.
+_CLI_DB_CANDIDATES: list[tuple[Path, str]] = [
+    (
+        Path.home() / ".local" / "share" / "kiro-cli" / "data.sqlite3",
+        "kiro-cli (Linux/macOS)",
+    ),
+    (
+        Path.home() / ".local" / "share" / "amazon-q" / "data.sqlite3",
+        "amazon-q-developer-cli (Linux/macOS)",
+    ),
+    (
+        Path.home() / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3",
+        "kiro-cli (macOS)",
+    ),
+]
+
+
+def detect_credentials() -> list[DetectedCredential]:
+    """Scan well-known paths for installed Kiro credential sources.
+
+    Checks each candidate path in ``_CLI_DB_CANDIDATES`` and returns
+    a list of those that actually exist on disk.
+
+    Returns:
+        List of DetectedCredential instances for each found source.
+        Empty list if nothing is found.
+    """
+    found: list[DetectedCredential] = []
+    for path, label in _CLI_DB_CANDIDATES:
+        if path.exists():
+            found.append(DetectedCredential(
+                type=CredentialType.CLI_DB,
+                path=path,
+                label=label,
+            ))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -167,15 +222,33 @@ class SetupWizard:
     def run(self) -> dict[str, str]:
         """Run the interactive setup wizard.
 
-        Guides the user through credential configuration step by step.
+        First attempts auto-detection of installed credential sources.
+        If found, prompts the user to confirm before using them.
+        Falls back to manual selection if nothing is detected or user declines.
 
         Returns:
             A dict mapping environment variable names to their values.
         """
         self._print_welcome()
 
-        cred_type = self._ask_credential_type()
         config: dict[str, str] = {}
+        detected = detect_credentials()
+
+        if detected:
+            chosen = self._ask_use_detected(detected)
+            if chosen is not None:
+                config["KIRO_CLI_DB_FILE"] = str(chosen.path)
+                proxy_key = self._io.prompt(
+                    f"{_CYAN}  Proxy API key (clients use this to authenticate){_RESET}",
+                    default=_DEFAULT_PROXY_API_KEY,
+                )
+                config["PROXY_API_KEY"] = proxy_key
+                print()
+                print(f"{_GREEN}  Configuration ready.{_RESET}")
+                return config
+            # User declined — fall through to manual flow
+
+        cred_type = self._ask_credential_type()
 
         if cred_type == CredentialType.CREDS_FILE:
             value = self._io.prompt(
@@ -218,6 +291,49 @@ class SetupWizard:
         print(f"  {_DIM}{'─' * 44}{_RESET}")
         print(f"  {_YELLOW}No credentials found. Let's set them up.{_RESET}")
         print()
+
+    def _ask_use_detected(
+        self, detected: list[DetectedCredential]
+    ) -> Optional[DetectedCredential]:
+        """Prompt the user to use an auto-detected credential source.
+
+        If exactly one source is found, asks a simple yes/no question.
+        If multiple are found, shows a numbered list and lets the user pick
+        one or skip to manual setup.
+
+        Args:
+            detected: Non-empty list of auto-detected credential sources.
+
+        Returns:
+            The chosen DetectedCredential, or None if the user declined.
+        """
+        if len(detected) == 1:
+            cred = detected[0]
+            print(f"  {_GREEN}Found:{_RESET} {cred.label}")
+            print(f"  {_DIM}{cred.path}{_RESET}")
+            print()
+            if self._io.confirm(f"  {_CYAN}Use this credential source?{_RESET}"):
+                return cred
+            return None
+
+        # Multiple detected — show numbered list
+        print(f"  {_GREEN}Found {len(detected)} credential sources:{_RESET}")
+        for i, cred in enumerate(detected, start=1):
+            print(f"  {_DIM}{i}){_RESET} {cred.label}")
+            print(f"     {_DIM}{cred.path}{_RESET}")
+        print(f"  {_DIM}0){_RESET} Enter manually")
+        print()
+
+        choices = {str(i): cred for i, cred in enumerate(detected, start=1)}
+        choices["0"] = None  # type: ignore[assignment]
+
+        while True:
+            raw = self._io.prompt(
+                f"  {_CYAN}Select (0-{len(detected)}){_RESET}"
+            ).strip()
+            if raw in choices:
+                return choices[raw]
+            print(f"  {_YELLOW}Invalid choice. Enter 0–{len(detected)}.{_RESET}")
 
     def _ask_credential_type(self) -> CredentialType:
         """Prompt the user to choose a credential type.

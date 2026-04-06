@@ -3,7 +3,7 @@
 """Unit tests for kiro.setup_wizard module.
 
 Covers: SetupWizard.run(), save_config(), get_user_config_path(),
-ConsoleWizardIO, and CredentialType.
+ConsoleWizardIO, CredentialType, DetectedCredential, detect_credentials().
 """
 
 import os
@@ -15,7 +15,9 @@ import pytest
 from kiro.setup_wizard import (
     CredentialType,
     ConsoleWizardIO,
+    DetectedCredential,
     SetupWizard,
+    detect_credentials,
     get_user_config_path,
     save_config,
 )
@@ -66,8 +68,8 @@ class TestSetupWizardCredsFile:
 
     def test_returns_kiro_creds_file(self) -> None:
         io = _make_io("1", "/path/to/creds.json", "my-api-key")
-        wizard = SetupWizard(io)
-        result = wizard.run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
 
         assert result["KIRO_CREDS_FILE"] == "/path/to/creds.json"
         assert result["PROXY_API_KEY"] == "my-api-key"
@@ -76,7 +78,8 @@ class TestSetupWizardCredsFile:
 
     def test_prompt_called_three_times(self) -> None:
         io = _make_io("1", "/path/to/creds.json", "key")
-        SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            SetupWizard(io).run()
         assert io.prompt.call_count == 3  # choice + creds path + proxy key
 
 
@@ -85,7 +88,8 @@ class TestSetupWizardRefreshToken:
 
     def test_returns_refresh_token(self) -> None:
         io = _make_io("2", "eyJhbGci.token.here", "secret")
-        result = SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
 
         assert result["REFRESH_TOKEN"] == "eyJhbGci.token.here"
         assert result["PROXY_API_KEY"] == "secret"
@@ -93,7 +97,8 @@ class TestSetupWizardRefreshToken:
 
     def test_prompt_called_three_times(self) -> None:
         io = _make_io("2", "token", "key")
-        SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            SetupWizard(io).run()
         assert io.prompt.call_count == 3
 
 
@@ -102,7 +107,8 @@ class TestSetupWizardCliDb:
 
     def test_returns_cli_db_file(self) -> None:
         io = _make_io("3", "~/.local/share/kiro-cli/data.sqlite3", "key")
-        result = SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
 
         assert result["KIRO_CLI_DB_FILE"] == "~/.local/share/kiro-cli/data.sqlite3"
         assert result["PROXY_API_KEY"] == "key"
@@ -113,7 +119,8 @@ class TestSetupWizardCliDb:
         # (ConsoleWizardIO returns default when input is empty).
         default_db = "~/.local/share/kiro-cli/data.sqlite3"
         io = _make_io("3", default_db, "key")
-        result = SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
         assert result["KIRO_CLI_DB_FILE"] == default_db
 
 
@@ -126,29 +133,34 @@ class TestSetupWizardEdgeCases:
     def test_invalid_choice_retries_until_valid(self) -> None:
         """Invalid choices (0, 4, 'x') should loop until a valid one is given."""
         io = _make_io("0", "4", "x", "2", "token", "key")
-        result = SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
         assert "REFRESH_TOKEN" in result
 
     def test_proxy_api_key_uses_default_when_empty(self) -> None:
         """Empty proxy key input should fall back to the default value."""
         default_key = "my-super-secret-password-123"
         io = _make_io("2", "token", default_key)
-        result = SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
         assert result["PROXY_API_KEY"] == default_key
 
     def test_result_contains_exactly_two_keys_for_token(self) -> None:
         io = _make_io("2", "tok", "key")
-        result = SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
         assert set(result.keys()) == {"REFRESH_TOKEN", "PROXY_API_KEY"}
 
     def test_result_contains_exactly_two_keys_for_creds_file(self) -> None:
         io = _make_io("1", "/creds.json", "key")
-        result = SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
         assert set(result.keys()) == {"KIRO_CREDS_FILE", "PROXY_API_KEY"}
 
     def test_result_contains_exactly_two_keys_for_cli_db(self) -> None:
         io = _make_io("3", "/db.sqlite3", "key")
-        result = SetupWizard(io).run()
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
         assert set(result.keys()) == {"KIRO_CLI_DB_FILE", "PROXY_API_KEY"}
 
 
@@ -259,3 +271,214 @@ class TestConsoleWizardIO:
         for answer in ("n", "N", "no", "", "nope"):
             with patch("builtins.input", return_value=answer):
                 assert io.confirm("Confirm?") is False
+
+
+# ---------------------------------------------------------------------------
+# detect_credentials
+# ---------------------------------------------------------------------------
+
+
+class TestDetectCredentials:
+    def test_returns_empty_when_no_paths_exist(self, tmp_path: Path) -> None:
+        with patch("kiro.setup_wizard._CLI_DB_CANDIDATES", [
+            (tmp_path / "missing1.sqlite3", "label1"),
+            (tmp_path / "missing2.sqlite3", "label2"),
+        ]):
+            result = detect_credentials()
+        assert result == []
+
+    def test_returns_found_paths(self, tmp_path: Path) -> None:
+        existing = tmp_path / "data.sqlite3"
+        existing.write_text("", encoding="utf-8")
+        with patch("kiro.setup_wizard._CLI_DB_CANDIDATES", [
+            (existing, "kiro-cli (test)"),
+            (tmp_path / "missing.sqlite3", "missing"),
+        ]):
+            result = detect_credentials()
+        assert len(result) == 1
+        assert result[0].path == existing
+        assert result[0].label == "kiro-cli (test)"
+        assert result[0].type == CredentialType.CLI_DB
+
+    def test_returns_all_found_paths(self, tmp_path: Path) -> None:
+        db1 = tmp_path / "db1.sqlite3"
+        db2 = tmp_path / "db2.sqlite3"
+        db1.write_text("", encoding="utf-8")
+        db2.write_text("", encoding="utf-8")
+        with patch("kiro.setup_wizard._CLI_DB_CANDIDATES", [
+            (db1, "label1"),
+            (db2, "label2"),
+        ]):
+            result = detect_credentials()
+        assert len(result) == 2
+
+    def test_detected_credential_is_dataclass(self, tmp_path: Path) -> None:
+        db = tmp_path / "data.sqlite3"
+        db.write_text("", encoding="utf-8")
+        with patch("kiro.setup_wizard._CLI_DB_CANDIDATES", [(db, "test label")]):
+            result = detect_credentials()
+        cred = result[0]
+        assert isinstance(cred, DetectedCredential)
+        assert cred.path == db
+        assert cred.label == "test label"
+        assert cred.type == CredentialType.CLI_DB
+
+
+# ---------------------------------------------------------------------------
+# SetupWizard — auto-detection flow
+# ---------------------------------------------------------------------------
+
+
+class TestSetupWizardAutoDetectSingle:
+    """Wizard with exactly one auto-detected credential."""
+
+    def _make_detected(self, path: Path) -> DetectedCredential:
+        return DetectedCredential(
+            type=CredentialType.CLI_DB,
+            path=path,
+            label="kiro-cli (test)",
+        )
+
+    def test_user_confirms_detected_credential(self, tmp_path: Path) -> None:
+        db = tmp_path / "data.sqlite3"
+        db.write_text("", encoding="utf-8")
+        detected = [self._make_detected(db)]
+
+        io = MagicMock()
+        io.confirm.return_value = True
+        io.prompt.return_value = "my-api-key"  # proxy key
+
+        with patch("kiro.setup_wizard.detect_credentials", return_value=detected):
+            result = SetupWizard(io).run()
+
+        assert result["KIRO_CLI_DB_FILE"] == str(db)
+        assert result["PROXY_API_KEY"] == "my-api-key"
+        assert "REFRESH_TOKEN" not in result
+
+    def test_user_declines_detected_falls_back_to_manual(self, tmp_path: Path) -> None:
+        db = tmp_path / "data.sqlite3"
+        db.write_text("", encoding="utf-8")
+        detected = [self._make_detected(db)]
+
+        # confirm=False (decline), then manual: choice "2" (token), token value, proxy key
+        io = MagicMock()
+        io.confirm.return_value = False
+        io.prompt.side_effect = ["2", "my-token", "my-key"]
+
+        with patch("kiro.setup_wizard.detect_credentials", return_value=detected):
+            result = SetupWizard(io).run()
+
+        assert result["REFRESH_TOKEN"] == "my-token"
+        assert result["PROXY_API_KEY"] == "my-key"
+        assert "KIRO_CLI_DB_FILE" not in result
+
+    def test_confirm_called_once_for_single_detection(self, tmp_path: Path) -> None:
+        db = tmp_path / "data.sqlite3"
+        db.write_text("", encoding="utf-8")
+        detected = [self._make_detected(db)]
+
+        io = MagicMock()
+        io.confirm.return_value = True
+        io.prompt.return_value = "key"
+
+        with patch("kiro.setup_wizard.detect_credentials", return_value=detected):
+            SetupWizard(io).run()
+
+        io.confirm.assert_called_once()
+
+
+class TestSetupWizardAutoDetectMultiple:
+    """Wizard with multiple auto-detected credentials."""
+
+    def _make_detected(self, path: Path, label: str) -> DetectedCredential:
+        return DetectedCredential(type=CredentialType.CLI_DB, path=path, label=label)
+
+    def test_user_selects_first_of_two(self, tmp_path: Path) -> None:
+        db1 = tmp_path / "db1.sqlite3"
+        db2 = tmp_path / "db2.sqlite3"
+        db1.write_text("", encoding="utf-8")
+        db2.write_text("", encoding="utf-8")
+        detected = [
+            self._make_detected(db1, "label1"),
+            self._make_detected(db2, "label2"),
+        ]
+
+        io = MagicMock()
+        io.prompt.side_effect = ["1", "my-key"]  # select #1, then proxy key
+
+        with patch("kiro.setup_wizard.detect_credentials", return_value=detected):
+            result = SetupWizard(io).run()
+
+        assert result["KIRO_CLI_DB_FILE"] == str(db1)
+
+    def test_user_selects_second_of_two(self, tmp_path: Path) -> None:
+        db1 = tmp_path / "db1.sqlite3"
+        db2 = tmp_path / "db2.sqlite3"
+        db1.write_text("", encoding="utf-8")
+        db2.write_text("", encoding="utf-8")
+        detected = [
+            self._make_detected(db1, "label1"),
+            self._make_detected(db2, "label2"),
+        ]
+
+        io = MagicMock()
+        io.prompt.side_effect = ["2", "my-key"]
+
+        with patch("kiro.setup_wizard.detect_credentials", return_value=detected):
+            result = SetupWizard(io).run()
+
+        assert result["KIRO_CLI_DB_FILE"] == str(db2)
+
+    def test_user_selects_zero_falls_back_to_manual(self, tmp_path: Path) -> None:
+        db1 = tmp_path / "db1.sqlite3"
+        db1.write_text("", encoding="utf-8")
+        detected = [self._make_detected(db1, "label1")]
+
+        # For single detection: confirm=False triggers manual flow
+        io = MagicMock()
+        io.confirm.return_value = False
+        io.prompt.side_effect = ["1", "/path/to/creds.json", "key"]
+
+        with patch("kiro.setup_wizard.detect_credentials", return_value=detected):
+            result = SetupWizard(io).run()
+
+        assert "KIRO_CREDS_FILE" in result
+
+    def test_invalid_choice_retries(self, tmp_path: Path) -> None:
+        db1 = tmp_path / "db1.sqlite3"
+        db2 = tmp_path / "db2.sqlite3"
+        db1.write_text("", encoding="utf-8")
+        db2.write_text("", encoding="utf-8")
+        detected = [
+            self._make_detected(db1, "label1"),
+            self._make_detected(db2, "label2"),
+        ]
+
+        io = MagicMock()
+        io.prompt.side_effect = ["9", "x", "1", "key"]  # invalid, invalid, valid
+
+        with patch("kiro.setup_wizard.detect_credentials", return_value=detected):
+            result = SetupWizard(io).run()
+
+        assert result["KIRO_CLI_DB_FILE"] == str(db1)
+
+
+class TestSetupWizardNoDetection:
+    """Wizard when detect_credentials() returns empty list — no regression."""
+
+    def test_no_detection_goes_straight_to_manual(self) -> None:
+        io = _make_io("2", "my-token", "my-key")
+
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            result = SetupWizard(io).run()
+
+        assert result["REFRESH_TOKEN"] == "my-token"
+        io.confirm.assert_not_called()
+
+    def test_no_detection_confirm_never_called(self) -> None:
+        io = _make_io("1", "/creds.json", "key")
+
+        with patch("kiro.setup_wizard.detect_credentials", return_value=[]):
+            SetupWizard(io).run()
+
+        io.confirm.assert_not_called()
