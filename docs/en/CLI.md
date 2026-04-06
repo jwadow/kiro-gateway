@@ -25,17 +25,25 @@ $ kiro-gateway
   ────────────────────────────────────────────
   No credentials found. Let's set them up.
 
+  Found: kiro-cli (Linux/macOS)
+  /home/you/.local/share/kiro-cli/data.sqlite3
+
+  Use this credential source? [y/N]: y
+  Proxy API key (clients use this to authenticate) [my-super-secret-password-123]:
+
+  Configuration ready.
+  Config saved to: /home/you/.config/kiro-gateway/.env
+```
+
+If no credential source is detected automatically, the wizard prompts you to choose manually:
+
+```
   Choose your credential source:
   1) JSON credentials file  (recommended)
   2) Refresh token
   3) kiro-cli SQLite database  (AWS SSO)
 
-  Enter choice (1-3): 1
-  Path to your Kiro credentials JSON file: /path/to/kiro-credentials.json
-  Proxy API key (clients use this to authenticate) [my-super-secret-password-123]:
-
-  Configuration ready.
-  Config saved to: /Users/you/.config/kiro-gateway/.env
+  Enter choice (1-3):
 ```
 
 The wizard saves your configuration to `~/.config/kiro-gateway/.env`. You only need to run it once.
@@ -66,50 +74,77 @@ Settings are resolved in this order (highest wins):
 |----------|--------|
 | 1 (highest) | CLI arguments (`--host`, `--port`) |
 | 2 | Environment variables (`SERVER_HOST`, `SERVER_PORT`) |
-| 3 (lowest) | Saved config (`~/.config/kiro-gateway/.env`) |
+| 3 | Current directory `.env` |
+| 4 (lowest) | Saved config (`~/.config/kiro-gateway/.env`) |
 
 ---
 
 ## Managing Configuration
 
-### View current configuration
+### Interactive config editor
 
 ```bash
 kiro-gateway config
 ```
 
-Output example:
+Opens an interactive numbered list of all configurable variables:
 
 ```
-  Kiro Gateway — Current Configuration
-  ────────────────────────────────────────────
-  Config file: /Users/you/.config/kiro-gateway/.env
+  Kiro Gateway — Configuration
+  ──────────────────────────────────────────────────
+  Config: /home/you/.config/kiro-gateway/.env
 
-  File exists
-  
-  REFRESH_TOKEN    = (not set)
-  KIRO_CREDS_FILE  = /path/to/kiro-credentials.json
-  KIRO_CLI_DB_FILE = (not set)
-  PROXY_API_KEY    = my-super-****
-  SERVER_HOST      = (not set)
-  SERVER_PORT      = (not set)
+  Credentials
+  [ 1] REFRESH_TOKEN                    (not set)
+        Kiro refresh token (from IDE network traffic)
+  [ 2] KIRO_CREDS_FILE                  /path/to/creds.json
+        Path to Kiro credentials JSON file
+  [ 3] KIRO_CLI_DB_FILE                 (not set)
+        Path to kiro-cli SQLite database (AWS SSO)
+
+  Server
+  [ 4] PROXY_API_KEY                    my-super-****
+        Client auth key (clients pass this as Bearer token)
+  [ 5] SERVER_HOST                      0.0.0.0
+        Bind address
+  [ 6] SERVER_PORT                      8001
+        Server port
+
+  Network
+  [ 7] VPN_PROXY_URL                    (not set)
+        Proxy for Kiro API (GFW / corporate networks)
+  [ 8] KIRO_REGION                      us-east-1
+        AWS region
+
+  Advanced
+  [ 9] LOG_LEVEL                        INFO
+        Log verbosity
+  ...
+
+  Enter number to edit, or q to quit:
 ```
 
-Sensitive values (`REFRESH_TOKEN`, `PROXY_API_KEY`) are partially masked.
+Select a variable by number to edit it:
 
-### Re-run setup wizard
-
-```bash
-kiro-gateway config --edit
+```
+  PROXY_API_KEY — Client auth key (clients pass this as Bearer token)
+  Current: my-super-****
+  Allowed: (any string)
+  Default: my-super-secret-password-123
+  (Enter to keep current, '-' to clear)
+  New value: my-new-secret-key
+  Saved.
 ```
 
-Launches the interactive wizard again to update your credentials or API key.
+Changes are written to `~/.config/kiro-gateway/.env` immediately.
+
+Enter `-` to clear a value. Press Enter without typing to keep the current value. Enter `q` to quit.
 
 ### Show config file path
 
 ```bash
 kiro-gateway config --show-path
-# /Users/you/.config/kiro-gateway/.env
+# /home/you/.config/kiro-gateway/.env
 ```
 
 ### Reset configuration
@@ -126,14 +161,13 @@ Prompts for confirmation, then deletes `~/.config/kiro-gateway/.env`.
 
 The config file lives at `~/.config/kiro-gateway/.env` (XDG Base Directory convention).
 
-You can edit it directly with any text editor:
+You can also edit it directly with any text editor:
 
 ```bash
-# macOS / Linux
 nano ~/.config/kiro-gateway/.env
 ```
 
-### Available options
+### All available options
 
 ```dotenv
 # ── Credentials (choose one) ─────────────────────────────────────
@@ -146,21 +180,28 @@ REFRESH_TOKEN=your_refresh_token_here
 # Option 3: kiro-cli SQLite database (AWS SSO / Builder ID)
 KIRO_CLI_DB_FILE=~/.local/share/kiro-cli/data.sqlite3
 
-# ── Proxy API key ─────────────────────────────────────────────────
-# Clients must pass this as the Authorization Bearer token
-PROXY_API_KEY=my-super-secret-password-123
-
 # ── Server ────────────────────────────────────────────────────────
+PROXY_API_KEY=my-super-secret-password-123
 SERVER_HOST=0.0.0.0
 SERVER_PORT=8001
 
 # ── Network ───────────────────────────────────────────────────────
-# Optional: route Kiro API traffic through a proxy (GFW, corporate)
 # VPN_PROXY_URL=http://127.0.0.1:7890
 # VPN_PROXY_URL=socks5://127.0.0.1:1080
+KIRO_REGION=us-east-1
 
-# ── AWS region ────────────────────────────────────────────────────
-# KIRO_REGION=us-east-1
+# ── Advanced ──────────────────────────────────────────────────────
+LOG_LEVEL=INFO                        # TRACE/DEBUG/INFO/WARNING/ERROR/CRITICAL
+FIRST_TOKEN_TIMEOUT=15
+STREAMING_READ_TIMEOUT=300
+FIRST_TOKEN_MAX_RETRIES=3
+TRUNCATION_RECOVERY=true              # true/false
+TOOL_DESCRIPTION_MAX_LENGTH=10000
+DEBUG_MODE=off                        # off/errors/all
+DEBUG_DIR=debug_logs
+FAKE_REASONING=true                   # true/false
+FAKE_REASONING_MAX_TOKENS=4000
+FAKE_REASONING_HANDLING=as_reasoning_content  # as_reasoning_content/remove/pass/strip_tags
 ```
 
 ---
@@ -173,7 +214,7 @@ All options can also be set as environment variables. They take priority over th
 REFRESH_TOKEN="your_token" PROXY_API_KEY="secret" kiro-gateway
 ```
 
-This is useful for Docker, CI/CD, or temporary overrides without modifying the saved config.
+Useful for Docker, CI/CD, or temporary overrides without modifying the saved config.
 
 ---
 
@@ -195,15 +236,29 @@ This is useful for Docker, CI/CD, or temporary overrides without modifying the s
 
 ### Option 3 — kiro-cli SQLite database
 
-If you use [kiro-cli](https://kiro.dev/cli/) with AWS SSO:
+If you use [kiro-cli](https://kiro.dev/cli/) with AWS SSO, the gateway auto-detects the database on first launch. You can also set it manually:
 
 | Platform | Default path |
 |----------|-------------|
 | Linux / macOS | `~/.local/share/kiro-cli/data.sqlite3` |
 | Amazon Q CLI | `~/.local/share/amazon-q/data.sqlite3` |
-| Windows | `%APPDATA%\kiro-cli\data.sqlite3` |
+| macOS (alt) | `~/Library/Application Support/kiro-cli/data.sqlite3` |
 
-Set `KIRO_CLI_DB_FILE` to the appropriate path.
+---
+
+## Command Reference
+
+```
+kiro-gateway [OPTIONS]
+  -H, --host HOST     Server bind address (default: 0.0.0.0)
+  -p, --port PORT     Server port (default: 8001)
+  -v, --version       Show version and exit
+
+kiro-gateway config
+  (no flags)          Interactive configuration editor
+  --show-path         Print config file path and exit
+  --reset             Delete saved config file (with confirmation)
+```
 
 ---
 
@@ -221,7 +276,7 @@ uv tool upgrade kiro-gateway
 uv tool uninstall kiro-gateway
 ```
 
-Your config file at `~/.config/kiro-gateway/.env` is **not** deleted automatically. Remove it manually if needed:
+Your config file at `~/.config/kiro-gateway/.env` is **not** deleted automatically:
 
 ```bash
 rm -rf ~/.config/kiro-gateway
@@ -231,29 +286,21 @@ rm -rf ~/.config/kiro-gateway
 
 ## Troubleshooting
 
-### "No credentials found" on every launch
-
-The wizard did not save, or the config file was deleted. Run:
+**"No credentials found" on every launch**
 
 ```bash
-kiro-gateway config --edit
+kiro-gateway config   # open editor and set credentials
 ```
 
-### Config file location
+**Check config file location**
 
 ```bash
 kiro-gateway config --show-path
 ```
 
-### Check what values are active
-
-```bash
-kiro-gateway config
-```
-
-### Reset and reconfigure from scratch
+**Reset and reconfigure from scratch**
 
 ```bash
 kiro-gateway config --reset
-kiro-gateway config --edit
+kiro-gateway          # wizard runs automatically on next launch
 ```

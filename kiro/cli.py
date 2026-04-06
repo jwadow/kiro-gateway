@@ -58,6 +58,7 @@ from kiro.config import (
     USER_CONFIG_FILE,
     _warn_timeout_configuration,
 )
+from kiro.config_editor import ConfigEditor
 from kiro.setup_wizard import ConsoleWizardIO, SetupWizard, save_config
 
 # ---------------------------------------------------------------------------
@@ -101,8 +102,8 @@ Examples:
   kiro-gateway --port 9000                # Override port only
   kiro-gateway --host 127.0.0.1           # Local connections only
   kiro-gateway -H 0.0.0.0 -p 8080        # Short form
-  kiro-gateway config                     # Show current configuration
-  kiro-gateway config --edit              # Re-run setup wizard
+  kiro-gateway config                     # Interactive config editor
+  kiro-gateway config --reset             # Delete saved config
 
   SERVER_PORT=9000 kiro-gateway           # Via environment
         """.format(default_port=DEFAULT_SERVER_PORT)
@@ -135,12 +136,7 @@ Examples:
     config_parser = subparsers.add_parser(
         "config",
         help="Manage gateway configuration",
-        description="View or modify the saved kiro-gateway configuration.",
-    )
-    config_parser.add_argument(
-        "--edit",
-        action="store_true",
-        help="Re-run the interactive setup wizard to update credentials",
+        description="Interactively view and edit the saved kiro-gateway configuration.",
     )
     config_parser.add_argument(
         "--reset",
@@ -308,6 +304,8 @@ def _reset_config() -> None:
 def handle_config_command(args: argparse.Namespace) -> None:
     """Handle the 'config' subcommand and its flags.
 
+    With no flags, launches the interactive configuration editor.
+
     Args:
         args: Parsed CLI arguments with config subcommand flags.
     """
@@ -315,10 +313,8 @@ def handle_config_command(args: argparse.Namespace) -> None:
         print(str(USER_CONFIG_FILE))
     elif args.reset:
         _reset_config()
-    elif args.edit:
-        _run_wizard_and_save()
     else:
-        _show_current_config()
+        ConfigEditor(USER_CONFIG_FILE).run()
 
 
 def main() -> None:

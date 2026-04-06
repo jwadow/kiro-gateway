@@ -39,11 +39,6 @@ class TestParseCliArgsConfigSubcommand:
         args = self._parse("config")
         assert args.command == "config"
 
-    def test_config_edit_flag(self) -> None:
-        args = self._parse("config", "--edit")
-        assert args.command == "config"
-        assert args.edit is True
-
     def test_config_reset_flag(self) -> None:
         args = self._parse("config", "--reset")
         assert args.reset is True
@@ -54,7 +49,6 @@ class TestParseCliArgsConfigSubcommand:
 
     def test_config_no_flags_all_false(self) -> None:
         args = self._parse("config")
-        assert args.edit is False
         assert args.reset is False
         assert args.show_path is False
 
@@ -73,14 +67,13 @@ class TestParseCliArgsConfigSubcommand:
 class TestHandleConfigCommandShowPath:
     def test_show_path_prints_config_file_path(self, capsys) -> None:
         from kiro.config import USER_CONFIG_FILE
-        args = MagicMock(show_path=True, reset=False, edit=False)
+        args = MagicMock(show_path=True, reset=False)
         handle_config_command(args)
         captured = capsys.readouterr()
         assert str(USER_CONFIG_FILE) in captured.out
 
-    def test_show_path_takes_priority_over_other_flags(self, capsys) -> None:
-        """show_path is checked first in the if/elif chain."""
-        args = MagicMock(show_path=True, reset=True, edit=True)
+    def test_show_path_takes_priority_over_reset(self, capsys) -> None:
+        args = MagicMock(show_path=True, reset=True)
         with patch("kiro.cli._reset_config") as mock_reset:
             handle_config_command(args)
             mock_reset.assert_not_called()
@@ -88,7 +81,7 @@ class TestHandleConfigCommandShowPath:
 
 class TestHandleConfigCommandReset:
     def test_reset_calls_reset_config(self) -> None:
-        args = MagicMock(show_path=False, reset=True, edit=False)
+        args = MagicMock(show_path=False, reset=True)
         with patch("kiro.cli._reset_config") as mock_reset:
             handle_config_command(args)
             mock_reset.assert_called_once()
@@ -128,20 +121,14 @@ class TestHandleConfigCommandReset:
         assert "No config file" in captured.out
 
 
-class TestHandleConfigCommandEdit:
-    def test_edit_runs_wizard(self) -> None:
-        args = MagicMock(show_path=False, reset=False, edit=True)
-        with patch("kiro.cli._run_wizard_and_save") as mock_wizard:
+class TestHandleConfigCommandEditor:
+    def test_no_flags_launches_config_editor(self) -> None:
+        args = MagicMock(show_path=False, reset=False)
+        with patch("kiro.cli.ConfigEditor") as mock_editor_cls:
+            mock_editor = MagicMock()
+            mock_editor_cls.return_value = mock_editor
             handle_config_command(args)
-            mock_wizard.assert_called_once()
-
-
-class TestHandleConfigCommandShow:
-    def test_no_flags_shows_config(self, capsys) -> None:
-        args = MagicMock(show_path=False, reset=False, edit=False)
-        with patch("kiro.cli._show_current_config") as mock_show:
-            handle_config_command(args)
-            mock_show.assert_called_once()
+            mock_editor.run.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
