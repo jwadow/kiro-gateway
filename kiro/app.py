@@ -61,6 +61,7 @@ from kiro.config import (
     HIDDEN_FROM_LIST,
     FALLBACK_MODELS,
     VPN_PROXY_URL,
+    USER_CONFIG_FILE,
 )
 from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
@@ -187,88 +188,74 @@ if VPN_PROXY_URL:
     logger.debug(f"NO_PROXY: {os.environ['NO_PROXY']}")
 
 
-def validate_configuration() -> None:
+def _print_config_errors(errors: list[str]) -> None:
+    """Print configuration errors in a formatted block.
+
+    Args:
+        errors: List of error message strings to display.
+    """
+    logger.error("")
+    logger.error("=" * 60)
+    logger.error("  CONFIGURATION ERROR")
+    logger.error("=" * 60)
+    for error in errors:
+        for line in error.split('\n'):
+            logger.error(f"  {line}")
+    logger.error("=" * 60)
+    logger.error("")
+
+
+def validate_configuration() -> bool:
     """Validate that required configuration is present.
 
     Checks that at least one credential source is configured:
     REFRESH_TOKEN, KIRO_CREDS_FILE, or KIRO_CLI_DB_FILE.
 
-    Raises:
-        SystemExit: If critical configuration is missing.
+    Returns:
+        True if configuration is valid, False otherwise.
+        Callers are responsible for deciding what to do on False
+        (e.g. launch the setup wizard or exit).
     """
     errors = []
 
-    env_file = Path(".env")
+    has_refresh_token = bool(os.environ.get("REFRESH_TOKEN", REFRESH_TOKEN))
+    _creds_file = os.environ.get("KIRO_CREDS_FILE", KIRO_CREDS_FILE)
+    _cli_db = os.environ.get("KIRO_CLI_DB_FILE", KIRO_CLI_DB_FILE)
 
-    has_refresh_token = bool(REFRESH_TOKEN)
-    has_creds_file = bool(KIRO_CREDS_FILE)
-    has_cli_db = bool(KIRO_CLI_DB_FILE)
+    has_creds_file = bool(_creds_file)
+    has_cli_db = bool(_cli_db)
 
-    if KIRO_CREDS_FILE:
-        creds_path = Path(KIRO_CREDS_FILE).expanduser()
+    if _creds_file:
+        creds_path = Path(_creds_file).expanduser()
         if not creds_path.exists():
             has_creds_file = False
-            logger.warning(f"KIRO_CREDS_FILE not found: {KIRO_CREDS_FILE}")
+            logger.warning(f"KIRO_CREDS_FILE not found: {_creds_file}")
 
-    if KIRO_CLI_DB_FILE:
-        cli_db_path = Path(KIRO_CLI_DB_FILE).expanduser()
+    if _cli_db:
+        cli_db_path = Path(_cli_db).expanduser()
         if not cli_db_path.exists():
             has_cli_db = False
-            logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
+            logger.warning(f"KIRO_CLI_DB_FILE not found: {_cli_db}")
 
     if not has_refresh_token and not has_creds_file and not has_cli_db:
-        if not env_file.exists():
-            errors.append(
-                "No Kiro credentials configured!\n"
-                "\n"
-                "To get started:\n"
-                "1. Create .env file:\n"
-                "   cp .env.example .env\n"
-                "\n"
-                "2. Edit .env and configure your credentials:\n"
-                "   2.1. Set you super-secret password as PROXY_API_KEY\n"
-                "   2.2. Set your Kiro credentials:\n"
-                "      - Option 1: KIRO_CREDS_FILE to your Kiro credentials JSON file\n"
-                "      - Option 2: REFRESH_TOKEN from Kiro IDE traffic\n"
-                "      - Option 3: KIRO_CLI_DB_FILE to kiro-cli SQLite database\n"
-                "\n"
-                "Or use environment variables (for Docker):\n"
-                "   docker run -e PROXY_API_KEY=\"...\" -e REFRESH_TOKEN=\"...\" ...\n"
-                "\n"
-                "See README.md for detailed instructions."
-            )
-        else:
-            errors.append(
-                "No Kiro credentials configured!\n"
-                "\n"
-                "   Configure one of the following in your .env file:\n"
-                "\n"
-                "Set you super-secret password as PROXY_API_KEY\n"
-                "   PROXY_API_KEY=\"my-super-secret-password-123\"\n"
-                "\n"
-                "   Option 1 (Recommended): JSON credentials file\n"
-                "      KIRO_CREDS_FILE=\"path/to/your/kiro-credentials.json\"\n"
-                "\n"
-                "   Option 2: Refresh token\n"
-                "      REFRESH_TOKEN=\"your_refresh_token_here\"\n"
-                "\n"
-                "   Option 3: kiro-cli SQLite database (AWS SSO)\n"
-                "      KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
-                "\n"
-                "   See README.md for how to obtain credentials."
-            )
+        errors.append(
+            "No Kiro credentials configured!\n"
+            "\n"
+            f"Run 'kiro-gateway config --edit' to set up your credentials.\n"
+            "\n"
+            "Or set environment variables directly:\n"
+            "   REFRESH_TOKEN=\"your_refresh_token\"\n"
+            "   KIRO_CREDS_FILE=\"/path/to/credentials.json\"\n"
+            "   KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
+            "\n"
+            f"Config file location: {USER_CONFIG_FILE}"
+        )
 
     if errors:
-        logger.error("")
-        logger.error("=" * 60)
-        logger.error("  CONFIGURATION ERROR")
-        logger.error("=" * 60)
-        for error in errors:
-            for line in error.split('\n'):
-                logger.error(f"  {line}")
-        logger.error("=" * 60)
-        logger.error("")
-        sys.exit(1)
+        _print_config_errors(errors)
+        return False
+
+    return True
 
 
 @asynccontextmanager

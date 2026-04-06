@@ -30,51 +30,78 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# ---------------------------------------------------------------------------
+# User config directory (XDG Base Directory convention)
+# Must be defined before load_dotenv() calls below.
+# ---------------------------------------------------------------------------
+
+USER_CONFIG_DIR: Path = Path.home() / ".config" / "kiro-gateway"
+USER_CONFIG_FILE: Path = USER_CONFIG_DIR / ".env"
+
+# Load environment variables.
+# Priority (highest → lowest): system env vars > current-dir .env > user config .env
+# load_dotenv(override=False) never overwrites an already-set env var, so loading
+# the higher-priority file first ensures it wins.
+load_dotenv(override=False)                        # current directory (high priority)
+load_dotenv(USER_CONFIG_FILE, override=False)      # user config dir  (low priority)
 
 
-def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
-    """
-    Read variable value from .env file without processing escape sequences.
-    
-    This is necessary for correct handling of Windows paths where backslashes
-    (e.g., D:\\Projects\\file.json) may be incorrectly interpreted
-    as escape sequences (\\a -> bell, \\n -> newline, etc.).
-    
+def _read_raw_from_file(var_name: str, path: Path) -> Optional[str]:
+    """Read a variable value from a specific .env file without escape processing.
+
+    Handles VAR=value, VAR="value", and VAR='value' formats.
+    Returns the raw value string so Windows paths (e.g. D:\\Projects\\file.json)
+    are not mangled by escape-sequence interpretation.
+
     Args:
-        var_name: Environment variable name
-        env_file: Path to .env file (default ".env")
-    
+        var_name: Environment variable name to look up.
+        path: Absolute or relative path to the .env file.
+
     Returns:
-        Raw variable value or None if not found
+        Raw value string, or None if the file does not exist or the variable
+        is not found.
     """
-    env_path = Path(env_file)
-    if not env_path.exists():
+    if not path.exists():
         return None
-    
+
     try:
-        # Read file as-is, without interpretation
-        content = env_path.read_text(encoding="utf-8")
-        
-        # Search for variable considering different formats:
-        # VAR="value" or VAR='value' or VAR=value
-        # Pattern captures value with or without quotes
+        content = path.read_text(encoding="utf-8")
         pattern = rf'^{re.escape(var_name)}=(["\']?)(.+?)\1\s*$'
-        
         for line in content.splitlines():
             line = line.strip()
             if line.startswith("#") or not line:
                 continue
-            
             match = re.match(pattern, line)
             if match:
-                # Return value as-is, without processing escape sequences
                 return match.group(2)
     except Exception:
         pass
-    
+
     return None
+
+
+def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
+    """Read a variable value from .env files without processing escape sequences.
+
+    Searches in priority order: current-directory .env first, then the user
+    config directory (~/.config/kiro-gateway/.env).  This mirrors the
+    load_dotenv() priority used at module import time.
+
+    This is necessary for correct handling of Windows paths where backslashes
+    (e.g., D:\\Projects\\file.json) may be incorrectly interpreted
+    as escape sequences (\\a -> bell, \\n -> newline, etc.).
+
+    Args:
+        var_name: Environment variable name.
+        env_file: Primary .env file path (default: ".env" in current directory).
+
+    Returns:
+        Raw variable value or None if not found in either location.
+    """
+    result = _read_raw_from_file(var_name, Path(env_file))
+    if result is None:
+        result = _read_raw_from_file(var_name, USER_CONFIG_FILE)
+    return result
 
 # ==================================================================================================
 # Server Settings
@@ -88,7 +115,7 @@ SERVER_HOST: str = os.getenv("SERVER_HOST", DEFAULT_SERVER_HOST)
 # Server port (default: 8000)
 # Can be overridden by CLI: python main.py --port 9000
 # Or by uvicorn directly: uvicorn main:app --port 9000
-DEFAULT_SERVER_PORT: int = 8000
+DEFAULT_SERVER_PORT: int = 8001
 SERVER_PORT: int = int(os.getenv("SERVER_PORT", str(DEFAULT_SERVER_PORT)))
 
 # ==================================================================================================

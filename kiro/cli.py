@@ -25,16 +25,23 @@ and by ``python -m kiro``. Handles argument parsing, configuration resolution,
 and uvicorn server startup.
 
 Usage:
-    # As installed tool
+    # Start the server (runs setup wizard on first launch if unconfigured)
     kiro-gateway
     kiro-gateway --port 9000
     kiro-gateway --host 127.0.0.1 --port 9000
+
+    # Manage configuration
+    kiro-gateway config               # show current config
+    kiro-gateway config --edit        # re-run setup wizard
+    kiro-gateway config --reset       # delete saved config
+    kiro-gateway config --show-path   # print config file path
 
     # Via python -m
     python -m kiro
 """
 
 import argparse
+import sys
 
 import uvicorn
 from loguru import logger
@@ -48,18 +55,37 @@ from kiro.config import (
     SERVER_PORT,
     DEFAULT_SERVER_HOST,
     DEFAULT_SERVER_PORT,
+    USER_CONFIG_FILE,
     _warn_timeout_configuration,
 )
+from kiro.setup_wizard import ConsoleWizardIO, SetupWizard, save_config
+
+# ---------------------------------------------------------------------------
+# ANSI color constants (shared across banner and config display)
+# ---------------------------------------------------------------------------
+
+_GREEN = "\033[92m"
+_YELLOW = "\033[93m"
+_WHITE = "\033[97m"
+_CYAN = "\033[96m"
+_BOLD = "\033[1m"
+_DIM = "\033[2m"
+_RESET = "\033[0m"
+
+# Sensitive env var names — values are masked in 'config' display
+_SENSITIVE_KEYS = {"REFRESH_TOKEN", "PROXY_API_KEY"}
 
 
 def parse_cli_args() -> argparse.Namespace:
-    """Parse command-line arguments for server configuration.
+    """Parse command-line arguments including the optional 'config' subcommand.
 
-    CLI arguments have the highest priority, overriding both
-    environment variables and default values.
+    Subcommands:
+        (none)  — start the gateway server
+        config  — manage saved configuration
 
     Returns:
-        Parsed arguments namespace with host and port values.
+        Parsed arguments namespace. ``args.command`` is ``"config"`` when the
+        config subcommand is used, otherwise ``None``.
     """
     parser = argparse.ArgumentParser(
         description=f"{APP_TITLE} - {APP_DESCRIPTION}",
@@ -68,16 +94,18 @@ def parse_cli_args() -> argparse.Namespace:
 Configuration Priority (highest to lowest):
   1. CLI arguments (--host, --port)
   2. Environment variables (SERVER_HOST, SERVER_PORT)
-  3. Default values (0.0.0.0:8000)
+  3. Default values (0.0.0.0:{default_port})
 
 Examples:
   kiro-gateway                            # Use defaults or env vars
   kiro-gateway --port 9000                # Override port only
   kiro-gateway --host 127.0.0.1           # Local connections only
   kiro-gateway -H 0.0.0.0 -p 8080        # Short form
+  kiro-gateway config                     # Show current configuration
+  kiro-gateway config --edit              # Re-run setup wizard
 
   SERVER_PORT=9000 kiro-gateway           # Via environment
-        """
+        """.format(default_port=DEFAULT_SERVER_PORT)
     )
 
     parser.add_argument(
@@ -102,6 +130,29 @@ Examples:
         version=f"%(prog)s {APP_VERSION}"
     )
 
+    subparsers = parser.add_subparsers(dest="command")
+
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Manage gateway configuration",
+        description="View or modify the saved kiro-gateway configuration.",
+    )
+    config_parser.add_argument(
+        "--edit",
+        action="store_true",
+        help="Re-run the interactive setup wizard to update credentials",
+    )
+    config_parser.add_argument(
+        "--reset",
+        action="store_true",
+        help=f"Delete the saved config file ({USER_CONFIG_FILE})",
+    )
+    config_parser.add_argument(
+        "--show-path",
+        action="store_true",
+        help="Print the path to the saved config file and exit",
+    )
+
     return parser.parse_args()
 
 
@@ -111,7 +162,7 @@ def resolve_server_config(args: argparse.Namespace) -> tuple[str, int]:
     Priority (highest to lowest):
     1. CLI arguments (--host, --port)
     2. Environment variables (SERVER_HOST, SERVER_PORT)
-    3. Default values (0.0.0.0:8000)
+    3. Default values
 
     Args:
         args: Parsed CLI arguments.
@@ -152,44 +203,154 @@ def print_startup_banner(host: str, port: int) -> None:
         host: Server host address.
         port: Server port.
     """
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    WHITE = "\033[97m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
-
     display_host = "localhost" if host == "0.0.0.0" else host
     url = f"http://{display_host}:{port}"
 
     print()
-    print(f"  {WHITE}{BOLD}👻 {APP_TITLE} v{APP_VERSION}{RESET}")
+    print(f"  {_WHITE}{_BOLD}👻 {APP_TITLE} v{APP_VERSION}{_RESET}")
     print()
-    print(f"  {WHITE}Server running at:{RESET}")
-    print(f"  {GREEN}{BOLD}➜  {url}{RESET}")
+    print(f"  {_WHITE}Server running at:{_RESET}")
+    print(f"  {_GREEN}{_BOLD}➜  {url}{_RESET}")
     print()
-    print(f"  {DIM}API Docs:      {url}/docs{RESET}")
-    print(f"  {DIM}Health Check:  {url}/health{RESET}")
+    print(f"  {_DIM}API Docs:      {url}/docs{_RESET}")
+    print(f"  {_DIM}Health Check:  {url}/health{_RESET}")
     print()
-    print(f"  {DIM}{'─' * 48}{RESET}")
-    print(f"  {WHITE}💬 Found a bug? Need help? Have questions?{RESET}")
-    print(f"  {YELLOW}➜  https://github.com/jwadow/kiro-gateway/issues{RESET}")
-    print(f"  {DIM}{'─' * 48}{RESET}")
+    print(f"  {_DIM}{'─' * 48}{_RESET}")
+    print(f"  {_WHITE}💬 Found a bug? Need help? Have questions?{_RESET}")
+    print(f"  {_YELLOW}➜  https://github.com/jwadow/kiro-gateway/issues{_RESET}")
+    print(f"  {_DIM}{'─' * 48}{_RESET}")
     print()
+
+
+def _mask_value(key: str, value: str) -> str:
+    """Mask sensitive values for display, showing only the first 8 characters.
+
+    Args:
+        key: Environment variable name.
+        value: The value to potentially mask.
+
+    Returns:
+        Masked string if the key is sensitive, otherwise the original value.
+    """
+    if key in _SENSITIVE_KEYS and len(value) > 8:
+        return value[:8] + "****"
+    return value
+
+
+def _show_current_config() -> None:
+    """Print the currently active configuration to stdout.
+
+    Reads from the saved config file if it exists, and indicates which
+    values are active. Sensitive values are partially masked.
+    """
+    import os
+
+    print()
+    print(f"  {_WHITE}{_BOLD}Kiro Gateway — Current Configuration{_RESET}")
+    print(f"  {_DIM}{'─' * 44}{_RESET}")
+    print(f"  {_DIM}Config file: {USER_CONFIG_FILE}{_RESET}")
+    print()
+
+    keys_to_show = [
+        "REFRESH_TOKEN",
+        "KIRO_CREDS_FILE",
+        "KIRO_CLI_DB_FILE",
+        "PROXY_API_KEY",
+        "SERVER_HOST",
+        "SERVER_PORT",
+    ]
+
+    if USER_CONFIG_FILE.exists():
+        print(f"  {_GREEN}File exists{_RESET}")
+    else:
+        print(f"  {_YELLOW}File not found — using environment variables or defaults{_RESET}")
+
+    print()
+    for key in keys_to_show:
+        value = os.environ.get(key, "")
+        if value:
+            display = _mask_value(key, value)
+            print(f"  {_CYAN}{key}{_RESET} = {display}")
+        else:
+            print(f"  {_DIM}{key} = (not set){_RESET}")
+    print()
+
+
+def _run_wizard_and_save() -> bool:
+    """Run the interactive setup wizard and save the result.
+
+    Returns:
+        True if the wizard completed and config was saved, False if aborted.
+    """
+    wizard = SetupWizard(ConsoleWizardIO())
+    config = wizard.run()
+    if config:
+        save_config(config, USER_CONFIG_FILE)
+        return True
+    return False
+
+
+def _reset_config() -> None:
+    """Delete the saved user config file after confirmation."""
+    if not USER_CONFIG_FILE.exists():
+        print(f"  {_YELLOW}No config file found at {USER_CONFIG_FILE}{_RESET}")
+        return
+
+    print(f"  {_YELLOW}This will delete: {USER_CONFIG_FILE}{_RESET}")
+    answer = input("  Are you sure? [y/N]: ").strip().lower()
+    if answer in ("y", "yes"):
+        USER_CONFIG_FILE.unlink()
+        print(f"  {_GREEN}Config file deleted.{_RESET}")
+    else:
+        print(f"  {_DIM}Cancelled.{_RESET}")
+
+
+def handle_config_command(args: argparse.Namespace) -> None:
+    """Handle the 'config' subcommand and its flags.
+
+    Args:
+        args: Parsed CLI arguments with config subcommand flags.
+    """
+    if args.show_path:
+        print(str(USER_CONFIG_FILE))
+    elif args.reset:
+        _reset_config()
+    elif args.edit:
+        _run_wizard_and_save()
+    else:
+        _show_current_config()
 
 
 def main() -> None:
     """Entry point for the kiro-gateway CLI.
 
-    Validates configuration, parses CLI arguments, resolves server
-    settings, and starts the uvicorn server.
+    Parses CLI arguments first so the 'config' subcommand works even when
+    no credentials are configured. For the default server-start flow,
+    validates configuration and launches the setup wizard if needed.
     """
-    validate_configuration()
+    args = parse_cli_args()
+
+    # config subcommand: manage saved configuration, no server startup needed
+    if args.command == "config":
+        handle_config_command(args)
+        return
+
+    # Server startup flow: validate credentials, run wizard if missing
+    if not validate_configuration():
+        print()
+        print(f"  {_YELLOW}No credentials found. Starting setup wizard...{_RESET}")
+        print()
+        if not _run_wizard_and_save():
+            logger.error("Setup wizard aborted. Cannot start server without credentials.")
+            sys.exit(1)
+        # Re-validate after wizard (os.environ was updated by save_config)
+        if not validate_configuration():
+            logger.error("Configuration still invalid after setup. Please check your credentials.")
+            sys.exit(1)
+
     _warn_timeout_configuration()
 
-    args = parse_cli_args()
     final_host, final_port = resolve_server_config(args)
-
     print_startup_banner(final_host, final_port)
 
     logger.info(f"Starting Uvicorn server on {final_host}:{final_port}...")
