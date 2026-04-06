@@ -251,9 +251,9 @@ async def messages(
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is only needed for Kiro Desktop auth
+    # profileArn is needed for Kiro Desktop auth and Enterprise SSO OIDC accounts
     profile_arn_for_payload = ""
-    if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+    if auth_manager.profile_arn:
         profile_arn_for_payload = auth_manager.profile_arn
     
     try:

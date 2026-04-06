@@ -29,6 +29,7 @@ Manages the lifecycle of access tokens:
 
 import asyncio
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from enum import Enum
@@ -342,12 +343,20 @@ class KiroAuthManager:
             if 'profileArn' in data:
                 self._profile_arn = data['profileArn']
             if 'region' in data:
-                self._region = data['region']
-                # Update URLs for new region
-                self._refresh_url = get_kiro_refresh_url(self._region)
-                self._api_host = get_kiro_api_host(self._region)
-                self._q_host = get_kiro_q_host(self._region)
-                logger.info(f"Region updated from credentials file: region={self._region}, api_host={self._api_host}, q_host={self._q_host}")
+                creds_region = data['region']
+                # Store credentials region as SSO region (for OIDC token refresh)
+                self._sso_region = creds_region
+                # Only update API region if not already set via env var (KIRO_REGION)
+                env_region = os.environ.get("KIRO_REGION")
+                if env_region:
+                    logger.info(f"Keeping API region from env KIRO_REGION={env_region}, SSO region from credentials={creds_region}")
+                else:
+                    self._region = creds_region
+                    # Update URLs for new region
+                    self._refresh_url = get_kiro_refresh_url(self._region)
+                    self._api_host = get_kiro_api_host(self._region)
+                    self._q_host = get_kiro_q_host(self._region)
+                    logger.info(f"Region updated from credentials file: region={self._region}, api_host={self._api_host}, q_host={self._q_host}")
             
             # Load clientIdHash and device registration for Enterprise Kiro IDE
             if 'clientIdHash' in data:
