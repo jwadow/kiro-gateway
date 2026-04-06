@@ -339,10 +339,13 @@ def main() -> None:
         if not _run_wizard_and_save():
             logger.error("Setup wizard aborted. Cannot start server without credentials.")
             sys.exit(1)
-        # Re-validate after wizard (os.environ was updated by save_config)
-        if not validate_configuration():
-            logger.error("Configuration still invalid after setup. Please check your credentials.")
-            sys.exit(1)
+        # Config was saved to disk. Re-exec the process so config.py module-level
+        # variables (REFRESH_TOKEN, KIRO_CREDS_FILE, etc.) are re-initialized from
+        # the newly written .env file. os.environ updates alone are not enough
+        # because those variables were already bound at import time.
+        import os as _os
+        _os.execv(sys.argv[0], sys.argv)
+        return  # unreachable in production; guards against mock fall-through in tests
 
     _warn_timeout_configuration()
 

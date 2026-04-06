@@ -187,15 +187,13 @@ class TestMainWizardTrigger:
 
     def test_invalid_config_triggers_wizard(self) -> None:
         with patch("sys.argv", ["kiro-gateway"]), \
-             patch("kiro.cli.validate_configuration", side_effect=[False, True]), \
+             patch("kiro.cli.validate_configuration", return_value=False), \
              patch("kiro.cli._run_wizard_and_save", return_value=True) as mock_wizard, \
-             patch("kiro.cli._warn_timeout_configuration"), \
-             patch("kiro.cli.resolve_server_config", return_value=("0.0.0.0", 8001)), \
-             patch("kiro.cli.print_startup_banner"), \
-             patch("uvicorn.run"):
+             patch("os.execv") as mock_execv:
             from kiro.cli import main
             main()
             mock_wizard.assert_called_once()
+            mock_execv.assert_called_once()
 
     def test_wizard_abort_exits_with_error(self) -> None:
         with patch("sys.argv", ["kiro-gateway"]), \
