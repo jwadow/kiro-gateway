@@ -949,6 +949,27 @@ class TestToolResultContentBlock:
         print(f"Comparing content type: Expected list, Got {type(block.content)}")
         assert isinstance(block.content, list)
         assert len(block.content) == 2
+
+    def test_accepts_tool_reference_list_content(self):
+        """
+        What it does: Verifies that tool_reference nested blocks are accepted.
+        Purpose: Ensure newer Anthropic tool_result payloads do not fail validation.
+        """
+        print("Setup: Creating ToolResultContentBlock with tool_reference content...")
+        block = ToolResultContentBlock(
+            tool_use_id="call_1",
+            content=[
+                {
+                    "type": "tool_reference",
+                    "tool_name": "mcp__github__get_file_contents",
+                }
+            ],
+        )
+
+        print(f"Result: {block}")
+        assert isinstance(block.content, list)
+        assert block.content[0]["type"] == "tool_reference"
+        assert block.content[0]["tool_name"] == "mcp__github__get_file_contents"
     
     def test_is_error_field(self):
         """

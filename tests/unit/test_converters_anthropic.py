@@ -597,6 +597,33 @@ class TestExtractToolResultsFromAnthropicContent:
         # Text is preserved, images are extracted separately
         assert result[0]["content"] == "Screenshot captured"
 
+    def test_handles_tool_reference_in_tool_result(self):
+        """
+        What it does: Verifies handling of tool_reference blocks in tool_result content.
+        Purpose: Ensure deferred tool loading payloads are converted to stable text.
+        """
+        print("Setup: Tool result with tool_reference content...")
+        content = [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_999",
+                "content": [
+                    {
+                        "type": "tool_reference",
+                        "tool_name": "mcp__github__get_file_contents",
+                    }
+                ],
+            }
+        ]
+
+        print("Action: Extracting tool results...")
+        result = extract_tool_results_from_anthropic_content(content)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0]["tool_use_id"] == "call_999"
+        assert result[0]["content"] == "[Tool Reference] mcp__github__get_file_contents"
+
 
 # ==================================================================================================
 # Tests for extract_images_from_tool_results

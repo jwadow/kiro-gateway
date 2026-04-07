@@ -640,6 +640,54 @@ class TestMessagesToolUse:
         print(f"Status: {response.status_code}")
         assert response.status_code != 422
 
+    def test_accepts_tool_reference_tool_result_message(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies tool_result content with tool_reference is accepted.
+        Purpose: Ensure newer Anthropic deferred-tool payloads do not fail validation.
+        """
+        print("Action: POST /v1/messages with tool_reference tool result...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "Load the GitHub file tool."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tooluse_123",
+                                "name": "ToolSearch",
+                                "input": {"query": "GitHub file contents"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tooluse_123",
+                                "content": [
+                                    {
+                                        "type": "tool_reference",
+                                        "tool_name": "mcp__github__get_file_contents",
+                                    }
+                                ],
+                            },
+                            {"type": "text", "text": "Tool loaded."},
+                        ],
+                    },
+                ],
+            },
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
+
 
 # =============================================================================
 # Tests for /v1/messages optional parameters

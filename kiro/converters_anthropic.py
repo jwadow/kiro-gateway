@@ -24,6 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
+import json
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -112,6 +113,129 @@ def extract_system_prompt(system: Any) -> str:
     return str(system)
 
 
+def _serialize_tool_result_block(block: Any) -> Dict[str, Any]:
+    """
+    Serialize a nested tool_result content block to a dictionary.
+
+    Args:
+        block: Nested content block in dict or Pydantic format
+
+    Returns:
+        Dictionary representation of the block
+    """
+    if isinstance(block, dict):
+        return block
+
+    if hasattr(block, "model_dump"):
+        return block.model_dump()
+
+    return {}
+
+
+def _summarize_tool_result_block(block: Any) -> str:
+    """
+    Convert nested Anthropic tool_result blocks into a text summary.
+
+    This keeps Kiro-compatible text context for newer Anthropic block types
+    such as tool references and documents while avoiding large binary payloads.
+
+    Args:
+        block: Nested tool_result content block
+
+    Returns:
+        Text summary for the block, or empty string if it should not
+        contribute text context
+    """
+    block_data = _serialize_tool_result_block(block)
+    block_type = block_data.get("type")
+
+    if block_type == "text":
+        return str(block_data.get("text", ""))
+
+    if block_type == "image":
+        return ""
+
+    if block_type == "tool_reference":
+        tool_name = str(block_data.get("tool_name", "")).strip()
+        return f"[Tool Reference] {tool_name}" if tool_name else "[Tool Reference]"
+
+    if block_type == "document":
+        source = block_data.get("source")
+        if isinstance(source, dict):
+            source_type = source.get("type")
+            if source_type == "text":
+                return str(source.get("data", ""))
+
+            media_type = str(source.get("media_type", source_type or "unknown")).strip()
+            title = str(block_data.get("title", "")).strip()
+            return f"[Document] {title}" if title else f"[Document: {media_type}]"
+
+        return "[Document]"
+
+    if block_type == "search_result":
+        title = str(block_data.get("title", "")).strip()
+        url = str(block_data.get("url", "")).strip()
+        snippet = str(
+            block_data.get("text")
+            or block_data.get("content")
+            or block_data.get("snippet")
+            or ""
+        ).strip()
+        parts = [part for part in [title, url, snippet] if part]
+        return "\n".join(parts) if parts else "[Search Result]"
+
+    sanitized: Dict[str, Any] = {}
+    for key, value in block_data.items():
+        if key in {"data", "encrypted_content", "encrypted_index"}:
+            continue
+        if key == "source" and isinstance(value, dict):
+            sanitized_source = {
+                source_key: source_value
+                for source_key, source_value in value.items()
+                if source_key not in {"data", "encrypted_content", "encrypted_index"}
+            }
+            if any(secret_key in value for secret_key in ("data", "encrypted_content", "encrypted_index")):
+                sanitized_source["payload"] = "<omitted>"
+            sanitized[key] = sanitized_source
+        else:
+            sanitized[key] = value
+
+    if not sanitized:
+        return ""
+
+    try:
+        return json.dumps(sanitized, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return f"[{block_type or 'content_block'}]"
+
+
+def normalize_tool_result_content(content: Any) -> str:
+    """
+    Normalize Anthropic tool_result content to Kiro-compatible text.
+
+    Args:
+        content: Tool result content in Anthropic format
+
+    Returns:
+        Text content suitable for Kiro tool results
+    """
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        normalized_parts = []
+        for block in content:
+            part = _summarize_tool_result_block(block).strip()
+            if part:
+                normalized_parts.append(part)
+        return "\n".join(normalized_parts)
+
+    if content is None:
+        return ""
+
+    return str(content)
+
+
 def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
     """
     Extracts tool results from Anthropic message content.
@@ -144,11 +268,7 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
             result_content = getattr(block, "content", "")
 
         if block_type == "tool_result" and tool_use_id:
-            # Convert content to text if it's a list
-            if isinstance(result_content, list):
-                result_content = extract_text_content(result_content)
-            elif not isinstance(result_content, str):
-                result_content = str(result_content) if result_content else ""
+            result_content = normalize_tool_result_content(result_content)
 
             tool_results.append(
                 {
