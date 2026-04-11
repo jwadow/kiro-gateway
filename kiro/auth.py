@@ -50,9 +50,10 @@ from kiro.utils import get_machine_fingerprint
 
 # Supported SQLite token keys (searched in priority order)
 SQLITE_TOKEN_KEYS = [
-    "kirocli:social:token",      # Social login (Google, GitHub, Microsoft, etc.)
-    "kirocli:odic:token",        # AWS SSO OIDC (kiro-cli corporate)
-    "codewhisperer:odic:token",  # Legacy AWS SSO OIDC
+    "kirocli:external-idp:token",  # External IdP (Microsoft Azure AD, etc.)
+    "kirocli:social:token",        # Social login (Google, GitHub, Microsoft, etc.)
+    "kirocli:odic:token",          # AWS SSO OIDC (kiro-cli corporate)
+    "codewhisperer:odic:token",    # Legacy AWS SSO OIDC
 ]
 
 # Device registration keys (for AWS SSO OIDC only)
@@ -65,18 +66,24 @@ SQLITE_REGISTRATION_KEYS = [
 class AuthType(Enum):
     """
     Type of authentication mechanism.
-    
+
     KIRO_DESKTOP: Kiro IDE credentials (default)
         - Uses https://prod.{region}.auth.desktop.kiro.dev/refreshToken
         - JSON body: {"refreshToken": "..."}
-    
+
     AWS_SSO_OIDC: AWS SSO credentials from kiro-cli
         - Uses https://oidc.{region}.amazonaws.com/token
         - Form body: grant_type=refresh_token&client_id=...&client_secret=...&refresh_token=...
         - Requires clientId and clientSecret from credentials file
+
+    EXTERNAL_IDP: External Identity Provider (e.g., Microsoft Azure AD / Entra ID)
+        - Uses the tokenEndpoint from the credentials file (e.g., login.microsoftonline.com)
+        - OAuth2 public client refresh (no client_secret required)
+        - Detected when authMethod is "external_idp" in credentials file
     """
     KIRO_DESKTOP = "kiro_desktop"
     AWS_SSO_OIDC = "aws_sso_oidc"
+    EXTERNAL_IDP = "external_idp"
 
 
 class KiroAuthManager:
@@ -150,6 +157,11 @@ class KiroAuthManager:
         
         # Enterprise Kiro IDE specific fields
         self._client_id_hash: Optional[str] = None  # clientIdHash from Enterprise Kiro IDE
+
+        # External IdP specific fields (e.g., Microsoft Azure AD / Entra ID)
+        self._auth_method: Optional[str] = None  # authMethod from credentials file
+        self._token_endpoint: Optional[str] = None  # OAuth2 token endpoint URL
+        self._idp_scopes: Optional[str] = None  # OAuth2 scopes string for external IdP
         
         # Track which SQLite key we loaded credentials from (for saving back to correct location)
         self._sqlite_token_key: Optional[str] = None
@@ -185,11 +197,16 @@ class KiroAuthManager:
     def _detect_auth_type(self) -> None:
         """
         Detects authentication type based on available credentials.
-        
-        AWS SSO OIDC credentials contain clientId and clientSecret.
-        Kiro Desktop credentials do not contain these fields.
+
+        Priority:
+        1. External IdP: authMethod is "external_idp" and tokenEndpoint is set
+        2. AWS SSO OIDC: clientId and clientSecret are both present
+        3. Kiro Desktop: fallback (default)
         """
-        if self._client_id and self._client_secret:
+        if self._auth_method == "external_idp" and self._token_endpoint:
+            self._auth_type = AuthType.EXTERNAL_IDP
+            logger.info(f"Detected auth type: External IdP (endpoint: {self._token_endpoint})")
+        elif self._client_id and self._client_secret:
             self._auth_type = AuthType.AWS_SSO_OIDC
             logger.info("Detected auth type: AWS SSO OIDC (kiro-cli)")
         else:
@@ -258,6 +275,14 @@ class KiroAuthManager:
                     # Load scopes if available
                     if 'scopes' in token_data:
                         self._scopes = token_data['scopes']
+
+                    # Load external IdP specific fields (snake_case in SQLite)
+                    if 'token_endpoint' in token_data:
+                        self._token_endpoint = token_data['token_endpoint']
+                    if 'issuer_url' in token_data:
+                        self._auth_method = "external_idp"
+                    if 'client_id' in token_data:
+                        self._client_id = token_data['client_id']
                     
                     # Parse expires_at (RFC3339 format)
                     if 'expires_at' in token_data:
@@ -354,6 +379,14 @@ class KiroAuthManager:
                 self._client_id_hash = data['clientIdHash']
                 self._load_enterprise_device_registration(self._client_id_hash)
             
+            # Load external IdP specific fields
+            if 'authMethod' in data:
+                self._auth_method = data['authMethod']
+            if 'tokenEndpoint' in data:
+                self._token_endpoint = data['tokenEndpoint']
+            if 'scopes' in data:
+                self._idp_scopes = data['scopes']
+
             # Load AWS SSO OIDC specific fields (if directly in credentials file)
             if 'clientId' in data:
                 self._client_id = data['clientId']
@@ -566,7 +599,9 @@ class KiroAuthManager:
             ValueError: If refresh token is not set or response doesn't contain accessToken
             httpx.HTTPError: On HTTP request error
         """
-        if self._auth_type == AuthType.AWS_SSO_OIDC:
+        if self._auth_type == AuthType.EXTERNAL_IDP:
+            await self._refresh_token_external_idp()
+        elif self._auth_type == AuthType.AWS_SSO_OIDC:
             await self._refresh_token_aws_sso_oidc()
         else:
             await self._refresh_token_kiro_desktop()
@@ -630,6 +665,66 @@ class KiroAuthManager:
         else:
             self._save_credentials_to_file()
     
+    async def _refresh_token_external_idp(self) -> None:
+        """
+        Refreshes token using an external Identity Provider (e.g., Microsoft Azure AD / Entra ID).
+
+        Uses the tokenEndpoint from the credentials file with a standard OAuth2
+        refresh_token grant. The resulting IdP JWT is used directly with the Kiro API
+        (the API recognizes it via the TokenType: EXTERNAL_IDP header).
+
+        Raises:
+            ValueError: If required credentials are not set
+            httpx.HTTPError: On HTTP request error
+        """
+        if not self._refresh_token:
+            raise ValueError("Refresh token is not set")
+        if not self._token_endpoint:
+            raise ValueError("Token endpoint is not set (required for External IdP)")
+        if not self._client_id:
+            raise ValueError("Client ID is not set (required for External IdP)")
+
+        logger.info(f"Refreshing token via External IdP: {self._token_endpoint}")
+
+        payload = {
+            "grant_type": "refresh_token",
+            "client_id": self._client_id,
+            "refresh_token": self._refresh_token,
+        }
+        if self._idp_scopes:
+            payload["scope"] = self._idp_scopes
+
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(self._token_endpoint, data=payload, headers=headers)
+
+            if response.status_code != 200:
+                error_body = response.text
+                logger.error(f"External IdP refresh failed: status={response.status_code}, body={error_body}")
+                response.raise_for_status()
+
+            result = response.json()
+
+        new_access_token = result.get("access_token")
+        new_refresh_token = result.get("refresh_token")
+        expires_in = result.get("expires_in", 3600)
+
+        if not new_access_token:
+            raise ValueError(f"External IdP response does not contain access_token: {result}")
+
+        self._access_token = new_access_token
+        if new_refresh_token:
+            self._refresh_token = new_refresh_token
+
+        self._expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
+
+        logger.info(f"Token refreshed via External IdP, expires: {self._expires_at.isoformat()}")
+
+        self._save_credentials_to_file()
+
     async def _refresh_token_aws_sso_oidc(self) -> None:
         """
         Refreshes token using AWS SSO OIDC endpoint.
@@ -863,5 +958,5 @@ class KiroAuthManager:
     
     @property
     def auth_type(self) -> AuthType:
-        """Authentication type (KIRO_DESKTOP or AWS_SSO_OIDC)."""
+        """Authentication type (KIRO_DESKTOP, AWS_SSO_OIDC, or EXTERNAL_IDP)."""
         return self._auth_type
