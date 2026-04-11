@@ -111,7 +111,7 @@ Specify the path to the credentials file:
 
 Works with:
 - **Kiro IDE** (standard) - for personal accounts
-- **Enterprise** - for corporate accounts with SSO
+- **Enterprise** - for corporate accounts with SSO (including External IdP such as Microsoft Azure AD / Entra ID)
 
 ```env
 KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"
@@ -124,6 +124,7 @@ PROXY_API_KEY="my-super-secret-password-123"
 <details>
 <summary>📄 JSON file format</summary>
 
+**Standard / Enterprise (IdC):**
 ```json
 {
   "accessToken": "eyJ...",
@@ -132,6 +133,20 @@ PROXY_API_KEY="my-super-secret-password-123"
   "profileArn": "arn:aws:codewhisperer:us-east-1:...",
   "region": "us-east-1",
   "clientIdHash": "abc123..."  // Optional: for corporate SSO setups
+}
+```
+
+**External IdP (Microsoft Azure AD / Entra ID):**
+```json
+{
+  "accessToken": "eyJ...",
+  "refreshToken": "eyJ...",
+  "expiresAt": "2025-01-12T23:00:00.000Z",
+  "authMethod": "external_idp",
+  "provider": "ExternalIdp",
+  "tokenEndpoint": "https://login.microsoftonline.com/{tenant-id}/oauth2/v2.0/token",
+  "clientId": "your-client-id",
+  "scopes": "api://your-client-id/codewhisperer:conversations ..."
 }
 ```
 
@@ -196,11 +211,15 @@ AWS SSO credentials files (from `~/.aws/sso/cache/`) contain:
 
 The gateway automatically detects the authentication type based on the credentials file:
 
-- **Kiro Desktop Auth** (default): Used when `clientId` and `clientSecret` are NOT present
-  - Endpoint: `https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
+- **External IdP** (e.g., Microsoft Azure AD / Entra ID): Used when `authMethod` is `"external_idp"` and `tokenEndpoint` is present
+  - Token refresh: via the IdP's OAuth2 token endpoint (e.g., `login.microsoftonline.com`)
+  - The IdP JWT is used directly with a `TokenType: EXTERNAL_IDP` header
   
 - **AWS SSO (OIDC)**: Used when `clientId` and `clientSecret` ARE present
   - Endpoint: `https://oidc.{region}.amazonaws.com/token`
+
+- **Kiro Desktop Auth** (default): Used when none of the above conditions are met
+  - Endpoint: `https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
 
 No additional configuration is needed — just point to your credentials file!
 
@@ -226,13 +245,16 @@ PROXY_API_KEY="my-super-secret-password-123"
 | CLI Tool | Database Path |
 |----------|---------------|
 | kiro-cli | `~/.local/share/kiro-cli/data.sqlite3` |
+| kiro-cli (macOS) | `~/Library/Application Support/kiro-cli/data.sqlite3` |
 | amazon-q-developer-cli | `~/.local/share/amazon-q/data.sqlite3` |
 
 The gateway reads credentials from the `auth_kv` table which stores:
-- `kirocli:odic:token` or `codewhisperer:odic:token` — access token, refresh token, expiration
+- `kirocli:external-idp:token` — External IdP credentials (Microsoft Azure AD, etc.)
+- `kirocli:social:token` — Social login (Google, GitHub, Microsoft, etc.)
+- `kirocli:odic:token` or `codewhisperer:odic:token` — AWS SSO OIDC credentials
 - `kirocli:odic:device-registration` or `codewhisperer:odic:device-registration` — client ID and secret
 
-Both key formats are supported for compatibility with different kiro-cli versions.
+All key formats are supported for compatibility with different kiro-cli versions and auth methods.
 
 </details>
 
