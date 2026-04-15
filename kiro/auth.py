@@ -445,77 +445,63 @@ class KiroAuthManager:
     
     def _save_credentials_to_sqlite(self) -> None:
         """
-        Saves updated credentials back to SQLite database.
-        
-        This ensures that tokens refreshed by the gateway are persisted
-        and available after gateway restart or for other processes reading
-        the same SQLite database.
-        
-        Strategy:
-        1. If we know which key we loaded from (_sqlite_token_key), save to that key
-        2. If that fails or key is unknown, try all supported keys as fallback
-        
-        This approach ensures credentials are saved to the correct location
-        regardless of authentication type (social login, AWS SSO OIDC, legacy).
-        
-        Updates the auth_kv table with fresh access_token, refresh_token,
-        and expires_at values after successful token refresh.
+        Saves updated credentials back to SQLite database using a
+        read-modify-write approach to preserve fields that kiro-cli needs
+        (e.g. client_id, client_secret, startUrl, registrationExpiresAt).
+
+        Only the token fields (accessToken/access_token, refreshToken/refresh_token,
+        expiresAt/expires_at) are updated; all other fields in the existing JSON
+        are left intact.
         """
         if not self._sqlite_db:
             return
-        
+
         try:
             path = Path(self._sqlite_db).expanduser()
             if not path.exists():
                 logger.warning(f"SQLite database not found for writing: {self._sqlite_db}")
                 return
-            
-            # Use timeout to avoid blocking if database is locked
+
             conn = sqlite3.connect(str(path), timeout=5.0)
             cursor = conn.cursor()
-            
-            # Prepare token data matching the structure from _load_credentials_from_sqlite
-            token_data = {
-                "access_token": self._access_token,
-                "refresh_token": self._refresh_token,
-                "expires_at": self._expires_at.isoformat() if self._expires_at else None,
-                "region": self._sso_region or self._region,
-            }
-            if self._scopes:
-                token_data["scopes"] = self._scopes
-            
-            token_json = json.dumps(token_data)
-            
-            # Save back to the same key we loaded from (if known)
-            if self._sqlite_token_key:
-                cursor.execute(
-                    "UPDATE auth_kv SET value = ? WHERE key = ?",
-                    (token_json, self._sqlite_token_key)
-                )
-                if cursor.rowcount > 0:
-                    conn.commit()
-                    conn.close()
-                    logger.debug(f"Credentials saved to SQLite key: {self._sqlite_token_key}")
-                    return
+
+            keys_to_try = ([self._sqlite_token_key] if self._sqlite_token_key else []) + list(SQLITE_TOKEN_KEYS)
+
+            for key in keys_to_try:
+                cursor.execute("SELECT value FROM auth_kv WHERE key = ?", (key,))
+                row = cursor.fetchone()
+                if not row:
+                    continue
+
+                # Load existing data and merge only refreshed token fields
+                try:
+                    existing = json.loads(row[0])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+                # Support both camelCase (kiro-cli) and snake_case field names
+                if "accessToken" in existing:
+                    existing["accessToken"] = self._access_token
+                    existing["refreshToken"] = self._refresh_token
+                    existing["expiresAt"] = self._expires_at.isoformat() if self._expires_at else None
                 else:
-                    logger.warning(f"Failed to update SQLite key: {self._sqlite_token_key}, trying fallback")
-            
-            # Fallback: try all keys (for edge cases where source key is unknown)
-            for key in SQLITE_TOKEN_KEYS:
+                    existing["access_token"] = self._access_token
+                    existing["refresh_token"] = self._refresh_token
+                    existing["expires_at"] = self._expires_at.isoformat() if self._expires_at else None
+
                 cursor.execute(
                     "UPDATE auth_kv SET value = ? WHERE key = ?",
-                    (token_json, key)
+                    (json.dumps(existing), key)
                 )
                 if cursor.rowcount > 0:
                     conn.commit()
                     conn.close()
-                    logger.debug(f"Credentials saved to SQLite key: {key} (fallback)")
+                    logger.debug(f"Credentials merged and saved to SQLite key: {key}")
                     return
-            
-            # If we get here, no keys were updated
+
             conn.close()
-            logger.warning(f"Failed to save credentials to SQLite: no matching keys found")
-            
+            logger.warning("Failed to save credentials to SQLite: no matching keys found")
+
         except sqlite3.Error as e:
             logger.error(f"SQLite error saving credentials: {e}")
         except Exception as e:
