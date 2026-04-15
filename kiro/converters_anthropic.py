@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from kiro.config import HIDDEN_MODELS
+from kiro.config import HIDDEN_MODELS, MODEL_ALIASES
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
@@ -405,7 +405,7 @@ def anthropic_to_kiro(
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
-    model_id = get_model_id_for_kiro(request.model, HIDDEN_MODELS)
+    model_id = get_model_id_for_kiro(request.model, HIDDEN_MODELS, aliases=MODEL_ALIASES)
 
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "
