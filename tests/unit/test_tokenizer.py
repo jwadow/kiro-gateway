@@ -19,6 +19,7 @@ from kiro.tokenizer import (
     count_tokens,
     count_message_tokens,
     count_tools_tokens,
+    count_system_tokens,
     estimate_request_tokens,
     CLAUDE_CORRECTION_FACTOR,
     _get_encoding
@@ -356,6 +357,41 @@ class TestCountMessageTokens:
         
         assert result > 0, "Сообщение с None content должно иметь служебные токены"
 
+    def test_anthropic_tool_use_and_tool_result_blocks(self):
+        """
+        Что он делает: Проверяет подсчёт Anthropic блоков tool_use/tool_result.
+        Цель: Убедиться, что ключевые блоки Claude Code не теряются в подсчёте.
+        """
+        print("Тест: Anthropic tool_use/tool_result блоки...")
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_123",
+                        "name": "get_weather",
+                        "input": {"city": "Tokyo"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_123",
+                        "content": [{"type": "text", "text": "晴天 26C"}],
+                        "is_error": False
+                    }
+                ]
+            }
+        ]
+
+        result = count_message_tokens(messages, apply_claude_correction=False)
+        print(f"Результат: {result}")
+        assert result > 0
+
 
 class TestCountToolsTokens:
     """Тесты для функции count_tools_tokens."""
@@ -569,6 +605,115 @@ class TestCountToolsTokens:
         
         assert with_correction > without_correction, "С коррекцией должно быть больше"
 
+    def test_openai_flat_tool_format(self):
+        """
+        Что он делает: Проверяет подсчёт токенов для flat/Cursor-style инструмента.
+        Цель: Убедиться, что формат без type=function тоже учитывается.
+        """
+        tools = [
+            {
+                "name": "search_docs",
+                "description": "Search docs by keyword",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        ]
+
+        result = count_tools_tokens(tools, apply_claude_correction=False)
+        assert result > 4  # Must exceed base service overhead, proving name/description/schema are counted
+
+    def test_anthropic_flat_and_openai_function_are_close(self):
+        """
+        Что он делает: Сравнивает Anthropic flat и OpenAI function форматы.
+        Цель: Prevent Anthropic tools from regressing to base-overhead-only counting.
+        """
+        shared_schema = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "recursive": {"type": "boolean", "description": "Recursive search"}
+            },
+            "required": ["path"]
+        }
+        openai_tools = [{
+            "type": "function",
+            "function": {
+                "name": "search_files",
+                "description": "Search files",
+                "parameters": shared_schema
+            }
+        }]
+        anthropic_tools = [{
+            "name": "search_files",
+            "description": "Search files",
+            "input_schema": shared_schema
+        }]
+
+        openai_tokens = count_tools_tokens(openai_tools, apply_claude_correction=False)
+        anthropic_tokens = count_tools_tokens(anthropic_tools, apply_claude_correction=False)
+
+        assert openai_tokens > 4
+        assert anthropic_tokens > 4
+        diff_ratio = abs(openai_tokens - anthropic_tokens) / max(openai_tokens, anthropic_tokens)
+        assert diff_ratio < 0.15
+
+
+class TestCountSystemTokens:
+    """Tests for count_system_tokens function."""
+
+    def test_none_returns_zero(self):
+        """Checks that None returns 0."""
+        assert count_system_tokens(None) == 0
+
+    def test_empty_string_returns_zero(self):
+        """Checks that empty string returns 0."""
+        assert count_system_tokens("") == 0
+
+    def test_plain_string(self):
+        """Checks that plain string is counted correctly."""
+        result = count_system_tokens("You are a helpful assistant.", apply_claude_correction=False)
+        assert result > 0
+
+    def test_dict_block_list(self):
+        """Checks that Anthropic dict block list is counted correctly."""
+        blocks = [
+            {"type": "text", "text": "You are a helpful assistant."},
+            {"type": "text", "text": "Be concise.", "cache_control": {"type": "ephemeral"}},
+        ]
+        result = count_system_tokens(blocks, apply_claude_correction=False)
+        assert result > 0
+        # Should be greater than single block result
+        single = count_system_tokens([blocks[0]], apply_claude_correction=False)
+        assert result > single
+
+    def test_dict_block_with_cache_control(self):
+        """Checks that cache_control field is counted in tokens."""
+        without_cache = [{"type": "text", "text": "Hello"}]
+        with_cache = [{"type": "text", "text": "Hello", "cache_control": {"type": "ephemeral"}}]
+        r1 = count_system_tokens(without_cache, apply_claude_correction=False)
+        r2 = count_system_tokens(with_cache, apply_claude_correction=False)
+        assert r2 > r1
+
+    def test_non_dict_block_fallback(self):
+        """Checks that non-dict elements fall back to str()."""
+        result = count_system_tokens([42, "text"], apply_claude_correction=False)
+        assert result > 0
+
+    def test_unknown_type_fallback(self):
+        """Checks that non-str/list types fall back to str()."""
+        result = count_system_tokens(12345, apply_claude_correction=False)
+        assert result > 0
+
+    def test_claude_correction_applied(self):
+        """Checks that Claude correction coefficient is applied."""
+        text = "You are a helpful assistant that answers questions about programming and software engineering."
+        without = count_system_tokens(text, apply_claude_correction=False)
+        with_corr = count_system_tokens(text, apply_claude_correction=True)
+        assert with_corr > without
+
 
 class TestEstimateRequestTokens:
     """Тесты для функции estimate_request_tokens."""
@@ -634,6 +779,24 @@ class TestEstimateRequestTokens:
         assert result["messages_tokens"] > 0
         assert result["system_tokens"] > 0
         assert result["total_tokens"] == result["messages_tokens"] + result["system_tokens"]
+
+    def test_anthropic_system_blocks(self):
+        """
+        Что он делает: Проверяет оценку токенов для Anthropic system block списка.
+        Цель: Убедиться, что system блоки тоже считаются.
+        """
+        print("Тест: Anthropic system blocks...")
+        messages = [{"role": "user", "content": "Hello!"}]
+        system_prompt = [
+            {"type": "text", "text": "你是 Claude Code"},
+            {"type": "text", "text": "Follow tools strictly", "cache_control": {"type": "ephemeral"}},
+        ]
+
+        result = estimate_request_tokens(messages, system_prompt=system_prompt, apply_claude_correction=False)
+        print(f"Результат: {result}")
+
+        assert result["system_tokens"] > 0
+        assert result["total_tokens"] == result["messages_tokens"] + result["system_tokens"]
     
     def test_full_request(self):
         """
@@ -666,6 +829,43 @@ class TestEstimateRequestTokens:
         
         expected_total = result["messages_tokens"] + result["tools_tokens"] + result["system_tokens"]
         assert result["total_tokens"] == expected_total, "Total должен быть суммой компонентов"
+
+    def test_anthropic_messages_with_flat_tools(self):
+        """
+        Что он делает: Simulates Anthropic /v1/messages with tools+system scenario.
+        Цель: Verify estimate_request_tokens no longer undercounts flat tools.
+        """
+        messages = [
+            {"role": "user", "content": "请先读取项目结构，再回答。"}
+        ]
+        tools = [
+            {
+                "name": "read_file",
+                "description": "Read a file from workspace",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Absolute path"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        ]
+        system_prompt = [{"type": "text", "text": "你是代码助手。"}]
+
+        result = estimate_request_tokens(
+            messages,
+            tools=tools,
+            system_prompt=system_prompt,
+            apply_claude_correction=False
+        )
+
+        assert result["messages_tokens"] > 0
+        assert result["tools_tokens"] > 4
+        assert result["system_tokens"] > 0
+        assert result["total_tokens"] == (
+            result["messages_tokens"] + result["tools_tokens"] + result["system_tokens"]
+        )
     
     def test_empty_messages(self):
         """

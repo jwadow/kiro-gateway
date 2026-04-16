@@ -47,7 +47,7 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
 )
-from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
+from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
 
@@ -98,6 +98,34 @@ def generate_thinking_signature() -> str:
     return f"sig_{uuid.uuid4().hex[:32]}"
 
 
+def _extract_cache_usage_fields(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    Extract cache token fields from upstream usage (if present).
+
+    Args:
+        usage: Usage data from Kiro stream event
+
+    Returns:
+        Dict containing only available cache fields; missing fields are omitted
+    """
+    if not isinstance(usage, dict):
+        return {}
+
+    extracted: Dict[str, int] = {}
+    key_map = {
+        "cache_read_input_tokens": "cache_read_input_tokens",
+        "cacheReadInputTokens": "cache_read_input_tokens",
+        "cache_creation_input_tokens": "cache_creation_input_tokens",
+        "cacheCreationInputTokens": "cache_creation_input_tokens",
+    }
+    for source_key, target_key in key_map.items():
+        value = usage.get(source_key)
+        if isinstance(value, (int, float)):
+            extracted[target_key] = int(value)
+
+    return extracted
+
+
 async def stream_kiro_to_anthropic(
     response: httpx.Response,
     model: str,
@@ -105,6 +133,8 @@ async def stream_kiro_to_anthropic(
     auth_manager: "KiroAuthManager",
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
+    request_tools: Optional[list] = None,
+    request_system: Optional[Any] = None,
     conversation_id: Optional[str] = None
 ) -> AsyncGenerator[str, None]:
     """
@@ -120,6 +150,8 @@ async def stream_kiro_to_anthropic(
         auth_manager: Authentication manager
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for token counting)
+        request_tools: Original request tools (for token counting)
+        request_system: Original system prompt (for token counting)
         conversation_id: Stable conversation ID for truncation recovery (optional)
     
     Yields:
@@ -134,9 +166,15 @@ async def stream_kiro_to_anthropic(
     full_content = ""
     full_thinking_content = ""
     
-    # Count input tokens from request messages
-    if request_messages:
-        input_tokens = count_message_tokens(request_messages, apply_claude_correction=False)
+    # Fallback estimation must cover messages/tools/system to avoid significant undercount
+    if request_messages or request_tools or request_system:
+        request_token_stats = estimate_request_tokens(
+            messages=request_messages or [],
+            tools=request_tools,
+            system_prompt=request_system,
+            apply_claude_correction=False
+        )
+        input_tokens = request_token_stats["total_tokens"]
     
     # Track content blocks - thinking block is index 0, text block is index 1 (when thinking enabled)
     current_block_index = 0
@@ -152,6 +190,7 @@ async def stream_kiro_to_anthropic(
     
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
+    upstream_cache_usage: Dict[str, int] = {}
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
@@ -475,6 +514,8 @@ async def stream_kiro_to_anthropic(
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
+            elif event.type == "usage" and event.usage:
+                upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
         
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
@@ -579,24 +620,29 @@ async def stream_kiro_to_anthropic(
         
         # Calculate total tokens from context usage if available
         if context_usage_percentage is not None:
-            prompt_tokens, total_tokens, _, _ = calculate_tokens_from_context_usage(
+            prompt_tokens, _, prompt_source, _ = calculate_tokens_from_context_usage(
                 context_usage_percentage, output_tokens, model_cache, model
             )
-            input_tokens = prompt_tokens
+            # Only override local estimate when upstream context usage is available, avoid 0% zeroing out
+            if prompt_source != "unknown":
+                input_tokens = prompt_tokens
         
         # Determine stop reason
         stop_reason = "tool_use" if tool_blocks else "end_turn"
         
         # Send message_delta with stop_reason and usage
+        usage_payload = {
+            "output_tokens": output_tokens
+        }
+        usage_payload.update(upstream_cache_usage)
+
         yield format_sse_event("message_delta", {
             "type": "message_delta",
             "delta": {
                 "stop_reason": stop_reason,
                 "stop_sequence": None
             },
-            "usage": {
-                "output_tokens": output_tokens
-            }
+            "usage": usage_payload
         })
         
         # Send message_stop
@@ -665,7 +711,9 @@ async def collect_anthropic_response(
     model: str,
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
-    request_messages: Optional[list] = None
+    request_messages: Optional[list] = None,
+    request_tools: Optional[list] = None,
+    request_system: Optional[Any] = None
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -678,19 +726,28 @@ async def collect_anthropic_response(
         model_cache: Model cache
         auth_manager: Authentication manager
         request_messages: Original request messages (for token counting)
+        request_tools: Original request tools (for token counting)
+        request_system: Original system prompt (for token counting)
     
     Returns:
         Dictionary with full response in Anthropic Messages format
     """
     message_id = generate_message_id()
     
-    # Count input tokens
+    # Non-streaming uses the same full-request estimation as streaming
     input_tokens = 0
-    if request_messages:
-        input_tokens = count_message_tokens(request_messages, apply_claude_correction=False)
+    if request_messages or request_tools or request_system:
+        request_token_stats = estimate_request_tokens(
+            messages=request_messages or [],
+            tools=request_tools,
+            system_prompt=request_system,
+            apply_claude_correction=False
+        )
+        input_tokens = request_token_stats["total_tokens"]
     
     # Collect stream result
     result = await collect_stream_to_result(response)
+    upstream_cache_usage = _extract_cache_usage_fields(result.usage)
     
     # Build content blocks
     content_blocks = []
@@ -739,10 +796,11 @@ async def collect_anthropic_response(
     
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:
-        prompt_tokens, _, _, _ = calculate_tokens_from_context_usage(
+        prompt_tokens, _, prompt_source, _ = calculate_tokens_from_context_usage(
             result.context_usage_percentage, output_tokens, model_cache, model
         )
-        input_tokens = prompt_tokens
+        if prompt_source != "unknown":
+            input_tokens = prompt_tokens
     
     # Determine stop reason
     stop_reason = "tool_use" if result.tool_calls else "end_turn"
@@ -753,6 +811,12 @@ async def collect_anthropic_response(
         f"tool_calls={len(result.tool_calls)}, stop_reason={stop_reason}"
     )
     
+    usage_payload: Dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens
+    }
+    usage_payload.update(upstream_cache_usage)
+
     return {
         "id": message_id,
         "type": "message",
@@ -761,10 +825,7 @@ async def collect_anthropic_response(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": usage_payload
     }
 
 
@@ -776,7 +837,8 @@ async def stream_with_first_token_retry_anthropic(
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    request_system: Optional[Any] = None
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -796,6 +858,7 @@ async def stream_with_first_token_retry_anthropic(
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        request_system: Original system prompt (for fallback token counting)
     
     Yields:
         Strings in Anthropic SSE format
@@ -831,7 +894,9 @@ async def stream_with_first_token_retry_anthropic(
             model_cache,
             auth_manager,
             first_token_timeout=first_token_timeout,
-            request_messages=request_messages
+            request_messages=request_messages,
+            request_tools=request_tools,
+            request_system=request_system,
         ):
             yield chunk
     
