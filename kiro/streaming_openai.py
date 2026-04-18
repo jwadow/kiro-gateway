@@ -185,7 +185,81 @@ async def stream_kiro_to_openai_internal(
                 yield chunk_text
             
             elif event.type == "tool_use" and event.tool_use:
-                # Collect tool calls from stream
+                tool = event.tool_use
+                
+                # Extract tool name safely (handle None/missing fields)
+                tool_name = ""
+                if tool:
+                    tool_name = (tool.get("function") or {}).get("name", "") or tool.get("name", "")
+                
+                # ==============================================================================
+                # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
+                # ==============================================================================
+                
+                # INTERCEPT web_search tool calls (Path B - MCP emulation)
+                if tool_name == "web_search":
+                    from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
+                    
+                    logger.info("Intercepted web_search tool call (Path B - MCP emulation)")
+                    
+                    # Parse tool_input
+                    tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
+                    if isinstance(tool_input, str):
+                        try:
+                            tool_input = json.loads(tool_input)
+                        except json.JSONDecodeError:
+                            tool_input = {}
+                    
+                    # Extract query
+                    query = tool_input.get("query", "")
+                    if not query:
+                        logger.warning("web_search called without query, skipping MCP call")
+                        # Continue with normal tool_use processing
+                    else:
+                        logger.debug(f"WebSearch query (Path B): {query}")
+                        
+                        # Call MCP API
+                        mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
+                        
+                        if results is None:
+                            logger.error("MCP API call failed for web_search")
+                            # Continue with normal tool_use processing (will show error to user)
+                        else:
+                            # Emit summary as content chunks (OpenAI format)
+                            summary = generate_search_summary(query, results)
+                            
+                            # Send content chunks
+                            chunk_size = 100
+                            for i in range(0, len(summary), chunk_size):
+                                content_chunk = summary[i:i + chunk_size]
+                                
+                                delta = {"content": content_chunk}
+                                if first_chunk:
+                                    delta["role"] = "assistant"
+                                    first_chunk = False
+                                
+                                openai_chunk = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_time,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                                }
+                                
+                                chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+                                
+                                if debug_logger:
+                                    debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+                                
+                                yield chunk_text
+                            
+                            # Accumulate for token counting
+                            full_content += summary
+                            
+                            # Skip normal tool_use processing
+                            continue
+                
+                # Collect tool calls from stream (normal tools, not web_search)
                 tool_calls_from_stream.append(event.tool_use)
             
             elif event.type == "usage" and event.usage:
@@ -219,8 +293,13 @@ async def stream_kiro_to_openai_internal(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
         
-        # Determine finish_reason
-        finish_reason = "tool_calls" if all_tool_calls else "stop"
+        # Determine finish_reason (truncation has highest priority)
+        if content_was_truncated:
+            finish_reason = "length"
+        elif all_tool_calls:
+            finish_reason = "tool_calls"
+        else:
+            finish_reason = "stop"
         
         # Count completion_tokens (output) using tiktoken
         completion_tokens = count_tokens(full_content + full_thinking_content)
@@ -409,6 +488,7 @@ async def stream_with_first_token_retry(
     model: str,
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
+    initial_response: Optional[httpx.Response] = None,
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
@@ -431,6 +511,8 @@ async def stream_with_first_token_retry(
         model: Model name
         model_cache: Model cache
         auth_manager: Authentication manager
+        initial_response: Optional pre-validated response to use on first attempt.
+                         If provided, make_request is only called on retries.
         max_retries: Maximum number of attempts
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for fallback token counting)
@@ -445,7 +527,10 @@ async def stream_with_first_token_retry(
     Example:
         >>> async def make_req():
         ...     return await http_client.request_with_retry("POST", url, payload, stream=True)
-        >>> async for chunk in stream_with_first_token_retry(make_req, client, model, cache, auth):
+        >>> response = await make_req()
+        >>> async for chunk in stream_with_first_token_retry(
+        ...     make_req, client, model, cache, auth, initial_response=response
+        ... ):
         ...     print(chunk)
     """
     def create_http_error(status_code: int, error_text: str) -> HTTPException:
@@ -479,6 +564,7 @@ async def stream_with_first_token_retry(
     async for chunk in stream_with_first_token_retry_core(
         make_request=make_request,
         stream_processor=stream_processor,
+        initial_response=initial_response,
         max_retries=max_retries,
         first_token_timeout=first_token_timeout,
         on_http_error=create_http_error,
@@ -518,6 +604,7 @@ async def collect_stream_response(
     full_reasoning_content = ""
     final_usage = None
     tool_calls = []
+    finish_reason = "stop"  # Default fallback
     completion_id = generate_completion_id()
     
     async for chunk_str in stream_kiro_to_openai(
@@ -548,6 +635,11 @@ async def collect_stream_response(
             if "tool_calls" in delta:
                 tool_calls.extend(delta["tool_calls"])
             
+            # Extract finish_reason from chunk (streaming already calculated it correctly)
+            finish_reason_from_chunk = chunk_data.get("choices", [{}])[0].get("finish_reason")
+            if finish_reason_from_chunk:
+                finish_reason = finish_reason_from_chunk
+            
             # Save usage from last chunk
             if "usage" in chunk_data:
                 final_usage = chunk_data["usage"]
@@ -576,8 +668,6 @@ async def collect_stream_response(
             }
             cleaned_tool_calls.append(cleaned_tc)
         message["tool_calls"] = cleaned_tool_calls
-    
-    finish_reason = "tool_calls" if tool_calls else "stop"
     
     # Form usage for response
     usage = final_usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}

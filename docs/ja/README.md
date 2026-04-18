@@ -4,7 +4,7 @@
 
 **Kiro API (Amazon Q Developer / AWS CodeWhisperer) 用プロキシゲートウェイ**
 
-[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • [🇰🇷 한국어](../ko/README.md)
+[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • 🇯🇵 日本語 • [🇰🇷 한국어](../ko/README.md)
 
 [@Jwadow](https://github.com/jwadow) が ❤️ を込めて作成
 
@@ -13,7 +13,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-開発を支援-ff69b4)](#-プロジェクトを支援)
 
-*Kiro の Claude モデルを Claude Code、OpenCode、Codex app、Cursor、Cline、Roo Code、Kilo Code、Obsidian、OpenAI SDK、LangChain、Continue などの OpenAI または Anthropic 互換ツールで使用*
+*Kiro の Claude モデルを Claude Code、OpenCode、OpenClaw、Claw Code、Codex app、Cursor、Cline、Roo Code、Kilo Code、Obsidian、OpenAI SDK、LangChain、Continue などの OpenAI または Anthropic 互換ツールで使用*
 
 [モデル](#-対応モデル) • [機能](#-機能) • [クイックスタート](#-クイックスタート) • [設定](#%EF%B8%8F-設定) • [💖 サポート](#-プロジェクトを支援)
 
@@ -21,7 +21,7 @@
 
 ---
 
-## 🤖 利用可能なモデル
+## 🤖 利用可能なモデル（無料リスト）
 
 > ⚠️ **重要：** モデルの利用可能性は Kiro プラン（無料/有料）によって異なります。ゲートウェイは、サブスクリプションに基づいて IDE または CLI で利用可能なモデルへのアクセスを提供します。以下のリストは**無料プラン**で一般的に利用可能なモデルを示しています。
 
@@ -35,7 +35,11 @@
 
 📦 **Claude 3.7 Sonnet** — レガシーモデル。後方互換性のために利用可能。
 
+💤 **GLM-5** — オープンMoEモデル（744Bパラメータ、40B活性）。複雑なシステムエンジニアリングと長期的なエージェントタスクのための高度なモデル。
+
 🐋 **DeepSeek-V3.2** — オープンMoEモデル（685Bパラメータ、37B活性）。コーディング、推論、一般的なタスクのバランスの取れたパフォーマンス。
+
+🧩 **MiniMax M2.5** — オープンMoEモデル（230Bパラメータ、10B活性）。推論とタスク処理能力が向上した強化版。
 
 🧩 **MiniMax M2.1** — オープンMoEモデル（230Bパラメータ、10B活性）。複雑なタスク、計画、マルチステップワークフローに最適。
 
@@ -54,6 +58,7 @@
 | 🌐 **VPN/プロキシサポート** | 制限されたネットワーク向けの HTTP/SOCKS5 プロキシ |
 | 🧠 **拡張思考** | 推論機能は本プロジェクト独自の機能 |
 | 👁️ **ビジョンサポート** | モデルに画像を送信 |
+| 🔍 **ウェブ検索** | インターネットから最新情報を検索 |
 | 🛠️ **ツール呼び出し** | 関数呼び出しをサポート |
 | 💬 **完全なメッセージ履歴** | 完全な会話コンテキストを渡す |
 | 📡 **ストリーミング** | 完全な SSE ストリーミングサポート |
@@ -717,7 +722,7 @@ AGPL-3.0 は、このソフトウェアへの改善がコミュニティ全体�
 
 ### 🤑 寄付
 
-[**☕ 一回限りの寄付**](https://app.lava.top/jwadow?tabId=donate) &nbsp;•&nbsp; [**💎 月額サポート**](https://app.lava.top/jwadow?tabId=subscriptions)
+[**☕ 一回限りのサポート**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
 
 <br>
 

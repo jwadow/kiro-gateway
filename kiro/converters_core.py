@@ -40,12 +40,45 @@ from kiro.config import (
     TOOL_DESCRIPTION_MAX_LENGTH,
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_MAX_TOKENS,
+    FAKE_REASONING_BUDGET_CAP,
+    KIRO_MAX_PAYLOAD_BYTES,
+    AUTO_TRIM_PAYLOAD,
 )
+from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 
 
 # ==================================================================================================
 # Data Classes for Unified Message Format
 # ==================================================================================================
+
+@dataclass
+class ThinkingConfig:
+    """
+    Unified thinking configuration for fake reasoning.
+    
+    This configuration is created by API-specific adapters (OpenAI, Anthropic)
+    and passed to the core layer for thinking tag injection.
+    
+    Attributes:
+        enabled: Whether to inject thinking tags into the request
+        budget_tokens: Token budget for thinking (None = use FAKE_REASONING_MAX_TOKENS default)
+    
+    Examples:
+        >>> # Default configuration (enabled with default budget)
+        >>> ThinkingConfig()
+        ThinkingConfig(enabled=True, budget_tokens=None)
+        
+        >>> # Disabled by client (reasoning_effort="none" or thinking.type="disabled")
+        >>> ThinkingConfig(enabled=False, budget_tokens=None)
+        ThinkingConfig(enabled=False, budget_tokens=None)
+        
+        >>> # Custom budget from client
+        >>> ThinkingConfig(enabled=True, budget_tokens=8000)
+        ThinkingConfig(enabled=True, budget_tokens=8000)
+    """
+    enabled: bool = True
+    budget_tokens: Optional[int] = None
+
 
 @dataclass
 class UnifiedMessage:
@@ -133,8 +166,8 @@ def extract_text_content(content: Any) -> str:
         text_parts = []
         for item in content:
             if isinstance(item, dict):
-                # Skip image blocks - they're handled separately
-                if item.get("type") in ("image", "image_url"):
+                # Skip image and tool_reference blocks - they're handled separately
+                if item.get("type") in ("image", "image_url", "tool_reference"):
                     continue
                 if item.get("type") == "text":
                     text_parts.append(item.get("text", ""))
@@ -325,22 +358,55 @@ def get_truncation_recovery_system_addition() -> str:
     )
 
 
-def inject_thinking_tags(content: str) -> str:
+def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
     """
-    Inject fake reasoning tags into content.
+    Inject fake reasoning tags into content based on configuration.
     
-    When FAKE_REASONING_ENABLED is True, this function prepends the special
-    thinking mode tags to the content. These tags instruct the model to
-    include its reasoning process in the response.
+    When FAKE_REASONING_ENABLED is True and thinking_config.enabled is True,
+    this function prepends the special thinking mode tags to the content.
+    These tags instruct the model to include its reasoning process in the response.
     
     Args:
         content: Original content string
+        thinking_config: Thinking configuration from API adapter
     
     Returns:
         Content with thinking tags prepended (if enabled) or original content
+    
+    Examples:
+        >>> # Disabled globally
+        >>> inject_thinking_tags("Hello", ThinkingConfig())  # Returns "Hello" if FAKE_REASONING_ENABLED=False
+        
+        >>> # Disabled by client
+        >>> inject_thinking_tags("Hello", ThinkingConfig(enabled=False))  # Returns "Hello"
+        
+        >>> # Enabled with custom budget
+        >>> inject_thinking_tags("Hello", ThinkingConfig(enabled=True, budget_tokens=8000))
+        '<thinking_mode>enabled</thinking_mode>\\n<max_thinking_length>8000</max_thinking_length>...Hello'
     """
+    # Check if thinking is enabled globally
     if not FAKE_REASONING_ENABLED:
         return content
+    
+    # Check if thinking is enabled for this request
+    if not thinking_config.enabled:
+        logger.debug("Thinking disabled by client request")
+        return content
+    
+    # Determine effective budget
+    if thinking_config.budget_tokens is not None:
+        effective_budget = thinking_config.budget_tokens
+    else:
+        effective_budget = FAKE_REASONING_MAX_TOKENS
+    
+    # Apply cap if enabled
+    if FAKE_REASONING_BUDGET_CAP > 0 and effective_budget > FAKE_REASONING_BUDGET_CAP:
+        logger.warning(
+            f"Client requested thinking budget {effective_budget} exceeds cap {FAKE_REASONING_BUDGET_CAP}. "
+            f"Using capped value {FAKE_REASONING_BUDGET_CAP}. "
+            f"Set FAKE_REASONING_BUDGET_CAP=0 to disable capping."
+        )
+        effective_budget = FAKE_REASONING_BUDGET_CAP
     
     # Thinking instruction to improve reasoning quality
     thinking_instruction = (
@@ -357,11 +423,11 @@ def inject_thinking_tags(content: str) -> str:
     
     thinking_prefix = (
         f"<thinking_mode>enabled</thinking_mode>\n"
-        f"<max_thinking_length>{FAKE_REASONING_MAX_TOKENS}</max_thinking_length>\n"
+        f"<max_thinking_length>{effective_budget}</max_thinking_length>\n"
         f"<thinking_instruction>{thinking_instruction}</thinking_instruction>\n\n"
     )
     
-    logger.debug(f"Injecting fake reasoning tags with max_tokens={FAKE_REASONING_MAX_TOKENS}")
+    logger.debug(f"Injecting thinking tags with budget={effective_budget}")
     
     return thinking_prefix + content
 
@@ -1344,7 +1410,7 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    inject_thinking: bool = True
+    thinking_config: ThinkingConfig
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1359,7 +1425,7 @@ def build_kiro_payload(
         tools: List of tools in unified format (or None)
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
-        inject_thinking: Whether to inject thinking tags (default True)
+        thinking_config: Thinking configuration from API adapter
     
     Returns:
         KiroPayloadResult with payload and tool documentation
@@ -1482,8 +1548,8 @@ def build_kiro_payload(
             user_input_context["toolResults"] = tool_results
     
     # Inject thinking tags if enabled (only for the current/last user message)
-    if inject_thinking and current_message.role == "user":
-        current_content = inject_thinking_tags(current_content)
+    if current_message.role == "user":
+        current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage
     user_input_message = {
@@ -1518,5 +1584,15 @@ def build_kiro_payload(
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn
-    
+
+    # Payload size guard — auto-trim if enabled
+    if AUTO_TRIM_PAYLOAD:
+        payload_size = check_payload_size(payload)
+        if payload_size > KIRO_MAX_PAYLOAD_BYTES:
+            stats = trim_payload_to_limit(payload, KIRO_MAX_PAYLOAD_BYTES)
+            logger.info(
+                f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
+                f"({stats.original_bytes} -> {stats.final_bytes} bytes)"
+            )
+
     return KiroPayloadResult(payload=payload, tool_documentation=tool_documentation)

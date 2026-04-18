@@ -4,7 +4,7 @@
 
 **Kiro API (Amazon Q Developer / AWS CodeWhisperer) 프록시 게이트웨이**
 
-[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md)
+[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md) • 🇰🇷 한국어
 
 [@Jwadow](https://github.com/jwadow)가 ❤️를 담아 제작
 
@@ -13,7 +13,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-개발_지원-ff69b4)](#-프로젝트-후원)
 
-*Kiro의 Claude 모델을 Claude Code, OpenCode, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue 및 기타 OpenAI 또는 Anthropic 호환 도구와 함께 사용*
+*Kiro의 Claude 모델을 Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue 및 기타 OpenAI 또는 Anthropic 호환 도구와 함께 사용*
 
 [모델](#-지원-모델) • [기능](#-기능) • [빠른-시작](#-빠른-시작) • [설정](#%EF%B8%8F-설정) • [💖 후원](#-프로젝트-후원)
 
@@ -21,7 +21,7 @@
 
 ---
 
-## 🤖 사용 가능한 모델
+## 🤖 사용 가능한 모델 (무료 목록)
 
 > ⚠️ **중요:** 모델 가용성은 Kiro 플랜(무료/유료)에 따라 다릅니다. 게이트웨이는 구독에 따라 IDE 또는 CLI에서 사용 가능한 모델에 대한 액세스를 제공합니다. 아래 목록은 **무료 플랜**에서 일반적으로 사용 가능한 모델을 보여줍니다.
 
@@ -35,7 +35,11 @@
 
 📦 **Claude 3.7 Sonnet** — 레거시 모델. 하위 호환성을 위해 제공.
 
+💤 **GLM-5** — 오픈 MoE 모델 (744B 파라미터, 40B 활성). 복잡한 시스템 엔지니어링 및 장기 에이전트 작업을 위한 고급 모델.
+
 🐋 **DeepSeek-V3.2** — 오픈 MoE 모델 (685B 파라미터, 37B 활성). 코딩, 추론 및 일반 작업을 위한 균형 잡힌 성능.
+
+🧩 **MiniMax M2.5** — 오픈 MoE 모델 (230B 파라미터, 10B 활성). 향상된 추론 및 작업 처리 기능을 갖춘 개선된 버전.
 
 🧩 **MiniMax M2.1** — 오픈 MoE 모델 (230B 파라미터, 10B 활성). 복잡한 작업, 계획 및 다단계 워크플로우에 적합.
 
@@ -54,6 +58,7 @@
 | 🌐 **VPN/프록시 지원** | 제한된 네트워크용 HTTP/SOCKS5 프록시 |
 | 🧠 **확장 사고** | 추론 기능은 우리 프로젝트만의 독점 기능 |
 | 👁️ **비전 지원** | 모델에 이미지 전송 |
+| 🔍 **웹 검색** | 인터넷에서 최신 정보 검색 |
 | 🛠️ **도구 호출** | 함수 호출 지원 |
 | 💬 **전체 메시지 기록** | 완전한 대화 컨텍스트 전달 |
 | 📡 **스트리밍** | 완전한 SSE 스트리밍 지원 |
@@ -717,7 +722,7 @@ AGPL-3.0은 이 소프트웨어에 대한 개선이 전체 커뮤니티에 이�
 
 ### 🤑 기부
 
-[**☕ 일회성 기부**](https://app.lava.top/jwadow?tabId=donate) &nbsp;•&nbsp; [**💎 월간 후원**](https://app.lava.top/jwadow?tabId=subscriptions)
+[**☕ 일회성 후원**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
 
 <br>
 

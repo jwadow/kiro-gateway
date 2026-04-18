@@ -47,7 +47,7 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
 )
-from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
+from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
 
@@ -98,6 +98,34 @@ def generate_thinking_signature() -> str:
     return f"sig_{uuid.uuid4().hex[:32]}"
 
 
+def _extract_cache_usage_fields(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    Extract cache token fields from upstream usage (if present).
+
+    Args:
+        usage: Usage data from Kiro stream event
+
+    Returns:
+        Dict containing only available cache fields; missing fields are omitted
+    """
+    if not isinstance(usage, dict):
+        return {}
+
+    extracted: Dict[str, int] = {}
+    key_map = {
+        "cache_read_input_tokens": "cache_read_input_tokens",
+        "cacheReadInputTokens": "cache_read_input_tokens",
+        "cache_creation_input_tokens": "cache_creation_input_tokens",
+        "cacheCreationInputTokens": "cache_creation_input_tokens",
+    }
+    for source_key, target_key in key_map.items():
+        value = usage.get(source_key)
+        if isinstance(value, (int, float)):
+            extracted[target_key] = int(value)
+
+    return extracted
+
+
 async def stream_kiro_to_anthropic(
     response: httpx.Response,
     model: str,
@@ -105,6 +133,8 @@ async def stream_kiro_to_anthropic(
     auth_manager: "KiroAuthManager",
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
+    request_tools: Optional[list] = None,
+    request_system: Optional[Any] = None,
     conversation_id: Optional[str] = None
 ) -> AsyncGenerator[str, None]:
     """
@@ -120,6 +150,8 @@ async def stream_kiro_to_anthropic(
         auth_manager: Authentication manager
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for token counting)
+        request_tools: Original request tools (for token counting)
+        request_system: Original system prompt (for token counting)
         conversation_id: Stable conversation ID for truncation recovery (optional)
     
     Yields:
@@ -134,9 +166,21 @@ async def stream_kiro_to_anthropic(
     full_content = ""
     full_thinking_content = ""
     
-    # Count input tokens from request messages
-    if request_messages:
-        input_tokens = count_message_tokens(request_messages, apply_claude_correction=False)
+    # NOTE: Anthropic streaming spec requires input_tokens in message_start (beginning),
+    # but Kiro API provides accurate context_usage at the end of stream.
+    # This creates a fundamental limitation: we must use fallback estimation in message_start.
+    # Accuracy: ~85-90% (acceptable trade-off for maintaining streaming capability).
+    # See: https://docs.anthropic.com/en/api/messages-streaming
+    
+    # Fallback estimation must cover messages/tools/system to avoid significant undercount
+    if request_messages or request_tools or request_system:
+        request_token_stats = estimate_request_tokens(
+            messages=request_messages or [],
+            tools=request_tools,
+            system_prompt=request_system,
+            apply_claude_correction=False
+        )
+        input_tokens = request_token_stats["total_tokens"]
     
     # Track content blocks - thinking block is index 0, text block is index 1 (when thinking enabled)
     current_block_index = 0
@@ -152,6 +196,7 @@ async def stream_kiro_to_anthropic(
     
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
+    upstream_cache_usage: Dict[str, int] = {}
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
@@ -302,6 +347,126 @@ async def stream_kiro_to_anthropic(
                 tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
                 tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
                 
+                # ==============================================================================
+                # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
+                # ==============================================================================
+                
+                # INTERCEPT web_search tool calls (Path B - MCP emulation)
+                if tool_name == "web_search":
+                    from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
+                    
+                    logger.info("Intercepted web_search tool call (Path B - MCP emulation)")
+                    
+                    # Parse tool_input if string
+                    if isinstance(tool_input, str):
+                        try:
+                            tool_input = json.loads(tool_input)
+                        except json.JSONDecodeError:
+                            tool_input = {}
+                    
+                    # Extract query
+                    query = tool_input.get("query", "")
+                    if not query:
+                        logger.warning("web_search called without query, skipping MCP call")
+                        continue
+                    
+                    logger.debug(f"WebSearch query (Path B): {query}")
+                    
+                    # Call MCP API
+                    mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
+                    
+                    if results is None:
+                        logger.error("MCP API call failed for web_search")
+                        # Continue with normal tool_use processing (will show error to user)
+                    else:
+                        # Emit server_tool_use + web_search_tool_result + text summary
+                        # (full SSE sequence as in mcp_tools.py)
+                        
+                        # Event: content_block_start (server_tool_use)
+                        yield format_sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": current_block_index,
+                            "content_block": {
+                                "id": mcp_tool_use_id,
+                                "type": "server_tool_use",
+                                "name": "web_search",
+                                "input": {}
+                            }
+                        })
+                        
+                        # Event: content_block_delta (input_json_delta)
+                        yield format_sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps({"query": query})
+                            }
+                        })
+                        
+                        # Event: content_block_stop (server_tool_use)
+                        yield format_sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": current_block_index
+                        })
+                        current_block_index += 1
+                        
+                        # Event: content_block_start (web_search_tool_result)
+                        search_content = []
+                        for r in results.get("results", []):
+                            search_content.append({
+                                "type": "web_search_result",
+                                "title": r.get("title", ""),
+                                "url": r.get("url", ""),
+                                "encrypted_content": r.get("snippet", ""),
+                                "page_age": None
+                            })
+                        
+                        yield format_sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": current_block_index,
+                            "content_block": {
+                                "type": "web_search_tool_result",
+                                "tool_use_id": mcp_tool_use_id,
+                                "content": search_content
+                            }
+                        })
+                        
+                        # Event: content_block_stop (web_search_tool_result)
+                        yield format_sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": current_block_index
+                        })
+                        current_block_index += 1
+                        
+                        # Event: content_block_start (text)
+                        yield format_sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": current_block_index,
+                            "content_block": {"type": "text", "text": ""}
+                        })
+                        
+                        # Events: content_block_delta (text_delta) - stream summary
+                        summary = generate_search_summary(query, results)
+                        chunk_size = 100
+                        for i in range(0, len(summary), chunk_size):
+                            chunk = summary[i:i + chunk_size]
+                            yield format_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": current_block_index,
+                                "delta": {"type": "text_delta", "text": chunk}
+                            })
+                        
+                        # Event: content_block_stop (text)
+                        yield format_sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": current_block_index
+                        })
+                        current_block_index += 1
+                        
+                        # Skip normal tool_use processing
+                        continue
+                
                 # Check if this tool was truncated
                 if tool.get('_truncation_detected'):
                     truncated_tools.append({
@@ -355,6 +520,8 @@ async def stream_kiro_to_anthropic(
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
+            elif event.type == "usage" and event.usage:
+                upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
         
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
@@ -459,24 +626,35 @@ async def stream_kiro_to_anthropic(
         
         # Calculate total tokens from context usage if available
         if context_usage_percentage is not None:
-            prompt_tokens, total_tokens, _, _ = calculate_tokens_from_context_usage(
+            prompt_tokens, _, prompt_source, _ = calculate_tokens_from_context_usage(
                 context_usage_percentage, output_tokens, model_cache, model
             )
-            input_tokens = prompt_tokens
+            # Don't override fallback when context_usage=0% (returns source="unknown")
+            # Only override local estimate when upstream context usage is available
+            if prompt_source != "unknown":
+                input_tokens = prompt_tokens
         
-        # Determine stop reason
-        stop_reason = "tool_use" if tool_blocks else "end_turn"
+        # Determine stop reason (truncation has highest priority)
+        if content_was_truncated:
+            stop_reason = "max_tokens"
+        elif tool_blocks:
+            stop_reason = "tool_use"
+        else:
+            stop_reason = "end_turn"
         
         # Send message_delta with stop_reason and usage
+        usage_payload = {
+            "output_tokens": output_tokens
+        }
+        usage_payload.update(upstream_cache_usage)
+
         yield format_sse_event("message_delta", {
             "type": "message_delta",
             "delta": {
                 "stop_reason": stop_reason,
                 "stop_sequence": None
             },
-            "usage": {
-                "output_tokens": output_tokens
-            }
+            "usage": usage_payload
         })
         
         # Send message_stop
@@ -545,7 +723,9 @@ async def collect_anthropic_response(
     model: str,
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
-    request_messages: Optional[list] = None
+    request_messages: Optional[list] = None,
+    request_tools: Optional[list] = None,
+    request_system: Optional[Any] = None
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -558,19 +738,28 @@ async def collect_anthropic_response(
         model_cache: Model cache
         auth_manager: Authentication manager
         request_messages: Original request messages (for token counting)
+        request_tools: Original request tools (for token counting)
+        request_system: Original system prompt (for token counting)
     
     Returns:
         Dictionary with full response in Anthropic Messages format
     """
     message_id = generate_message_id()
     
-    # Count input tokens
+    # Non-streaming uses the same full-request estimation as streaming
     input_tokens = 0
-    if request_messages:
-        input_tokens = count_message_tokens(request_messages, apply_claude_correction=False)
+    if request_messages or request_tools or request_system:
+        request_token_stats = estimate_request_tokens(
+            messages=request_messages or [],
+            tools=request_tools,
+            system_prompt=request_system,
+            apply_claude_correction=False
+        )
+        input_tokens = request_token_stats["total_tokens"]
     
     # Collect stream result
     result = await collect_stream_to_result(response)
+    upstream_cache_usage = _extract_cache_usage_fields(result.usage)
     
     # Build content blocks
     content_blocks = []
@@ -619,13 +808,36 @@ async def collect_anthropic_response(
     
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:
-        prompt_tokens, _, _, _ = calculate_tokens_from_context_usage(
+        prompt_tokens, _, prompt_source, _ = calculate_tokens_from_context_usage(
             result.context_usage_percentage, output_tokens, model_cache, model
         )
-        input_tokens = prompt_tokens
+        # Don't override fallback when context_usage=0% (returns source="unknown")
+        if prompt_source != "unknown":
+            input_tokens = prompt_tokens
     
-    # Determine stop reason
-    stop_reason = "tool_use" if result.tool_calls else "end_turn"
+    # Detect content truncation (missing completion signals)
+    stream_completed_normally = result.context_usage_percentage is not None
+    content_was_truncated = (
+        not stream_completed_normally and
+        len(result.content) > 0 and
+        not result.tool_calls  # Don't confuse with tool call truncation
+    )
+    
+    if content_was_truncated:
+        from kiro.config import TRUNCATION_RECOVERY
+        logger.error(
+            f"Content truncated by Kiro API (non-streaming): stream ended without completion signals, "
+            f"length={len(result.content)} chars. "
+            f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
+        )
+    
+    # Determine stop reason (truncation has highest priority)
+    if content_was_truncated:
+        stop_reason = "max_tokens"
+    elif result.tool_calls:
+        stop_reason = "tool_use"
+    else:
+        stop_reason = "end_turn"
     
     logger.debug(
         f"[Anthropic Non-Streaming] Completed: "
@@ -633,6 +845,12 @@ async def collect_anthropic_response(
         f"tool_calls={len(result.tool_calls)}, stop_reason={stop_reason}"
     )
     
+    usage_payload: Dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens
+    }
+    usage_payload.update(upstream_cache_usage)
+
     return {
         "id": message_id,
         "type": "message",
@@ -641,10 +859,7 @@ async def collect_anthropic_response(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": usage_payload
     }
 
 
@@ -653,10 +868,12 @@ async def stream_with_first_token_retry_anthropic(
     model: str,
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
+    initial_response: Optional[httpx.Response] = None,
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    request_system: Optional[Any] = None
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -672,10 +889,13 @@ async def stream_with_first_token_retry_anthropic(
         model: Model name
         model_cache: Model cache
         auth_manager: Authentication manager
+        initial_response: Optional pre-validated response to use on first attempt.
+                         If provided, make_request is only called on retries.
         max_retries: Maximum number of attempts
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        request_system: Original system prompt (for fallback token counting)
     
     Yields:
         Strings in Anthropic SSE format
@@ -711,13 +931,16 @@ async def stream_with_first_token_retry_anthropic(
             model_cache,
             auth_manager,
             first_token_timeout=first_token_timeout,
-            request_messages=request_messages
+            request_messages=request_messages,
+            request_tools=request_tools,
+            request_system=request_system,
         ):
             yield chunk
     
     async for chunk in stream_with_first_token_retry(
         make_request=make_request,
         stream_processor=stream_processor,
+        initial_response=initial_response,
         max_retries=max_retries,
         first_token_timeout=first_token_timeout,
         on_http_error=create_http_error,

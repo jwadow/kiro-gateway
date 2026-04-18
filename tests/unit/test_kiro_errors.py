@@ -471,3 +471,40 @@ class TestEnhanceKiroErrorIntegration:
         assert info1.original_message == "Error 1"
         assert info2.original_message == "Error 2"
         assert info3.original_message == "Error 3"
+
+
+class TestEnhanceImproperlyFormedRequest:
+    """Tests for 'Improperly formed request.' error enhancement (issue #73)."""
+
+    def test_enhance_improperly_formed_request_null_reason(self):
+        """
+        'Improperly formed request.' with null/UNKNOWN reason is enhanced
+        to a clear payload-size message.
+        """
+        error_json = {
+            "message": "Improperly formed request.",
+            "reason": None,
+        }
+        error_info = enhance_kiro_error(error_json)
+
+        assert "payload size exceeded" in error_info.user_message
+        assert "/compact" in error_info.user_message
+        assert error_info.original_message == "Improperly formed request."
+
+    def test_enhance_improperly_formed_request_unknown_reason(self):
+        """Same enhancement when reason field is missing (defaults to UNKNOWN)."""
+        error_json = {"message": "Improperly formed request."}
+        error_info = enhance_kiro_error(error_json)
+
+        assert "payload size exceeded" in error_info.user_message
+
+    def test_improperly_formed_with_real_reason_not_enhanced(self):
+        """If reason is a real code, don't apply the size-limit enhancement."""
+        error_json = {
+            "message": "Improperly formed request.",
+            "reason": "VALIDATION_ERROR",
+        }
+        error_info = enhance_kiro_error(error_json)
+
+        # Should fall through to generic handler, not the size-limit message
+        assert "payload size exceeded" not in error_info.user_message

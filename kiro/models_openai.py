@@ -25,7 +25,7 @@ providing validation and serialization.
 """
 
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 from typing_extensions import Annotated
 from pydantic import BaseModel, Field
 
@@ -163,6 +163,10 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
+    
+    # Reasoning (OpenAI reasoning models)
+    # Supports all official reasoning_effort levels from OpenAI API
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = None
     
     # Tools (function calling)
     tools: Optional[List[Tool]] = None

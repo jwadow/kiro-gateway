@@ -28,7 +28,7 @@ Reference: https://docs.anthropic.com/en/api/messages
 
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ==================================================================================================
@@ -78,20 +78,36 @@ class ToolUseContentBlock(BaseModel):
     input: Dict[str, Any]
 
 
+class ToolReferenceContentBlock(BaseModel):
+    """
+    Tool reference content block (Claude Code deferred tools).
+
+    Sent by Claude Code v2.1.69+ inside tool_result blocks to indicate
+    which tools were loaded via the ToolSearch deferred tool mechanism.
+    """
+
+    type: Literal["tool_reference"] = "tool_reference"
+    tool_name: str
+
+    model_config = {"extra": "allow"}
+
+
 class ToolResultContentBlock(BaseModel):
     """
     Tool result content block in Anthropic format.
 
     Represents the result of a tool call, sent by the user.
-    Tool results can contain text, images, or a mix of both.
+    Tool results can contain text, images, tool references, or a mix.
     """
 
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
     content: Optional[
-        Union[str, List[Union["TextContentBlock", "ImageContentBlock"]]]
+        Union[str, List[Union["TextContentBlock", "ImageContentBlock", "ToolReferenceContentBlock"]]]
     ] = None
     is_error: Optional[bool] = None
+
+    model_config = {"extra": "allow"}
 
 
 # ==================================================================================================
@@ -153,6 +169,7 @@ ContentBlock = Union[
     ImageContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
+    ToolReferenceContentBlock,
 ]
 
 
@@ -184,16 +201,51 @@ class AnthropicMessage(BaseModel):
 class AnthropicTool(BaseModel):
     """
     Tool definition in Anthropic format.
-
+    
+    Supports both user-defined tools and server-side tools (Anthropic):
+    - User-defined tools: require input_schema
+    - Server-side tools: use type field (e.g., "web_search_20250305")
+    
     Attributes:
+        type: Tool type for server-side tools (e.g., "web_search_20250305")
         name: Tool name (must match pattern ^[a-zA-Z0-9_-]{1,64}$)
         description: Tool description (optional but recommended)
-        input_schema: JSON Schema for tool parameters
+        input_schema: JSON Schema for tool parameters (required for user-defined tools)
+        max_uses: Maximum uses per conversation (server-side tools, optional)
+        allowed_domains: Allowed domains for web_search (optional)
+        blocked_domains: Blocked domains for web_search (optional)
+        user_location: User location for web_search (optional)
     """
-
+    
+    # Server-side tool fields (Anthropic spec)
+    type: Optional[str] = None
+    
+    # Common fields
     name: str
     description: Optional[str] = None
-    input_schema: Dict[str, Any]
+    input_schema: Optional[Dict[str, Any]] = None  # Now optional for server-side tools
+    
+    # Server-side tool parameters (Anthropic spec - accepted but not enforced)
+    max_uses: Optional[int] = None
+    allowed_domains: Optional[List[str]] = None
+    blocked_domains: Optional[List[str]] = None
+    user_location: Optional[Dict[str, Any]] = None
+    
+    model_config = {"extra": "allow"}  # Forward compatibility
+    
+    @model_validator(mode="after")
+    def validate_tool_consistency(self):
+        """Validate that user-defined tools have input_schema."""
+        is_server_side = self.type is not None
+        
+        if not is_server_side:
+            # User-defined tool: input_schema is required
+            if self.input_schema is None:
+                raise ValueError(
+                    "input_schema is required for user-defined tools "
+                    "(those without a 'type' field)"
+                )
+        return self
 
 
 class ToolChoiceAuto(BaseModel):
@@ -269,6 +321,9 @@ class AnthropicMessagesRequest(BaseModel):
     system: Optional[SystemPrompt] = None
     stream: bool = False
 
+    # Extended thinking (official Anthropic parameter)
+    thinking: Optional[Dict[str, Any]] = None
+
     # Tools
     tools: Optional[List[AnthropicTool]] = None
     tool_choice: Optional[Union[ToolChoice, Dict[str, Any]]] = None
@@ -297,10 +352,16 @@ class AnthropicUsage(BaseModel):
     Attributes:
         input_tokens: Number of input tokens
         output_tokens: Number of output tokens
+        cache_read_input_tokens: Tokens read from prompt cache (only forwarded when explicitly returned by upstream Kiro API)
+        cache_creation_input_tokens: Tokens used to create prompt cache (only forwarded when explicitly returned by upstream Kiro API)
     """
 
     input_tokens: int
     output_tokens: int
+    cache_read_input_tokens: Optional[int] = None
+    cache_creation_input_tokens: Optional[int] = None
+
+    model_config = {"extra": "allow"}
 
 
 class AnthropicMessagesResponse(BaseModel):

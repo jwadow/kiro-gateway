@@ -1054,3 +1054,63 @@ class TestChatCompletionChunk:
         print(f"Comparing usage: Got {chunk.usage}")
         assert chunk.usage is not None
         assert chunk.usage.total_tokens == 15
+
+
+# ==================================================================================================
+# Tests for Client Thinking Budget Support (Issue #111)
+# ==================================================================================================
+
+class TestReasoningEffort:
+    """Tests for reasoning_effort parameter in ChatCompletionRequest."""
+    
+    def test_reasoning_effort_valid_values(self):
+        """
+        What it does: Verifies all 6 reasoning_effort values are accepted
+        Purpose: Ensure Pydantic validates all official OpenAI reasoning_effort levels
+        """
+        print("Testing all valid reasoning_effort values...")
+        
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh"]:
+            print(f"  Testing reasoning_effort='{effort}'...")
+            request = ChatCompletionRequest(
+                model="claude-sonnet-4.5",
+                messages=[ChatMessage(role="user", content="test")],
+                reasoning_effort=effort
+            )
+            
+            print(f"  Comparing: expected='{effort}', got='{request.reasoning_effort}'")
+            assert request.reasoning_effort == effort
+    
+    def test_reasoning_effort_optional(self):
+        """
+        What it does: Verifies reasoning_effort can be None (not specified)
+        Purpose: Ensure reasoning_effort is optional parameter
+        """
+        print("Creating ChatCompletionRequest without reasoning_effort...")
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="user", content="test")]
+        )
+        
+        print(f"Comparing: expected=None, got={request.reasoning_effort}")
+        assert request.reasoning_effort is None
+    
+    def test_reasoning_effort_invalid_value_rejected(self):
+        """
+        What it does: Verifies invalid reasoning_effort value is rejected by Pydantic
+        Purpose: Ensure type safety for reasoning_effort parameter
+        """
+        print("Attempting to create ChatCompletionRequest with invalid reasoning_effort...")
+        
+        from pydantic import ValidationError
+        try:
+            request = ChatCompletionRequest(
+                model="claude-sonnet-4.5",
+                messages=[ChatMessage(role="user", content="test")],
+                reasoning_effort="ultra"  # Invalid value
+            )
+            print("ERROR: Should have raised ValidationError!")
+            assert False, "Expected ValidationError for invalid reasoning_effort"
+        except ValidationError as e:
+            print(f"Correctly raised ValidationError: {e}")
+            assert "reasoning_effort" in str(e).lower()

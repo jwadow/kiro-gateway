@@ -4,7 +4,7 @@
 
 **Kiro API (Amazon Q Developer / AWS CodeWhisperer) 代理网关**
 
-[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
+[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • 🇨🇳 中文 • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
 
 由 [@Jwadow](https://github.com/jwadow) 用 ❤️ 制作
 
@@ -13,7 +13,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-支持开发-ff69b4)](#-支持项目)
 
-*通过 Claude Code、OpenCode、Codex app、Cursor、Cline、Roo Code、Kilo Code、Obsidian、OpenAI SDK、LangChain、Continue 和其他兼容 OpenAI 或 Anthropic 的工具使用 Kiro 的 Claude 模型*
+*通过 Claude Code、OpenCode、OpenClaw、Claw Code、Codex app、Cursor、Cline、Roo Code、Kilo Code、Obsidian、OpenAI SDK、LangChain、Continue 和其他兼容 OpenAI 或 Anthropic 的工具使用 Kiro 的 Claude 模型*
 
 [模型](#-支持的模型) • [功能](#-功能特性) • [快速开始](#-快速开始) • [配置](#%EF%B8%8F-配置) • [💖 支持](#-支持项目)
 
@@ -21,7 +21,7 @@
 
 ---
 
-## 🤖 可用模型
+## 🤖 可用模型（免费列表）
 
 > ⚠️ **重要：** 模型可用性取决于您的 Kiro 套餐（免费/付费）。网关提供对您的 IDE 或 CLI 中基于订阅可用的模型的访问。下面的列表显示**免费套餐**上通常可用的模型。
 
@@ -35,7 +35,11 @@
 
 📦 **Claude 3.7 Sonnet** — 旧版模型。为向后兼容而保留。
 
+💤 **GLM-5** — 开源MoE模型（744B参数，40B活跃）。用于复杂系统工程和长期代理任务的先进模型。
+
 🐋 **DeepSeek-V3.2** — 开源MoE模型（685B参数，37B活跃）。编程、推理和通用任务的均衡性能。
+
+🧩 **MiniMax M2.5** — 开源MoE模型（230B参数，10B活跃）。增强版本，具有改进的推理和任务处理能力。
 
 🧩 **MiniMax M2.1** — 开源MoE模型（230B参数，10B活跃）。适合复杂任务、规划和多步工作流。
 
@@ -54,6 +58,7 @@
 | 🌐 **VPN/代理支持** | 用于受限网络的 HTTP/SOCKS5 代理 |
 | 🧠 **扩展思维** | 推理功能是我们项目的独家特性 |
 | 👁️ **视觉支持** | 向模型发送图像 |
+| 🔍 **网络搜索** | 搜索互联网上的最新信息 |
 | 🛠️ **工具调用** | 支持函数调用 |
 | 💬 **完整消息历史** | 传递完整的对话上下文 |
 | 📡 **流式传输** | 完整的 SSE 流式传输支持 |
@@ -717,7 +722,7 @@ AGPL-3.0 确保对此软件的改进惠及整个社区。如果您修改此网�
 
 ### 🤑 捐赠
 
-[**☕ 一次性捐赠**](https://app.lava.top/jwadow?tabId=donate) &nbsp;•&nbsp; [**💎 每月支持**](https://app.lava.top/jwadow?tabId=subscriptions)
+[**☕ 一次性支持**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
 
 <br>
 

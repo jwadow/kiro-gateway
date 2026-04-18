@@ -50,6 +50,8 @@ from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
+from kiro.config import WEB_SEARCH_ENABLED
+from kiro.mcp_tools import handle_native_web_search
 
 # Import debug_logger
 try:
@@ -229,6 +231,52 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         request_data.messages = modified_messages
         logger.info(f"Truncation recovery: modified {tool_results_modified} tool_result(s), added {content_notices_added} content notice(s)")
     
+    # ==============================================================================
+    # WebSearch Support - Path B: Auto-Injection (MCP Tool Emulation)
+    # ==============================================================================
+    
+    # Auto-inject web_search tool if enabled (Path B - MCP emulation)
+    if WEB_SEARCH_ENABLED:
+        if request_data.tools is None:
+            request_data.tools = []
+        
+        # Check if web_search already exists
+        has_ws = any(
+            getattr(tool, "type", None) == "function" and
+            getattr(getattr(tool, "function", None), "name", None) == "web_search"
+            for tool in request_data.tools
+        )
+        
+        if not has_ws:
+            from kiro.models_openai import Tool, ToolFunction
+            web_search_tool = Tool(
+                type="function",
+                function=ToolFunction(
+                    name="web_search",
+                    description="Search the web for current information. Use when you need up-to-date data from the internet.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                )
+            )
+            request_data.tools.append(web_search_tool)
+            logger.debug("Auto-injected web_search tool for MCP emulation (Path B)")
+    
+    # ==============================================================================
+    # WebSearch Support - Path A: Native Format Check (OpenAI doesn't have native server-side tools)
+    # ==============================================================================
+    
+    # OpenAI API doesn't have native server-side tools like Anthropic
+    # But we check for consistency - if someone sends web_search function, handle it
+    # This is actually Path B for OpenAI (all web_search goes through MCP emulation)
+    
     # Generate conversation ID for Kiro API (random UUID, not used for tracking)
     conversation_id = generate_conversation_id()
     
@@ -330,17 +378,25 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
         
         if request_data.stream:
-            # Streaming mode
+            # Streaming mode with first token retry
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
                 try:
-                    async for chunk in stream_kiro_to_openai(
-                        http_client.client,
-                        response,
-                        request_data.model,
-                        model_cache,
-                        auth_manager,
+                    # Create retry request function for retries
+                    async def make_retry_request():
+                        return await http_client.request_with_retry(
+                            "POST", url, kiro_payload, stream=True
+                        )
+                    
+                    # Use retry wrapper with initial response
+                    async for chunk in stream_with_first_token_retry(
+                        make_request=make_retry_request,
+                        client=http_client.client,
+                        model=request_data.model,
+                        model_cache=model_cache,
+                        auth_manager=auth_manager,
+                        initial_response=response,
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer
                     ):
