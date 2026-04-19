@@ -47,6 +47,7 @@ from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
+    stream_with_first_token_retry_anthropic,
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
