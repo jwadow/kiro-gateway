@@ -342,6 +342,23 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 # Default: 3 attempts
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
 
+# Inactivity timeout for streaming responses (in seconds).
+# This is an APPLICATION-LEVEL timeout that tracks time since the last meaningful
+# SSE chunk was received from the upstream provider. Unlike STREAMING_READ_TIMEOUT
+# (which is an httpx-level TCP read timeout that resets on any bytes including
+# TCP keepalives), this timeout only resets when actual data chunks arrive.
+#
+# This prevents the gateway from hanging indefinitely when the upstream provider
+# accepts the connection and keeps it alive but stops sending data.
+# Default: 300 seconds (5 minutes)
+STREAMING_INACTIVITY_TIMEOUT: float = float(os.getenv("STREAMING_INACTIVITY_TIMEOUT", "300"))
+
+# Interval for logging long-running streaming requests (in seconds).
+# When a streaming request is in progress, a periodic log line is emitted
+# so operators can see that the gateway is still waiting for data.
+# Default: 60 seconds
+STREAMING_LOG_INTERVAL: float = float(os.getenv("STREAMING_LOG_INTERVAL", "60"))
+
 # ==================================================================================================
 # Debug Settings
 # ==================================================================================================
