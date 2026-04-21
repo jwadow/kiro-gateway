@@ -32,6 +32,7 @@ empirical observations: Claude tokenizes text approximately 15%
 more than GPT-4 (cl100k_base). This is due to differences in BPE vocabularies.
 """
 
+import json
 from typing import List, Dict, Any, Optional
 from loguru import logger
 
@@ -141,14 +142,51 @@ def count_message_tokens(messages: List[Dict[str, Any]], apply_claude_correction
             if isinstance(content, str):
                 total_tokens += count_tokens(content, apply_claude_correction=False)
             elif isinstance(content, list):
-                # Multimodal content (text + images)
+                # Support OpenAI/Anthropic multi-type content blocks
                 for item in content:
                     if isinstance(item, dict):
-                        if item.get("type") == "text":
+                        item_type = item.get("type")
+                        if item_type == "text":
                             total_tokens += count_tokens(item.get("text", ""), apply_claude_correction=False)
-                        elif item.get("type") == "image_url":
-                            # Images take ~85-170 tokens depending on size
-                            total_tokens += 100  # Average estimate
+                        elif item_type in {"image_url", "image"}:
+                            # Estimate image as fixed cost to avoid significant undercount
+                            total_tokens += 100
+                        elif item_type == "tool_use":
+                            total_tokens += count_tokens(item.get("id", ""), apply_claude_correction=False)
+                            total_tokens += count_tokens(item.get("name", ""), apply_claude_correction=False)
+                            tool_input_str = json.dumps(item.get("input", {}), ensure_ascii=False)
+                            total_tokens += count_tokens(tool_input_str, apply_claude_correction=False)
+                        elif item_type == "tool_result":
+                            total_tokens += count_tokens(item.get("tool_use_id", ""), apply_claude_correction=False)
+                            if item.get("is_error") is not None:
+                                total_tokens += count_tokens(str(item.get("is_error")), apply_claude_correction=False)
+
+                            tool_result_content = item.get("content")
+                            if isinstance(tool_result_content, str):
+                                total_tokens += count_tokens(tool_result_content, apply_claude_correction=False)
+                            elif isinstance(tool_result_content, list):
+                                for result_block in tool_result_content:
+                                    if isinstance(result_block, dict):
+                                        result_type = result_block.get("type")
+                                        if result_type == "text":
+                                            total_tokens += count_tokens(
+                                                result_block.get("text", ""),
+                                                apply_claude_correction=False
+                                            )
+                                        elif result_type in {"image_url", "image"}:
+                                            total_tokens += 100
+                                    else:
+                                        total_tokens += count_tokens(str(result_block), apply_claude_correction=False)
+                            elif tool_result_content is not None:
+                                total_tokens += count_tokens(str(tool_result_content), apply_claude_correction=False)
+                        else:
+                            # Unknown block fallback: estimate via JSON to avoid undercount
+                            total_tokens += count_tokens(
+                                json.dumps(item, ensure_ascii=False),
+                                apply_claude_correction=False
+                            )
+                    else:
+                        total_tokens += count_tokens(str(item), apply_claude_correction=False)
         
         # tool_calls tokens (if present)
         tool_calls = message.get("tool_calls")
@@ -190,24 +228,66 @@ def count_tools_tokens(tools: Optional[List[Dict[str, Any]]], apply_claude_corre
     
     for tool in tools:
         total_tokens += 4  # Service tokens
-        
-        if tool.get("type") == "function":
-            func = tool.get("function", {})
-            
-            # Function name
-            total_tokens += count_tokens(func.get("name", ""), apply_claude_correction=False)
-            
-            # Function description
-            total_tokens += count_tokens(func.get("description", ""), apply_claude_correction=False)
-            
-            # Parameters (JSON schema)
-            params = func.get("parameters")
-            if params:
-                import json
-                params_str = json.dumps(params, ensure_ascii=False)
-                total_tokens += count_tokens(params_str, apply_claude_correction=False)
+
+        # Support both OpenAI standard tools and Anthropic/OpenAI flat tools
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            tool_payload = tool.get("function", {})
+        else:
+            tool_payload = tool
+
+        # Name / description
+        total_tokens += count_tokens(tool_payload.get("name", ""), apply_claude_correction=False)
+        total_tokens += count_tokens(tool_payload.get("description", ""), apply_claude_correction=False)
+
+        # JSON schema（Anthropic: input_schema, OpenAI: parameters）
+        params = tool_payload.get("input_schema")
+        if params is None:
+            params = tool_payload.get("parameters")
+        if params is not None:
+            params_str = json.dumps(params, ensure_ascii=False)
+            total_tokens += count_tokens(params_str, apply_claude_correction=False)
     
     # Apply correction to total count
+    if apply_claude_correction:
+        return int(total_tokens * CLAUDE_CORRECTION_FACTOR)
+    return total_tokens
+
+
+def count_system_tokens(system_prompt: Optional[Any], apply_claude_correction: bool = True) -> int:
+    """
+    Counts tokens in system prompt.
+
+    Supports both plain string and Anthropic block list.
+
+    Args:
+        system_prompt: System prompt (str / list of blocks)
+        apply_claude_correction: Apply correction coefficient for Claude
+
+    Returns:
+        Approximate number of tokens
+    """
+    if not system_prompt:
+        return 0
+
+    total_tokens = 0
+
+    if isinstance(system_prompt, str):
+        total_tokens += count_tokens(system_prompt, apply_claude_correction=False)
+    elif isinstance(system_prompt, list):
+        for block in system_prompt:
+            if isinstance(block, dict):
+                # Count text content, support prompt caching structure
+                total_tokens += count_tokens(block.get("text", ""), apply_claude_correction=False)
+                if block.get("cache_control") is not None:
+                    total_tokens += count_tokens(
+                        json.dumps(block.get("cache_control"), ensure_ascii=False),
+                        apply_claude_correction=False
+                    )
+            else:
+                total_tokens += count_tokens(str(block), apply_claude_correction=False)
+    else:
+        total_tokens += count_tokens(str(system_prompt), apply_claude_correction=False)
+
     if apply_claude_correction:
         return int(total_tokens * CLAUDE_CORRECTION_FACTOR)
     return total_tokens
@@ -216,7 +296,8 @@ def count_tools_tokens(tools: Optional[List[Dict[str, Any]]], apply_claude_corre
 def estimate_request_tokens(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
-    system_prompt: Optional[str] = None
+    system_prompt: Optional[Any] = None,
+    apply_claude_correction: bool = True
 ) -> Dict[str, int]:
     """
     Estimates total number of tokens in request.
@@ -224,7 +305,8 @@ def estimate_request_tokens(
     Args:
         messages: List of messages
         tools: List of tools (optional)
-        system_prompt: System prompt (optional, if not in messages)
+        system_prompt: System prompt (optional, string or Anthropic content blocks)
+        apply_claude_correction: Apply correction coefficient for Claude
     
     Returns:
         Dictionary with token breakdown:
@@ -233,9 +315,9 @@ def estimate_request_tokens(
         - system_tokens: system prompt tokens
         - total_tokens: total count
     """
-    messages_tokens = count_message_tokens(messages)
-    tools_tokens = count_tools_tokens(tools)
-    system_tokens = count_tokens(system_prompt) if system_prompt else 0
+    messages_tokens = count_message_tokens(messages, apply_claude_correction=apply_claude_correction)
+    tools_tokens = count_tools_tokens(tools, apply_claude_correction=apply_claude_correction)
+    system_tokens = count_system_tokens(system_prompt, apply_claude_correction=apply_claude_correction)
     
     return {
         "messages_tokens": messages_tokens,

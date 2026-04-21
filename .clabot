@@ -1,5 +1,5 @@
 {
-  "contributors": ["Kartvya69", "Doggyman67", "bhaskoro-muthohar", "Indokq", "kilhyeonjun", "kil-penguin", "cniu6", "DedInc", "somehow-paul", "PAzter1101", "Ry-DS", "Publicker", "bunkerbyte", "sametakofficial"],
+  "contributors": ["jwadow", "Kartvya69", "Doggyman67", "bhaskoro-muthohar", "Indokq", "kilhyeonjun", "kil-penguin", "cniu6", "DedInc", "somehow-paul", "PAzter1101", "Ry-DS", "Publicker", "bunkerbyte", "sametakofficial", "yzddmr6", "hookokoko", "Logesh-waran2003", "river-walras", "juslintek", "d0zingcat", "lukasBlckIT", "Hunter-Leo", "lombax85", "severity1", "BoosterY", "abhinav-bhateja", "XuNeo", "leikaiwei", "ramaiyaKushal", "KenEzekiel"],
   "label": "cla-signed",
   "message": "Thanks for the PR! 🎉\n\nBefore merge, we need a one-time CLA confirmation.\nIt confirms that you have the right to contribute this code and allow the project to use it.\n\nFull CLA text:\nhttps://github.com/jwadow/kiro-gateway/blob/main/CLA.md\n\nPlease reply once with:\n```\nI have read the CLA and I accept its terms\n```\n\nYou need to write once, all further messages from me can be ignored."
 }

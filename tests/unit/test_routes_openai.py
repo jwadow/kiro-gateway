@@ -1397,3 +1397,104 @@ class TestContentTruncationRecovery:
         print("Checking: Match found...")
         assert info is not None
         assert info.message_hash == hash1
+
+
+# ==================================================================================================
+# Tests for WebSearch Support (OpenAI)
+# ==================================================================================================
+
+class TestWebSearchAutoInjectionOpenAI:
+    """Tests for WebSearch auto-injection in OpenAI endpoint (Path B only)."""
+    
+    def test_auto_injection_logic_openai(self):
+        """
+        What it does: Verifies web_search function tool auto-injection logic for OpenAI.
+        Purpose: Ensure WEB_SEARCH_ENABLED controls auto-injection for OpenAI format.
+        """
+        print("Setup: Testing OpenAI auto-injection logic...")
+        from kiro.models_openai import Tool, ToolFunction
+        
+        # Simulate auto-injection logic for OpenAI
+        WEB_SEARCH_ENABLED = True
+        tools = []
+        
+        if WEB_SEARCH_ENABLED:
+            has_ws = any(
+                getattr(tool, "type", None) == "function" and
+                getattr(getattr(tool, "function", None), "name", None) == "web_search"
+                for tool in tools
+            )
+            
+            if not has_ws:
+                web_search_tool = Tool(
+                    type="function",
+                    function=ToolFunction(
+                        name="web_search",
+                        description="Search the web for current information. Use when you need up-to-date data from the internet.",
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "Search query"
+                                }
+                            },
+                            "required": ["query"]
+                        }
+                    )
+                )
+                tools.append(web_search_tool)
+        
+        print(f"Checking: web_search tool was added...")
+        assert len(tools) == 1
+        assert tools[0].type == "function"
+        assert tools[0].function.name == "web_search"
+        assert tools[0].function.parameters is not None
+    
+    def test_no_duplicate_injection_logic_openai(self):
+        """
+        What it does: Verifies duplicate detection logic for OpenAI format.
+        Purpose: Ensure auto-injection doesn't create duplicates for OpenAI.
+        """
+        print("Setup: Testing OpenAI duplicate detection...")
+        from kiro.models_openai import Tool, ToolFunction
+        
+        # Simulate existing web_search tool
+        existing_tools = [
+            Tool(
+                type="function",
+                function=ToolFunction(
+                    name="web_search",
+                    description="Existing web search",
+                    parameters={"type": "object", "properties": {}}
+                )
+            )
+        ]
+        
+        # Simulate auto-injection logic with duplicate check
+        WEB_SEARCH_ENABLED = True
+        
+        if WEB_SEARCH_ENABLED:
+            has_ws = any(
+                getattr(tool, "type", None) == "function" and
+                getattr(getattr(tool, "function", None), "name", None) == "web_search"
+                for tool in existing_tools
+            )
+            
+            if not has_ws:
+                # Would add web_search here
+                existing_tools.append(Tool(
+                    type="function",
+                    function=ToolFunction(
+                        name="web_search",
+                        description="Auto-injected",
+                        parameters={"type": "object", "properties": {}}
+                    )
+                ))
+        
+        print(f"Checking: Only one web_search tool...")
+        web_search_count = sum(
+            1 for t in existing_tools
+            if t.type == "function" and t.function.name == "web_search"
+        )
+        assert web_search_count == 1

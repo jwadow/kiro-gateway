@@ -947,11 +947,11 @@ class TestInjectThinkingTags:
         Purpose: Ensure tags are added to content.
         """
         print("Testing tag injection when enabled...")
-        from kiro.converters_core import inject_thinking_tags
+        from kiro.converters_core import inject_thinking_tags, ThinkingConfig
         
         with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
             with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags("Hello")
+                result = inject_thinking_tags("Hello", ThinkingConfig())
         
         print(f"Result: '{result}'")
         assert "<thinking_mode>enabled</thinking_mode>" in result
@@ -964,10 +964,10 @@ class TestInjectThinkingTags:
         Purpose: Ensure tags are not added when disabled.
         """
         print("Testing no tag injection when disabled...")
-        from kiro.converters_core import inject_thinking_tags
+        from kiro.converters_core import inject_thinking_tags, ThinkingConfig
         
         with patch('kiro.converters_core.FAKE_REASONING_ENABLED', False):
-            result = inject_thinking_tags("Hello")
+            result = inject_thinking_tags("Hello", ThinkingConfig())
         
         print(f"Result: '{result}'")
         assert result == "Hello"
@@ -979,13 +979,13 @@ class TestInjectThinkingTags:
         Purpose: Ensure content is not modified.
         """
         print("Testing content preservation...")
-        from kiro.converters_core import inject_thinking_tags
+        from kiro.converters_core import inject_thinking_tags, ThinkingConfig
         
         original = "This is my original content with special chars: <>&"
         
         with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
             with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(original)
+                result = inject_thinking_tags(original, ThinkingConfig())
         
         print(f"Result ends with original: {result.endswith(original)}")
         assert result.endswith(original)

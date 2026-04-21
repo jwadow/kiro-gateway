@@ -990,3 +990,244 @@ def temp_enterprise_ide_complete(tmp_path, monkeypatch):
     device_reg_file.write_text(json.dumps(device_reg_data))
     
     return (str(creds_file), str(device_reg_file))
+
+
+# =============================================================================
+# API Region Auto-Detection Fixtures
+# =============================================================================
+
+@pytest.fixture
+def temp_sqlite_db_with_profile_arn(tmp_path):
+    """
+    Creates SQLite database with state table containing profile ARN.
+    
+    Tables:
+    - auth_kv: token data with SSO region=eu-west-1
+    - state: profile ARN with API region=eu-central-1
+    
+    This simulates kiro-cli with profile ARN that has different API region.
+    """
+    import sqlite3
+    
+    db_file = tmp_path / "data_with_arn.sqlite3"
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    
+    # Create auth_kv table
+    cursor.execute("""
+        CREATE TABLE auth_kv (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    # Insert token data with SSO region
+    token_data = {
+        "access_token": "arn_access_token",
+        "refresh_token": "arn_refresh_token",
+        "expires_at": "2099-01-01T00:00:00Z",
+        "region": "eu-west-1"  # SSO region
+    }
+    cursor.execute(
+        "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+        ("codewhisperer:odic:token", json.dumps(token_data))
+    )
+    
+    # Insert device registration
+    registration_data = {
+        "client_id": "test_client_id",
+        "client_secret": "test_client_secret",
+        "region": "eu-west-1"
+    }
+    cursor.execute(
+        "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+        ("codewhisperer:odic:device-registration", json.dumps(registration_data))
+    )
+    
+    # Create state table with profile ARN
+    cursor.execute("""
+        CREATE TABLE state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    # Insert profile with ARN containing different API region
+    profile_data = {
+        "arn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/test-profile",
+        "name": "test-profile"
+    }
+    cursor.execute(
+        "INSERT INTO state (key, value) VALUES (?, ?)",
+        ("api.codewhisperer.profile", json.dumps(profile_data))
+    )
+    
+    conn.commit()
+    conn.close()
+    
+    return str(db_file)
+
+
+@pytest.fixture
+def temp_sqlite_db_with_empty_state_table(tmp_path):
+    """
+    Creates SQLite database with empty state table (no profile key).
+    
+    Used for testing fallback behavior when state table exists but has no profile.
+    """
+    import sqlite3
+    
+    db_file = tmp_path / "data_empty_state.sqlite3"
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    
+    # Create auth_kv table
+    cursor.execute("""
+        CREATE TABLE auth_kv (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    # Insert token data
+    token_data = {
+        "access_token": "empty_state_access",
+        "refresh_token": "empty_state_refresh",
+        "expires_at": "2099-01-01T00:00:00Z",
+        "region": "us-west-2"
+    }
+    cursor.execute(
+        "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+        ("codewhisperer:odic:token", json.dumps(token_data))
+    )
+    
+    # Create empty state table
+    cursor.execute("""
+        CREATE TABLE state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+    
+    return str(db_file)
+
+
+@pytest.fixture(params=[
+    "not-an-arn",
+    "arn:aws:codewhisperer",
+    "arn:aws:codewhisperer:INVALID_REGION:account:profile",
+    "arn:aws:codewhisperer::account:profile",
+])
+def temp_sqlite_db_with_invalid_arn(tmp_path, request):
+    """
+    Creates SQLite database with invalid ARN formats.
+    
+    Parametrized fixture that tests various invalid ARN formats:
+    - Not an ARN at all
+    - Too short ARN
+    - Invalid region format
+    - Empty region
+    """
+    import sqlite3
+    
+    db_file = tmp_path / f"data_invalid_arn_{request.param_index}.sqlite3"
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    
+    # Create auth_kv table
+    cursor.execute("""
+        CREATE TABLE auth_kv (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    # Insert token data
+    token_data = {
+        "access_token": "invalid_arn_access",
+        "refresh_token": "invalid_arn_refresh",
+        "expires_at": "2099-01-01T00:00:00Z",
+        "region": "ap-southeast-1"
+    }
+    cursor.execute(
+        "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+        ("codewhisperer:odic:token", json.dumps(token_data))
+    )
+    
+    # Create state table with invalid ARN
+    cursor.execute("""
+        CREATE TABLE state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    profile_data = {
+        "arn": request.param,  # Invalid ARN from parametrize
+        "name": "test-profile"
+    }
+    cursor.execute(
+        "INSERT INTO state (key, value) VALUES (?, ?)",
+        ("api.codewhisperer.profile", json.dumps(profile_data))
+    )
+    
+    conn.commit()
+    conn.close()
+    
+    return str(db_file)
+
+
+@pytest.fixture
+def temp_sqlite_db_with_malformed_state_json(tmp_path):
+    """
+    Creates SQLite database with malformed JSON in state table.
+    
+    Used for testing graceful error handling when state table contains invalid JSON.
+    """
+    import sqlite3
+    
+    db_file = tmp_path / "data_malformed_state.sqlite3"
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    
+    # Create auth_kv table
+    cursor.execute("""
+        CREATE TABLE auth_kv (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    # Insert token data
+    token_data = {
+        "access_token": "malformed_state_access",
+        "refresh_token": "malformed_state_refresh",
+        "expires_at": "2099-01-01T00:00:00Z",
+        "region": "ap-south-1"
+    }
+    cursor.execute(
+        "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+        ("codewhisperer:odic:token", json.dumps(token_data))
+    )
+    
+    # Create state table with malformed JSON
+    cursor.execute("""
+        CREATE TABLE state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    # Insert malformed JSON
+    cursor.execute(
+        "INSERT INTO state (key, value) VALUES (?, ?)",
+        ("api.codewhisperer.profile", "not a valid json {{{")
+    )
+    
+    conn.commit()
+    conn.close()
+    
+    return str(db_file)

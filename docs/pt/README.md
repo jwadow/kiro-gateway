@@ -4,7 +4,7 @@
 
 **Gateway proxy para Kiro API (Amazon Q Developer / AWS CodeWhisperer)**
 
-[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
+[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • 🇧🇷 Português • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
 
 Feito com ❤️ por [@Jwadow](https://github.com/jwadow)
 
@@ -13,7 +13,7 @@ Feito com ❤️ por [@Jwadow](https://github.com/jwadow)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-Apoie_o_Desenvolvimento-ff69b4)](#-apoie-o-projeto)
 
-*Use modelos Claude do Kiro com Claude Code, OpenCode, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue e outras ferramentas compatíveis com OpenAI ou Anthropic*
+*Use modelos Claude do Kiro com Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue e outras ferramentas compatíveis com OpenAI ou Anthropic*
 
 [Modelos](#-modelos-suportados) • [Recursos](#-recursos) • [Início Rápido](#-início-rápido) • [Configuração](#%EF%B8%8F-configuração) • [💖 Apoiar](#-apoie-o-projeto)
 
@@ -21,7 +21,7 @@ Feito com ❤️ por [@Jwadow](https://github.com/jwadow)
 
 ---
 
-## 🤖 Modelos Disponíveis
+## 🤖 Modelos Disponíveis (Lista Gratuita)
 
 > ⚠️ **Importante:** A disponibilidade de modelos depende do seu plano Kiro (gratuito/pago). O gateway fornece acesso aos modelos disponíveis no seu IDE ou CLI com base na sua assinatura. A lista abaixo mostra os modelos comumente disponíveis no **plano gratuito**.
 
@@ -35,7 +35,11 @@ Feito com ❤️ por [@Jwadow](https://github.com/jwadow)
 
 📦 **Claude 3.7 Sonnet** — Modelo legado. Disponível para compatibilidade retroativa.
 
+💤 **GLM-5** — Modelo MoE aberto (744B parâmetros, 40B ativos). Modelo avançado para engenharia de sistemas complexos e tarefas agênticas de longo prazo.
+
 🐋 **DeepSeek-V3.2** — Modelo MoE aberto (685B parâmetros, 37B ativos). Desempenho equilibrado para programação, raciocínio e tarefas gerais.
+
+🧩 **MiniMax M2.5** — Modelo MoE aberto (230B parâmetros, 10B ativos). Versão aprimorada com capacidades expandidas de raciocínio e tratamento de tarefas.
 
 🧩 **MiniMax M2.1** — Modelo MoE aberto (230B parâmetros, 10B ativos). Ótimo para tarefas complexas, planejamento e fluxos de trabalho multietapas.
 
@@ -54,6 +58,7 @@ Feito com ❤️ por [@Jwadow](https://github.com/jwadow)
 | 🌐 **Suporte a VPN/Proxy** | Proxy HTTP/SOCKS5 para redes restritas |
 | 🧠 **Pensamento Estendido** | Raciocínio é exclusivo do nosso projeto |
 | 👁️ **Suporte a Visão** | Envie imagens para o modelo |
+| 🔍 **Busca na Web** | Busque informações atualizadas na internet |
 | 🛠️ **Chamada de Ferramentas** | Suporta chamada de funções |
 | 💬 **Histórico completo de mensagens** | Passa o contexto completo da conversa |
 | 📡 **Streaming** | Suporte completo a streaming SSE |
@@ -340,8 +345,8 @@ volumes:
   # - ${USERPROFILE}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro  # Windows
   
   # Banco de dados kiro-cli (escolha seu SO)
-  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Linux/macOS
-  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Windows
+  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
+  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Windows
   
   # Logs de depuração (opcional)
   - ./debug_logs:/app/debug_logs
@@ -717,7 +722,7 @@ Cada contribuição ajuda a manter este projeto vivo e crescendo
 
 ### 🤑 Doar
 
-[**☕ Doação Única**](https://app.lava.top/jwadow?tabId=donate) &nbsp;•&nbsp; [**💎 Apoio Mensal**](https://app.lava.top/jwadow?tabId=subscriptions)
+[**☕ Apoio Único**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
 
 <br>
 

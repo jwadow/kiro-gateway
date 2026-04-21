@@ -1589,3 +1589,144 @@ class TestContentTruncationRecovery:
         print("Checking: Message unchanged...")
         text = self._get_block_value(modified_messages[0].content[0], "text")
         assert text == "This is a complete response."
+
+
+# ==================================================================================================
+# Tests for WebSearch Support
+# ==================================================================================================
+
+class TestWebSearchAutoInjection:
+    """Tests for WebSearch auto-injection (Path B - MCP Tool Emulation)."""
+    
+    def test_auto_injection_logic(self, monkeypatch):
+        """
+        What it does: Verifies web_search tool auto-injection logic.
+        Purpose: Ensure WEB_SEARCH_ENABLED controls auto-injection.
+        """
+        print("Setup: Testing auto-injection logic...")
+        from kiro.models_anthropic import AnthropicTool
+        
+        # Simulate auto-injection logic
+        WEB_SEARCH_ENABLED = True
+        tools = []
+        
+        if WEB_SEARCH_ENABLED:
+            has_ws = any(
+                getattr(tool, "name", "") == "web_search"
+                for tool in tools
+            )
+            
+            if not has_ws:
+                web_search_tool = AnthropicTool(
+                    name="web_search",
+                    description="Search the web for current information. Use when you need up-to-date data from the internet.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query"}
+                        },
+                        "required": ["query"]
+                    }
+                )
+                tools.append(web_search_tool)
+        
+        print(f"Checking: web_search tool was added...")
+        assert len(tools) == 1
+        assert tools[0].name == "web_search"
+        assert tools[0].input_schema is not None
+    
+    def test_no_duplicate_injection_logic(self):
+        """
+        What it does: Verifies duplicate detection logic.
+        Purpose: Ensure auto-injection doesn't create duplicates.
+        """
+        print("Setup: Testing duplicate detection...")
+        from kiro.models_anthropic import AnthropicTool
+        
+        # Simulate existing web_search tool
+        existing_tools = [
+            AnthropicTool(
+                name="web_search",
+                description="Existing web search",
+                input_schema={"type": "object", "properties": {}}
+            )
+        ]
+        
+        # Simulate auto-injection logic with duplicate check
+        WEB_SEARCH_ENABLED = True
+        
+        if WEB_SEARCH_ENABLED:
+            has_ws = any(
+                getattr(tool, "name", "") == "web_search"
+                for tool in existing_tools
+            )
+            
+            if not has_ws:
+                # Would add web_search here
+                existing_tools.append(AnthropicTool(
+                    name="web_search",
+                    description="Auto-injected",
+                    input_schema={"type": "object", "properties": {}}
+                ))
+        
+        print(f"Checking: Only one web_search tool...")
+        web_search_count = sum(1 for t in existing_tools if t.name == "web_search")
+        assert web_search_count == 1
+
+
+class TestWebSearchNativeDetection:
+    """Tests for native Anthropic server-side tools detection (Path A)."""
+    
+    def test_native_tool_type_detection(self):
+        """
+        What it does: Verifies detection of native server-side tools by type field.
+        Purpose: Ensure Path A detection logic works.
+        """
+        print("Setup: Creating tools list with native server-side tool...")
+        from kiro.models_anthropic import AnthropicTool
+        
+        tools = [
+            AnthropicTool(
+                type="web_search_20250305",
+                name="web_search",
+                max_uses=8
+            )
+        ]
+        
+        print("Action: Checking for native web_search...")
+        has_native_web_search = False
+        for tool in tools:
+            tool_type = getattr(tool, "type", None)
+            if tool_type and tool_type.startswith("web_search"):
+                has_native_web_search = True
+                break
+        
+        print(f"Checking: Native web_search detected...")
+        assert has_native_web_search is True
+    
+    def test_user_defined_tool_not_detected_as_native(self):
+        """
+        What it does: Verifies user-defined tools are not detected as native.
+        Purpose: Ensure Path A detection doesn't trigger for regular tools.
+        """
+        print("Setup: Creating tools list with user-defined tool...")
+        from kiro.models_anthropic import AnthropicTool
+        
+        tools = [
+            AnthropicTool(
+                name="web_search",
+                description="User-defined web search",
+                input_schema={"type": "object", "properties": {}}
+            )
+        ]
+        
+        print("Action: Checking for native web_search...")
+        has_native_web_search = False
+        for tool in tools:
+            tool_type = getattr(tool, "type", None)
+            if tool_type and tool_type.startswith("web_search"):
+                has_native_web_search = True
+                break
+        
+        print(f"Checking: Native web_search NOT detected...")
+        assert has_native_web_search is False

@@ -47,10 +47,12 @@ from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
+    stream_with_first_token_retry_anthropic,
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
-from kiro.tokenizer import count_tools_tokens
+from kiro.config import WEB_SEARCH_ENABLED
+from kiro.mcp_tools import handle_native_web_search
 
 # Import debug_logger
 try:
@@ -247,6 +249,55 @@ async def messages(
         request_data.messages = modified_messages
         logger.info(f"Truncation recovery: modified {tool_results_modified} tool_result(s), added {content_notices_added} content notice(s)")
     
+    # ==============================================================================
+    # WebSearch Support - Path B: Auto-Injection (MCP Tool Emulation)
+    # ==============================================================================
+    
+    # Auto-inject web_search tool if enabled (Path B - MCP emulation)
+    if WEB_SEARCH_ENABLED:
+        if request_data.tools is None:
+            request_data.tools = []
+        
+        # Check if web_search already exists (by name)
+        has_ws = any(
+            getattr(tool, "name", "") == "web_search"
+            for tool in request_data.tools
+        )
+        
+        if not has_ws:
+            from kiro.models_anthropic import AnthropicTool
+            web_search_tool = AnthropicTool(
+                name="web_search",
+                description="Search the web for current information. Use when you need up-to-date data from the internet.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"}
+                    },
+                    "required": ["query"]
+                }
+            )
+            request_data.tools.append(web_search_tool)
+            logger.debug("Auto-injected web_search tool for MCP emulation (Path B)")
+    
+    # ==============================================================================
+    # WebSearch Support - Path A: Native Anthropic (Early Return)
+    # ==============================================================================
+    
+    # Check for native Anthropic server-side tool (Path A)
+    # This works ALWAYS, regardless of WEB_SEARCH_ENABLED setting
+    if request_data.tools:
+        for tool in request_data.tools:
+            tool_type = getattr(tool, "type", None)
+            if tool_type and tool_type.startswith("web_search"):
+                # Path A: Early return, direct MCP call
+                logger.info("Detected native Anthropic web_search (Path A), routing to MCP API")
+                return await handle_native_web_search(request, request_data, auth_manager, api_format="anthropic")
+    
+    # ==============================================================================
+    # Normal Flow (Path B will be intercepted in streaming, or no web_search)
+    # ==============================================================================
+    
     # Generate conversation ID for Kiro API (random UUID, not used for tracking)
     conversation_id = generate_conversation_id()
     
@@ -302,6 +353,11 @@ async def messages(
     # Convert Pydantic models to dicts for tokenizer
     messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
     tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+    # Serialize system prompt (may be a list of Pydantic objects)
+    if isinstance(request_data.system, list):
+        system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
+    else:
+        system_for_tokenizer = request_data.system
     
     try:
         # Make request to Kiro API (for both streaming and non-streaming modes)
@@ -358,17 +414,27 @@ async def messages(
             )
         
         if request_data.stream:
-            # Streaming mode - Kiro already returned 200, now stream the response
+            # Streaming mode with first token retry
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
                 try:
-                    async for chunk in stream_kiro_to_anthropic(
-                        response,
-                        request_data.model,
-                        model_cache,
-                        auth_manager,
-                        request_messages=messages_for_tokenizer
+                    # Create retry request function for retries
+                    async def make_retry_request():
+                        return await http_client.request_with_retry(
+                            "POST", url, kiro_payload, stream=True
+                        )
+                    
+                    # Use retry wrapper with initial response
+                    async for chunk in stream_with_first_token_retry_anthropic(
+                        make_request=make_retry_request,
+                        model=request_data.model,
+                        model_cache=model_cache,
+                        auth_manager=auth_manager,
+                        initial_response=response,
+                        request_messages=messages_for_tokenizer,
+                        request_tools=tools_for_tokenizer,
+                        request_system=system_for_tokenizer,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -415,7 +481,9 @@ async def messages(
                 request_data.model,
                 model_cache,
                 auth_manager,
-                request_messages=messages_for_tokenizer
+                request_messages=messages_for_tokenizer,
+                request_tools=tools_for_tokenizer,
+                request_system=system_for_tokenizer,
             )
             
             await http_client.close()

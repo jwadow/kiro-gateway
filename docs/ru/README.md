@@ -4,7 +4,7 @@
 
 **Прокси-шлюз для Kiro API (Amazon Q Developer / AWS CodeWhisperer)**
 
-[🇬🇧 English](../../README.md) • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
+[🇬🇧 English](../../README.md) • 🇷🇺 Русский • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
 
 Сделано с ❤️ от [@Jwadow](https://github.com/jwadow)
 
@@ -13,7 +13,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-Поддержать_разработку-ff69b4)](#-поддержать-проект)
 
-*Используйте модели Claude из Kiro с Claude Code, OpenCode, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue и другими инструментами, совместимыми с OpenAI или Anthropic*
+*Используйте модели Claude из Kiro с Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue и другими инструментами, совместимыми с OpenAI или Anthropic*
 
 [Модели](#-поддерживаемые-модели) • [Возможности](#-возможности) • [Быстрый старт](#-быстрый-старт) • [Конфигурация](#%EF%B8%8F-конфигурация) • [💖 Поддержать](#-поддержать-проект)
 
@@ -21,7 +21,7 @@
 
 ---
 
-## 🤖 Доступные модели
+## 🤖 Доступные модели (Бесплатный список)
 
 > ⚠️ **Важно:** Доступность моделей зависит от вашего тарифа Kiro (бесплатный/платный). Шлюз предоставляет доступ к тем моделям, которые доступны в вашей IDE или CLI в зависимости от вашей подписки. Список ниже показывает модели, обычно доступные на **бесплатном тарифе**.
 
@@ -35,7 +35,11 @@
 
 📦 **Claude 3.7 Sonnet** — Устаревшая модель. Доступна для обратной совместимости.
 
+💤 **GLM-5** — Открытая MoE модель (744B параметров, 40B активных). Продвинутая модель для сложной системной инженерии и долгосрочных агентных задач.
+
 🐋 **DeepSeek-V3.2** — Открытая MoE модель (685B параметров, 37B активных). Сбалансированная производительность для программирования, рассуждений и задач общего назначения.
+
+🧩 **MiniMax M2.5** — Открытая MoE модель (230B параметров, 10B активных). Улучшенная версия с расширенными возможностями рассуждений и обработки задач.
 
 🧩 **MiniMax M2.1** — Открытая MoE модель (230B параметров, 10B активных). Отлично подходит для сложных задач, планирования и многошаговых рабочих процессов.
 
@@ -54,6 +58,7 @@
 | 🌐 **Поддержка VPN/Proxy** | HTTP/SOCKS5 прокси для ограниченных сетей |
 | 🧠 **Расширенное мышление** | Режим рассуждений — эксклюзив нашего проекта |
 | 👁️ **Поддержка изображений** | Отправляйте изображения модели |
+| 🔍 **Веб-поиск** | Поиск актуальной информации в интернете |
 | 🛠️ **Вызов инструментов** | Поддержка вызова функций |
 | 💬 **Полная история сообщений** | Передаёт полный контекст разговора |
 | 📡 **Стриминг** | Полная поддержка SSE-стриминга |
@@ -340,8 +345,8 @@ volumes:
   # - ${USERPROFILE}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro  # Windows
   
   # База данных kiro-cli (выберите вашу ОС)
-  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Linux/macOS
-  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Windows
+  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
+  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Windows
   
   # Логи отладки (опционально)
   - ./debug_logs:/app/debug_logs
@@ -717,7 +722,7 @@ AGPL-3.0 гарантирует, что улучшения этого прогр
 
 ### 🤑 Пожертвовать
 
-[**☕ Разовое пожертвование**](https://app.lava.top/jwadow?tabId=donate) &nbsp;•&nbsp; [**💎 Ежемесячная поддержка**](https://app.lava.top/jwadow?tabId=subscriptions)
+[**☕ Разовая поддержка**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
 
 <br>
 

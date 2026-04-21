@@ -108,7 +108,14 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
     elif reason == "MONTHLY_REQUEST_COUNT":
         # Monthly request limit exceeded - account quota exhausted
         user_message = "Monthly request limit exceeded. Account has reached its monthly quota."
-    
+
+    elif original_message == "Improperly formed request." and reason in (None, "UNKNOWN", "null"):
+        # Generic 400 error likely caused by payload exceeding ~615KB size limit
+        user_message = (
+            "Kiro API rejected the request (likely payload size exceeded ~615KB). "
+            "Use /compact or start a new session to reduce context size."
+        )
+
     # Future error enhancements can be added here:
     # elif reason == "RATE_LIMIT_EXCEEDED":
     #     user_message = "Rate limit exceeded. Too many requests in a short time."

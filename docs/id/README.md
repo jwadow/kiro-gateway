@@ -4,7 +4,7 @@
 
 **Gateway proxy untuk Kiro API (Amazon Q Developer / AWS CodeWhisperer)**
 
-[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
+[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • [🇪🇸 Español](../es/README.md) • 🇮🇩 Indonesia • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
 
 Dibuat dengan ❤️ oleh [@Jwadow](https://github.com/jwadow)
 
@@ -13,7 +13,7 @@ Dibuat dengan ❤️ oleh [@Jwadow](https://github.com/jwadow)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-Dukung_Pengembangan-ff69b4)](#-dukung-proyek)
 
-*Gunakan model Claude dari Kiro dengan Claude Code, OpenCode, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue dan alat lain yang kompatibel dengan OpenAI atau Anthropic*
+*Gunakan model Claude dari Kiro dengan Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue dan alat lain yang kompatibel dengan OpenAI atau Anthropic*
 
 [Model](#-model-yang-didukung) • [Fitur](#-fitur) • [Mulai Cepat](#-mulai-cepat) • [Konfigurasi](#%EF%B8%8F-konfigurasi) • [💖 Dukung](#-dukung-proyek)
 
@@ -21,7 +21,7 @@ Dibuat dengan ❤️ oleh [@Jwadow](https://github.com/jwadow)
 
 ---
 
-## 🤖 Model yang Tersedia
+## 🤖 Model yang Tersedia (Daftar Gratis)
 
 > ⚠️ **Penting:** Ketersediaan model bergantung pada paket Kiro Anda (gratis/berbayar). Gateway menyediakan akses ke model yang tersedia di IDE atau CLI Anda berdasarkan langganan Anda. Daftar di bawah menunjukkan model yang umumnya tersedia di **paket gratis**.
 
@@ -35,7 +35,11 @@ Dibuat dengan ❤️ oleh [@Jwadow](https://github.com/jwadow)
 
 📦 **Claude 3.7 Sonnet** — Model lama. Tersedia untuk kompatibilitas mundur.
 
+💤 **GLM-5** — Model MoE terbuka (744B parameter, 40B aktif). Model canggih untuk rekayasa sistem kompleks dan tugas agentik jangka panjang.
+
 🐋 **DeepSeek-V3.2** — Model MoE terbuka (685B parameter, 37B aktif). Performa seimbang untuk coding, penalaran, dan tugas umum.
+
+🧩 **MiniMax M2.5** — Model MoE terbuka (230B parameter, 10B aktif). Versi yang ditingkatkan dengan kemampuan penalaran dan penanganan tugas yang lebih baik.
 
 🧩 **MiniMax M2.1** — Model MoE terbuka (230B parameter, 10B aktif). Bagus untuk tugas kompleks, perencanaan, dan alur kerja multi-langkah.
 
@@ -54,6 +58,7 @@ Dibuat dengan ❤️ oleh [@Jwadow](https://github.com/jwadow)
 | 🌐 **Dukungan VPN/Proxy** | Proxy HTTP/SOCKS5 untuk jaringan terbatas |
 | 🧠 **Pemikiran Diperluas** | Penalaran adalah eksklusif proyek kami |
 | 👁️ **Dukungan Visi** | Kirim gambar ke model |
+| 🔍 **Pencarian Web** | Cari informasi terkini di internet |
 | 🛠️ **Pemanggilan Alat** | Mendukung pemanggilan fungsi |
 | 💬 **Riwayat pesan lengkap** | Meneruskan konteks percakapan lengkap |
 | 📡 **Streaming** | Dukungan streaming SSE penuh |
@@ -340,8 +345,8 @@ volumes:
   # - ${USERPROFILE}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro  # Windows
   
   # Database kiro-cli (pilih OS Anda)
-  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Linux/macOS
-  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Windows
+  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
+  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Windows
   
   # Debug logs (opsional)
   - ./debug_logs:/app/debug_logs
@@ -717,7 +722,7 @@ Setiap kontribusi membantu menjaga proyek ini tetap hidup dan berkembang
 
 ### 🤑 Donasi
 
-[**☕ Donasi Sekali**](https://app.lava.top/jwadow?tabId=donate) &nbsp;•&nbsp; [**💎 Dukungan Bulanan**](https://app.lava.top/jwadow?tabId=subscriptions)
+[**☕ Dukungan Sekali**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
 
 <br>
 

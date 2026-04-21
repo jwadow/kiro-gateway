@@ -4,7 +4,7 @@
 
 **Gateway proxy para Kiro API (Amazon Q Developer / AWS CodeWhisperer)**
 
-[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
+[🇬🇧 English](../../README.md) • [🇷🇺 Русский](../ru/README.md) • [🇨🇳 中文](../zh/README.md) • 🇪🇸 Español • [🇮🇩 Indonesia](../id/README.md) • [🇧🇷 Português](../pt/README.md) • [🇯🇵 日本語](../ja/README.md) • [🇰🇷 한국어](../ko/README.md)
 
 Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 
@@ -13,7 +13,7 @@ Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-Apoya_el_Desarrollo-ff69b4)](#-apoya-el-proyecto)
 
-*Usa modelos Claude de Kiro con Claude Code, OpenCode, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue y otras herramientas compatibles con OpenAI o Anthropic*
+*Usa modelos Claude de Kiro con Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue y otras herramientas compatibles con OpenAI o Anthropic*
 
 [Modelos](#-modelos-soportados) • [Características](#-características) • [Inicio Rápido](#-inicio-rápido) • [Configuración](#%EF%B8%8F-configuración) • [💖 Apoyar](#-apoya-el-proyecto)
 
@@ -21,7 +21,7 @@ Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 
 ---
 
-## 🤖 Modelos Disponibles
+## 🤖 Modelos Disponibles (Lista Gratuita)
 
 > ⚠️ **Importante:** La disponibilidad de modelos depende de tu plan de Kiro (gratuito/pago). El gateway proporciona acceso a los modelos disponibles en tu IDE o CLI según tu suscripción. La lista a continuación muestra los modelos comúnmente disponibles en el **plan gratuito**.
 
@@ -35,7 +35,11 @@ Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 
 📦 **Claude 3.7 Sonnet** — Modelo heredado. Disponible para compatibilidad retroactiva.
 
+💤 **GLM-5** — Modelo MoE abierto (744B parámetros, 40B activos). Modelo avanzado para ingeniería de sistemas complejos y tareas agénticas de largo alcance.
+
 🐋 **DeepSeek-V3.2** — Modelo MoE abierto (685B parámetros, 37B activos). Rendimiento equilibrado para programación, razonamiento y tareas generales.
+
+🧩 **MiniMax M2.5** — Modelo MoE abierto (230B parámetros, 10B activos). Versión mejorada con capacidades ampliadas de razonamiento y manejo de tareas.
 
 🧩 **MiniMax M2.1** — Modelo MoE abierto (230B parámetros, 10B activos). Excelente para tareas complejas, planificación y flujos de trabajo multietapa.
 
@@ -54,6 +58,7 @@ Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 | 🌐 **Soporte de VPN/Proxy** | Proxy HTTP/SOCKS5 para redes restringidas |
 | 🧠 **Pensamiento Extendido** | El razonamiento es exclusivo de nuestro proyecto |
 | 👁️ **Soporte de Visión** | Envía imágenes al modelo |
+| 🔍 **Búsqueda Web** | Busca información actualizada en internet |
 | 🛠️ **Llamada de Herramientas** | Soporta llamada de funciones |
 | 💬 **Historial completo de mensajes** | Pasa el contexto completo de la conversación |
 | 📡 **Streaming** | Soporte completo de streaming SSE |
@@ -340,8 +345,8 @@ volumes:
   # - ${USERPROFILE}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro  # Windows
   
   # Base de datos kiro-cli (elige tu SO)
-  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Linux/macOS
-  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Windows
+  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
+  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Windows
   
   # Logs de depuración (opcional)
   - ./debug_logs:/app/debug_logs
@@ -717,7 +722,7 @@ Cada contribución ayuda a mantener este proyecto vivo y creciendo
 
 ### 🤑 Donar
 
-[**☕ Donación Única**](https://app.lava.top/jwadow?tabId=donate) &nbsp;•&nbsp; [**💎 Apoyo Mensual**](https://app.lava.top/jwadow?tabId=subscriptions)
+[**☕ Apoyo Único**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
 
 <br>
 

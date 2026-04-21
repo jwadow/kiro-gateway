@@ -4,7 +4,7 @@
 
 **Proxy gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer)**
 
-[🇷🇺 Русский](docs/ru/README.md) • [🇨🇳 中文](docs/zh/README.md) • [🇪🇸 Español](docs/es/README.md) • [🇮🇩 Indonesia](docs/id/README.md) • [🇧🇷 Português](docs/pt/README.md) • [🇯🇵 日本語](docs/ja/README.md) • [🇰🇷 한국어](docs/ko/README.md)
+🇬🇧 English • [🇷🇺 Русский](docs/ru/README.md) • [🇨🇳 中文](docs/zh/README.md) • [🇪🇸 Español](docs/es/README.md) • [🇮🇩 Indonesia](docs/id/README.md) • [🇧🇷 Português](docs/pt/README.md) • [🇯🇵 日本語](docs/ja/README.md) • [🇰🇷 한국어](docs/ko/README.md)
 
 Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 
@@ -13,7 +13,7 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-Support_Development-ff69b4)](#-support-the-project)
 
-*Use Claude models from Kiro with Claude Code, OpenCode, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue and other OpenAI or Anthropic compatible tools*
+*Use Claude models from Kiro with Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue and other OpenAI or Anthropic compatible tools*
 
 [Models](#-supported-models) • [Features](#-features) • [Quick Start](#-quick-start) • [Configuration](#%EF%B8%8F-configuration) • [💖 Sponsor](#-support-the-project)
 
@@ -21,7 +21,7 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 
 ---
 
-## 🤖 Available Models
+## 🤖 Available Models (Free List)
 
 > ⚠️ **Important:** Model availability depends on your Kiro tier (free/paid). The gateway provides access to whatever models are available in your IDE or CLI based on your subscription. The list below shows models commonly available on the **free tier**.
 
@@ -35,7 +35,11 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 
 📦 **Claude 3.7 Sonnet** — Legacy model. Available for backward compatibility.
 
+💤 **GLM-5** — Open MoE model (744B params, 40B active). Advanced model for complex systems engineering and long-horizon agentic tasks.
+
 🐋 **DeepSeek-V3.2** — Open MoE model (685B params, 37B active). Balanced performance for coding, reasoning, and general tasks.
+
+🧩 **MiniMax M2.5** — Open MoE model (230B params, 10B active). Enhanced version with improved reasoning and task handling.
 
 🧩 **MiniMax M2.1** — Open MoE model (230B params, 10B active). Great for complex tasks, planning, and multi-step workflows.
 
@@ -54,6 +58,7 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 | 🌐 **VPN/Proxy Support** | HTTP/SOCKS5 proxy for restricted networks |
 | 🧠 **Extended Thinking** | Reasoning is exclusive to our project |
 | 👁️ **Vision Support** | Send images to model |
+| 🔍 **Web Search** | Search the web for current information |
 | 🛠️ **Tool Calling** | Supports function calling |
 | 💬 **Full message history** | Passes complete conversation context |
 | 📡 **Streaming** | Full SSE streaming support |
@@ -340,8 +345,8 @@ volumes:
   # - ${USERPROFILE}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro  # Windows
   
   # kiro-cli database (choose your OS)
-  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Linux/macOS
-  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro  # Windows
+  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
+  # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Windows
   
   # Debug logs (optional)
   - ./debug_logs:/app/debug_logs
@@ -677,6 +682,44 @@ When enabled, requests are logged to the `debug_logs/` folder:
 
 ---
 
+## 🔧 Troubleshooting
+
+### Connection Issues
+
+**Error: "Name or service not known" or DNS resolution failed**
+
+The Q API endpoint may not be publicly resolvable in your region. Use a VPN or proxy:
+
+```env
+VPN_PROXY_URL=http://127.0.0.1:7890
+```
+
+See [VPN/Proxy Support](#-vpnproxy-support) for details.
+
+---
+
+**Error: "503 Service Unavailable" through proxy**
+
+The Q API endpoint exists in specific regions only. Try a different region:
+
+```env
+KIRO_API_REGION="eu-central-1"  # or us-east-1
+```
+
+Commonly reachable regions: `us-east-1`, `eu-central-1`
+
+---
+
+**OIDC works but Q API fails**
+
+Your SSO region may differ from the Q API region. The gateway auto-detects this from credentials, but you can override:
+
+```env
+KIRO_API_REGION="eu-central-1"
+```
+
+---
+
 ## 📜 License
 
 This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
@@ -717,7 +760,7 @@ Every contribution helps keep this project alive and growing
 
 ### 🤑 Donate
 
-[**☕ One-time Donation**](https://app.lava.top/jwadow?tabId=donate) &nbsp;•&nbsp; [**💎 Monthly Support**](https://app.lava.top/jwadow?tabId=subscriptions)
+[**☕ One-time Support**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
 
 <br>
 

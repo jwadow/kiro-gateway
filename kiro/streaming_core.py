@@ -420,6 +420,7 @@ def calculate_tokens_from_context_usage(
 async def stream_with_first_token_retry(
     make_request: Callable[[], Awaitable[httpx.Response]],
     stream_processor: Callable[[httpx.Response], AsyncGenerator[str, None]],
+    initial_response: Optional[httpx.Response] = None,
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     on_http_error: Optional[Callable[[int, str], Exception]] = None,
@@ -438,6 +439,9 @@ async def stream_with_first_token_retry(
         make_request: Function to create new HTTP request (returns httpx.Response)
         stream_processor: Function that processes response and yields SSE strings.
                          Must use parse_kiro_stream internally for timeout handling.
+        initial_response: Optional pre-validated response to use on first attempt.
+                         If provided, make_request is only called on retries.
+                         This allows reusing an already-opened HTTP 200 response.
         max_retries: Maximum number of attempts
         first_token_timeout: First token wait timeout (seconds)
         on_http_error: Optional callback to create exception for HTTP errors.
@@ -459,7 +463,9 @@ async def stream_with_first_token_retry(
         >>> async def process(response):
         ...     async for chunk in stream_kiro_to_openai(response, ...):
         ...         yield chunk
-        >>> async for chunk in stream_with_first_token_retry(make_req, process):
+        >>> # With initial response (reuse already-validated 200 response)
+        >>> response = await make_req()
+        >>> async for chunk in stream_with_first_token_retry(make_req, process, initial_response=response):
         ...     print(chunk)
     """
     last_error: Optional[Exception] = None
@@ -471,7 +477,12 @@ async def stream_with_first_token_retry(
             if attempt > 0:
                 logger.warning(f"Retry attempt {attempt + 1}/{max_retries} after first token timeout")
             
-            response = await make_request()
+            # On first attempt, reuse initial_response if provided
+            if attempt == 0 and initial_response is not None:
+                response = initial_response
+                logger.debug("Reusing initial response for first attempt")
+            else:
+                response = await make_request()
             
             if response.status_code != 200:
                 # Error from API - close response and raise exception

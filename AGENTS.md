@@ -6,6 +6,8 @@ This document provides essential information for AI agents (Claude, GPT, etc.) w
 
 **Kiro Gateway is a transparent proxy with minimal, purposeful modifications.**
 
+This is a **reverse engineering project** for Kiro API (Amazon Q Developer). We expose undocumented functionality and work around API quirks. Transparency means being clear about what we add, not refusing to add anything.
+
 ### Core Principles
 
 1. **Transparency First**
@@ -64,6 +66,16 @@ This document provides essential information for AI agents (Claude, GPT, etc.) w
    - Debug logging exists to help users troubleshoot, not just for developers
    - Documentation is part of the feature - if users can't figure it out, it doesn't work
    - Every error should guide the user toward a solution, not leave them confused
+
+10. **Feature Parity Between APIs**
+   - When adding new functionality, implement it for BOTH OpenAI and Anthropic APIs
+   - Both API surfaces must have equal capabilities - no fragmentation
+   - If a feature only makes sense for one API, document why explicitly
+
+11. **Pragmatic Transparency**
+   - Transparency means being clear about modifications, not refusing to add useful features
+   - Response enrichment (adding derived fields) is acceptable if it doesn't break compatibility
+   - Clients can ignore added fields - original upstream data is always preserved
 
 ### About "Improperly formed request" Errors
 
@@ -197,7 +209,7 @@ docker run -d \
 # Mount kiro-cli database
 docker run -d \
   -p 8000:8000 \
-  -v ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli:ro \
+  -v ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli \
   -e KIRO_CLI_DB_FILE=/home/kiro/.local/share/kiro-cli/data.sqlite3 \
   -e PROXY_API_KEY="your-secret-key" \
   --name kiro-gateway \

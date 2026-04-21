@@ -84,16 +84,17 @@ tests/
 │   ├── test_http_client.py         # KiroHttpClient tests
 │   ├── test_kiro_errors.py         # Kiro API error enhancement tests (CONTENT_LENGTH_EXCEEDS_THRESHOLD, unknown errors)
 │   ├── test_main_cli.py            # CLI argument parsing tests (--host, --port)
+│   ├── test_mcp_tools.py           # MCP Tools tests (WebSearch: ID generation, MCP API calls, SSE emulation, query extraction)
 │   ├── test_model_resolver.py      # Dynamic Model Resolution System tests
-│   ├── test_models_anthropic.py    # Anthropic Pydantic models tests (all content blocks, tools, streaming)
+│   ├── test_models_anthropic.py    # Anthropic Pydantic models tests (all content blocks, tools, streaming, server-side tools)
 │   ├── test_models_openai.py       # OpenAI Pydantic models tests (messages, tools, responses, streaming)
 │   ├── test_network_errors.py      # Network error handling tests
 │   ├── test_parsers.py             # AwsEventStreamParser tests (JSON truncation diagnostics, truncation recovery integration)
-│   ├── test_routes_anthropic.py    # Anthropic API endpoint tests (/v1/messages, truncation recovery message modification)
-│   ├── test_routes_openai.py       # OpenAI API endpoint tests (/v1/chat/completions, truncation recovery message modification)
-│   ├── test_streaming_anthropic.py # Anthropic streaming response tests
-│   ├── test_streaming_core.py      # Shared streaming logic tests
-│   ├── test_streaming_openai.py    # OpenAI streaming response tests
+│   ├── test_routes_anthropic.py    # Anthropic API endpoint tests (/v1/messages, truncation recovery, WebSearch auto-injection and native detection)
+│   ├── test_routes_openai.py       # OpenAI API endpoint tests (/v1/chat/completions, truncation recovery, WebSearch auto-injection)
+│   ├── test_streaming_anthropic.py # Anthropic streaming response tests (truncation detection, stop_reason priority, initial_response reuse)
+│   ├── test_streaming_core.py      # Shared streaming logic tests (first-token retry, initial_response parameter)
+│   ├── test_streaming_openai.py    # OpenAI streaming response tests (truncation detection, finish_reason priority, initial_response reuse)
 │   ├── test_thinking_parser.py     # ThinkingParser tests (FSM for thinking blocks)
 │   ├── test_tokenizer.py           # Tokenizer tests (tiktoken)
 │   ├── test_truncation_recovery.py # Truncation Recovery System tests (synthetic message generation)

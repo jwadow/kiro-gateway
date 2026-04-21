@@ -1682,3 +1682,153 @@ class TestStreamWithFirstTokenRetryCore:
         print(f"Response aclose called: {response.aclose.called}")
         response.aclose.assert_called()
         print("✓ Response closed on HTTP error")
+    
+    @pytest.mark.asyncio
+    async def test_reuses_initial_response_on_first_attempt(self):
+        """
+        What it does: Reuses initial_response on first attempt.
+        Goal: Verify initial_response is used instead of calling make_request.
+        """
+        print("Setup: Mock initial response...")
+        
+        initial_response = AsyncMock()
+        initial_response.status_code = 200
+        initial_response.aclose = AsyncMock()
+        
+        make_request_called = False
+        
+        async def mock_make_request():
+            nonlocal make_request_called
+            make_request_called = True
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+        
+        async def mock_stream_processor(response):
+            # Verify we got the initial response
+            assert response is initial_response
+            yield "chunk_from_initial"
+        
+        print("Action: Streaming with initial_response...")
+        chunks = []
+        
+        async for chunk in stream_with_first_token_retry(
+            make_request=mock_make_request,
+            stream_processor=mock_stream_processor,
+            initial_response=initial_response,
+            max_retries=3,
+            first_token_timeout=30
+        ):
+            chunks.append(chunk)
+        
+        print(f"make_request called: {make_request_called}")
+        print(f"Received {len(chunks)} chunks")
+        
+        # make_request should NOT be called on first attempt
+        assert not make_request_called
+        assert len(chunks) == 1
+        assert chunks[0] == "chunk_from_initial"
+        print("✓ initial_response reused on first attempt")
+    
+    @pytest.mark.asyncio
+    async def test_calls_make_request_on_retry(self):
+        """
+        What it does: Calls make_request on retry attempts.
+        Goal: Verify make_request is called when retrying after timeout.
+        """
+        print("Setup: Mock initial response that times out...")
+        
+        initial_response = AsyncMock()
+        initial_response.status_code = 200
+        initial_response.aclose = AsyncMock()
+        
+        make_request_call_count = 0
+        
+        async def mock_make_request():
+            nonlocal make_request_call_count
+            make_request_call_count += 1
+            print(f"make_request called (retry attempt {make_request_call_count})")
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+        
+        attempt_count = 0
+        
+        async def mock_stream_processor(response):
+            nonlocal attempt_count
+            attempt_count += 1
+            
+            if attempt_count == 1:
+                # First attempt with initial_response - timeout
+                assert response is initial_response
+                raise FirstTokenTimeoutError("Timeout on first attempt")
+            else:
+                # Retry attempts - should get response from make_request
+                assert response is not initial_response
+                yield "success_chunk"
+        
+        print("Action: Streaming with initial_response that times out...")
+        chunks = []
+        
+        async for chunk in stream_with_first_token_retry(
+            make_request=mock_make_request,
+            stream_processor=mock_stream_processor,
+            initial_response=initial_response,
+            max_retries=3,
+            first_token_timeout=30
+        ):
+            chunks.append(chunk)
+        
+        print(f"make_request call count: {make_request_call_count}")
+        print(f"Total attempts: {attempt_count}")
+        print(f"Received {len(chunks)} chunks")
+        
+        # make_request should be called once (on retry)
+        assert make_request_call_count == 1
+        assert attempt_count == 2  # First with initial_response, second with make_request
+        assert len(chunks) == 1
+        print("✓ make_request called on retry")
+    
+    @pytest.mark.asyncio
+    async def test_initial_response_none_calls_make_request_immediately(self):
+        """
+        What it does: Calls make_request immediately when initial_response is None.
+        Goal: Verify backward compatibility (old behavior).
+        """
+        print("Setup: No initial_response (None)...")
+        
+        make_request_call_count = 0
+        
+        async def mock_make_request():
+            nonlocal make_request_call_count
+            make_request_call_count += 1
+            print(f"make_request called (attempt {make_request_call_count})")
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+        
+        async def mock_stream_processor(response):
+            yield "chunk"
+        
+        print("Action: Streaming without initial_response...")
+        chunks = []
+        
+        async for chunk in stream_with_first_token_retry(
+            make_request=mock_make_request,
+            stream_processor=mock_stream_processor,
+            initial_response=None,  # Explicitly None
+            max_retries=3,
+            first_token_timeout=30
+        ):
+            chunks.append(chunk)
+        
+        print(f"make_request call count: {make_request_call_count}")
+        print(f"Received {len(chunks)} chunks")
+        
+        # make_request should be called immediately (old behavior)
+        assert make_request_call_count == 1
+        assert len(chunks) == 1
+        print("✓ make_request called immediately when initial_response is None")

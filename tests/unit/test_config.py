@@ -688,3 +688,119 @@ class TestFallbackModelsIntegration:
         
         print(f"Comparing sets: Expected {fallback_ids}, Got {available_set}")
         assert fallback_ids == available_set
+
+
+# ==================================================================================================
+# Tests for WebSearch Configuration
+# ==================================================================================================
+
+class TestWebSearchConfig:
+    """Tests for WebSearch configuration (WEB_SEARCH_ENABLED)."""
+    
+    def test_web_search_enabled_default_true(self, monkeypatch):
+        """
+        What it does: Verifies WEB_SEARCH_ENABLED defaults to true.
+        Purpose: Ensure auto-injection is enabled by default.
+        """
+        print("Setup: Removing WEB_SEARCH_ENABLED from environment...")
+        monkeypatch.delenv("WEB_SEARCH_ENABLED", raising=False)
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
+        assert config_module.WEB_SEARCH_ENABLED is True
+    
+    def test_web_search_enabled_false(self, monkeypatch):
+        """
+        What it does: Verifies WEB_SEARCH_ENABLED=false disables auto-injection.
+        Purpose: Ensure users can disable auto-injection.
+        """
+        print("Setup: Setting WEB_SEARCH_ENABLED=false...")
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "false")
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing WEB_SEARCH_ENABLED: Expected False, Got {config_module.WEB_SEARCH_ENABLED}")
+        assert config_module.WEB_SEARCH_ENABLED is False
+    
+    def test_web_search_enabled_true(self, monkeypatch):
+        """
+        What it does: Verifies WEB_SEARCH_ENABLED=true enables auto-injection.
+        Purpose: Ensure explicit true value works.
+        """
+        print("Setup: Setting WEB_SEARCH_ENABLED=true...")
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "true")
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
+        assert config_module.WEB_SEARCH_ENABLED is True
+    
+    def test_web_search_enabled_numeric_values(self, monkeypatch):
+        """
+        What it does: Verifies numeric values (1/0) work for WEB_SEARCH_ENABLED.
+        Purpose: Ensure compatibility with numeric boolean values.
+        """
+        print("Setup: Testing WEB_SEARCH_ENABLED=1...")
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "1")
+        
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
+        assert config_module.WEB_SEARCH_ENABLED is True
+        
+        print("Setup: Testing WEB_SEARCH_ENABLED=0...")
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "0")
+        reload(config_module)
+        
+        print(f"Comparing WEB_SEARCH_ENABLED: Expected False, Got {config_module.WEB_SEARCH_ENABLED}")
+        assert config_module.WEB_SEARCH_ENABLED is False
+    
+    def test_web_search_enabled_yes_value(self, monkeypatch):
+        """
+        What it does: Verifies WEB_SEARCH_ENABLED=yes enables auto-injection.
+        Purpose: Ensure 'yes' value works.
+        """
+        print("Setup: Setting WEB_SEARCH_ENABLED=yes...")
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "yes")
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
+        assert config_module.WEB_SEARCH_ENABLED is True
+    
+    def test_web_search_enabled_case_insensitive(self, monkeypatch):
+        """
+        What it does: Verifies WEB_SEARCH_ENABLED is case-insensitive.
+        Purpose: Ensure TRUE, True, true all work.
+        """
+        print("Setup: Testing WEB_SEARCH_ENABLED=TRUE...")
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "TRUE")
+        
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
+        assert config_module.WEB_SEARCH_ENABLED is True
+        
+        print("Setup: Testing WEB_SEARCH_ENABLED=FALSE...")
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "FALSE")
+        reload(config_module)
+        
+        print(f"Comparing WEB_SEARCH_ENABLED: Expected False, Got {config_module.WEB_SEARCH_ENABLED}")
+        assert config_module.WEB_SEARCH_ENABLED is False
