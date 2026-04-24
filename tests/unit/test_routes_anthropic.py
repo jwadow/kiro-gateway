@@ -844,7 +844,7 @@ class TestMessagesAnthropicVersion:
 
 class TestAnthropicRouterIntegration:
     """Tests for Anthropic router configuration and integration."""
-    
+
     def test_router_has_messages_endpoint(self):
         """
         What it does: Verifies messages endpoint is registered.
@@ -852,9 +852,20 @@ class TestAnthropicRouterIntegration:
         """
         print("Checking: Router endpoints...")
         routes = [route.path for route in router.routes]
-        
+
         print(f"Found routes: {routes}")
         assert "/v1/messages" in routes
+
+    def test_router_has_count_tokens_endpoint(self):
+        """
+        What it does: Verifies count_tokens endpoint is registered.
+        Purpose: Ensure Anthropic token counting API is available.
+        """
+        print("Checking: Router endpoints...")
+        routes = [route.path for route in router.routes]
+
+        print(f"Found routes: {routes}")
+        assert "/v1/messages/count_tokens" in routes
     
     def test_messages_endpoint_uses_post_method(self):
         """
@@ -882,6 +893,158 @@ class TestAnthropicRouterIntegration:
 # =============================================================================
 # Tests for conversation history
 # =============================================================================
+
+class TestCountTokensEndpoint:
+    """Tests for /v1/messages/count_tokens endpoint."""
+
+    def test_count_tokens_returns_input_tokens(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies count_tokens returns input_tokens for a valid request.
+        Purpose: Ensure Anthropic token counting API works for Claude Code.
+        """
+        print("Action: POST /v1/messages/count_tokens with valid request...")
+        response = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        print(f"Response: {response.json()}")
+        assert response.status_code == 200
+        data = response.json()
+        assert "input_tokens" in data
+        assert isinstance(data["input_tokens"], int)
+        assert data["input_tokens"] > 0
+
+    def test_count_tokens_simple_request_stays_under_200(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies a trivial request stays within logical Anthropic input size.
+        Purpose: Ensure count_tokens does not include Kiro wrapper payload overhead.
+        """
+        print("Action: POST /v1/messages/count_tokens with trivial request...")
+        response = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        print(f"Response: {response.json()}")
+        assert response.status_code == 200
+        assert response.json()["input_tokens"] < 200
+
+    def test_count_tokens_excludes_auto_injected_web_search(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies auto-injected web_search is excluded from token counting.
+        Purpose: Ensure gateway-added tools do not inflate logical Anthropic input size.
+        """
+        print("Action: POST /v1/messages/count_tokens without user tools...")
+        response = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        data = response.json()
+        assert response.status_code == 200
+        assert data["input_tokens"] < 200
+
+    def test_count_tokens_includes_user_provided_tools(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies user-provided tools still contribute to token counting.
+        Purpose: Ensure logical Anthropic input size includes caller-supplied tools.
+        """
+        print("Action: POST /v1/messages/count_tokens with user tool...")
+        response = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather for a location",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"]
+                        }
+                    }
+                ]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        data = response.json()
+        assert response.status_code == 200
+        assert data["input_tokens"] > 10
+
+    def test_count_tokens_counts_user_provided_web_search_tool(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies a user-provided server-side web_search tool is counted.
+        Purpose: Ensure only gateway auto-injected web_search is excluded.
+        """
+        print("Action: POST /v1/messages/count_tokens with user-provided web_search tool...")
+        response = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "max_uses": 8
+                    }
+                ]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        data = response.json()
+        assert response.status_code == 200
+        assert data["input_tokens"] > 5
+
+    def test_count_tokens_accepts_structured_system_blocks(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies structured system blocks are counted without serialization errors.
+        Purpose: Ensure count_tokens normalizes system blocks like the messages endpoint does.
+        """
+        print("Action: POST /v1/messages/count_tokens with structured system blocks...")
+        response = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "system": [{"type": "text", "text": "You are a helpful assistant."}],
+                "messages": [{"role": "user", "content": "hello"}]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        print(f"Response: {response.json()}")
+        assert response.status_code == 200
+        assert response.json()["input_tokens"] > 0
+
 
 class TestMessagesConversationHistory:
     """Tests for conversation history handling on /v1/messages endpoint."""

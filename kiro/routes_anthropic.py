@@ -53,6 +53,7 @@ from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
+from kiro.tokenizer import count_tokens, count_message_tokens, count_system_tokens, count_tools_tokens
 
 # Import debug_logger
 try:
@@ -905,3 +906,34 @@ async def messages(
                 }
             }
         )
+
+
+@router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_anthropic_api_key)])
+async def count_tokens_endpoint(
+    request: Request,
+    request_data: AnthropicMessagesRequest,
+):
+    """
+    Anthropic Count Tokens API endpoint.
+
+    Returns estimated token count for the given request payload.
+    Used by Claude Code to decide when to trigger conversation compaction.
+    """
+    logger.info(
+        f"Request to /v1/messages/count_tokens (model={request_data.model}, messages={len(request_data.messages)})"
+    )
+
+    def _count_user_tools(tools):
+        if not tools:
+            return 0
+        user_tools = [tool.model_dump() if hasattr(tool, "model_dump") else tool for tool in tools]
+        return count_tools_tokens(user_tools, apply_claude_correction=False)
+
+    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+    system_for_tokenizer = request_data.system
+    input_tokens = count_message_tokens(messages_for_tokenizer, apply_claude_correction=False)
+    input_tokens += count_system_tokens(system_for_tokenizer, apply_claude_correction=False)
+    input_tokens += _count_user_tools(request_data.tools)
+
+    logger.info(f"Token count estimate: {input_tokens} (logical Anthropic input)")
+    return JSONResponse(content={"input_tokens": input_tokens})

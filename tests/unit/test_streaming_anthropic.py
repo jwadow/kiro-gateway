@@ -25,6 +25,7 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.streaming_core import KiroEvent, StreamResult
+from kiro.tokenizer import estimate_request_tokens
 
 
 # ==================================================================================================
@@ -53,6 +54,12 @@ def mock_response():
     response.status_code = 200
     response.aclose = AsyncMock()
     return response
+
+
+def _event_payload(events, event_type):
+    event = next(e for e in events if f"event: {event_type}" in e)
+    data_line = next(line for line in event.splitlines() if line.startswith("data: "))
+    return json.loads(data_line[6:])
 
 
 # ==================================================================================================
@@ -381,6 +388,33 @@ class TestStreamKiroToAnthropic:
         print("✓ message_delta with stop_reason yielded")
     
     @pytest.mark.asyncio
+    async def test_streaming_usage_keeps_logical_input_tokens_when_context_usage_is_high(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="context_usage", context_usage_percentage=50.0)
+
+        request_messages = [{"role": "user", "content": "hello"}]
+        expected_input_tokens = estimate_request_tokens(
+            messages=request_messages,
+            apply_claude_correction=False,
+        )["total_tokens"]
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            async for event in stream_kiro_to_anthropic(
+                mock_response,
+                "claude-opus-4.6",
+                mock_model_cache,
+                mock_auth_manager,
+                request_messages=request_messages,
+            ):
+                events.append(event)
+
+        message_start = _event_payload(events, "message_start")
+        assert message_start["message"]["usage"]["input_tokens"] == expected_input_tokens
+
+    @pytest.mark.asyncio
     async def test_yields_message_stop_at_end(self, mock_response, mock_model_cache, mock_auth_manager):
         """
         What it does: Yields message_stop at end.
@@ -533,6 +567,31 @@ class TestStreamKiroToAnthropic:
 class TestCollectAnthropicResponse:
     """Tests for collect_anthropic_response() function."""
     
+    @pytest.mark.asyncio
+    async def test_non_streaming_usage_keeps_logical_input_tokens_when_context_usage_is_high(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        request_messages = [{"role": "user", "content": "hello"}]
+        expected_input_tokens = estimate_request_tokens(
+            messages=request_messages,
+            apply_claude_correction=False,
+        )["total_tokens"]
+        result = StreamResult(
+            content="done",
+            context_usage_percentage=50.0,
+        )
+
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=result):
+            response = await collect_anthropic_response(
+                mock_response,
+                "claude-opus-4.6",
+                mock_model_cache,
+                mock_auth_manager,
+                request_messages=request_messages,
+            )
+
+        assert response["usage"]["input_tokens"] == expected_input_tokens
+
     @pytest.mark.asyncio
     async def test_collects_text_content(self, mock_response, mock_model_cache, mock_auth_manager):
         """

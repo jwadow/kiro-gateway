@@ -806,15 +806,6 @@ async def collect_anthropic_response(
     # Calculate output tokens
     output_tokens = count_tokens(result.content + result.thinking_content)
     
-    # Calculate from context usage if available
-    if result.context_usage_percentage is not None:
-        prompt_tokens, _, prompt_source, _ = calculate_tokens_from_context_usage(
-            result.context_usage_percentage, output_tokens, model_cache, model
-        )
-        # Don't override fallback when context_usage=0% (returns source="unknown")
-        if prompt_source != "unknown":
-            input_tokens = prompt_tokens
-    
     # Detect content truncation (missing completion signals)
     stream_completed_normally = result.context_usage_percentage is not None
     content_was_truncated = (
