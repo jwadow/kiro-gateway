@@ -621,8 +621,12 @@ async def stream_kiro_to_anthropic(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
         
-        # Calculate output tokens
-        output_tokens = count_tokens(full_content + full_thinking_content)
+        # Calculate output tokens (include tool_use block content)
+        tool_content = ""
+        for tb in tool_blocks:
+            tool_content += json.dumps(tb.get("input", {}), ensure_ascii=False)
+            tool_content += tb.get("name", "")
+        output_tokens = count_tokens(full_content + full_thinking_content + tool_content)
         
         # Calculate total tokens from context usage if available
         if context_usage_percentage is not None:
@@ -803,8 +807,13 @@ async def collect_anthropic_response(
             "input": tool_input
         })
     
-    # Calculate output tokens
-    output_tokens = count_tokens(result.content + result.thinking_content)
+    # Calculate output tokens (include tool_use block content)
+    tool_content = ""
+    for tc in result.tool_calls:
+        func = tc.get("function", {})
+        tool_content += func.get("name", "")
+        tool_content += func.get("arguments", "")
+    output_tokens = count_tokens(result.content + result.thinking_content + tool_content)
     
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:
