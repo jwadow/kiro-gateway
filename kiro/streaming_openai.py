@@ -301,8 +301,13 @@ async def stream_kiro_to_openai_internal(
         else:
             finish_reason = "stop"
         
-        # Count completion_tokens (output) using tiktoken
-        completion_tokens = count_tokens(full_content + full_thinking_content)
+        # Count completion_tokens (output) using tiktoken (include tool_use content)
+        tool_content = ""
+        for tc in all_tool_calls:
+            func = tc.get("function", {})
+            tool_content += func.get("name", "")
+            tool_content += func.get("arguments", "")
+        completion_tokens = count_tokens(full_content + full_thinking_content + tool_content)
         
         # Calculate total_tokens based on context_usage_percentage from Kiro API
         # context_usage shows TOTAL percentage of context usage (input + output)
