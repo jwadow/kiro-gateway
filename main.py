@@ -78,6 +78,7 @@ from kiro.config import (
     ACCOUNT_SYSTEM,
     ACCOUNTS_CONFIG_FILE,
     ACCOUNTS_STATE_FILE,
+    normalize_config_path,
     _warn_timeout_configuration,
 )
 from kiro.auth import KiroAuthManager
@@ -224,7 +225,7 @@ def validate_configuration() -> None:
     # Priority 1: Check if credentials.json exists (Account System)
     # If it exists, legacy .env validation is skipped
     from kiro.config import ACCOUNTS_CONFIG_FILE
-    creds_json_path = Path(ACCOUNTS_CONFIG_FILE)
+    creds_json_path = Path(normalize_config_path(ACCOUNTS_CONFIG_FILE))
     
     if creds_json_path.exists():
         logger.debug(f"Found {ACCOUNTS_CONFIG_FILE}, skipping legacy .env validation")
@@ -243,14 +244,14 @@ def validate_configuration() -> None:
     
     # Check if creds file actually exists
     if KIRO_CREDS_FILE:
-        creds_path = Path(KIRO_CREDS_FILE).expanduser()
+        creds_path = Path(normalize_config_path(KIRO_CREDS_FILE))
         if not creds_path.exists():
             has_creds_file = False
             logger.warning(f"KIRO_CREDS_FILE not found: {KIRO_CREDS_FILE}")
     
     # Check if CLI database file actually exists
     if KIRO_CLI_DB_FILE:
-        cli_db_path = Path(KIRO_CLI_DB_FILE).expanduser()
+        cli_db_path = Path(normalize_config_path(KIRO_CLI_DB_FILE))
         if not cli_db_path.exists():
             has_cli_db = False
             logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
@@ -296,6 +297,7 @@ def validate_configuration() -> None:
                 "\n"
                 "   Option 3: kiro-cli SQLite database (AWS SSO)\n"
                 "      KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
+                "      Windows: KIRO_CLI_DB_FILE=\"%LOCALAPPDATA%\\Kiro-Cli\\data.sqlite3\"\n"
                 "\n"
                 "   See README.md for how to obtain credentials."
             )
@@ -358,12 +360,12 @@ async def lifespan(app: FastAPI):
     # ==============================================================================
     # Legacy Fallback: .env → credentials.json
     # ==============================================================================
-    creds_path = Path(ACCOUNTS_CONFIG_FILE)
+    creds_path = Path(normalize_config_path(ACCOUNTS_CONFIG_FILE))
     
     # Check if we have legacy .env credentials
     has_refresh_token = bool(REFRESH_TOKEN)
-    has_creds_file = bool(KIRO_CREDS_FILE) and Path(KIRO_CREDS_FILE).expanduser().exists()
-    has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
+    has_creds_file = bool(KIRO_CREDS_FILE) and Path(normalize_config_path(KIRO_CREDS_FILE)).exists()
+    has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(normalize_config_path(KIRO_CLI_DB_FILE)).exists()
     
     # Helper function to add optional per-account overrides from .env
     def _add_env_overrides(entry: dict) -> None:

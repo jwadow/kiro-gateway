@@ -219,7 +219,10 @@ No additional configuration is needed — just point to your credentials file!
 If you use `kiro-cli` and prefer to use its SQLite database directly:
 
 ```env
+# Linux/macOS:
 KIRO_CLI_DB_FILE="~/.local/share/kiro-cli/data.sqlite3"
+# Windows:
+# KIRO_CLI_DB_FILE="%LOCALAPPDATA%\Kiro-Cli\data.sqlite3"
 
 # Password to protect YOUR proxy server
 PROXY_API_KEY="my-super-secret-password-123"
@@ -231,16 +234,18 @@ PROXY_API_KEY="my-super-secret-password-123"
 <details>
 <summary>📄 Database locations</summary>
 
-| CLI Tool | Database Path |
-|----------|---------------|
-| kiro-cli | `~/.local/share/kiro-cli/data.sqlite3` |
-| amazon-q-developer-cli | `~/.local/share/amazon-q/data.sqlite3` |
+| Platform | CLI Tool | Database Path |
+|----------|----------|---------------|
+| Linux/macOS | kiro-cli | `~/.local/share/kiro-cli/data.sqlite3` |
+| Linux/macOS | amazon-q-developer-cli | `~/.local/share/amazon-q/data.sqlite3` |
+| Windows | kiro-cli | `%LOCALAPPDATA%\Kiro-Cli\data.sqlite3` |
 
 The gateway reads credentials from the `auth_kv` table which stores:
-- `kirocli:odic:token` or `codewhisperer:odic:token` — access token, refresh token, expiration
-- `kirocli:odic:device-registration` or `codewhisperer:odic:device-registration` — client ID and secret
+- `kirocli:social:token` — social login (Google, GitHub, Microsoft) — **used by Windows kiro-cli**
+- `kirocli:odic:token` or `codewhisperer:odic:token` — AWS SSO OIDC (corporate accounts)
+- `kirocli:odic:device-registration` or `codewhisperer:odic:device-registration` — client ID and secret (AWS SSO only)
 
-Both key formats are supported for compatibility with different kiro-cli versions.
+All key formats are supported for compatibility with different kiro-cli versions and platforms.
 
 </details>
 

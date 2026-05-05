@@ -43,6 +43,7 @@ from loguru import logger
 from kiro.config import (
     TOKEN_REFRESH_THRESHOLD,
     SQLITE_READONLY,
+    normalize_config_path,
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
@@ -268,7 +269,7 @@ class KiroAuthManager:
             db_path: Path to SQLite database file
         """
         try:
-            path = Path(db_path).expanduser()
+            path = Path(normalize_config_path(db_path))
             if not path.exists():
                 logger.warning(f"SQLite database not found: {db_path}")
                 return
@@ -402,7 +403,7 @@ class KiroAuthManager:
             file_path: Path to JSON file
         """
         try:
-            path = Path(file_path).expanduser()
+            path = Path(normalize_config_path(file_path))
             if not path.exists():
                 logger.warning(f"Credentials file not found: {file_path}")
                 return
@@ -493,7 +494,7 @@ class KiroAuthManager:
             return
         
         try:
-            path = Path(self._creds_file).expanduser()
+            path = Path(normalize_config_path(self._creds_file))
             
             # Read existing data
             existing_data = {}
@@ -542,7 +543,7 @@ class KiroAuthManager:
             return
         
         try:
-            path = Path(self._sqlite_db).expanduser()
+            path = Path(normalize_config_path(self._sqlite_db))
             if not path.exists():
                 logger.warning(f"SQLite database not found for writing: {self._sqlite_db}")
                 return

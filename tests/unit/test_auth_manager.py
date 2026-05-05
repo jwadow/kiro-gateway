@@ -9,6 +9,7 @@ import asyncio
 import json
 import pytest
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
@@ -643,6 +644,20 @@ class TestKiroAuthManagerSqliteCredentials:
         
         print("Verification: refresh_token loaded...")
         print(f"Comparing refresh_token: Expected 'sqlite_refresh_token', Got '{manager._refresh_token}'")
+        assert manager._refresh_token == "sqlite_refresh_token"
+    
+    def test_load_credentials_from_sqlite_expands_percent_environment_path(self, temp_sqlite_db, monkeypatch):
+        """
+        What it does: Verifies loading SQLite credentials through a %VAR% path.
+        Purpose: Ensure Windows-style environment paths work for auth loading.
+        """
+        print("Setup: Creating KiroAuthManager with percent-style SQLite path...")
+        db_path = Path(temp_sqlite_db)
+        monkeypatch.setenv("KIRO_TEST_DB_DIR", str(db_path.parent))
+        manager = KiroAuthManager(sqlite_db=f"%KIRO_TEST_DB_DIR%/{db_path.name}")
+        
+        print("Verification: credentials loaded from expanded SQLite path...")
+        assert manager._access_token == "sqlite_access_token"
         assert manager._refresh_token == "sqlite_refresh_token"
     
     def test_load_credentials_from_sqlite_file_not_found(self, tmp_path):

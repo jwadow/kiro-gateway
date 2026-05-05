@@ -169,6 +169,42 @@ class TestAccountManagerLoadCredentials:
         assert str(Path(temp_sqlite_db).resolve()) in manager._accounts
     
     @pytest.mark.asyncio
+    async def test_load_credentials_expands_percent_environment_path(self, tmp_path, temp_sqlite_db, monkeypatch):
+        """
+        Test loading credentials from paths containing %VAR% placeholders.
+        
+        What it does: Loads SQLite credentials through a percent-style env path.
+        Purpose: Verify Windows-style paths work in credentials.json.
+        """
+        print("\n=== Test: load_credentials expands percent environment path ===")
+        
+        # Arrange
+        db_path = Path(temp_sqlite_db)
+        monkeypatch.setenv("KIRO_TEST_DB_DIR", str(db_path.parent))
+        creds_file = tmp_path / "credentials.json"
+        credentials = [
+            {
+                "type": "sqlite",
+                "path": f"%KIRO_TEST_DB_DIR%/{db_path.name}",
+                "enabled": True
+            }
+        ]
+        creds_file.write_text(json.dumps(credentials))
+        
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        
+        # Act
+        await manager.load_credentials()
+        
+        # Assert
+        print(f"Loaded accounts: {len(manager._accounts)}")
+        assert len(manager._accounts) == 1
+        assert str(db_path.resolve()) in manager._accounts
+    
+    @pytest.mark.asyncio
     async def test_load_credentials_refresh_token_type(self, tmp_path):
         """
         Test loading credentials with type=refresh_token.

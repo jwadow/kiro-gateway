@@ -71,10 +71,37 @@ def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
             if match:
                 # Return value as-is, without processing escape sequences
                 return match.group(2)
-    except Exception:
-        pass
+    except (OSError, UnicodeDecodeError):
+        return None
     
     return None
+
+
+def normalize_config_path(raw_path: str) -> str:
+    """
+    Normalize a user-provided configuration path without requiring it to exist.
+    
+    Handles both Unix-style and Windows-style environment variable syntax so
+    paths such as ``~/.aws/...`` and ``%LOCALAPPDATA%\\Kiro-Cli\\data.sqlite3``
+    work regardless of how they are provided.
+    
+    Args:
+        raw_path: Path string from environment variables or credentials config.
+    
+    Returns:
+        Normalized path string, or an empty string when no path was provided.
+    """
+    if not raw_path:
+        return ""
+    
+    stripped_path = raw_path.strip().strip('"').strip("'")
+    windows_expanded = re.sub(
+        r"%([^%]+)%",
+        lambda match: os.environ.get(match.group(1), match.group(0)),
+        stripped_path,
+    )
+    expanded_path = os.path.expandvars(windows_expanded)
+    return str(Path(expanded_path).expanduser())
 
 # ==================================================================================================
 # Server Settings
@@ -151,13 +178,16 @@ REGION: str = os.getenv("KIRO_REGION", "us-east-1")
 # (e.g., \a in path D:\Projects\adolf is interpreted as bell character)
 _raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv("KIRO_CREDS_FILE", "")
 # Normalize path for cross-platform compatibility
-KIRO_CREDS_FILE: str = str(Path(_raw_creds_file)) if _raw_creds_file else ""
+KIRO_CREDS_FILE: str = normalize_config_path(_raw_creds_file)
 
 # Path to kiro-cli SQLite database (optional, for AWS SSO OIDC authentication)
-# Default location: ~/.local/share/kiro-cli/data.sqlite3 (Linux/macOS)
-# or ~/.local/share/amazon-q/data.sqlite3 (amazon-q-developer-cli)
+# Default locations:
+#   Linux/macOS (kiro-cli):          ~/.local/share/kiro-cli/data.sqlite3
+#   Linux/macOS (amazon-q-dev-cli):  ~/.local/share/amazon-q/data.sqlite3
+#   Windows (kiro-cli):              %LOCALAPPDATA%\\Kiro-Cli\\data.sqlite3
+#                                    (e.g., C:\\Users\\<user>\\AppData\\Local\\Kiro-Cli\\data.sqlite3)
 _raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
-KIRO_CLI_DB_FILE: str = str(Path(_raw_cli_db_file)) if _raw_cli_db_file else ""
+KIRO_CLI_DB_FILE: str = normalize_config_path(_raw_cli_db_file)
 
 # Disable SQLite write-back (read-only mode)
 # When enabled, gateway will only read from kiro-cli database without modifying it.

@@ -52,6 +52,7 @@ from kiro.config import (
     HIDDEN_MODELS,
     MODEL_ALIASES,
     HIDDEN_FROM_LIST,
+    normalize_config_path,
     ACCOUNT_RECOVERY_TIMEOUT,
     ACCOUNT_MAX_BACKOFF_MULTIPLIER,
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
@@ -191,7 +192,7 @@ class AccountManager:
         Invalid entries are skipped with warnings.
         Folders are scanned for credential files.
         """
-        creds_path = Path(self._credentials_file).expanduser()
+        creds_path = Path(normalize_config_path(self._credentials_file))
         
         if not creds_path.exists():
             logger.warning(f"Credentials file not found: {self._credentials_file}")
@@ -239,7 +240,7 @@ class AccountManager:
                 continue  # Skip path processing for refresh_token
             
             # Handle folder scanning for json/sqlite types
-            expanded_path = Path(path).expanduser()
+            expanded_path = Path(normalize_config_path(path))
             if expanded_path.is_dir():
                 logger.info(f"Scanning folder for credentials: {path}")
                 for file_path in expanded_path.iterdir():
@@ -303,7 +304,7 @@ class AccountManager:
         Restores model_to_accounts mapping and account runtime state.
         Creates empty state if file doesn't exist.
         """
-        state_path = Path(self._state_file)
+        state_path = Path(normalize_config_path(self._state_file))
         
         if not state_path.exists():
             logger.debug("State file not found, starting with empty state")
@@ -370,7 +371,7 @@ class AccountManager:
             }
         }
         
-        state_path = Path(self._state_file)
+        state_path = Path(normalize_config_path(self._state_file))
         tmp_path = state_path.with_suffix('.json.tmp')
         
         try:
@@ -421,7 +422,7 @@ class AccountManager:
             creds_config = None
             for entry in self._credentials_config:
                 path = entry.get("path", "")
-                expanded_path = Path(path).expanduser()
+                expanded_path = Path(normalize_config_path(path))
                 
                 if entry.get("type") == "refresh_token":
                     # Match by deterministic hash for refresh_token type
