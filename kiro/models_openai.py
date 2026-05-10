@@ -39,12 +39,22 @@ class OpenAIModel(BaseModel):
     Data model for describing an AI model in OpenAI format.
     
     Used in the /v1/models endpoint response.
+
+    The ``context_length`` / ``max_input_tokens`` / ``max_output_tokens``
+    fields are a local extension (not part of stock OpenAI) that forwards the
+    upstream ``tokenLimits`` Kiro reports via ``ListAvailableModels``. They let
+    clients (e.g. Hermes agent's ``get_model_context_length``) discover the
+    real per-model ceiling instead of falling back to 256K / 128K defaults.
     """
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "anthropic"
     description: Optional[str] = None
+    # Local extension — real per-model token ceilings from Kiro's tokenLimits.
+    context_length: Optional[int] = None
+    max_input_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
 
 
 class ModelList(BaseModel):
