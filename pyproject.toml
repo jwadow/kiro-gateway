@@ -1,0 +1,36 @@
+[project]
+name = "kiro-gateway"
+version = "0.1.0"
+description = "OpenAI-compatible interface for Kiro API"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "loguru",
+    "python-dotenv",
+    "tiktoken",
+]
+
+[project.scripts]
+kiro-gateway = "main:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "hypothesis",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+pythonpath = ["."]
+norecursedirs = [".git", "__pycache__", "old", "requests", "_notes"]
+
+[tool.uv]
+package = false

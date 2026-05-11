@@ -18,6 +18,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.venv/
+uv.lock
 
 # Debug logs (generated when DEBUG_MODE is enabled)
 debug_logs*/

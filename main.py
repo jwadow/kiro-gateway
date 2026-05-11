@@ -153,12 +153,14 @@ class InterceptHandler(logging.Handler):
 def setup_logging_intercept():
     """
     Configures log interception from standard logging to loguru.
-    
+
     Intercepts logs from:
     - uvicorn (access logs, error logs)
     - uvicorn.error
     - uvicorn.access
     - fastapi
+    - httpx (HTTP client requests)
+    - httpcore (low-level HTTP connections)
     """
     # List of loggers to intercept
     loggers_to_intercept = [
@@ -166,6 +168,8 @@ def setup_logging_intercept():
         "uvicorn.error",
         "uvicorn.access",
         "fastapi",
+        "httpx",
+        "httpcore",
     ]
     
     for logger_name in loggers_to_intercept:
