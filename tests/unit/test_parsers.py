@@ -1357,3 +1357,161 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+class TestToolStartEmptyDictFix:
+    """
+    Tests for the fix: tool_start with empty dict input must not corrupt
+    subsequent tool_input string fragments.
+
+    Root cause: when Kiro sends tool_start with input={} (empty dict), the old
+    code serialised it to '{}' and then appended tool_input fragments, producing
+    '{}...' which is invalid JSON.  The fix uses '' (empty string) for an empty
+    dict so that fragments are concatenated cleanly.
+    """
+
+    def test_tool_start_empty_dict_then_fragments_produce_valid_json(self, aws_event_parser):
+        """
+        What it does: Simulates the exact Kiro protocol for file-write tools.
+        Goal: Ensure tool_start with input={} followed by tool_input fragments
+              produces valid, parseable JSON arguments.
+        """
+        print("Setup: tool_start with empty dict input...")
+        aws_event_parser.feed(b'{"name":"str_replace_based_edit","toolUseId":"call_abc","input":{}}')
+
+        print("Action: Feeding tool_input string fragments...")
+        aws_event_parser.feed(b'{"input":"{\\"command\\": \\"create\\", \\"path\\": \\"/foo.py\\""}')
+        aws_event_parser.feed(b'{"input":", \\"file_text\\": \\"print(1)\\"}"}')
+
+        print("Action: Stopping tool call...")
+        aws_event_parser.feed(b'{"stop":true}')
+
+        tool_calls = aws_event_parser.get_tool_calls()
+        print(f"Result: {tool_calls}")
+
+        assert len(tool_calls) == 1
+        args = tool_calls[0]["function"]["arguments"]
+        print(f"Arguments: {args}")
+
+        import json as _json
+        parsed = _json.loads(args)
+        assert parsed["command"] == "create"
+        assert parsed["path"] == "/foo.py"
+        assert "print(1)" in parsed["file_text"]
+
+    def test_tool_start_nonempty_dict_is_complete_no_fragments(self, aws_event_parser):
+        """
+        What it does: When tool_start carries a non-empty dict, it is the full input.
+        Goal: Ensure non-empty dict is serialised correctly and no fragments corrupt it.
+        """
+        print("Setup: tool_start with non-empty dict input (complete)...")
+        aws_event_parser.feed(
+            b'{"name":"bash","toolUseId":"call_xyz","input":{"command":"ls -la"}}'
+        )
+        aws_event_parser.feed(b'{"stop":true}')
+
+        tool_calls = aws_event_parser.get_tool_calls()
+        print(f"Result: {tool_calls}")
+
+        assert len(tool_calls) == 1
+        import json as _json
+        parsed = _json.loads(tool_calls[0]["function"]["arguments"])
+        assert parsed["command"] == "ls -la"
+
+    def test_tool_start_empty_string_input_then_fragments(self, aws_event_parser):
+        """
+        What it does: tool_start with input='' (empty string) followed by fragments.
+        Goal: Ensure empty string input also works correctly with fragments.
+        """
+        print("Setup: tool_start with empty string input...")
+        aws_event_parser.feed(b'{"name":"write_file","toolUseId":"call_001","input":""}')
+
+        print("Action: Feeding fragments...")
+        aws_event_parser.feed(b'{"input":"{\\"path\\": \\"/tmp/x.txt\\""}')
+        aws_event_parser.feed(b'{"input":", \\"content\\": \\"hello\\"}"}')
+        aws_event_parser.feed(b'{"stop":true}')
+
+        tool_calls = aws_event_parser.get_tool_calls()
+        assert len(tool_calls) == 1
+        import json as _json
+        parsed = _json.loads(tool_calls[0]["function"]["arguments"])
+        assert parsed["path"] == "/tmp/x.txt"
+        assert parsed["content"] == "hello"
+
+    def test_tool_input_empty_dict_fragment_is_ignored(self, aws_event_parser):
+        """
+        What it does: tool_input event with input={} (empty dict) contributes nothing.
+        Goal: Ensure empty dict in tool_input doesn't append '{}' to arguments.
+        """
+        print("Setup: tool_start then tool_input with empty dict...")
+        aws_event_parser.feed(b'{"name":"func","toolUseId":"call_002","input":{}}')
+        aws_event_parser.feed(b'{"input":{}}')  # empty dict fragment — should add nothing
+        aws_event_parser.feed(b'{"input":"{\\"key\\": \\"val\\"}"}')
+        aws_event_parser.feed(b'{"stop":true}')
+
+        tool_calls = aws_event_parser.get_tool_calls()
+        assert len(tool_calls) == 1
+        import json as _json
+        parsed = _json.loads(tool_calls[0]["function"]["arguments"])
+        assert parsed["key"] == "val"
+
+    def test_large_file_content_in_fragments(self, aws_event_parser):
+        """
+        What it does: Simulates a large file write split across many tool_input events.
+        Goal: Ensure all fragments are concatenated and the final JSON is valid.
+        """
+        import json as _json
+
+        file_content = "x = 1\n" * 500  # ~3 KB of content
+        full_args = _json.dumps({"command": "create", "path": "/big.py", "file_text": file_content})
+
+        # Split into 50-char fragments
+        chunk_size = 50
+        fragments = [full_args[i:i + chunk_size] for i in range(0, len(full_args), chunk_size)]
+
+        print(f"Setup: {len(fragments)} fragments for {len(full_args)}-char JSON...")
+        aws_event_parser.feed(b'{"name":"str_replace_based_edit","toolUseId":"call_big","input":{}}')
+
+        for frag in fragments:
+            escaped = frag.replace('\\', '\\\\').replace('"', '\\"')
+            aws_event_parser.feed(f'{{"input":"{escaped}"}}'.encode())
+
+        aws_event_parser.feed(b'{"stop":true}')
+
+        tool_calls = aws_event_parser.get_tool_calls()
+        assert len(tool_calls) == 1
+
+        parsed = _json.loads(tool_calls[0]["function"]["arguments"])
+        assert parsed["command"] == "create"
+        assert parsed["path"] == "/big.py"
+        assert parsed["file_text"] == file_content
+
+    def test_str_replace_tool_with_old_and_new_str(self, aws_event_parser):
+        """
+        What it does: Simulates str_replace_based_edit with old_str/new_str fields.
+        Goal: Ensure multi-field tool arguments with newlines are parsed correctly.
+        """
+        import json as _json
+
+        args = {
+            "command": "str_replace",
+            "path": "/src/main.py",
+            "old_str": "def foo():\n    pass",
+            "new_str": "def foo():\n    return 42"
+        }
+        full_json = _json.dumps(args)
+
+        aws_event_parser.feed(b'{"name":"str_replace_based_edit","toolUseId":"call_sr","input":{}}')
+
+        # Send as a single tool_input fragment
+        escaped = full_json.replace('\\', '\\\\').replace('"', '\\"')
+        aws_event_parser.feed(f'{{"input":"{escaped}"}}'.encode())
+        aws_event_parser.feed(b'{"stop":true}')
+
+        tool_calls = aws_event_parser.get_tool_calls()
+        assert len(tool_calls) == 1
+
+        parsed = _json.loads(tool_calls[0]["function"]["arguments"])
+        assert parsed["command"] == "str_replace"
+        assert parsed["old_str"] == "def foo():\n    pass"
+        assert parsed["new_str"] == "def foo():\n    return 42"

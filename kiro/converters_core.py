@@ -1547,8 +1547,15 @@ def build_kiro_payload(
         if tool_results:
             user_input_context["toolResults"] = tool_results
     
-    # Inject thinking tags if enabled (only for the current/last user message)
-    if current_message.role == "user":
+    # Inject thinking tags if enabled (only for the current/last user message,
+    # and only when the message does NOT carry tool_results).
+    # When tool_results are present the model is processing tool output, not a
+    # new user turn — injecting thinking tags here confuses Kiro API and can
+    # cause "Improperly formed request" errors for file-write tool calls.
+    has_tool_results_in_current = bool(
+        current_message.tool_results or user_input_context.get("toolResults")
+    )
+    if current_message.role == "user" and not has_tool_results_in_current:
         current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage

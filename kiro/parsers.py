@@ -348,15 +348,30 @@ class AwsEventStreamParser:
         return {"type": "content", "data": content}
     
     def _process_tool_start_event(self, data: dict) -> Optional[Dict[str, Any]]:
-        """Processes tool call start."""
+        """Processes tool call start.
+        
+        Kiro API sends tool arguments in two ways:
+        1. Entirely in tool_start as a non-empty dict: input is complete, no tool_input events follow.
+        2. As streaming string fragments: tool_start has input={} (empty dict) or input="" (empty string),
+           followed by tool_input events that carry raw JSON string fragments to be concatenated.
+        
+        The key insight: an empty dict {} in tool_start means "no input yet, fragments follow".
+        We must NOT serialize it to "{}" because that would corrupt the concatenation of fragments.
+        """
         # Finalize previous tool call if exists
         if self.current_tool_call:
             self._finalize_tool_call()
         
-        # input can be string or object
         input_data = data.get('input', '')
         if isinstance(input_data, dict):
-            input_str = json.dumps(input_data)
+            if input_data:
+                # Non-empty dict: the entire input was delivered in tool_start.
+                # Serialize it; no tool_input fragments are expected.
+                input_str = json.dumps(input_data)
+            else:
+                # Empty dict {}: tool_input string fragments will follow.
+                # Use empty string so fragments can be appended cleanly.
+                input_str = ''
         else:
             input_str = str(input_data) if input_data else ''
         
@@ -375,12 +390,20 @@ class AwsEventStreamParser:
         return None
     
     def _process_tool_input_event(self, data: dict) -> Optional[Dict[str, Any]]:
-        """Processes input continuation for tool call."""
+        """Processes input continuation for tool call.
+        
+        tool_input events carry raw JSON string fragments that must be concatenated
+        to form the complete JSON arguments string.  The input field is always a
+        string fragment in practice; a dict value here would be unusual but is
+        handled by serialising it and appending (same logic as tool_start).
+        """
         if self.current_tool_call:
-            # input can be string or object
             input_data = data.get('input', '')
             if isinstance(input_data, dict):
-                input_str = json.dumps(input_data)
+                if input_data:
+                    input_str = json.dumps(input_data)
+                else:
+                    input_str = ''
             else:
                 input_str = str(input_data) if input_data else ''
             self.current_tool_call['function']['arguments'] += input_str

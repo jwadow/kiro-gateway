@@ -6455,3 +6455,136 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestThinkingTagsNotInjectedWithToolResults:
+    """
+    Tests that thinking tags are NOT injected when the current message contains
+    tool_results (file-write tool responses from Claude Code / OpenCode).
+
+    Injecting thinking tags into a tool_result message confuses Kiro API and
+    causes "Improperly formed request" errors for file-write operations.
+    """
+
+    def test_no_thinking_tags_when_current_message_has_tool_results(self, monkeypatch):
+        """
+        What it does: Verifies thinking tags are skipped for tool_result messages.
+        Purpose: Prevent "Improperly formed request" on file-write tool responses.
+        """
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 0)
+
+        messages = [
+            UnifiedMessage(role="user", content="Write a file"),
+            UnifiedMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{
+                    "id": "toolu_abc",
+                    "type": "function",
+                    "function": {"name": "str_replace_based_edit", "arguments": '{"command":"create","path":"/foo.py","file_text":"x=1"}'}
+                }]
+            ),
+            UnifiedMessage(
+                role="user",
+                content="",
+                tool_results=[{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_abc",
+                    "content": "File written successfully"
+                }]
+            ),
+        ]
+
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4.5",
+            tools=[UnifiedTool(name="str_replace_based_edit", description="Edit files", input_schema={})],
+            conversation_id="conv-1",
+            profile_arn="",
+            thinking_config=ThinkingConfig(enabled=True, budget_tokens=8000)
+        )
+
+        user_input = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        content = user_input["content"]
+
+        print(f"Current message content: {repr(content)}")
+        assert "<thinking_mode>" not in content, (
+            "Thinking tags must NOT be injected when current message has tool_results"
+        )
+        # Tool results must still be present
+        ctx = user_input.get("userInputMessageContext", {})
+        assert "toolResults" in ctx
+
+    def test_thinking_tags_injected_for_plain_user_message(self, monkeypatch):
+        """
+        What it does: Verifies thinking tags ARE injected for normal user messages.
+        Purpose: Ensure the fix doesn't break the happy path.
+        """
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 0)
+
+        messages = [UnifiedMessage(role="user", content="Hello")]
+
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4.5",
+            tools=None,
+            conversation_id="conv-2",
+            profile_arn="",
+            thinking_config=ThinkingConfig(enabled=True, budget_tokens=5000)
+        )
+
+        content = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "<thinking_mode>enabled</thinking_mode>" in content
+        assert "<max_thinking_length>5000</max_thinking_length>" in content
+
+    def test_no_thinking_tags_openai_tool_result_message(self, monkeypatch):
+        """
+        What it does: Simulates OpenCode sending tool results (OpenAI format).
+        Purpose: Ensure OpenCode file-write tool responses work correctly.
+        """
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 0)
+
+        # OpenCode sends: assistant with tool_calls, then user with tool_results
+        messages = [
+            UnifiedMessage(role="user", content="Create a file"),
+            UnifiedMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{
+                    "id": "call_xyz",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": '{"path":"/tmp/x.py","content":"print(1)"}'}
+                }]
+            ),
+            UnifiedMessage(
+                role="user",
+                content="",
+                tool_results=[{
+                    "type": "tool_result",
+                    "tool_use_id": "call_xyz",
+                    "content": "File created at /tmp/x.py"
+                }]
+            ),
+        ]
+
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4.5",
+            tools=[UnifiedTool(name="write_file", description="Write file", input_schema={})],
+            conversation_id="conv-3",
+            profile_arn="",
+            thinking_config=ThinkingConfig(enabled=True, budget_tokens=8000)
+        )
+
+        user_input = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        content = user_input["content"]
+        assert "<thinking_mode>" not in content
+        ctx = user_input.get("userInputMessageContext", {})
+        assert "toolResults" in ctx
+        assert ctx["toolResults"][0]["toolUseId"] == "call_xyz"
