@@ -36,6 +36,7 @@ from kiro.converters_core import (
     convert_tool_results_to_kiro_format,
     tool_calls_to_text,
     tool_results_to_text,
+    get_tool_call_size_guard_system_addition,
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
@@ -6588,3 +6589,92 @@ class TestThinkingTagsNotInjectedWithToolResults:
         ctx = user_input.get("userInputMessageContext", {})
         assert "toolResults" in ctx
         assert ctx["toolResults"][0]["toolUseId"] == "call_xyz"
+
+
+# ==================================================================================================
+# Tests for get_tool_call_size_guard_system_addition
+# ==================================================================================================
+
+class TestToolCallSizeGuard:
+    """Tests for get_tool_call_size_guard_system_addition and its integration in build_kiro_payload."""
+
+    def test_returns_empty_when_disabled(self):
+        """
+        What it does: Returns empty string when TOOL_CALL_SIZE_GUARD=false.
+        Purpose: Ensure users can opt out of the guard.
+        """
+        tools = [UnifiedTool(name="Write", description="Write a file", input_schema={})]
+        with patch("kiro.config.TOOL_CALL_SIZE_GUARD", False):
+            result = get_tool_call_size_guard_system_addition(tools)
+        assert result == ""
+
+    def test_returns_empty_when_no_tools(self):
+        """
+        What it does: Returns empty string when tools list is None or empty.
+        Purpose: Guard is irrelevant without tools — avoid polluting system prompt.
+        """
+        with patch("kiro.config.TOOL_CALL_SIZE_GUARD", True):
+            assert get_tool_call_size_guard_system_addition(None) == ""
+            assert get_tool_call_size_guard_system_addition([]) == ""
+
+    def test_returns_instruction_when_tools_present(self):
+        """
+        What it does: Returns non-empty instruction when tools are present and guard is enabled.
+        Purpose: Core behavior — instruction must be present and mention key constraints.
+        """
+        tools = [UnifiedTool(name="Write", description="Write a file", input_schema={})]
+        with patch("kiro.config.TOOL_CALL_SIZE_GUARD", True):
+            result = get_tool_call_size_guard_system_addition(tools)
+        assert len(result) > 0
+        assert "7KB" in result
+        assert "Write" in result
+        assert "Edit" in result
+
+    def test_injected_into_payload_when_tools_present(self):
+        """
+        What it does: Verifies build_kiro_payload includes size guard in system prompt.
+        Purpose: Integration — guard must reach the Kiro API payload.
+        """
+        messages = [UnifiedMessage(role="user", content="Write a large file")]
+        tools = [UnifiedTool(
+            name="Write",
+            description="Write a file",
+            input_schema={"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}}
+        )]
+        with patch("kiro.config.TOOL_CALL_SIZE_GUARD", True), \
+             patch("kiro.config.FAKE_REASONING_ENABLED", False), \
+             patch("kiro.config.TRUNCATION_RECOVERY", False):
+            result = build_kiro_payload(
+                messages=messages,
+                system_prompt="You are helpful.",
+                model_id="claude-sonnet-4-5",
+                tools=tools,
+                conversation_id="test-conv",
+                profile_arn="",
+                thinking_config=ThinkingConfig(enabled=False),
+            )
+        # No history → system prompt is prepended to current message content
+        current_content = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "Tool Call Size Constraint" in current_content
+        assert "7KB" in current_content
+
+    def test_not_injected_when_no_tools(self):
+        """
+        What it does: Verifies size guard is absent from payload when no tools.
+        Purpose: Avoid polluting system prompt for non-tool requests.
+        """
+        messages = [UnifiedMessage(role="user", content="Hello")]
+        with patch("kiro.config.TOOL_CALL_SIZE_GUARD", True), \
+             patch("kiro.config.FAKE_REASONING_ENABLED", False), \
+             patch("kiro.config.TRUNCATION_RECOVERY", False):
+            result = build_kiro_payload(
+                messages=messages,
+                system_prompt="",
+                model_id="claude-sonnet-4-5",
+                tools=None,
+                conversation_id="test-conv",
+                profile_arn="",
+                thinking_config=ThinkingConfig(enabled=False),
+            )
+        current_content = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "Tool Call Size Constraint" not in current_content

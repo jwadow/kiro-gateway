@@ -329,6 +329,15 @@ TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", 
 TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in ("true", "1", "yes")
 
 # ==================================================================================================
+# Tool Call Size Guard Settings
+# ==================================================================================================
+
+# Inject system prompt instruction to prevent tool call arguments exceeding
+# Kiro API's ~9KB output limit (causes silent truncation to empty {})
+# Default: true (enabled) — disable only if you handle chunking at the client level
+TOOL_CALL_SIZE_GUARD: bool = os.getenv("TOOL_CALL_SIZE_GUARD", "true").lower() in ("true", "1", "yes")
+
+# ==================================================================================================
 # Logging Settings
 # ==================================================================================================
 
