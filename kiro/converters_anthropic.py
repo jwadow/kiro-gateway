@@ -24,6 +24,8 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
+import base64
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -43,6 +45,114 @@ from kiro.converters_core import (
     extract_text_content,
     extract_images_from_content,
 )
+
+try:
+    from pypdf import PdfReader
+except ImportError:  # pragma: no cover - exercised only when optional dependency is absent
+    PdfReader = None
+
+
+MAX_EXTRACTED_DOCUMENT_CHARS = 60000
+
+
+def _block_value(block: Any, key: str, default: Any = None) -> Any:
+    if isinstance(block, dict):
+        return block.get(key, default)
+    return getattr(block, key, default)
+
+
+def _truncate_document_text(text: str) -> str:
+    if len(text) <= MAX_EXTRACTED_DOCUMENT_CHARS:
+        return text
+    return text[:MAX_EXTRACTED_DOCUMENT_CHARS] + "\n\n[Document text truncated]"
+
+
+def _extract_pdf_text_from_base64(data: str) -> str:
+    if PdfReader is None:
+        return "[PDF text extraction unavailable: pypdf is not installed]"
+
+    pdf_bytes = base64.b64decode(data)
+    reader = PdfReader(BytesIO(pdf_bytes))
+    page_texts = []
+
+    for index, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        text = text.strip()
+        if text:
+            page_texts.append(f"Page {index}:\n{text}")
+
+    if not page_texts:
+        return "[PDF text extraction returned no text]"
+
+    return _truncate_document_text("\n\n".join(page_texts))
+
+
+def _document_block_to_text(block: Any) -> str:
+    source = _block_value(block, "source", {})
+    title = _block_value(block, "title", None)
+
+    if isinstance(source, dict):
+        source_type = source.get("type")
+        media_type = source.get("media_type", "application/octet-stream")
+        data = source.get("data", "")
+        url = source.get("url", "")
+    else:
+        source_type = getattr(source, "type", None)
+        media_type = getattr(source, "media_type", "application/octet-stream")
+        data = getattr(source, "data", "")
+        url = getattr(source, "url", "")
+
+    label = f"Document: {title or media_type}"
+
+    if source_type == "base64" and data:
+        try:
+            if media_type == "application/pdf":
+                body = _extract_pdf_text_from_base64(data)
+            elif media_type.startswith("text/"):
+                body = base64.b64decode(data).decode("utf-8", errors="replace")
+                body = _truncate_document_text(body)
+            else:
+                byte_count = len(base64.b64decode(data, validate=True))
+                body = f"[Document extraction unsupported for {media_type}; {byte_count} bytes]"
+        except Exception as exc:
+            logger.warning(f"Failed to extract Anthropic document block ({media_type}): {exc}")
+            body = f"[Document extraction failed for {media_type}: {exc}]"
+
+        return f"[{label}]\n{body}"
+
+    if source_type == "url" and url:
+        return f"[{label}]\n[URL document sources are not supported by Kiro Gateway: {url}]"
+
+    return f"[{label}]\n[Document source was empty or unsupported]"
+
+
+def extract_documents_from_anthropic_content(content: Any) -> str:
+    """
+    Extracts document blocks from Anthropic content as plain text.
+
+    Kiro does not accept Anthropic document blocks directly, so PDF/text
+    documents are converted into text and appended to the user message.
+    """
+    if not isinstance(content, list):
+        return ""
+
+    document_parts = []
+
+    for block in content:
+        block_type = _block_value(block, "type")
+
+        if block_type == "document":
+            document_parts.append(_document_block_to_text(block))
+            continue
+
+        if block_type == "tool_result":
+            result_content = _block_value(block, "content", None)
+            if isinstance(result_content, list):
+                for item in result_content:
+                    if _block_value(item, "type") == "document":
+                        document_parts.append(_document_block_to_text(item))
+
+    return "\n\n".join(document_parts)
 
 
 def convert_anthropic_content_to_text(content: Any) -> str:
@@ -284,6 +394,9 @@ def convert_anthropic_messages(
 
         # Extract text content
         text_content = convert_anthropic_content_to_text(content)
+        document_text = extract_documents_from_anthropic_content(content)
+        if document_text:
+            text_content = f"{text_content}\n\n{document_text}".strip()
 
         # Extract tool-related data and images based on role
         tool_calls = None
