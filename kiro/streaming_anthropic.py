@@ -135,7 +135,8 @@ async def stream_kiro_to_anthropic(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    metering_holder: Optional[list] = None
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -522,6 +523,8 @@ async def stream_kiro_to_anthropic(
                 context_usage_percentage = event.context_usage_percentage
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
+                if metering_holder is not None:
+                    metering_holder.append(event.usage)
         
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
@@ -725,7 +728,8 @@ async def collect_anthropic_response(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    metering_holder: Optional[list] = None
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -760,6 +764,8 @@ async def collect_anthropic_response(
     # Collect stream result
     result = await collect_stream_to_result(response)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
+    if metering_holder is not None and result.usage is not None:
+        metering_holder.append(result.usage)
     
     # Build content blocks
     content_blocks = []
@@ -873,7 +879,8 @@ async def stream_with_first_token_retry_anthropic(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    metering_holder: Optional[list] = None
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -934,6 +941,7 @@ async def stream_with_first_token_retry_anthropic(
             request_messages=request_messages,
             request_tools=request_tools,
             request_system=request_system,
+            metering_holder=metering_holder,
         ):
             yield chunk
     

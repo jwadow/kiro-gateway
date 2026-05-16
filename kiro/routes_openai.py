@@ -375,6 +375,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
                     tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
                     
+                    # Per-response credit collector. Kiro emits a `usage` event
+                    # at the end of every successful stream representing the
+                    # cost of that single response. We attribute that to the
+                    # originating account once the stream finishes.
+                    metering_holder: list = []
+                    
                     if request_data.stream:
                         # Streaming mode
                         async def stream_wrapper():
@@ -394,7 +400,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     auth_manager=auth_manager,
                                     initial_response=response,
                                     request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer
+                                    request_tools=tools_for_tokenizer,
+                                    metering_holder=metering_holder
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -409,6 +416,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                 raise
                             finally:
                                 await http_client.close()
+                                # Report any captured credits to the account stats
+                                if not streaming_error and metering_holder:
+                                    for credits in metering_holder:
+                                        try:
+                                            await account_manager.report_credits_used(account.id, credits)
+                                        except Exception as report_error:
+                                            logger.warning(f"Failed to report credits for {account.id}: {report_error}")
                                 if streaming_error:
                                     error_type = type(streaming_error).__name__
                                     error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
@@ -434,10 +448,16 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             model_cache,
                             auth_manager,
                             request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer
+                            request_tools=tools_for_tokenizer,
+                            metering_holder=metering_holder
                         )
                         
                         await http_client.close()
+                        for credits in metering_holder:
+                            try:
+                                await account_manager.report_credits_used(account.id, credits)
+                            except Exception as report_error:
+                                logger.warning(f"Failed to report credits for {account.id}: {report_error}")
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
                         
                         if debug_logger:

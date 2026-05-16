@@ -78,7 +78,8 @@ async def stream_kiro_to_openai_internal(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    metering_holder: Optional[list] = None
 ) -> AsyncGenerator[str, None]:
     """
     Internal generator for converting Kiro stream to OpenAI format.
@@ -264,6 +265,8 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "usage" and event.usage:
                 metering_data = event.usage
+                if metering_holder is not None:
+                    metering_holder.append(event.usage)
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
@@ -454,7 +457,8 @@ async def stream_kiro_to_openai(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    metering_holder: Optional[list] = None
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to OpenAI format.
@@ -470,6 +474,10 @@ async def stream_kiro_to_openai(
         auth_manager: Authentication manager
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        metering_holder: Optional list to capture Kiro `usage` (credit) values.
+            When provided, every credits event seen on the stream is appended
+            to this list, allowing the caller to attribute the cost to the
+            originating account after the stream completes.
     
     Yields:
         Strings in SSE format: "data: {...}\\n\\n" or "data: [DONE]\\n\\n"
@@ -477,7 +485,8 @@ async def stream_kiro_to_openai(
     async for chunk in stream_kiro_to_openai_internal(
         client, response, model, model_cache, auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        metering_holder=metering_holder
     ):
         yield chunk
 
@@ -492,7 +501,8 @@ async def stream_with_first_token_retry(
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    metering_holder: Optional[list] = None
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout.
@@ -557,7 +567,8 @@ async def stream_with_first_token_retry(
             auth_manager,
             first_token_timeout=first_token_timeout,
             request_messages=request_messages,
-            request_tools=request_tools
+            request_tools=request_tools,
+            metering_holder=metering_holder
         ):
             yield chunk
     
@@ -580,7 +591,8 @@ async def collect_stream_response(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    metering_holder: Optional[list] = None
 ) -> dict:
     """
     Collect full response from streaming stream.
@@ -596,6 +608,8 @@ async def collect_stream_response(
         auth_manager: Authentication manager
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        metering_holder: Optional list to capture Kiro `usage` (credit) values
+            for account-level credit accounting.
     
     Returns:
         Dictionary with full response in OpenAI chat.completion format
@@ -614,7 +628,8 @@ async def collect_stream_response(
         model_cache,
         auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        metering_holder=metering_holder
     ):
         if not chunk_str.startswith("data:"):
             continue

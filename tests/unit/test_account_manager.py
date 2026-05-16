@@ -1578,3 +1578,272 @@ class TestAccountManagerManagementPanel:
         assert snapshot["totals"]["total_requests"] == 3
         assert snapshot["totals"]["successful_requests"] == 2
         assert snapshot["totals"]["failed_requests"] == 1
+
+
+class TestAccountManagerCreditsUsage:
+    """
+    Tests for credit usage accounting on AccountManager.
+
+    Credit accounting is a best-effort meter: every successful Kiro response
+    carries a `usage` event with a numeric credit cost, and we accumulate it
+    on the originating account so the admin panel can show how much was burned
+    through this gateway. The real Kiro quota lives server-side and we never
+    see the remaining balance.
+    """
+
+    def test_account_stats_default_credits_used_total_is_zero(self):
+        """
+        AccountStats credits_used_total defaults to 0.0.
+
+        What it does: Instantiates AccountStats with no arguments
+        Purpose: Ensure new field has a safe default for fresh accounts
+        """
+        print("\n=== Test: AccountStats default credits_used_total ===")
+        stats = AccountStats()
+        print(f"credits_used_total={stats.credits_used_total}")
+        assert stats.credits_used_total == 0.0
+        assert isinstance(stats.credits_used_total, float)
+
+    @pytest.mark.asyncio
+    async def test_report_credits_used_accumulates_multiple_calls(self, tmp_path):
+        """
+        Multiple credit reports are summed into credits_used_total.
+
+        What it does: Reports three different credit values for one account
+        Purpose: Verify accumulation across responses
+        """
+        print("\n=== Test: report_credits_used accumulates ===")
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "refresh_token", "refresh_token": "abcdefghijklmnop", "enabled": True}
+        ]))
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = list(manager._accounts.keys())[0]
+        manager._dirty = False
+
+        await manager.report_credits_used(account_id, 1.5)
+        await manager.report_credits_used(account_id, 2)
+        await manager.report_credits_used(account_id, 0.25)
+
+        total = manager._accounts[account_id].stats.credits_used_total
+        print(f"Accumulated credits: {total}")
+        assert total == pytest.approx(3.75)
+        assert manager._dirty is True
+
+    @pytest.mark.asyncio
+    async def test_report_credits_used_ignores_invalid_values(self, tmp_path):
+        """
+        Non-finite, non-positive, or non-numeric values are silently ignored.
+
+        What it does: Reports None / NaN / negative / zero / non-numeric values
+        Purpose: Guard against malformed `usage` events from Kiro
+        """
+        print("\n=== Test: report_credits_used ignores invalid values ===")
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "refresh_token", "refresh_token": "abcdefghijklmnop", "enabled": True}
+        ]))
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = list(manager._accounts.keys())[0]
+        manager._dirty = False
+
+        await manager.report_credits_used(account_id, None)  # type: ignore[arg-type]
+        await manager.report_credits_used(account_id, float("nan"))
+        await manager.report_credits_used(account_id, float("inf"))
+        await manager.report_credits_used(account_id, -5.0)
+        await manager.report_credits_used(account_id, 0)
+        await manager.report_credits_used(account_id, "not-a-number")  # type: ignore[arg-type]
+
+        total = manager._accounts[account_id].stats.credits_used_total
+        print(f"Total after invalid inputs: {total}")
+        assert total == 0.0
+        assert manager._dirty is False
+
+    @pytest.mark.asyncio
+    async def test_report_credits_used_unknown_account_is_noop(self, tmp_path):
+        """
+        Reporting credits for an unknown account_id is a silent no-op.
+
+        What it does: Calls report_credits_used with an unregistered account id
+        Purpose: Prevent crashes when an account is removed mid-flight
+        """
+        print("\n=== Test: report_credits_used unknown account no-op ===")
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text("[]")
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        manager._dirty = False
+
+        await manager.report_credits_used("missing-account-id", 1.0)
+
+        assert manager._dirty is False
+
+    @pytest.mark.asyncio
+    async def test_report_credits_used_accepts_string_numeric(self, tmp_path):
+        """
+        Numeric strings like "0.5" are coerced to float.
+
+        What it does: Passes a numeric string to report_credits_used
+        Purpose: Be lenient with stream payload typing while staying safe
+        """
+        print("\n=== Test: report_credits_used accepts numeric strings ===")
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "refresh_token", "refresh_token": "abcdefghijklmnop", "enabled": True}
+        ]))
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = list(manager._accounts.keys())[0]
+
+        await manager.report_credits_used(account_id, "0.5")  # type: ignore[arg-type]
+
+        total = manager._accounts[account_id].stats.credits_used_total
+        print(f"Total: {total}")
+        assert total == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_credits_used_total_persists_across_save_and_load(self, tmp_path):
+        """
+        credits_used_total survives a state.json save/load cycle.
+
+        What it does: Saves state with credits, reloads into a fresh manager
+        Purpose: Verify persistence of the new field across restarts
+        """
+        print("\n=== Test: credits_used_total persists across save/load ===")
+
+        creds_file = tmp_path / "credentials.json"
+        state_file = tmp_path / "state.json"
+        creds_file.write_text(json.dumps([
+            {"type": "refresh_token", "refresh_token": "abcdefghijklmnop", "enabled": True}
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(state_file)
+        )
+        await manager.load_credentials()
+        account_id = list(manager._accounts.keys())[0]
+        await manager.report_credits_used(account_id, 7.5)
+        await manager.report_credits_used(account_id, 0.25)
+        await manager._save_state()
+
+        # Inspect raw state file
+        raw_state = json.loads(state_file.read_text())
+        print(f"Persisted state stats: {raw_state['accounts'][account_id]['stats']}")
+        assert raw_state["accounts"][account_id]["stats"]["credits_used_total"] == pytest.approx(7.75)
+
+        # Reload into a fresh manager
+        manager2 = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(state_file)
+        )
+        await manager2.load_credentials()
+        await manager2.load_state()
+
+        reloaded = manager2._accounts[account_id].stats.credits_used_total
+        print(f"Reloaded credits_used_total: {reloaded}")
+        assert reloaded == pytest.approx(7.75)
+
+    @pytest.mark.asyncio
+    async def test_load_state_legacy_without_credits_field_defaults_to_zero(self, tmp_path):
+        """
+        State files written before this feature load with credits_used_total=0.0.
+
+        What it does: Writes a state.json missing credits_used_total
+        Purpose: Backwards compatibility with pre-existing deployments
+        """
+        print("\n=== Test: legacy state.json without credits_used_total ===")
+
+        creds_file = tmp_path / "credentials.json"
+        state_file = tmp_path / "state.json"
+        creds_file.write_text(json.dumps([
+            {"type": "refresh_token", "refresh_token": "abcdefghijklmnop", "enabled": True}
+        ]))
+
+        # Build a legacy state file without the new field
+        legacy_state = {
+            "current_account_index": 0,
+            "accounts": {},
+            "model_to_accounts": {}
+        }
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(state_file)
+        )
+        await manager.load_credentials()
+        account_id = list(manager._accounts.keys())[0]
+        legacy_state["accounts"][account_id] = {
+            "failures": 1,
+            "last_failure_time": 123.0,
+            "models_cached_at": 456.0,
+            "stats": {
+                "total_requests": 4,
+                "successful_requests": 3,
+                "failed_requests": 1,
+            }
+        }
+        state_file.write_text(json.dumps(legacy_state))
+
+        await manager.load_state()
+
+        stats = manager._accounts[account_id].stats
+        print(
+                f"Loaded stats: total={stats.total_requests}, successful={stats.successful_requests}, "
+                f"failed={stats.failed_requests}, credits={stats.credits_used_total}"
+        )
+        assert stats.total_requests == 4
+        assert stats.successful_requests == 3
+        assert stats.failed_requests == 1
+        assert stats.credits_used_total == 0.0
+
+    @pytest.mark.asyncio
+    async def test_management_snapshot_exposes_credits_used_total(self, tmp_path):
+        """
+        get_management_snapshot includes credits_used_total per account and in totals.
+
+        What it does: Mutates two accounts' credits and inspects snapshot
+        Purpose: Admin panel must see per-account and aggregated credits
+        """
+        print("\n=== Test: management snapshot exposes credits_used_total ===")
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "refresh_token", "refresh_token": "aaaaaaaaaaaaaaaa", "enabled": True},
+            {"type": "refresh_token", "refresh_token": "bbbbbbbbbbbbbbbb", "enabled": True}
+        ]))
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        ids = list(manager._accounts.keys())
+
+        await manager.report_credits_used(ids[0], 1.25)
+        await manager.report_credits_used(ids[1], 2.5)
+
+        snapshot = manager.get_management_snapshot()
+
+        per_account = {a["id"]: a["stats"]["credits_used_total"] for a in snapshot["accounts"]}
+        print(f"Per-account credits: {per_account}")
+        assert per_account[ids[0]] == pytest.approx(1.25)
+        assert per_account[ids[1]] == pytest.approx(2.5)
+        assert snapshot["totals"]["credits_used_total"] == pytest.approx(3.75)

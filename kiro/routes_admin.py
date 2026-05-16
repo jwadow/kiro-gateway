@@ -177,6 +177,34 @@ def _format_age(timestamp: float) -> str:
     return f"{age_seconds // 86400}d ago"
 
 
+def _format_credits(value: Any) -> str:
+    """
+    Format an accumulated credits value for HTML rendering.
+
+    Kiro returns credit consumption as a numeric value per response. We
+    accumulate it as a float; this helper renders it with three significant
+    decimals and a dash for missing/zero values to keep the table compact.
+
+    Args:
+        value: Accumulated credit value (int/float). None or non-numeric
+            inputs render as a dash.
+
+    Returns:
+        Formatted credit string.
+    """
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if amount <= 0:
+        return "-"
+    if amount >= 100:
+        return f"{amount:.0f}"
+    if amount >= 1:
+        return f"{amount:.2f}"
+    return f"{amount:.3f}"
+
+
 def _escape_json(data: Dict[str, Any]) -> str:
     """
     Render sanitized JSON for HTML.
@@ -285,12 +313,13 @@ def _render_panel(request: Request, snapshot: Dict[str, Any]) -> HTMLResponse:
           <td>{account['stats']['total_requests']}</td>
           <td>{account['stats']['successful_requests']}</td>
           <td>{account['stats']['failed_requests']}</td>
+          <td>{_format_credits(account['stats'].get('credits_used_total', 0.0))}</td>
           <td>{_format_age(account['last_failure_time'])}</td>
           <td>{_format_timestamp(account['models_cached_at'])}</td>
         </tr>
         """
         for account in accounts
-    ) or "<tr><td colspan='9' class='muted'>No runtime accounts loaded.</td></tr>"
+    ) or "<tr><td colspan='10' class='muted'>No runtime accounts loaded.</td></tr>"
 
     disabled_notice = "" if account_system_enabled else """
       <div class="error">
@@ -353,6 +382,7 @@ def _render_panel(request: Request, snapshot: Dict[str, Any]) -> HTMLResponse:
       <div class="card"><strong>{totals.get('total_requests', 0)}</strong><span class="muted">total requests</span></div>
       <div class="card"><strong>{totals.get('successful_requests', 0)}</strong><span class="muted">successful requests</span></div>
       <div class="card"><strong>{totals.get('failed_requests', 0)}</strong><span class="muted">failed requests</span></div>
+      <div class="card"><strong>{_format_credits(totals.get('credits_used_total', 0.0))}</strong><span class="muted">credits used (gateway-tracked)</span></div>
       <div class="card"><strong>{snapshot.get('model_mapping_count', 0)}</strong><span class="muted">model mappings</span></div>
     </div>
 
@@ -381,7 +411,7 @@ def _render_panel(request: Request, snapshot: Dict[str, Any]) -> HTMLResponse:
       <h2>Runtime statistics</h2>
       <table>
         <thead>
-          <tr><th>Account</th><th>Initialized</th><th>Failures</th><th>Models</th><th>Total</th><th>OK</th><th>Failed</th><th>Last failure</th><th>Models cached at</th></tr>
+          <tr><th>Account</th><th>Initialized</th><th>Failures</th><th>Models</th><th>Total</th><th>OK</th><th>Failed</th><th>Credits</th><th>Last failure</th><th>Models cached at</th></tr>
         </thead>
         <tbody>{account_rows}</tbody>
       </table>

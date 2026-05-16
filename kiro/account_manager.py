@@ -35,6 +35,7 @@ Key features:
 import asyncio
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -129,11 +130,20 @@ class AccountStats:
     """
     Statistics for account usage.
     
-    Tracks request counts for monitoring and future web UI.
+    Tracks request counts and accumulated credit consumption for monitoring
+    and the local web UI.
+    
+    Attributes:
+        total_requests: Total number of requests routed to this account.
+        successful_requests: Number of successful (HTTP 200) requests.
+        failed_requests: Number of failed requests (recoverable + fatal).
+        credits_used_total: Sum of `usage` (credits) values reported by Kiro
+            on each successful response since the last state reset.
     """
     total_requests: int = 0
     successful_requests: int = 0
     failed_requests: int = 0
+    credits_used_total: float = 0.0
 
 
 @dataclass
@@ -363,7 +373,8 @@ class AccountManager:
                     account.stats = AccountStats(
                         total_requests=stats_data.get("total_requests", 0),
                         successful_requests=stats_data.get("successful_requests", 0),
-                        failed_requests=stats_data.get("failed_requests", 0)
+                        failed_requests=stats_data.get("failed_requests", 0),
+                        credits_used_total=float(stats_data.get("credits_used_total", 0.0))
                     )
             
             logger.info(f"Loaded state: {len(self._model_to_accounts)} model mappings, {len(self._accounts)} accounts")
@@ -387,7 +398,8 @@ class AccountManager:
                     "stats": {
                         "total_requests": account.stats.total_requests,
                         "successful_requests": account.stats.successful_requests,
-                        "failed_requests": account.stats.failed_requests
+                        "failed_requests": account.stats.failed_requests,
+                        "credits_used_total": account.stats.credits_used_total
                     }
                 }
                 for account_id, account in self._accounts.items()
@@ -807,6 +819,45 @@ class AccountManager:
             except ValueError:
                 pass
     
+    async def report_credits_used(self, account_id: str, credits: float) -> None:
+        """
+        Accumulate the credit consumption Kiro reported for one response.
+        
+        Kiro returns a `usage` event at the end of every successful stream that
+        represents the credit cost of that single response. We accumulate it on
+        the originating account so the admin panel can show how much was burned
+        through this account since the last state reset.
+        
+        This is a best-effort meter - it only counts what the gateway routed
+        through this account. The real Kiro quota lives server-side and is not
+        exposed here.
+        
+        Args:
+            account_id: Account that produced the response.
+            credits: Credit amount from the Kiro `usage` event. Non-finite or
+                negative values are silently ignored.
+        """
+        try:
+            credits_value = float(credits)
+        except (TypeError, ValueError):
+            logger.debug(f"Ignoring non-numeric credits value for {account_id}: {credits!r}")
+            return
+        
+        if not math.isfinite(credits_value) or credits_value <= 0:
+            return
+        
+        async with self._lock:
+            account = self._accounts.get(account_id)
+            if not account:
+                return
+            
+            account.stats.credits_used_total += credits_value
+            self._dirty = True
+            logger.debug(
+                f"Account {account_id}: +{credits_value} credits "
+                f"(total={account.stats.credits_used_total})"
+            )
+    
     async def report_failure(
         self,
         account_id: str,
@@ -896,16 +947,19 @@ class AccountManager:
         total_requests = 0
         successful_requests = 0
         failed_requests = 0
+        credits_used_total = 0.0
         
         for account_id, account in self._accounts.items():
             stats = {
                 "total_requests": account.stats.total_requests,
                 "successful_requests": account.stats.successful_requests,
                 "failed_requests": account.stats.failed_requests,
+                "credits_used_total": account.stats.credits_used_total,
             }
             total_requests += account.stats.total_requests
             successful_requests += account.stats.successful_requests
             failed_requests += account.stats.failed_requests
+            credits_used_total += account.stats.credits_used_total
             
             available_models = []
             if account.model_resolver:
@@ -941,6 +995,7 @@ class AccountManager:
                 "total_requests": total_requests,
                 "successful_requests": successful_requests,
                 "failed_requests": failed_requests,
+                "credits_used_total": credits_used_total,
             },
         }
     
