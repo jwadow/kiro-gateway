@@ -2620,6 +2620,51 @@ class TestSanitizeJsonSchema:
         assert "required" not in result
         assert result["type"] == "object"
         assert result["properties"] == {}
+
+    def test_removes_null_required_value(self):
+        """
+        What it does: Verifies removal of null required value.
+        Purpose: Ensure required: None is removed from schema.
+
+        Bedrock rejects tool schemas with required: null because required must
+        be an array when present.
+        """
+        print("Setup: Schema with null required...")
+        schema = {
+            "type": "object",
+            "properties": {},
+            "required": None
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        print("Checking that required is removed...")
+        assert "required" not in result
+        assert result["type"] == "object"
+        assert result["properties"] == {}
+
+    def test_removes_non_array_required_value(self):
+        """
+        What it does: Verifies removal of non-array required value.
+        Purpose: Ensure invalid required values are removed from schema.
+        """
+        print("Setup: Schema with non-array required...")
+        schema = {
+            "type": "object",
+            "properties": {},
+            "required": "location"
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        print("Checking that required is removed...")
+        assert "required" not in result
+        assert result["type"] == "object"
+        assert result["properties"] == {}
     
     def test_preserves_non_empty_required_array(self):
         """
@@ -2711,6 +2756,31 @@ class TestSanitizeJsonSchema:
         nested = result["properties"]["nested"]
         assert "required" not in nested
         assert "additionalProperties" not in nested
+
+    def test_recursively_removes_null_required_value(self):
+        """
+        What it does: Verifies recursive removal of null required values.
+        Purpose: Ensure nested schemas with required: None are sanitized.
+        """
+        print("Setup: Schema with nested null required...")
+        schema = {
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "properties": {},
+                    "required": None
+                }
+            }
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        print("Checking nested object...")
+        nested = result["properties"]["nested"]
+        assert "required" not in nested
     
     def test_sanitizes_items_in_lists(self):
         """
@@ -3500,6 +3570,29 @@ class TestConvertToolsToKiroFormat:
         schema = result[0]["toolSpecification"]["inputSchema"]["json"]
         assert "required" not in schema
         assert "additionalProperties" not in schema
+
+    def test_sanitizes_null_required_in_input_schema(self):
+        """
+        What it does: Verifies null required values are removed from input schema.
+        Purpose: Ensure Bedrock receives a valid tool inputSchema.
+        """
+        print("Setup: Tool with null required...")
+        tools = [UnifiedTool(
+            name="test_tool",
+            description="Test",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "required": None
+            }
+        )]
+
+        print("Action: Converting tools...")
+        result = convert_tools_to_kiro_format(tools)
+
+        print(f"Result: {result}")
+        schema = result[0]["toolSpecification"]["inputSchema"]["json"]
+        assert "required" not in schema
 
 
 # ==================================================================================================
