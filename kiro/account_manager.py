@@ -37,10 +37,11 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from loguru import logger
@@ -879,6 +880,351 @@ class AccountManager:
             if account.auth_manager is not None:
                 return account
         raise RuntimeError("No initialized accounts available")
+    
+    def get_management_snapshot(self) -> Dict[str, Any]:
+        """
+        Build a sanitized snapshot for the local web management panel.
+        
+        Sensitive credential values are masked before returning. Runtime
+        statistics are included to help users understand account health without
+        exposing tokens.
+        
+        Returns:
+            Dictionary with credential entries, account runtime state and totals.
+        """
+        accounts = []
+        total_requests = 0
+        successful_requests = 0
+        failed_requests = 0
+        
+        for account_id, account in self._accounts.items():
+            stats = {
+                "total_requests": account.stats.total_requests,
+                "successful_requests": account.stats.successful_requests,
+                "failed_requests": account.stats.failed_requests,
+            }
+            total_requests += account.stats.total_requests
+            successful_requests += account.stats.successful_requests
+            failed_requests += account.stats.failed_requests
+            
+            available_models = []
+            if account.model_resolver:
+                available_models = account.model_resolver.get_available_models()
+            
+            accounts.append({
+                "id": account_id,
+                "initialized": account.auth_manager is not None,
+                "failures": account.failures,
+                "last_failure_time": account.last_failure_time,
+                "models_cached_at": account.models_cached_at,
+                "available_model_count": len(available_models),
+                "stats": stats,
+            })
+        
+        return {
+            "credentials_file": self._credentials_file,
+            "state_file": self._state_file,
+            "credentials": [
+                {
+                    "index": index,
+                    "entry": self._sanitize_credentials_entry(entry),
+                }
+                for index, entry in enumerate(self._credentials_config)
+            ],
+            "accounts": accounts,
+            "model_mapping_count": len(self._model_to_accounts),
+            "current_account_index": self._current_account_index,
+            "totals": {
+                "configured_entries": len(self._credentials_config),
+                "loaded_accounts": len(self._accounts),
+                "initialized_accounts": sum(1 for account in self._accounts.values() if account.auth_manager is not None),
+                "total_requests": total_requests,
+                "successful_requests": successful_requests,
+                "failed_requests": failed_requests,
+            },
+        }
+    
+    async def add_credentials_entries(self, entries: List[Dict[str, Any]]) -> None:
+        """
+        Add credential entries to credentials.json and reload account metadata.
+        
+        Args:
+            entries: Credential entries in the same JSON format used by credentials.json.
+        
+        Raises:
+            ValueError: If entries are empty or malformed.
+            OSError: If the credentials file cannot be written.
+            json.JSONDecodeError: If the existing credentials file is invalid JSON.
+        """
+        if not entries:
+            raise ValueError("At least one account entry is required")
+        
+        async with self._lock:
+            credentials = self._read_credentials_config_file()
+            normalized_entries = [self._prepare_credentials_entry_for_storage(entry) for entry in entries]
+            for entry in normalized_entries:
+                self._validate_credentials_entry(entry)
+            credentials.extend(normalized_entries)
+            self._write_credentials_config_file(credentials)
+            await self._reload_credentials_locked()
+        
+        logger.info(f"Added {len(entries)} account credential entrie(s)")
+    
+    async def delete_credentials_entry(self, index: int) -> None:
+        """
+        Delete a credential entry from credentials.json and reload account metadata.
+        
+        Args:
+            index: Zero-based index of the credential entry to delete.
+        
+        Raises:
+            ValueError: If index is outside the credentials list.
+            OSError: If the credentials file cannot be written.
+            json.JSONDecodeError: If the existing credentials file is invalid JSON.
+        """
+        async with self._lock:
+            credentials = self._read_credentials_config_file()
+            if index < 0 or index >= len(credentials):
+                raise ValueError(f"Credential entry index out of range: {index}")
+            
+            removed_entry = credentials.pop(index)
+            self._write_credentials_config_file(credentials)
+            await self._reload_credentials_locked()
+        
+        removed_type = removed_entry.get("type", "unknown")
+        logger.info(f"Deleted account credential entry #{index} (type={removed_type})")
+    
+    async def _reload_credentials_locked(self) -> None:
+        """
+        Reload credentials and state after management panel changes.
+        
+        Caller must hold self._lock. Existing initialized auth managers are
+        intentionally discarded so new/deleted entries are reflected immediately.
+        """
+        self._accounts = {}
+        self._model_to_accounts = {}
+        self._credentials_config = []
+        await self.load_credentials()
+        await self.load_state()
+        self._dirty = True
+    
+    def _read_credentials_config_file(self) -> List[Dict[str, Any]]:
+        """
+        Read the credentials configuration file from disk.
+        
+        Returns:
+            List of credential entries. Missing files are treated as an empty list.
+        
+        Raises:
+            ValueError: If the file does not contain a JSON list of objects.
+            OSError: If the file cannot be read.
+            json.JSONDecodeError: If the file contains invalid JSON.
+        """
+        credentials_path = Path(self._credentials_file).expanduser()
+        if not credentials_path.exists():
+            return []
+        
+        with open(credentials_path, "r", encoding="utf-8") as file:
+            credentials = json.load(file)
+        
+        if not isinstance(credentials, list):
+            raise ValueError("Credentials file must contain a JSON array")
+        
+        for entry in credentials:
+            if not isinstance(entry, dict):
+                raise ValueError("Each credentials entry must be a JSON object")
+        
+        return credentials
+    
+    def _write_credentials_config_file(self, credentials: List[Dict[str, Any]]) -> None:
+        """
+        Write credentials configuration atomically.
+        
+        Args:
+            credentials: Full credentials configuration to persist.
+        
+        Raises:
+            OSError: If writing or replacing the file fails.
+        """
+        credentials_path = Path(self._credentials_file).expanduser()
+        credentials_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = credentials_path.with_suffix(f"{credentials_path.suffix}.tmp")
+        
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            json.dump(credentials, file, indent=2, ensure_ascii=False)
+            file.write("\n")
+        
+        tmp_path.replace(credentials_path)
+    
+    def _prepare_credentials_entry_for_storage(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert a pasted account payload into a credentials.json entry.
+        
+        The admin panel accepts both the native credentials.json entry format and
+        raw kiro-auth-token.json objects. Raw token objects are written into a
+        managed JSON file and represented in credentials.json as a type=json entry.
+        
+        Args:
+            entry: Pasted account payload.
+        
+        Returns:
+            Credential entry ready to append to credentials.json.
+        
+        Raises:
+            ValueError: If the raw token object is malformed.
+            OSError: If the managed token file cannot be written.
+        """
+        if self._is_raw_kiro_auth_token(entry):
+            managed_path = self._write_managed_json_credentials_file(entry)
+            return {
+                "type": "json",
+                "path": str(managed_path),
+                "enabled": True,
+                "comment": "Managed by /admin from pasted kiro-auth-token.json",
+            }
+        
+        return dict(entry)
+    
+    @staticmethod
+    def _is_raw_kiro_auth_token(entry: Dict[str, Any]) -> bool:
+        """
+        Check whether an entry looks like a raw kiro-auth-token.json object.
+        
+        Args:
+            entry: Pasted account payload.
+        
+        Returns:
+            True when the object contains Kiro token fields instead of a
+            credentials.json entry type.
+        """
+        return "type" not in entry and (
+            "refreshToken" in entry or "accessToken" in entry or "profileArn" in entry
+        )
+    
+    def _write_managed_json_credentials_file(self, token_data: Dict[str, Any]) -> Path:
+        """
+        Persist a raw kiro-auth-token.json object as a managed account file.
+        
+        Args:
+            token_data: Raw Kiro token JSON from the user.
+        
+        Returns:
+            Path to the managed credentials file.
+        
+        Raises:
+            ValueError: If required token fields are missing or invalid.
+            OSError: If writing the file fails.
+        """
+        self._validate_raw_kiro_auth_token(token_data)
+        managed_dir = Path(self._credentials_file).expanduser().parent / "managed_accounts"
+        managed_dir.mkdir(parents=True, exist_ok=True)
+        file_path = managed_dir / self._build_managed_credentials_filename(token_data)
+        tmp_path = file_path.with_suffix(f"{file_path.suffix}.tmp")
+        
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            json.dump(token_data, file, indent=2, ensure_ascii=False)
+            file.write("\n")
+        
+        tmp_path.replace(file_path)
+        return file_path
+    
+    @staticmethod
+    def _validate_raw_kiro_auth_token(token_data: Dict[str, Any]) -> None:
+        """
+        Validate a raw kiro-auth-token.json payload.
+        
+        Args:
+            token_data: Raw Kiro token JSON from the user.
+        
+        Raises:
+            ValueError: If required fields are missing or invalid.
+        """
+        refresh_token = token_data.get("refreshToken")
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            raise ValueError("Raw kiro-auth-token.json must contain a non-empty refreshToken")
+        
+        for optional_string_field in ("accessToken", "profileArn", "expiresAt", "authMethod", "provider"):
+            value = token_data.get(optional_string_field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Raw kiro-auth-token.json field '{optional_string_field}' must be a string")
+    
+    @staticmethod
+    def _build_managed_credentials_filename(token_data: Dict[str, Any]) -> str:
+        """
+        Build a deterministic safe filename for a managed raw token file.
+        
+        Args:
+            token_data: Raw Kiro token JSON from the user.
+        
+        Returns:
+            Filename for the managed credentials file.
+        """
+        profile_arn = token_data.get("profileArn", "")
+        profile_suffix = profile_arn.rsplit("/", 1)[-1] if isinstance(profile_arn, str) and profile_arn else "kiro"
+        safe_profile = re.sub(r"[^A-Za-z0-9_.-]+", "-", profile_suffix).strip("-._") or "kiro"
+        token_hash_source = json.dumps(token_data, sort_keys=True, ensure_ascii=False)
+        token_hash = hashlib.sha256(token_hash_source.encode("utf-8")).hexdigest()[:16]
+        return f"{safe_profile}-{token_hash}.json"
+    
+    @staticmethod
+    def _validate_credentials_entry(entry: Dict[str, Any]) -> None:
+        """
+        Validate a credentials.json entry accepted by the management panel.
+        
+        Args:
+            entry: Credential entry to validate.
+        
+        Raises:
+            ValueError: If the entry is malformed or missing required fields.
+        """
+        if not isinstance(entry, dict):
+            raise ValueError("Account entry must be a JSON object")
+        
+        credential_type = entry.get("type")
+        if credential_type not in ("json", "sqlite", "refresh_token"):
+            raise ValueError("Account entry type must be one of: json, sqlite, refresh_token")
+        
+        if "enabled" in entry and not isinstance(entry["enabled"], bool):
+            raise ValueError("Account entry field 'enabled' must be a boolean")
+        
+        if credential_type in ("json", "sqlite") and not entry.get("path"):
+            raise ValueError(f"Account entry type '{credential_type}' requires field 'path'")
+        
+        if credential_type == "refresh_token" and not entry.get("refresh_token"):
+            raise ValueError("Account entry type 'refresh_token' requires field 'refresh_token'")
+    
+    @staticmethod
+    def _sanitize_credentials_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Return a copy of a credential entry with secret values masked.
+        
+        Args:
+            entry: Original credential entry.
+        
+        Returns:
+            Sanitized copy safe for rendering in the management panel.
+        """
+        sanitized = dict(entry)
+        for key in ("refresh_token", "access_token", "accessToken", "refreshToken", "clientSecret"):
+            value = sanitized.get(key)
+            if isinstance(value, str) and value:
+                sanitized[key] = AccountManager._mask_secret(value)
+        return sanitized
+    
+    @staticmethod
+    def _mask_secret(value: str) -> str:
+        """
+        Mask a secret while leaving enough context for identification.
+        
+        Args:
+            value: Secret value to mask.
+        
+        Returns:
+            Masked value safe for display.
+        """
+        if len(value) <= 8:
+            return "***"
+        return f"{value[:4]}...{value[-4:]}"
     
     def get_all_available_models(self) -> List[str]:
         """

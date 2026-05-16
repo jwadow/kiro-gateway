@@ -291,7 +291,20 @@ async def messages(
             if tool_type and tool_type.startswith("web_search"):
                 # Path A: Early return, direct MCP call
                 # Get auth_manager from first available account (no failover needed for early return)
-                account = request.app.state.account_manager.get_first_account()
+                try:
+                    account = request.app.state.account_manager.get_first_account()
+                except RuntimeError:
+                    logger.error("No accounts configured for native web_search")
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": "No Kiro accounts configured. Open /admin and add an account first."
+                            }
+                        }
+                    )
                 if not account.auth_manager:
                     logger.error("No initialized accounts available for native web_search")
                     return JSONResponse(
@@ -321,6 +334,17 @@ async def messages(
         
         account_manager = request.app.state.account_manager
         all_accounts = list(account_manager._accounts.keys())
+        if not all_accounts:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "No Kiro accounts configured. Open /admin and add an account first."
+                    }
+                }
+            )
         MAX_ATTEMPTS = len(all_accounts) * 2  # Full circle with margin
         
         last_error_message = None

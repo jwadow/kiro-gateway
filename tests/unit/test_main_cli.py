@@ -407,3 +407,48 @@ class TestCliVersion:
         print(f"APP_VERSION: {APP_VERSION}")
         
         assert APP_VERSION in captured.out
+
+
+class TestValidateConfiguration:
+    """Tests for validate_configuration() startup checks."""
+
+    def test_account_system_allows_missing_credentials_for_admin_panel(self, tmp_path, monkeypatch):
+        """
+        What it does: Runs validation with ACCOUNT_SYSTEM=true and no credentials.
+        Purpose: Allow first account setup through the /admin panel.
+        """
+        print("Setup: ACCOUNT_SYSTEM=true with no credentials...")
+        from main import validate_configuration
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
+        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(tmp_path / "credentials.json"))
+        monkeypatch.setattr("kiro.config.ACCOUNTS_CONFIG_FILE", str(tmp_path / "credentials.json"))
+        monkeypatch.setattr("main.REFRESH_TOKEN", "")
+        monkeypatch.setattr("main.KIRO_CREDS_FILE", "")
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", "")
+
+        validate_configuration()
+
+        print("Validation passed so /admin can be opened before accounts exist")
+
+    def test_legacy_mode_rejects_missing_credentials(self, tmp_path, monkeypatch):
+        """
+        What it does: Runs validation with legacy mode and no credentials.
+        Purpose: Preserve strict startup checks outside multi-account management.
+        """
+        print("Setup: ACCOUNT_SYSTEM=false with no credentials...")
+        from main import validate_configuration
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("main.ACCOUNT_SYSTEM", False)
+        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(tmp_path / "credentials.json"))
+        monkeypatch.setattr("kiro.config.ACCOUNTS_CONFIG_FILE", str(tmp_path / "credentials.json"))
+        monkeypatch.setattr("main.REFRESH_TOKEN", "")
+        monkeypatch.setattr("main.KIRO_CREDS_FILE", "")
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", "")
+
+        with pytest.raises(RuntimeError, match="Configuration validation failed"):
+            validate_configuration()
+
+        print("Validation still rejects missing credentials in legacy mode")

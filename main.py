@@ -86,6 +86,7 @@ from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
+from kiro.routes_admin import router as admin_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
 
@@ -254,6 +255,16 @@ def validate_configuration() -> None:
         if not cli_db_path.exists():
             has_cli_db = False
             logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
+    
+    # In multi-account mode the web panel can be used to add the first account.
+    # Starting without Kiro credentials is intentional in that setup; API calls
+    # will return account-unavailable errors until at least one account is added.
+    if ACCOUNT_SYSTEM and not has_refresh_token and not has_creds_file and not has_cli_db:
+        logger.warning(
+            "No Kiro credentials configured yet. Starting with admin panel only because ACCOUNT_SYSTEM=true. "
+            "Open /admin and sign in with PROXY_API_KEY to add accounts."
+        )
+        return
     
     # If no credentials found, show helpful error
     if not has_refresh_token and not has_creds_file and not has_cli_db:
@@ -471,33 +482,44 @@ async def lifespan(app: FastAPI):
     all_accounts = list(app.state.account_manager._accounts.keys())
     
     if not all_accounts:
-        logger.error("No accounts configured in credentials.json")
-        raise RuntimeError("No accounts configured in credentials.json")
-    
-    # Determine start index from state.json
-    start_index = app.state.account_manager._current_account_index
-    
-    # Try to initialize accounts (full circle)
-    initialized = False
-    
-    for i in range(len(all_accounts)):
-        current_index = (start_index + i) % len(all_accounts)
-        account_id = all_accounts[current_index]
-        
-        logger.info(f"Attempting to initialize account: {account_id}")
-        
-        success = await app.state.account_manager._initialize_account(account_id)
-        
-        if success:
-            logger.info(f"Successfully initialized account: {account_id}")
-            initialized = True
-            break
+        if ACCOUNT_SYSTEM:
+            logger.warning(
+                "No accounts configured yet. Gateway API is unavailable until an account is added in /admin."
+            )
         else:
-            logger.warning(f"Failed to initialize account: {account_id}")
-    
-    if not initialized:
-        logger.error("Failed to initialize any account. Check your credentials.")
-        raise RuntimeError("Failed to initialize any account")
+            logger.error("No accounts configured in credentials.json")
+            raise RuntimeError("No accounts configured in credentials.json")
+    else:
+        # Determine start index from state.json
+        start_index = app.state.account_manager._current_account_index
+        
+        # Try to initialize accounts (full circle)
+        initialized = False
+        
+        for i in range(len(all_accounts)):
+            current_index = (start_index + i) % len(all_accounts)
+            account_id = all_accounts[current_index]
+            
+            logger.info(f"Attempting to initialize account: {account_id}")
+            
+            success = await app.state.account_manager._initialize_account(account_id)
+            
+            if success:
+                logger.info(f"Successfully initialized account: {account_id}")
+                initialized = True
+                break
+            else:
+                logger.warning(f"Failed to initialize account: {account_id}")
+        
+        if not initialized:
+            if ACCOUNT_SYSTEM:
+                logger.warning(
+                    "Failed to initialize any account. Gateway API is unavailable, but /admin remains available "
+                    "so credentials can be fixed."
+                )
+            else:
+                logger.error("Failed to initialize any account. Check your credentials.")
+                raise RuntimeError("Failed to initialize any account")
     
     # Save initial state
     await app.state.account_manager._save_state()
@@ -570,6 +592,9 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Small authenticated web panel: /admin
+app.include_router(admin_router)
 
 
 # --- Uvicorn log config ---

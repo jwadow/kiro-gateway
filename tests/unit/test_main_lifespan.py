@@ -614,18 +614,18 @@ class TestLifespanAccountManagerInit:
         print("✓ Full circle initialization was attempted")
     
     @pytest.mark.asyncio
-    async def test_lifespan_exit_if_no_accounts(self, tmp_path, monkeypatch):
+    async def test_lifespan_allows_empty_accounts_in_account_system(self, tmp_path, monkeypatch):
         """
-        Test 102: RuntimeError если нет аккаунтов в credentials.json
+        Test 102: ACCOUNT_SYSTEM=true allows startup without configured accounts.
         
-        What it does: Verifies application raises RuntimeError if no accounts configured
-        Purpose: Prevent startup with empty configuration
+        What it does: Starts lifespan with an empty AccountManager
+        Purpose: Allow users to open /admin and add the first account
         """
-        print("\n=== Test 102: RuntimeError if no accounts configured ===")
+        print("\n=== Test 102: Account system allows empty accounts ===")
         
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
+        monkeypatch.setattr("main.REFRESH_TOKEN", "")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
@@ -638,6 +638,8 @@ class TestLifespanAccountManagerInit:
         mock_manager = AsyncMock()
         mock_manager._accounts = {}  # Empty accounts dict
         mock_manager._current_account_index = 0
+        mock_manager._save_state = AsyncMock()
+        mock_manager.save_state_periodically = AsyncMock()
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -646,22 +648,21 @@ class TestLifespanAccountManagerInit:
                 
                 from main import lifespan, app
                 
-                # Assert: RuntimeError is raised
-                with pytest.raises(RuntimeError, match="No accounts configured"):
-                    async with lifespan(app):
-                        pass
+                async with lifespan(app):
+                    assert app.state.account_system is True
+                    assert app.state.account_manager._accounts == {}
                 
-                print("✓ RuntimeError was raised for empty accounts")
+                print("✓ Lifespan started so /admin can add the first account")
     
     @pytest.mark.asyncio
-    async def test_lifespan_exit_if_all_failed(self, tmp_path, monkeypatch):
+    async def test_lifespan_allows_all_failed_in_account_system(self, tmp_path, monkeypatch):
         """
-        Test 103: RuntimeError если все аккаунты не инициализировались
+        Test 103: ACCOUNT_SYSTEM=true allows startup when all accounts fail initialization.
         
-        What it does: Verifies application raises RuntimeError if all accounts fail to initialize
-        Purpose: Prevent startup without any working accounts
+        What it does: Starts lifespan with configured but invalid accounts
+        Purpose: Keep /admin available so users can delete or fix broken credentials
         """
-        print("\n=== Test 103: RuntimeError if all accounts failed ===")
+        print("\n=== Test 103: Account system allows all failed accounts ===")
         
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
@@ -682,6 +683,8 @@ class TestLifespanAccountManagerInit:
         }
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=False)  # All fail
+        mock_manager._save_state = AsyncMock()
+        mock_manager.save_state_periodically = AsyncMock()
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -690,12 +693,11 @@ class TestLifespanAccountManagerInit:
                 
                 from main import lifespan, app
                 
-                # Assert: RuntimeError is raised
-                with pytest.raises(RuntimeError, match="Failed to initialize any account"):
-                    async with lifespan(app):
-                        pass
+                async with lifespan(app):
+                    assert app.state.account_system is True
                 
-                print("✓ RuntimeError was raised when all accounts failed")
+                assert mock_manager._initialize_account.await_count == 2
+                print("✓ Lifespan stayed up so /admin can fix broken accounts")
     
     @pytest.mark.asyncio
     async def test_lifespan_save_initial_state(self, tmp_path, monkeypatch):

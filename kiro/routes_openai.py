@@ -283,6 +283,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         
         account_manager = request.app.state.account_manager
         all_accounts = list(account_manager._accounts.keys())
+        if not all_accounts:
+            raise HTTPException(
+                status_code=503,
+                detail="No Kiro accounts configured. Open /admin and add an account first."
+            )
         MAX_ATTEMPTS = len(all_accounts) * 2  # Full circle with margin
         
         last_error_message = None

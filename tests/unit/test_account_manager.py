@@ -1300,3 +1300,281 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+class TestAccountManagerManagementPanel:
+    """
+    Tests for management panel helper methods in AccountManager.
+    """
+
+    @pytest.mark.asyncio
+    async def test_add_credentials_entries_persists_and_reloads(self, tmp_path):
+        """
+        Test adding credentials entries through AccountManager.
+        
+        What it does: Adds one JSON entry and reloads manager state
+        Purpose: Verify admin panel additions update credentials.json safely
+        """
+        print("\n=== Test: add_credentials_entries persists and reloads ===")
+        
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        first_account = tmp_path / "first.json"
+        second_account = tmp_path / "second.json"
+        first_account.write_text(json.dumps({"refreshToken": "first"}))
+        second_account.write_text(json.dumps({"refreshToken": "second"}))
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": str(first_account), "enabled": True}
+        ]))
+        
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        
+        # Act
+        await manager.add_credentials_entries([
+            {"type": "json", "path": str(second_account), "enabled": True}
+        ])
+        
+        # Assert
+        persisted = json.loads(creds_file.read_text())
+        print(f"Persisted entries: {len(persisted)}")
+        assert len(persisted) == 2
+        assert persisted[1]["path"] == str(second_account)
+        assert len(manager._credentials_config) == 2
+        assert str(second_account.resolve()) in manager._accounts
+        assert manager._dirty is True
+
+    @pytest.mark.asyncio
+    async def test_add_credentials_entries_accepts_raw_kiro_auth_token_json(self, tmp_path):
+        """
+        Test adding raw kiro-auth-token.json through AccountManager.
+        
+        What it does: Adds a raw token object and stores it as a managed JSON file
+        Purpose: Support pasting Kiro IDE token JSON directly into the admin panel
+        """
+        print("\n=== Test: add_credentials_entries accepts raw kiro-auth-token.json ===")
+        
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text("[]")
+        raw_token = {
+            "accessToken": "access-token-value",
+            "refreshToken": "refresh-token-value",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/PROFILE123",
+            "expiresAt": "2026-05-16T09:45:03.903Z",
+            "authMethod": "social",
+            "provider": "Google",
+        }
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        
+        # Act
+        await manager.add_credentials_entries([raw_token])
+        
+        # Assert
+        persisted = json.loads(creds_file.read_text())
+        print(f"Persisted raw-token entry: {persisted}")
+        assert len(persisted) == 1
+        assert persisted[0]["type"] == "json"
+        assert persisted[0]["enabled"] is True
+        assert persisted[0]["comment"] == "Managed by /admin from pasted kiro-auth-token.json"
+        managed_path = Path(persisted[0]["path"])
+        assert managed_path.exists()
+        assert managed_path.parent == tmp_path / "managed_accounts"
+        assert managed_path.name.startswith("PROFILE123-")
+        assert json.loads(managed_path.read_text()) == raw_token
+        assert str(managed_path.resolve()) in manager._accounts
+        assert manager._dirty is True
+
+    @pytest.mark.asyncio
+    async def test_add_credentials_entries_accepts_raw_kiro_auth_token_array(self, tmp_path):
+        """
+        Test adding multiple raw token objects through AccountManager.
+        
+        What it does: Adds two raw token objects at once
+        Purpose: Ensure pasted arrays work for bulk account upload
+        """
+        print("\n=== Test: add_credentials_entries accepts raw token array ===")
+        
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text("[]")
+        raw_tokens = [
+            {"refreshToken": "refresh-one", "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/ONE"},
+            {"refreshToken": "refresh-two", "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/TWO"},
+        ]
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        
+        # Act
+        await manager.add_credentials_entries(raw_tokens)
+        
+        # Assert
+        persisted = json.loads(creds_file.read_text())
+        print(f"Persisted raw-token entries: {persisted}")
+        assert len(persisted) == 2
+        assert all(entry["type"] == "json" for entry in persisted)
+        assert all(Path(entry["path"]).exists() for entry in persisted)
+        assert len(manager._accounts) == 2
+
+    @pytest.mark.asyncio
+    async def test_add_credentials_entries_rejects_raw_token_without_refresh_token(self, tmp_path):
+        """
+        Test malformed raw token JSON is rejected.
+        
+        What it does: Attempts to add raw token JSON without refreshToken
+        Purpose: Prevent unusable managed token files from being created
+        """
+        print("\n=== Test: add_credentials_entries rejects raw token without refreshToken ===")
+        
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text("[]")
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        
+        # Act & Assert
+        with pytest.raises(ValueError, match="refreshToken"):
+            await manager.add_credentials_entries([{"accessToken": "access-only"}])
+        
+        assert json.loads(creds_file.read_text()) == []
+        assert not (tmp_path / "managed_accounts").exists()
+
+    @pytest.mark.asyncio
+    async def test_add_credentials_entries_rejects_invalid_entry(self, tmp_path):
+        """
+        Test invalid credential entries are rejected before writing.
+        
+        What it does: Attempts to add a JSON entry without path
+        Purpose: Prevent malformed account config from the admin panel
+        """
+        print("\n=== Test: add_credentials_entries rejects invalid entry ===")
+        
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text("[]")
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        
+        # Act & Assert
+        with pytest.raises(ValueError, match="requires field 'path'"):
+            await manager.add_credentials_entries([{"type": "json"}])
+        
+        assert json.loads(creds_file.read_text()) == []
+
+    @pytest.mark.asyncio
+    async def test_delete_credentials_entry_persists_and_reloads(self, tmp_path):
+        """
+        Test deleting credential entries through AccountManager.
+        
+        What it does: Deletes the first entry and reloads manager state
+        Purpose: Verify admin panel deletion updates credentials.json safely
+        """
+        print("\n=== Test: delete_credentials_entry persists and reloads ===")
+        
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        first_account = tmp_path / "first.json"
+        second_account = tmp_path / "second.json"
+        first_account.write_text(json.dumps({"refreshToken": "first"}))
+        second_account.write_text(json.dumps({"refreshToken": "second"}))
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": str(first_account), "enabled": True},
+            {"type": "json", "path": str(second_account), "enabled": True}
+        ]))
+        
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        
+        # Act
+        await manager.delete_credentials_entry(0)
+        
+        # Assert
+        persisted = json.loads(creds_file.read_text())
+        print(f"Persisted entries after delete: {persisted}")
+        assert len(persisted) == 1
+        assert persisted[0]["path"] == str(second_account)
+        assert str(first_account.resolve()) not in manager._accounts
+        assert str(second_account.resolve()) in manager._accounts
+        assert manager._dirty is True
+
+    @pytest.mark.asyncio
+    async def test_delete_credentials_entry_rejects_out_of_range_index(self, tmp_path):
+        """
+        Test deleting a missing credential entry fails clearly.
+        
+        What it does: Attempts to delete an index outside the config list
+        Purpose: Prevent accidental writes from malformed admin panel requests
+        """
+        print("\n=== Test: delete_credentials_entry rejects out of range index ===")
+        
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text("[]")
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        
+        # Act & Assert
+        with pytest.raises(ValueError, match="index out of range"):
+            await manager.delete_credentials_entry(0)
+        
+        assert json.loads(creds_file.read_text()) == []
+
+    @pytest.mark.asyncio
+    async def test_get_management_snapshot_masks_refresh_tokens(self, tmp_path):
+        """
+        Test management snapshot never exposes raw refresh tokens.
+        
+        What it does: Loads a refresh_token entry and builds panel snapshot
+        Purpose: Ensure the web panel renders sanitized credential data
+        """
+        print("\n=== Test: get_management_snapshot masks refresh tokens ===")
+        
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {
+                "type": "refresh_token",
+                "refresh_token": "abcdefghijklmnopqrstuvwxyz",
+                "enabled": True
+            }
+        ]))
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = list(manager._accounts.keys())[0]
+        manager._accounts[account_id].stats.total_requests = 3
+        manager._accounts[account_id].stats.successful_requests = 2
+        manager._accounts[account_id].stats.failed_requests = 1
+        
+        # Act
+        snapshot = manager.get_management_snapshot()
+        
+        # Assert
+        sanitized_entry = snapshot["credentials"][0]["entry"]
+        print(f"Sanitized entry: {sanitized_entry}")
+        assert sanitized_entry["refresh_token"] == "abcd...wxyz"
+        assert "abcdefghijklmnopqrstuvwxyz" not in json.dumps(snapshot)
+        assert snapshot["totals"]["configured_entries"] == 1
+        assert snapshot["totals"]["loaded_accounts"] == 1
+        assert snapshot["totals"]["total_requests"] == 3
+        assert snapshot["totals"]["successful_requests"] == 2
+        assert snapshot["totals"]["failed_requests"] == 1
