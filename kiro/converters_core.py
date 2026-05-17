@@ -458,9 +458,11 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     result = {}
     
     for key, value in schema.items():
-        # Skip empty required arrays
-        if key == "required" and isinstance(value, list) and len(value) == 0:
-            continue
+        # Skip invalid or empty required values. Bedrock requires an array
+        # when this field is present, and Kiro rejects empty arrays.
+        if key == "required":
+            if not isinstance(value, list) or len(value) == 0:
+                continue
         
         # Skip additionalProperties - Kiro API doesn't support it
         if key == "additionalProperties":
@@ -1504,18 +1506,18 @@ def build_kiro_payload(
         current_content = f"{full_system_prompt}\n\n{current_content}"
     
     # If current message is assistant, need to add it to history
-    # and create user message "Continue"
+    # and create user message placeholder
     if current_message.role == "assistant":
         history.append({
             "assistantResponseMessage": {
                 "content": current_content
             }
         })
-        current_content = "Continue"
+        current_content = "(empty)"
     
-    # If content is empty - use "Continue"
+    # If content is empty - use placeholder
     if not current_content:
-        current_content = "Continue"
+        current_content = "(empty)"
     
     # Process images in current message - extract from message or content
     # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext
