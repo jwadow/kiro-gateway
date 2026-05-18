@@ -6,6 +6,7 @@ Tests retry logic, error handling, and HTTP client management.
 """
 
 import asyncio
+import json
 import pytest
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 from datetime import datetime, timezone, timedelta
@@ -1046,7 +1047,7 @@ class TestKiroHttpClientConnectionCloseHeader:
         mock_request = Mock()
         captured_headers = {}
         
-        def capture_build_request(method, url, json, headers):
+        def capture_build_request(method, url, content, headers):
             captured_headers.update(headers)
             return mock_request
         
@@ -1086,7 +1087,7 @@ class TestKiroHttpClientConnectionCloseHeader:
         
         captured_headers = {}
         
-        async def capture_request(method, url, json, headers):
+        async def capture_request(method, url, content, headers):
             captured_headers.update(headers)
             return mock_response
         
@@ -1124,7 +1125,7 @@ class TestKiroHttpClientConnectionCloseHeader:
         mock_request = Mock()
         captured_headers = {}
         
-        def capture_build_request(method, url, json, headers):
+        def capture_build_request(method, url, content, headers):
             captured_headers.update(headers)
             return mock_request
         
@@ -1155,4 +1156,128 @@ class TestKiroHttpClientConnectionCloseHeader:
         assert captured_headers["Content-Type"] == "application/json"
         assert captured_headers["X-Custom-Header"] == "custom_value"
         assert captured_headers["Connection"] == "close"
+        assert response.status_code == 200
+
+
+class TestKiroHttpClientRequestParameters:
+    """Tests for request_with_retry method with params and optional json_data (Account System)."""
+    
+    @pytest.mark.asyncio
+    async def test_request_with_retry_get_with_params(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies GET request with query parameters.
+        Purpose: Ensure params are passed correctly for GET requests (used by AccountManager for /ListAvailableModels).
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={"models": []})
+        
+        captured_kwargs = {}
+        
+        async def capture_request(method, url, **kwargs):
+            captured_kwargs.update(kwargs)
+            return mock_response
+        
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=capture_request)
+        
+        print("Action: Executing GET request with params...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={"Authorization": "Bearer test"}):
+                response = await http_client.request_with_retry(
+                    "GET",
+                    "https://api.example.com/ListAvailableModels",
+                    json_data=None,
+                    params={"origin": "AI_EDITOR", "profileArn": "arn:aws:..."}
+                )
+        
+        print("Verification: params passed, json NOT passed...")
+        print(f"Captured kwargs: {captured_kwargs}")
+        assert "params" in captured_kwargs, f"params not found in kwargs: {captured_kwargs}"
+        assert captured_kwargs["params"]["origin"] == "AI_EDITOR"
+        assert captured_kwargs["params"]["profileArn"] == "arn:aws:..."
+        assert "json" not in captured_kwargs, f"json should not be present for GET: {captured_kwargs}"
+        assert response.status_code == 200
+    
+    @pytest.mark.asyncio
+    async def test_request_with_retry_post_without_json(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies POST request without json_data.
+        Purpose: Ensure json_data is optional and not passed when None.
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        
+        captured_kwargs = {}
+        
+        async def capture_request(method, url, **kwargs):
+            captured_kwargs.update(kwargs)
+            return mock_response
+        
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=capture_request)
+        
+        print("Action: Executing POST request without json_data...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={"Authorization": "Bearer test"}):
+                response = await http_client.request_with_retry(
+                    "POST",
+                    "https://api.example.com/test",
+                    json_data=None,
+                    params=None
+                )
+        
+        print("Verification: Only headers passed, no json or params...")
+        print(f"Captured kwargs: {captured_kwargs}")
+        assert "headers" in captured_kwargs
+        assert "json" not in captured_kwargs, f"json should not be present when None: {captured_kwargs}"
+        assert "params" not in captured_kwargs, f"params should not be present when None: {captured_kwargs}"
+        assert response.status_code == 200
+    
+    @pytest.mark.asyncio
+    async def test_request_with_retry_params_and_json(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies simultaneous use of params and json_data.
+        Purpose: Ensure both params and json can be passed together (edge case).
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        
+        captured_kwargs = {}
+        
+        async def capture_request(method, url, **kwargs):
+            captured_kwargs.update(kwargs)
+            return mock_response
+        
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=capture_request)
+        
+        print("Action: Executing request with both params and json...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={"Authorization": "Bearer test"}):
+                response = await http_client.request_with_retry(
+                    "POST",
+                    "https://api.example.com/test",
+                    json_data={"data": "value"},
+                    params={"filter": "active"}
+                )
+        
+        print("Verification: Both params and content passed...")
+        print(f"Captured kwargs: {captured_kwargs}")
+        assert "params" in captured_kwargs, f"params not found: {captured_kwargs}"
+        assert "content" in captured_kwargs, f"content not found: {captured_kwargs}"
+        assert captured_kwargs["params"]["filter"] == "active"
+        assert json.loads(captured_kwargs["content"])["data"] == "value"
         assert response.status_code == 200

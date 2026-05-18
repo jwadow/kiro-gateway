@@ -37,6 +37,7 @@ from loguru import logger
 from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
+    PROFILE_ARN,
 )
 from kiro.models_openai import (
     OpenAIModel,
@@ -136,10 +137,14 @@ async def get_models(request: Request):
     """
     logger.info("Request to /v1/models")
     
-    model_resolver: ModelResolver = request.app.state.model_resolver
-    
-    # Get all available models from resolver (cache + hidden models)
-    available_model_ids = model_resolver.get_available_models()
+    # Get available models based on mode
+    if request.app.state.account_system:
+        # Account system: collect models from all initialized accounts
+        available_model_ids = request.app.state.account_manager.get_all_available_models()
+    else:
+        # Legacy: use resolver from first account
+        account = request.app.state.account_manager.get_first_account()
+        available_model_ids = account.model_resolver.get_available_models()
     
     # Build OpenAI-compatible model list
     openai_models = [
@@ -174,9 +179,6 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         HTTPException: On validation or API errors
     """
     logger.info(f"Request to /v1/chat/completions (model={request_data.model}, stream={request_data.stream})")
-    
-    auth_manager: KiroAuthManager = request.app.state.auth_manager
-    model_cache: ModelInfoCache = request.app.state.model_cache
     
     # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
     # This ensures debug logging works even for requests that fail Pydantic validation (422 errors)
@@ -272,22 +274,307 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             logger.debug("Auto-injected web_search tool for MCP emulation (Path B)")
     
     # ==============================================================================
-    # WebSearch Support - Path A: Native Format Check (OpenAI doesn't have native server-side tools)
+    # Account System: Account System Failover or Legacy Mode
     # ==============================================================================
     
-    # OpenAI API doesn't have native server-side tools like Anthropic
-    # But we check for consistency - if someone sends web_search function, handle it
-    # This is actually Path B for OpenAI (all web_search goes through MCP emulation)
+    if request.app.state.account_system:
+        # ==============================================================================
+        # ACCOUNT SYSTEM ENABLED: Failover Loop
+        # ==============================================================================
+        from kiro.account_errors import classify_error, ErrorType
+        
+        account_manager = request.app.state.account_manager
+        all_accounts = list(account_manager._accounts.keys())
+        MAX_ATTEMPTS = len(all_accounts) * 2  # Full circle with margin
+        
+        last_error_message = None
+        last_error_status = None
+        tried_accounts = set()  # Track tried accounts in current failover loop
+        
+        for attempt in range(MAX_ATTEMPTS):
+            # Get next available account (excluding already tried)
+            account = await account_manager.get_next_account(
+                request_data.model,
+                exclude_accounts=tried_accounts
+            )
+            
+            if account is None:
+                # All accounts unavailable
+                if len(all_accounts) == 1:
+                    # Single account - return original error with original status code
+                    raise HTTPException(
+                        status_code=last_error_status or 503,
+                        detail=last_error_message or "Account unavailable"
+                    )
+                else:
+                    # Multiple accounts - generic error with context
+                    detail = "No available accounts for this model."
+                    if last_error_message:
+                        detail += f" Last error: {last_error_message}"
+                    raise HTTPException(status_code=503, detail=detail)
+            
+            # Mark account as tried in current failover loop
+            tried_accounts.add(account.id)
+            
+            # Use objects from account
+            auth_manager = account.auth_manager
+            model_cache = account.model_cache
+            model_resolver = account.model_resolver
+            
+            # Generate conversation ID
+            conversation_id = generate_conversation_id()
+            
+            # Build payload for Kiro
+            # profileArn is required by runtime.kiro.dev for all auth types
+            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+            
+            try:
+                kiro_payload = build_kiro_payload(
+                    request_data,
+                    conversation_id,
+                    profile_arn_for_payload
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            
+            # Log Kiro payload
+            try:
+                kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
+                if debug_logger:
+                    debug_logger.log_kiro_request_body(kiro_request_body)
+            except Exception as e:
+                logger.warning(f"Failed to log Kiro request: {e}")
+            
+            # Create HTTP client
+            url = f"{auth_manager.api_host}/generateAssistantResponse"
+            logger.debug(f"Kiro API URL: {url} (account: {account.id})")
+            
+            if request_data.stream:
+                http_client = KiroHttpClient(auth_manager, shared_client=None)
+            else:
+                shared_client = request.app.state.http_client
+                http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+            
+            try:
+                # Make request to Kiro API
+                response = await http_client.request_with_retry(
+                    "POST",
+                    url,
+                    kiro_payload,
+                    stream=True
+                )
+                
+                if response.status_code == 200:
+                    # SUCCESS - report and return
+                    await account_manager.report_success(account.id, request_data.model)
+                    
+                    # Prepare data for token counting
+                    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+                    tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+                    
+                    if request_data.stream:
+                        # Streaming mode
+                        async def stream_wrapper():
+                            streaming_error = None
+                            client_disconnected = False
+                            try:
+                                async def make_retry_request():
+                                    return await http_client.request_with_retry(
+                                        "POST", url, kiro_payload, stream=True
+                                    )
+                                
+                                async for chunk in stream_with_first_token_retry(
+                                    make_request=make_retry_request,
+                                    client=http_client.client,
+                                    model=request_data.model,
+                                    model_cache=model_cache,
+                                    auth_manager=auth_manager,
+                                    initial_response=response,
+                                    request_messages=messages_for_tokenizer,
+                                    request_tools=tools_for_tokenizer
+                                ):
+                                    yield chunk
+                            except GeneratorExit:
+                                client_disconnected = True
+                                logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
+                            except Exception as e:
+                                streaming_error = e
+                                try:
+                                    yield "data: [DONE]\n\n"
+                                except Exception:
+                                    pass
+                                raise
+                            finally:
+                                await http_client.close()
+                                if streaming_error:
+                                    error_type = type(streaming_error).__name__
+                                    error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
+                                    logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
+                                elif client_disconnected:
+                                    logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
+                                else:
+                                    logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
+                                if debug_logger:
+                                    if streaming_error:
+                                        debug_logger.flush_on_error(500, str(streaming_error))
+                                    else:
+                                        debug_logger.discard_buffers()
+                        
+                        return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
+                    
+                    else:
+                        # Non-streaming mode
+                        openai_response = await collect_stream_response(
+                            http_client.client,
+                            response,
+                            request_data.model,
+                            model_cache,
+                            auth_manager,
+                            request_messages=messages_for_tokenizer,
+                            request_tools=tools_for_tokenizer
+                        )
+                        
+                        await http_client.close()
+                        logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
+                        
+                        if debug_logger:
+                            debug_logger.discard_buffers()
+                        
+                        return JSONResponse(content=openai_response)
+                
+                else:
+                    # ERROR - classify and decide
+                    try:
+                        error_content = await response.aread()
+                    except Exception:
+                        error_content = b"Unknown error"
+                    
+                    await http_client.close()
+                    error_text = error_content.decode('utf-8', errors='replace')
+                    
+                    # Extract error reason and save for final return
+                    error_reason = None
+                    try:
+                        error_json = json.loads(error_text)
+                        from kiro.kiro_errors import enhance_kiro_error
+                        error_info = enhance_kiro_error(error_json)
+                        error_reason = error_info.reason
+                        last_error_message = error_info.user_message
+                        last_error_status = response.status_code
+                        logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
+                    except (json.JSONDecodeError, KeyError):
+                        last_error_message = error_text
+                        last_error_status = response.status_code
+                    
+                    # Classify error
+                    error_type = classify_error(response.status_code, error_reason)
+                    
+                    if error_type == ErrorType.FATAL:
+                        # FATAL - return to client immediately
+                        await account_manager.report_failure(
+                            account.id, request_data.model, error_type,
+                            response.status_code, error_reason
+                        )
+                        
+                        logger.warning(f"HTTP {response.status_code} - POST /v1/chat/completions - {last_error_message[:100]}")
+                        
+                        if debug_logger:
+                            debug_logger.flush_on_error(response.status_code, last_error_message)
+                        
+                        return JSONResponse(
+                            status_code=response.status_code,
+                            content={
+                                "error": {
+                                    "message": last_error_message,
+                                    "type": "kiro_api_error",
+                                    "code": response.status_code
+                                }
+                            }
+                        )
+                    
+                    else:  # ErrorType.RECOVERABLE
+                        # RECOVERABLE - try next account
+                        await account_manager.report_failure(
+                            account.id, request_data.model, error_type,
+                            response.status_code, error_reason
+                        )
+                        
+                        # Single account - no point in failover, break immediately
+                        if len(all_accounts) == 1:
+                            break
+                        
+                        continue  # Next iteration
+            
+            except HTTPException as e:
+                await http_client.close()
+                
+                # Network errors (502/504 from request_with_retry) = RECOVERABLE
+                # These are thrown ONLY for network-level issues (timeouts, connection errors)
+                # NOT for HTTP-level errors (which are returned as response objects)
+                if e.status_code in (502, 504):
+                    # Network error → try next account
+                    await account_manager.report_failure(
+                        account.id, request_data.model, ErrorType.RECOVERABLE,
+                        e.status_code, None
+                    )
+                    
+                    last_error_message = str(e.detail)
+                    last_error_status = e.status_code
+                    
+                    # Single account - no point in failover, break immediately
+                    if len(all_accounts) == 1:
+                        break
+                    
+                    logger.warning(f"Network error on account {account.id}, trying next account")
+                    continue  # Try next account
+                
+                # All other HTTPException (400, 500, etc.) = application errors
+                # These come from build_kiro_payload() or other places → re-raise immediately
+                logger.error(f"HTTP {e.status_code} - POST /v1/chat/completions - {e.detail}")
+                if debug_logger:
+                    debug_logger.flush_on_error(e.status_code, str(e.detail))
+                raise
+            except Exception as e:
+                await http_client.close()
+                logger.error(f"Internal error: {e}", exc_info=True)
+                logger.error(f"HTTP 500 - POST /v1/chat/completions - {str(e)[:100]}")
+                if debug_logger:
+                    debug_logger.flush_on_error(500, str(e))
+                raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+        
+        # All attempts exhausted
+        if len(all_accounts) == 1:
+            # Single account - return its original error
+            # last_error_status and last_error_message are guaranteed to be set
+            raise HTTPException(
+                status_code=last_error_status,
+                detail=last_error_message
+            )
+        else:
+            # Multiple accounts - generic error with context
+            detail = "All accounts failed after full circle."
+            if last_error_message:
+                detail += f" Last error: {last_error_message}"
+            raise HTTPException(status_code=503, detail=detail)
+    
+    else:
+        # ==============================================================================
+        # LEGACY MODE: Single Account (no failover)
+        # ==============================================================================
+        account = request.app.state.account_manager.get_first_account()
+        if not account.auth_manager:
+            logger.error("No initialized accounts available (legacy mode)")
+            raise HTTPException(503, "No initialized accounts available")
+        auth_manager = account.auth_manager
+        model_cache = account.model_cache
+        model_resolver = account.model_resolver
     
     # Generate conversation ID for Kiro API (random UUID, not used for tracking)
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is needed for Kiro Desktop auth and Enterprise SSO OIDC accounts
-    # Regular Builder ID users don't need profileArn
-    profile_arn_for_payload = ""
-    if auth_manager.profile_arn:
-        profile_arn_for_payload = auth_manager.profile_arn
+    # profileArn is required by runtime.kiro.dev for all auth types
+    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
     
     try:
         kiro_payload = build_kiro_payload(
@@ -462,6 +749,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     
     except HTTPException as e:
         await http_client.close()
+        
+        # Network errors (502/504 from request_with_retry) = RECOVERABLE
+        # In legacy mode, we still log them but re-raise (no failover available)
+        if e.status_code in (502, 504):
+            logger.warning(f"Network error (legacy mode, no failover available)")
+        
         # Log access log for HTTP error
         logger.error(f"HTTP {e.status_code} - POST /v1/chat/completions - {e.detail}")
         # Flush debug logs on HTTP error ("errors" mode)

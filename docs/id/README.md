@@ -33,8 +33,6 @@ Dibuat dengan ❤️ oleh [@Jwadow](https://github.com/jwadow)
 
 📦 **Claude Sonnet 4** — Generasi sebelumnya. Masih kuat dan andal untuk sebagian besar kasus penggunaan.
 
-📦 **Claude 3.7 Sonnet** — Model lama. Tersedia untuk kompatibilitas mundur.
-
 💤 **GLM-5** — Model MoE terbuka (744B parameter, 40B aktif). Model canggih untuk rekayasa sistem kompleks dan tugas agentik jangka panjang.
 
 🐋 **DeepSeek-V3.2** — Model MoE terbuka (685B parameter, 37B aktif). Performa seimbang untuk coding, penalaran, dan tugas umum.
@@ -55,6 +53,7 @@ Dibuat dengan ❤️ oleh [@Jwadow](https://github.com/jwadow)
 |-------|-----------|
 | 🔌 **API kompatibel OpenAI** | Bekerja dengan alat apa pun yang kompatibel dengan OpenAI |
 | 🔌 **API kompatibel Anthropic** | Endpoint native `/v1/messages` |
+| 🔀 **Dukungan Multi-Akun** | Perpindahan cerdas antar beberapa akun |
 | 🌐 **Dukungan VPN/Proxy** | Proxy HTTP/SOCKS5 untuk jaringan terbatas |
 | 🧠 **Pemikiran Diperluas** | Penalaran adalah eksklusif proyek kami |
 | 👁️ **Dukungan Visi** | Kirim gambar ke model |
@@ -109,6 +108,8 @@ Server akan tersedia di `http://localhost:8000`
 ---
 
 ## ⚙️ Konfigurasi
+
+> 💡 **Pengguna lanjutan:** Mencari dukungan multi-akun? Lihat [Sistem Akun](#-sistem-akun-lanjutan) di bawah.
 
 ### Opsi 1: File JSON Kredensial (Kiro IDE / Enterprise)
 
@@ -258,6 +259,85 @@ Jika Anda perlu mengekstrak refresh token secara manual (misalnya, untuk debuggi
 - Cari request ke: `prod.us-east-1.auth.desktop.kiro.dev/refreshToken`
 
 </details>
+
+---
+
+## 🔀 Sistem Akun (Lanjutan)
+
+Sistem Akun adalah cara untuk mengelola beberapa akun Kiro dengan perpindahan otomatis saat terjadi kegagalan. Di masa depan, sistem ini akan menggantikan file `.env` untuk konfigurasi kredensial, tetapi saat ini bersifat opsional dan ditujukan bagi mereka yang ingin menggunakan beberapa akun.
+
+### Mengapa Anda Membutuhkannya
+
+Jika Anda memiliki beberapa akun Kiro, gateway dapat secara otomatis beralih di antara mereka ketika satu akun tidak tersedia sementara.
+
+Sistem ini juga bekerja dengan satu akun — hanya tanpa perpindahan.
+
+### Cara Mengaktifkannya
+
+Tambahkan ke `.env` Anda:
+
+```env
+ACCOUNT_SYSTEM=true
+```
+
+**Yang terjadi:**
+- Pada startup pertama, kredensial Anda dari `.env` secara otomatis dimigrasikan ke `credentials.json` (hanya sekali)
+- Setelah itu, semua pengaturan akun dan region dari `.env` diabaikan
+- Manajemen akun hanya melalui `credentials.json`
+
+<details>
+<summary>📄 Contoh Konfigurasi</summary>
+
+**Satu akun:**
+```json
+[
+  {
+    "type": "json",
+    "path": "~/.aws/sso/cache/kiro-auth-token.json"
+  }
+]
+```
+
+**Beberapa akun:**
+```json
+[
+  {
+    "type": "json",
+    "path": "~/.aws/sso/cache/kiro-auth-token.json"
+  },
+  {
+    "type": "sqlite",
+    "path": "~/.local/share/kiro-cli/data.sqlite3"
+  },
+  {
+    "type": "refresh_token",
+    "refresh_token": "eyJhbGc...",
+    "profile_arn": "arn:aws:codewhisperer:us-east-1:..."
+  }
+]
+```
+
+**Folder dengan file:**
+```json
+[
+  {
+    "type": "json",
+    "path": "C:\\MyAccs\\kiro67"
+  }
+]
+```
+
+Gateway akan memindai semua file di folder dan menambahkannya sebagai akun terpisah.
+
+</details>
+
+### Cara Kerja Perpindahan
+
+Ketika satu akun mengembalikan error (batas kecepatan 429, kuota terlampaui 402), gateway secara otomatis mencoba akun berikutnya dari daftar. Jika satu akun gagal beberapa kali berturut-turut, gateway berhenti menggunakannya sementara dan secara berkala memeriksa apakah telah pulih.
+
+Untuk satu akun, perpindahan tidak berfungsi — Anda akan menerima error asli dari Kiro API.
+
+Untuk contoh konfigurasi lengkap (termasuk pengaturan region per akun), lihat [`credentials.json.example`](../../credentials.json.example).
 
 ---
 

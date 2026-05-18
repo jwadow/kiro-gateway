@@ -804,3 +804,168 @@ class TestWebSearchConfig:
         
         print(f"Comparing WEB_SEARCH_ENABLED: Expected False, Got {config_module.WEB_SEARCH_ENABLED}")
         assert config_module.WEB_SEARCH_ENABLED is False
+
+
+# ==================================================================================================
+# Tests for Account System Configuration
+# ==================================================================================================
+
+class TestAccountSystemConfig:
+    """Tests for Account System configuration constants."""
+    
+    def test_account_system_default_false(self):
+        """
+        What it does: Verifies ACCOUNT_SYSTEM defaults to false.
+        Purpose: Ensure legacy mode is default (backward compatibility).
+        """
+        print("Setup: Mocking os.getenv for ACCOUNT_SYSTEM...")
+        
+        original_getenv = os.getenv
+        
+        def mock_getenv(key, default=None):
+            if key == "ACCOUNT_SYSTEM":
+                print(f"os.getenv('{key}') -> None (mocked)")
+                return default  # Return default, simulating missing variable
+            return original_getenv(key, default)
+        
+        with patch.object(os, 'getenv', side_effect=mock_getenv):
+            print("Action: Reloading config module...")
+            from importlib import reload
+            import kiro.config as config_module
+            reload(config_module)
+            
+            print(f"Comparing ACCOUNT_SYSTEM: Expected False, Got {config_module.ACCOUNT_SYSTEM}")
+            assert config_module.ACCOUNT_SYSTEM is False
+        
+        # Restore module with real values
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+    
+    def test_account_system_enabled(self, monkeypatch):
+        """
+        What it does: Verifies ACCOUNT_SYSTEM=true enables account system.
+        Purpose: Ensure account system can be enabled via environment variable.
+        """
+        print("Setup: Setting ACCOUNT_SYSTEM=true...")
+        monkeypatch.setenv("ACCOUNT_SYSTEM", "true")
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing ACCOUNT_SYSTEM: Expected True, Got {config_module.ACCOUNT_SYSTEM}")
+        assert config_module.ACCOUNT_SYSTEM is True
+    
+    def test_accounts_config_file_default(self, monkeypatch):
+        """
+        What it does: Verifies ACCOUNTS_CONFIG_FILE defaults to credentials.json.
+        Purpose: Ensure default path for credentials configuration.
+        """
+        print("Setup: Removing ACCOUNTS_CONFIG_FILE from environment...")
+        monkeypatch.delenv("ACCOUNTS_CONFIG_FILE", raising=False)
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing ACCOUNTS_CONFIG_FILE: Expected 'credentials.json', Got '{config_module.ACCOUNTS_CONFIG_FILE}'")
+        assert config_module.ACCOUNTS_CONFIG_FILE == "credentials.json"
+    
+    def test_accounts_state_file_default(self, monkeypatch):
+        """
+        What it does: Verifies ACCOUNTS_STATE_FILE defaults to state.json.
+        Purpose: Ensure default path for runtime state file.
+        """
+        print("Setup: Removing ACCOUNTS_STATE_FILE from environment...")
+        monkeypatch.delenv("ACCOUNTS_STATE_FILE", raising=False)
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing ACCOUNTS_STATE_FILE: Expected 'state.json', Got '{config_module.ACCOUNTS_STATE_FILE}'")
+        assert config_module.ACCOUNTS_STATE_FILE == "state.json"
+    
+    def test_account_recovery_timeout_default(self, monkeypatch):
+        """
+        What it does: Verifies ACCOUNT_RECOVERY_TIMEOUT defaults to 60 seconds.
+        Purpose: Ensure base timeout for exponential backoff is 60s.
+        """
+        print("Setup: Removing ACCOUNT_RECOVERY_TIMEOUT from environment...")
+        monkeypatch.delenv("ACCOUNT_RECOVERY_TIMEOUT", raising=False)
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing ACCOUNT_RECOVERY_TIMEOUT: Expected 60, Got {config_module.ACCOUNT_RECOVERY_TIMEOUT}")
+        assert config_module.ACCOUNT_RECOVERY_TIMEOUT == 60
+    
+    def test_account_max_backoff_multiplier_default(self, monkeypatch):
+        """
+        What it does: Verifies ACCOUNT_MAX_BACKOFF_MULTIPLIER defaults to 1440.0.
+        Purpose: Ensure maximum backoff cap is 1 day (60s * 1440 = 86400s).
+        """
+        print("Setup: Removing ACCOUNT_MAX_BACKOFF_MULTIPLIER from environment...")
+        monkeypatch.delenv("ACCOUNT_MAX_BACKOFF_MULTIPLIER", raising=False)
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing ACCOUNT_MAX_BACKOFF_MULTIPLIER: Expected 1440.0, Got {config_module.ACCOUNT_MAX_BACKOFF_MULTIPLIER}")
+        assert config_module.ACCOUNT_MAX_BACKOFF_MULTIPLIER == 1440.0
+    
+    def test_account_probabilistic_retry_chance_default(self, monkeypatch):
+        """
+        What it does: Verifies ACCOUNT_PROBABILISTIC_RETRY_CHANCE defaults to 0.1.
+        Purpose: Ensure 10% chance for probabilistic retry of broken accounts.
+        """
+        print("Setup: Removing ACCOUNT_PROBABILISTIC_RETRY_CHANCE from environment...")
+        monkeypatch.delenv("ACCOUNT_PROBABILISTIC_RETRY_CHANCE", raising=False)
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing ACCOUNT_PROBABILISTIC_RETRY_CHANCE: Expected 0.1, Got {config_module.ACCOUNT_PROBABILISTIC_RETRY_CHANCE}")
+        assert config_module.ACCOUNT_PROBABILISTIC_RETRY_CHANCE == 0.1
+    
+    def test_account_cache_ttl_default(self, monkeypatch):
+        """
+        What it does: Verifies ACCOUNT_CACHE_TTL defaults to 43200 seconds (12 hours).
+        Purpose: Ensure model cache TTL is 12 hours by default.
+        """
+        print("Setup: Removing ACCOUNT_CACHE_TTL from environment...")
+        monkeypatch.delenv("ACCOUNT_CACHE_TTL", raising=False)
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing ACCOUNT_CACHE_TTL: Expected 43200, Got {config_module.ACCOUNT_CACHE_TTL}")
+        assert config_module.ACCOUNT_CACHE_TTL == 43200
+    
+    def test_state_save_interval_seconds_default(self, monkeypatch):
+        """
+        What it does: Verifies STATE_SAVE_INTERVAL_SECONDS defaults to 10 seconds.
+        Purpose: Ensure periodic state saving happens every 10 seconds.
+        """
+        print("Setup: Removing STATE_SAVE_INTERVAL_SECONDS from environment...")
+        monkeypatch.delenv("STATE_SAVE_INTERVAL_SECONDS", raising=False)
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
+        assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10

@@ -483,9 +483,9 @@ class TestKiroAuthManagerProperties:
             region="us-east-1"
         )
         
-        print("Verification: api_host contains q.{region}.amazonaws.com pattern...")
+        print("Verification: api_host contains runtime.{region}.kiro.dev pattern...")
         print(f"api_host: {manager.api_host}")
-        assert "q.us-east-1.amazonaws.com" in manager.api_host
+        assert "runtime.us-east-1.kiro.dev" in manager.api_host
         assert "us-east-1" in manager.api_host
     
     def test_fingerprint_property(self):
@@ -4135,4 +4135,119 @@ class TestAPIRegionPriorityHierarchy:
         print("Verification: API hosts use custom default region...")
         print(f"api_host: {manager._api_host}")
         assert "ap-south-1" in manager._api_host
+    
+    def test_auth_manager_api_region_parameter(self, temp_creds_file, monkeypatch):
+        """
+        What it does: Verifies api_region parameter has highest priority.
+        Purpose: Ensure per-account api_region override works correctly.
+        """
+        print("Setup: Setting KIRO_API_REGION env var to us-west-1...")
+        monkeypatch.setenv("KIRO_API_REGION", "us-west-1")
+        
+        print("Setup: Creating KiroAuthManager with api_region=eu-central-1...")
+        print("  - JSON file has region=us-east-1 (detected)")
+        print("  - KIRO_API_REGION env var=us-west-1")
+        print("  - api_region parameter=eu-central-1 (should win)")
+        manager = KiroAuthManager(
+            creds_file=temp_creds_file,
+            api_region="eu-central-1"
+        )
+        
+        print("Verification: Region detected from JSON...")
+        print(f"Comparing _detected_api_region: Expected 'us-east-1', Got '{manager._detected_api_region}'")
+        assert manager._detected_api_region == "us-east-1"
+        
+        print("Verification: But API hosts use api_region parameter (highest priority)...")
+        print(f"api_host: {manager._api_host}")
+        assert "eu-central-1" in manager._api_host
+        assert "us-west-1" not in manager._api_host
+        assert "us-east-1" not in manager._api_host
+        
+        print(f"q_host: {manager._q_host}")
+        assert "eu-central-1" in manager._q_host
+    
+    def test_auth_manager_api_region_priority_hierarchy(self, temp_sqlite_db_with_profile_arn, monkeypatch):
+        """
+        What it does: Verifies complete priority hierarchy for API region.
+        Purpose: Ensure all 5 levels of priority work correctly.
+        
+        Priority hierarchy (highest to lowest):
+        1. api_region parameter (per-account override)
+        2. KIRO_API_REGION env var (global override)
+        3. Auto-detected from credentials (SQLite ARN or JSON region)
+        4. SSO region (fallback)
+        5. Default region parameter (last resort)
+        """
+        print("=== Test 1: api_region parameter (highest priority) ===")
+        monkeypatch.setenv("KIRO_API_REGION", "us-west-1")
+        manager1 = KiroAuthManager(
+            sqlite_db=temp_sqlite_db_with_profile_arn,
+            region="ap-south-1",
+            api_region="ap-northeast-1"
+        )
+        print(f"  - api_region=ap-northeast-1 (parameter)")
+        print(f"  - KIRO_API_REGION=us-west-1 (env)")
+        print(f"  - detected=eu-central-1 (from ARN)")
+        print(f"  - sso=eu-west-1 (from token)")
+        print(f"  - default=ap-south-1 (parameter)")
+        print(f"Result: api_host={manager1._api_host}")
+        assert "ap-northeast-1" in manager1._api_host
+        
+        print("\n=== Test 2: KIRO_API_REGION env var (2nd priority) ===")
+        manager2 = KiroAuthManager(
+            sqlite_db=temp_sqlite_db_with_profile_arn,
+            region="ap-south-1"
+        )
+        print(f"  - api_region=None")
+        print(f"  - KIRO_API_REGION=us-west-1 (env)")
+        print(f"  - detected=eu-central-1 (from ARN)")
+        print(f"  - sso=eu-west-1 (from token)")
+        print(f"  - default=ap-south-1 (parameter)")
+        print(f"Result: api_host={manager2._api_host}")
+        assert "us-west-1" in manager2._api_host
+        
+        print("\n=== Test 3: Auto-detected from ARN (3rd priority) ===")
+        monkeypatch.delenv("KIRO_API_REGION", raising=False)
+        manager3 = KiroAuthManager(
+            sqlite_db=temp_sqlite_db_with_profile_arn,
+            region="ap-south-1"
+        )
+        print(f"  - api_region=None")
+        print(f"  - KIRO_API_REGION=None")
+        print(f"  - detected=eu-central-1 (from ARN)")
+        print(f"  - sso=eu-west-1 (from token)")
+        print(f"  - default=ap-south-1 (parameter)")
+        print(f"Result: api_host={manager3._api_host}")
+        assert "eu-central-1" in manager3._api_host
+        
+        print("\n=== Test 4: SSO region fallback (4th priority) ===")
+        manager4 = KiroAuthManager(
+            sqlite_db=temp_sqlite_db_with_profile_arn,
+            region="ap-south-1"
+        )
+        # Force no detection by clearing detected region
+        manager4._detected_api_region = None
+        # Rebuild URLs to apply the change
+        manager4._api_host = f"https://codewhisperer.{manager4._sso_region}.api.aws"
+        manager4._q_host = f"https://q.{manager4._sso_region}.api.aws"
+        print(f"  - api_region=None")
+        print(f"  - KIRO_API_REGION=None")
+        print(f"  - detected=None (forced)")
+        print(f"  - sso=eu-west-1 (from token)")
+        print(f"  - default=ap-south-1 (parameter)")
+        print(f"Result: api_host={manager4._api_host}")
+        assert "eu-west-1" in manager4._api_host
+        
+        print("\n=== Test 5: Default region (lowest priority) ===")
+        manager5 = KiroAuthManager(
+            refresh_token="test_refresh",
+            region="ap-south-1"
+        )
+        print(f"  - api_region=None")
+        print(f"  - KIRO_API_REGION=None")
+        print(f"  - detected=None (no file)")
+        print(f"  - sso=None (no file)")
+        print(f"  - default=ap-south-1 (parameter)")
+        print(f"Result: api_host={manager5._api_host}")
+        assert "ap-south-1" in manager5._api_host
 

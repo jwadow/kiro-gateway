@@ -1,6 +1,8 @@
 # Environment
 .env
 .env.local
+credentials.json
+state.json
 
 # IDE
 .vscode/

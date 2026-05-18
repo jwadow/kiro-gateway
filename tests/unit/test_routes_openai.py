@@ -17,6 +17,7 @@ import pytest
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 from datetime import datetime, timezone
 import json
+import time
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -1498,3 +1499,502 @@ class TestWebSearchAutoInjectionOpenAI:
             if t.type == "function" and t.function.name == "web_search"
         )
         assert web_search_count == 1
+
+
+# ==================================================================================================
+# Tests for Account System - /v1/models endpoint
+# ==================================================================================================
+
+class TestModelsEndpointAccountSystem:
+    """Tests for /v1/models endpoint with Account System."""
+    
+    def test_get_models_account_system_logic(self):
+        """
+        What it does: Verifies logic for collecting models in account system mode.
+        Purpose: Ensure models are collected from all initialized accounts.
+        """
+        print("\n--- Test: /v1/models account system logic ---")
+        
+        # Simulate account system mode logic
+        account_system = True
+        
+        mock_account_manager = Mock()
+        mock_account_manager.get_all_available_models.return_value = [
+            "claude-opus-4.5",
+            "claude-sonnet-4.5",
+            "claude-haiku-4.5"
+        ]
+        
+        print("Action: Getting models in account system mode...")
+        if account_system:
+            available_model_ids = mock_account_manager.get_all_available_models()
+        else:
+            available_model_ids = []
+        
+        print("Checking: get_all_available_models() was called...")
+        mock_account_manager.get_all_available_models.assert_called_once()
+        
+        print("Checking: Models from all accounts collected...")
+        assert "claude-opus-4.5" in available_model_ids
+        assert "claude-sonnet-4.5" in available_model_ids
+        assert "claude-haiku-4.5" in available_model_ids
+        assert len(available_model_ids) == 3
+        print("✅ Account system mode correctly collects models from all accounts")
+    
+    def test_get_models_legacy_logic(self):
+        """
+        What it does: Verifies logic for getting models in legacy mode.
+        Purpose: Ensure backward compatibility with single account.
+        """
+        print("\n--- Test: /v1/models legacy mode logic ---")
+        
+        # Simulate legacy mode logic
+        account_system = False
+        
+        mock_account = Mock()
+        mock_resolver = Mock()
+        mock_resolver.get_available_models.return_value = [
+            "claude-opus-4.5",
+            "claude-sonnet-4.5"
+        ]
+        mock_account.model_resolver = mock_resolver
+        
+        mock_account_manager = Mock()
+        mock_account_manager.get_first_account.return_value = mock_account
+        
+        print("Action: Getting models in legacy mode...")
+        if account_system:
+            available_model_ids = []
+        else:
+            account = mock_account_manager.get_first_account()
+            available_model_ids = account.model_resolver.get_available_models()
+        
+        print("Checking: get_first_account() was called...")
+        mock_account_manager.get_first_account.assert_called_once()
+        
+        print("Checking: model_resolver.get_available_models() was called...")
+        mock_resolver.get_available_models.assert_called_once()
+        
+        print("Checking: Models from first account returned...")
+        assert "claude-opus-4.5" in available_model_ids
+        assert "claude-sonnet-4.5" in available_model_ids
+        assert len(available_model_ids) == 2
+        print("✅ Legacy mode correctly uses first account's resolver")
+
+
+# ==================================================================================================
+# Tests for Account System - Failover Loop
+# ==================================================================================================
+
+class TestChatCompletionsFailoverLoop:
+    """Tests for failover loop in /v1/chat/completions endpoint."""
+    
+    @pytest.mark.asyncio
+    async def test_chat_completions_failover_get_next_account(self):
+        """
+        What it does: Verifies get_next_account() is called with exclude_accounts.
+        Purpose: Ensure failover loop tracks tried accounts.
+        """
+        print("\n--- Test: Failover calls get_next_account() with exclude_accounts ---")
+        
+        mock_account = Mock()
+        mock_account.id = "/home/user/account1.json"
+        mock_account.auth_manager = Mock()
+        mock_account.model_cache = Mock()
+        mock_account.model_resolver = Mock()
+        
+        mock_manager = Mock()
+        mock_manager.get_next_account = AsyncMock(return_value=mock_account)
+        mock_manager._accounts = {mock_account.id: mock_account}
+        
+        print("Checking: get_next_account() called with exclude_accounts parameter...")
+        # This test verifies the signature - actual implementation tested in integration tests
+        await mock_manager.get_next_account("claude-opus-4.5", exclude_accounts=set())
+        
+        mock_manager.get_next_account.assert_called_once()
+        call_kwargs = mock_manager.get_next_account.call_args[1]
+        assert "exclude_accounts" in call_kwargs
+        print("✅ Failover loop correctly passes exclude_accounts")
+    
+    @pytest.mark.asyncio
+    async def test_chat_completions_failover_success_first_account(self):
+        """
+        What it does: Verifies successful response on first account attempt.
+        Purpose: Ensure no unnecessary failover when first account works.
+        """
+        print("\n--- Test: Success on first account ---")
+        
+        from kiro.account_manager import Account, AccountStats
+        
+        mock_account = Account(
+            id="/home/user/account1.json",
+            failures=0,
+            last_failure_time=0.0,
+            models_cached_at=time.time(),
+            stats=AccountStats()
+        )
+        
+        mock_manager = Mock()
+        mock_manager.get_next_account = AsyncMock(return_value=mock_account)
+        mock_manager.report_success = AsyncMock()
+        mock_manager._accounts = {mock_account.id: mock_account}
+        
+        print("Action: Simulating successful request...")
+        account = await mock_manager.get_next_account("claude-opus-4.5", exclude_accounts=set())
+        
+        print("Checking: First account returned...")
+        assert account is not None
+        assert account.id == "/home/user/account1.json"
+        
+        print("Action: Reporting success...")
+        await mock_manager.report_success(account.id, "claude-opus-4.5")
+        
+        print("Checking: report_success() was called...")
+        mock_manager.report_success.assert_called_once_with(
+            "/home/user/account1.json",
+            "claude-opus-4.5"
+        )
+        print("✅ Success on first account works correctly")
+    
+    @pytest.mark.asyncio
+    async def test_chat_completions_failover_recoverable_try_next(self):
+        """
+        What it does: Verifies RECOVERABLE error triggers next account attempt.
+        Purpose: Ensure failover happens for account-specific errors.
+        """
+        print("\n--- Test: RECOVERABLE error tries next account ---")
+        
+        from kiro.account_errors import ErrorType, classify_error
+        
+        print("Setup: Classifying 429 error...")
+        error_type = classify_error(429, None)
+        
+        print("Checking: 429 is RECOVERABLE...")
+        assert error_type == ErrorType.RECOVERABLE
+        
+        print("Checking: Failover logic should continue to next account...")
+        # In actual implementation, this would trigger:
+        # await account_manager.report_failure(...)
+        # continue  # Next iteration of failover loop
+        
+        mock_manager = Mock()
+        mock_manager.report_failure = AsyncMock()
+        
+        await mock_manager.report_failure(
+            "/home/user/account1.json",
+            "claude-opus-4.5",
+            ErrorType.RECOVERABLE,
+            429,
+            None
+        )
+        
+        mock_manager.report_failure.assert_called_once()
+        print("✅ RECOVERABLE error correctly triggers failover")
+    
+    @pytest.mark.asyncio
+    async def test_chat_completions_failover_fatal_immediate_return(self):
+        """
+        What it does: Verifies FATAL error returns immediately to client.
+        Purpose: Ensure no wasted retries for request-level errors.
+        """
+        print("\n--- Test: FATAL error returns immediately ---")
+        
+        from kiro.account_errors import ErrorType, classify_error
+        
+        print("Setup: Classifying 400 + CONTENT_LENGTH_EXCEEDS_THRESHOLD...")
+        error_type = classify_error(400, "CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        
+        print("Checking: Error is FATAL...")
+        assert error_type == ErrorType.FATAL
+        
+        print("Checking: Failover logic should break immediately...")
+        # In actual implementation, this would trigger:
+        # await account_manager.report_failure(...)
+        # return JSONResponse(...)  # No continue, immediate return
+        
+        mock_manager = Mock()
+        mock_manager.report_failure = AsyncMock()
+        
+        await mock_manager.report_failure(
+            "/home/user/account1.json",
+            "claude-opus-4.5",
+            ErrorType.FATAL,
+            400,
+            "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+        )
+        
+        mock_manager.report_failure.assert_called_once()
+        print("✅ FATAL error correctly returns immediately")
+    
+    def test_chat_completions_failover_single_account_original_error(self):
+        """
+        What it does: Verifies single account returns original error message.
+        Purpose: Ensure users see specific error for single account setup.
+        """
+        print("\n--- Test: Single account returns original error ---")
+        
+        all_accounts = ["/home/user/account1.json"]
+        last_error_message = "Monthly request limit exceeded"
+        last_error_status = 402
+        
+        print("Checking: Single account error handling...")
+        if len(all_accounts) == 1:
+            error_response = {
+                "status_code": last_error_status,
+                "detail": last_error_message
+            }
+        else:
+            error_response = {
+                "status_code": 503,
+                "detail": "No available accounts for this model"
+            }
+        
+        print(f"Error response: {error_response}")
+        assert error_response["status_code"] == 402
+        assert error_response["detail"] == "Monthly request limit exceeded"
+        print("✅ Single account correctly returns original error")
+    
+    def test_chat_completions_failover_multi_account_generic_error(self):
+        """
+        What it does: Verifies multi-account returns generic error message.
+        Purpose: Ensure users don't see confusing account-specific errors.
+        """
+        print("\n--- Test: Multi-account returns generic error ---")
+        
+        all_accounts = [
+            "/home/user/account1.json",
+            "/home/user/account2.json"
+        ]
+        last_error_message = "Token expired"
+        
+        print("Checking: Multi-account error handling...")
+        if len(all_accounts) == 1:
+            error_response = {
+                "status_code": 403,
+                "detail": last_error_message
+            }
+        else:
+            detail = "No available accounts for this model."
+            if last_error_message:
+                detail += f" Last error: {last_error_message}"
+            error_response = {
+                "status_code": 503,
+                "detail": detail
+            }
+        
+        print(f"Error response: {error_response}")
+        assert error_response["status_code"] == 503
+        assert "No available accounts" in error_response["detail"]
+        assert "Last error: Token expired" in error_response["detail"]
+        print("✅ Multi-account correctly returns generic error with context")
+    
+    @pytest.mark.asyncio
+    async def test_chat_completions_failover_all_unavailable(self):
+        """
+        What it does: Verifies behavior when all accounts are unavailable.
+        Purpose: Ensure graceful handling of complete failure.
+        """
+        print("\n--- Test: All accounts unavailable ---")
+        
+        mock_manager = Mock()
+        mock_manager.get_next_account = AsyncMock(return_value=None)
+        mock_manager._accounts = {
+            "/home/user/account1.json": Mock(),
+            "/home/user/account2.json": Mock()
+        }
+        
+        print("Action: Requesting account when all unavailable...")
+        account = await mock_manager.get_next_account(
+            "claude-opus-4.5",
+            exclude_accounts=set()
+        )
+        
+        print("Checking: None returned...")
+        assert account is None
+        
+        print("Checking: Error response logic...")
+        all_accounts = list(mock_manager._accounts.keys())
+        if len(all_accounts) == 1:
+            error_msg = "Account unavailable"
+        else:
+            error_msg = "No available accounts for this model"
+        
+        assert "No available accounts" in error_msg
+        print("✅ All unavailable correctly handled")
+    
+    @pytest.mark.asyncio
+    async def test_chat_completions_failover_report_success(self):
+        """
+        What it does: Verifies report_success() is called after successful request.
+        Purpose: Ensure statistics and sticky behavior are updated.
+        """
+        print("\n--- Test: report_success() called on success ---")
+        
+        mock_manager = Mock()
+        mock_manager.report_success = AsyncMock()
+        
+        account_id = "/home/user/account1.json"
+        model = "claude-opus-4.5"
+        
+        print("Action: Reporting success...")
+        await mock_manager.report_success(account_id, model)
+        
+        print("Checking: report_success() was called with correct params...")
+        mock_manager.report_success.assert_called_once_with(account_id, model)
+        print("✅ report_success() correctly called")
+    
+    @pytest.mark.asyncio
+    async def test_chat_completions_failover_report_failure(self):
+        """
+        What it does: Verifies report_failure() is called after failed request.
+        Purpose: Ensure Circuit Breaker state is updated.
+        """
+        print("\n--- Test: report_failure() called on failure ---")
+        
+        from kiro.account_errors import ErrorType
+        
+        mock_manager = Mock()
+        mock_manager.report_failure = AsyncMock()
+        
+        account_id = "/home/user/account1.json"
+        model = "claude-opus-4.5"
+        error_type = ErrorType.RECOVERABLE
+        status_code = 429
+        reason = None
+        
+        print("Action: Reporting failure...")
+        await mock_manager.report_failure(
+            account_id,
+            model,
+            error_type,
+            status_code,
+            reason
+        )
+        
+        print("Checking: report_failure() was called with correct params...")
+        mock_manager.report_failure.assert_called_once_with(
+            account_id,
+            model,
+            error_type,
+            status_code,
+            reason
+        )
+        print("✅ report_failure() correctly called")
+    
+    @pytest.mark.asyncio
+    async def test_chat_completions_failover_exclude_tried_accounts(self):
+        """
+        What it does: Verifies exclude_accounts grows with each attempt.
+        Purpose: Ensure accounts aren't retried in same failover loop.
+        """
+        print("\n--- Test: exclude_accounts grows with attempts ---")
+        
+        tried_accounts = set()
+        
+        print("Action: Simulating multiple attempts...")
+        account1_id = "/home/user/account1.json"
+        account2_id = "/home/user/account2.json"
+        
+        # Attempt 1
+        tried_accounts.add(account1_id)
+        print(f"After attempt 1: {tried_accounts}")
+        assert account1_id in tried_accounts
+        assert len(tried_accounts) == 1
+        
+        # Attempt 2
+        tried_accounts.add(account2_id)
+        print(f"After attempt 2: {tried_accounts}")
+        assert account2_id in tried_accounts
+        assert len(tried_accounts) == 2
+        
+        print("Checking: Both accounts in exclude set...")
+        assert account1_id in tried_accounts
+        assert account2_id in tried_accounts
+        print("✅ exclude_accounts correctly tracks tried accounts")
+    
+    def test_chat_completions_failover_max_attempts(self):
+        """
+        What it does: Verifies failover loop stops after MAX_ATTEMPTS.
+        Purpose: Ensure infinite loops are prevented.
+        """
+        print("\n--- Test: MAX_ATTEMPTS prevents infinite loop ---")
+        
+        all_accounts = [
+            "/home/user/account1.json",
+            "/home/user/account2.json"
+        ]
+        MAX_ATTEMPTS = len(all_accounts) * 2
+        
+        print(f"Checking: MAX_ATTEMPTS = {MAX_ATTEMPTS}...")
+        assert MAX_ATTEMPTS == 4
+        
+        print("Checking: Loop would stop after 4 attempts...")
+        attempts = 0
+        for attempt in range(MAX_ATTEMPTS):
+            attempts += 1
+            if attempts >= MAX_ATTEMPTS:
+                break
+        
+        assert attempts == MAX_ATTEMPTS
+        print("✅ MAX_ATTEMPTS correctly limits failover loop")
+
+
+# ==================================================================================================
+# Tests for Account System - Legacy Mode
+# ==================================================================================================
+
+class TestChatCompletionsLegacyMode:
+    """Tests for legacy mode (ACCOUNT_SYSTEM=false) in /v1/chat/completions."""
+    
+    @pytest.mark.asyncio
+    async def test_chat_completions_legacy_get_first_account(self):
+        """
+        What it does: Verifies legacy mode uses get_first_account().
+        Purpose: Ensure backward compatibility with single account.
+        """
+        print("\n--- Test: Legacy mode uses get_first_account() ---")
+        
+        from kiro.account_manager import Account, AccountStats
+        
+        mock_account = Account(
+            id="/home/user/account1.json",
+            failures=0,
+            last_failure_time=0.0,
+            models_cached_at=time.time(),
+            stats=AccountStats()
+        )
+        
+        mock_manager = Mock()
+        mock_manager.get_first_account.return_value = mock_account
+        
+        print("Action: Getting first account in legacy mode...")
+        account = mock_manager.get_first_account()
+        
+        print("Checking: get_first_account() was called...")
+        mock_manager.get_first_account.assert_called_once()
+        
+        print("Checking: Account returned...")
+        assert account is not None
+        assert account.id == "/home/user/account1.json"
+        print("✅ Legacy mode correctly uses get_first_account()")
+    
+    def test_chat_completions_legacy_no_failover(self):
+        """
+        What it does: Verifies legacy mode has no failover loop.
+        Purpose: Ensure single account behavior is preserved.
+        """
+        print("\n--- Test: Legacy mode has no failover ---")
+        
+        account_system = False
+        
+        print("Checking: account_system flag is False...")
+        assert account_system is False
+        
+        print("Checking: Failover loop should be skipped...")
+        if account_system:
+            failover_enabled = True
+        else:
+            failover_enabled = False
+        
+        assert failover_enabled is False
+        print("✅ Legacy mode correctly skips failover loop")

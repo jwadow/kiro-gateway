@@ -31,6 +31,7 @@ with connection pooling for better resource management.
 """
 
 import asyncio
+import json
 from typing import Optional
 
 import httpx
@@ -170,7 +171,8 @@ class KiroHttpClient:
         self,
         method: str,
         url: str,
-        json_data: dict,
+        json_data: Optional[dict] = None,
+        params: Optional[dict] = None,
         stream: bool = False
     ) -> httpx.Response:
         """
@@ -188,7 +190,8 @@ class KiroHttpClient:
         Args:
             method: HTTP method (GET, POST, etc.)
             url: Request URL
-            json_data: Request body (JSON)
+            json_data: Optional JSON body (for POST/PUT/PATCH)
+            params: Optional query parameters (for GET)
             stream: Use streaming (default False)
         
         Returns:
@@ -204,6 +207,7 @@ class KiroHttpClient:
         client = await self._get_client(stream=stream)
         last_error = None
         last_error_info: Optional[NetworkErrorInfo] = None
+        last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
         
         for attempt in range(max_retries):
             try:
@@ -211,10 +215,19 @@ class KiroHttpClient:
                 token = await self.auth_manager.get_access_token()
                 headers = get_kiro_headers(self.auth_manager, token)
                 
+                # Build request kwargs based on parameters
+                request_kwargs = {"headers": headers}
+                
+                if json_data is not None:
+                    request_kwargs["content"] = json.dumps(json_data).encode()
+                
+                if params is not None:
+                    request_kwargs["params"] = params
+                
                 if stream:
                     # Prevent CLOSE_WAIT connection leak (issue #38)
                     headers["Connection"] = "close"
-                    req = client.build_request(method, url, json=json_data, headers=headers)
+                    req = client.build_request(method, url, **request_kwargs)
                     logger.debug("Sending request to Kiro API...")
                     response = await asyncio.wait_for(
                         client.send(req, stream=True),
@@ -222,7 +235,7 @@ class KiroHttpClient:
                     )
                 else:
                     logger.debug("Sending request to Kiro API...")
-                    response = await client.request(method, url, json=json_data, headers=headers)
+                    response = await client.request(method, url, **request_kwargs)
                 
                 # Check status
                 if response.status_code == 200:
@@ -240,15 +253,17 @@ class KiroHttpClient:
                 
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
+                    last_response = response  # Сохраняем для возврата после exhaustion
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
                 
                 # 5xx - server error, wait and retry
                 if 500 <= response.status_code < 600:
+                    last_response = response  # Сохраняем для возврата после exhaustion
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
                 
@@ -308,6 +323,15 @@ class KiroHttpClient:
                     logger.error(f"{short_msg} - no more retries (attempt {attempt + 1}/{max_retries})")
                     if not error_info.is_retryable:
                         break  # Don't retry non-retryable errors
+        
+        # If we have a last_response (429/5xx retry exhausted), return it
+        # This allows the caller to see the real status code and error body
+        if last_response is not None:
+            logger.warning(
+                f"Retries exhausted for HTTP {last_response.status_code}, "
+                f"returning response to caller for classification"
+            )
+            return last_response
         
         # All attempts exhausted - provide detailed, user-friendly error message
         if last_error_info:

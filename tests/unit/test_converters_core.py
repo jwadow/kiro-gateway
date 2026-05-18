@@ -1342,7 +1342,7 @@ class TestEnsureFirstMessageIsUser:
         
         print("Checking first message is synthetic user...")
         assert result[0].role == "user"
-        assert result[0].content == "(empty)"
+        assert result[0].content == "(empty placeholder)"
         
         print("Checking original messages are preserved...")
         assert result[1].role == "assistant"
@@ -1379,7 +1379,7 @@ class TestEnsureFirstMessageIsUser:
         print(f"Comparing length: Expected 2 (synthetic + original), Got {len(result)}")
         assert len(result) == 2
         assert result[0].role == "user"
-        assert result[0].content == "(empty)"
+        assert result[0].content == "(empty placeholder)"
         assert result[1].role == "assistant"
     
     def test_handles_assistant_user_assistant_sequence(self):
@@ -1400,7 +1400,7 @@ class TestEnsureFirstMessageIsUser:
         print(f"Comparing length: Expected 4 (synthetic + 3 original), Got {len(result)}")
         assert len(result) == 4
         assert result[0].role == "user"
-        assert result[0].content == "(empty)"
+        assert result[0].content == "(empty placeholder)"
         assert result[1].role == "assistant"
         assert result[2].role == "user"
         assert result[3].role == "assistant"
@@ -1429,7 +1429,7 @@ class TestEnsureFirstMessageIsUser:
         print("Checking synthetic user was prepended...")
         assert len(result) == 2
         assert result[0].role == "user"
-        assert result[0].content == "(empty)"
+        assert result[0].content == "(empty placeholder)"
         
         print("Checking tool_calls are preserved...")
         assert result[1].role == "assistant"
@@ -1463,7 +1463,7 @@ class TestEnsureFirstMessageIsUser:
     
     def test_uses_minimal_content_for_synthetic_message(self):
         """
-        What it does: Verifies synthetic message uses minimal content ("(empty)").
+        What it does: Verifies synthetic message uses minimal content ("(empty placeholder)").
         Purpose: Ensure minimal token usage and avoid disrupting conversation context.
         """
         print("Setup: Assistant-first conversation...")
@@ -1475,7 +1475,7 @@ class TestEnsureFirstMessageIsUser:
         result = ensure_first_message_is_user(messages)
         
         print("Checking synthetic message content...")
-        assert result[0].content == "(empty)"
+        assert result[0].content == "(empty placeholder)"
         print("✓ Synthetic message uses minimal content (matches LiteLLM behavior)")
 
 
@@ -1685,7 +1685,7 @@ class TestEnsureAlternatingRoles:
     Tests for ensure_alternating_roles function.
     
     This function ensures alternating user/assistant roles by inserting synthetic
-    assistant messages with "(empty)" content between consecutive user messages.
+    assistant messages with "(empty placeholder)" content between consecutive user messages.
     This is part of the fix for Issue #64 where multiple 'developer' roles
     (converted to 'user') create consecutive userInputMessage entries.
     """
@@ -1710,7 +1710,7 @@ class TestEnsureAlternatingRoles:
         assert result[0].role == "user"
         assert result[0].content == "First"
         assert result[1].role == "assistant"
-        assert result[1].content == "(empty)"
+        assert result[1].content == "(empty placeholder)"
         assert result[2].role == "user"
         assert result[2].content == "Second"
     
@@ -1734,11 +1734,11 @@ class TestEnsureAlternatingRoles:
         assert len(result) == 7
         print("Checking alternation pattern...")
         assert result[0].role == "user" and result[0].content == "First"
-        assert result[1].role == "assistant" and result[1].content == "(empty)"
+        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
         assert result[2].role == "user" and result[2].content == "Second"
-        assert result[3].role == "assistant" and result[3].content == "(empty)"
+        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
         assert result[4].role == "user" and result[4].content == "Third"
-        assert result[5].role == "assistant" and result[5].content == "(empty)"
+        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
         assert result[6].role == "user" and result[6].content == "Fourth"
     
     def test_preserves_already_alternating_messages(self):
@@ -1787,15 +1787,15 @@ class TestEnsureAlternatingRoles:
         assert len(result) == 9
         print("Checking first group (A, synthetic, B)...")
         assert result[0].role == "user" and result[0].content == "A"
-        assert result[1].role == "assistant" and result[1].content == "(empty)"
+        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
         assert result[2].role == "user" and result[2].content == "B"
         print("Checking real assistant...")
         assert result[3].role == "assistant" and result[3].content == "C"
         print("Checking second group (D, synthetic, E, synthetic, F)...")
         assert result[4].role == "user" and result[4].content == "D"
-        assert result[5].role == "assistant" and result[5].content == "(empty)"
+        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
         assert result[6].role == "user" and result[6].content == "E"
-        assert result[7].role == "assistant" and result[7].content == "(empty)"
+        assert result[7].role == "assistant" and result[7].content == "(empty placeholder)"
         assert result[8].role == "user" and result[8].content == "F"
     
     def test_handles_empty_list(self):
@@ -1931,11 +1931,11 @@ class TestNormalizeAndAlternatingIntegration:
         assert len(result) == 7
         print("Checking alternation pattern...")
         assert result[0].role == "user" and result[0].content == "Context 1"
-        assert result[1].role == "assistant" and result[1].content == "(empty)"
+        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
         assert result[2].role == "user" and result[2].content == "Context 2"
-        assert result[3].role == "assistant" and result[3].content == "(empty)"
+        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
         assert result[4].role == "user" and result[4].content == "Context 3"
-        assert result[5].role == "assistant" and result[5].content == "(empty)"
+        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
         assert result[6].role == "user" and result[6].content == "Question"
     
     def test_mixed_roles_are_normalized_and_alternated(self):
@@ -1970,13 +1970,13 @@ class TestNormalizeAndAlternatingIntegration:
         assert len(result) == 9
         print("Checking that all system/developer were converted to user...")
         assert result[0].role == "user" and result[0].content == "System"
-        assert result[1].role == "assistant" and result[1].content == "(empty)"
+        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
         assert result[2].role == "user" and result[2].content == "Dev"
-        assert result[3].role == "assistant" and result[3].content == "(empty)"
+        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
         assert result[4].role == "user" and result[4].content == "User1"
         assert result[5].role == "assistant" and result[5].content == "Assistant1"
         assert result[6].role == "user" and result[6].content == "Dev2"
-        assert result[7].role == "assistant" and result[7].content == "(empty)"
+        assert result[7].role == "assistant" and result[7].content == "(empty placeholder)"
         assert result[8].role == "user" and result[8].content == "User2"
 
 
@@ -3899,7 +3899,7 @@ class TestBuildKiroHistory:
     
     def test_adds_empty_placeholder_for_empty_user_content(self):
         """
-        What it does: Verifies that "(empty)" placeholder is added for user messages with empty content.
+        What it does: Verifies that "(empty placeholder)" placeholder is added for user messages with empty content.
         Purpose: Ensure Kiro API receives non-empty content in history.
         
         This is a fallback test for issue #20 - ensures any edge case with empty content
@@ -3913,12 +3913,12 @@ class TestBuildKiroHistory:
         
         print(f"Result: {result}")
         print(f"Content: '{result[0]['userInputMessage']['content']}'")
-        print("Checking that '(empty)' placeholder is added...")
-        assert result[0]["userInputMessage"]["content"] == "(empty)"
+        print("Checking that '(empty placeholder)' placeholder is added...")
+        assert result[0]["userInputMessage"]["content"] == "(empty placeholder)"
     
     def test_adds_empty_placeholder_for_empty_assistant_content(self):
         """
-        What it does: Verifies that "(empty)" placeholder is added for assistant messages with empty content.
+        What it does: Verifies that "(empty placeholder)" placeholder is added for assistant messages with empty content.
         Purpose: Ensure Kiro API receives non-empty content in history.
         
         This is a fallback test for issue #20 - ensures any edge case with empty content
@@ -3932,12 +3932,12 @@ class TestBuildKiroHistory:
         
         print(f"Result: {result}")
         print(f"Content: '{result[0]['assistantResponseMessage']['content']}'")
-        print("Checking that '(empty)' placeholder is added...")
-        assert result[0]["assistantResponseMessage"]["content"] == "(empty)"
+        print("Checking that '(empty placeholder)' placeholder is added...")
+        assert result[0]["assistantResponseMessage"]["content"] == "(empty placeholder)"
     
     def test_adds_empty_placeholder_for_none_user_content(self):
         """
-        What it does: Verifies that "(empty)" placeholder is added for user messages with None content.
+        What it does: Verifies that "(empty placeholder)" placeholder is added for user messages with None content.
         Purpose: Ensure Kiro API receives non-empty content when content is None.
         """
         print("Setup: User message with None content...")
@@ -3948,12 +3948,12 @@ class TestBuildKiroHistory:
         
         print(f"Result: {result}")
         print(f"Content: '{result[0]['userInputMessage']['content']}'")
-        print("Checking that '(empty)' placeholder is added...")
-        assert result[0]["userInputMessage"]["content"] == "(empty)"
+        print("Checking that '(empty placeholder)' placeholder is added...")
+        assert result[0]["userInputMessage"]["content"] == "(empty placeholder)"
     
     def test_adds_empty_placeholder_for_none_assistant_content(self):
         """
-        What it does: Verifies that "(empty)" placeholder is added for assistant messages with None content.
+        What it does: Verifies that "(empty placeholder)" placeholder is added for assistant messages with None content.
         Purpose: Ensure Kiro API receives non-empty content when content is None.
         """
         print("Setup: Assistant message with None content...")
@@ -3964,8 +3964,8 @@ class TestBuildKiroHistory:
         
         print(f"Result: {result}")
         print(f"Content: '{result[0]['assistantResponseMessage']['content']}'")
-        print("Checking that '(empty)' placeholder is added...")
-        assert result[0]["assistantResponseMessage"]["content"] == "(empty)"
+        print("Checking that '(empty placeholder)' placeholder is added...")
+        assert result[0]["assistantResponseMessage"]["content"] == "(empty placeholder)"
     
     def test_preserves_non_empty_content_in_history(self):
         """
@@ -4011,10 +4011,10 @@ class TestBuildKiroHistory:
         assert result[0]["userInputMessage"]["content"] == "Start"
         
         print(f"Message 1 content: '{result[1]['assistantResponseMessage']['content']}'")
-        assert result[1]["assistantResponseMessage"]["content"] == "(empty)"
+        assert result[1]["assistantResponseMessage"]["content"] == "(empty placeholder)"
         
         print(f"Message 2 content: '{result[2]['userInputMessage']['content']}'")
-        assert result[2]["userInputMessage"]["content"] == "(empty)"
+        assert result[2]["userInputMessage"]["content"] == "(empty placeholder)"
         
         print(f"Message 3 content: '{result[3]['assistantResponseMessage']['content']}'")
         assert result[3]["assistantResponseMessage"]["content"] == "Response"
@@ -4488,7 +4488,7 @@ class TestStripAllToolContent:
                 content="",
                 tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "tool", "arguments": "{}"}}]
             ),  # Has tool content
-            UnifiedMessage(role="user", content="Continue"),  # No tool content
+            UnifiedMessage(role="user", content="(empty placeholder)"),  # No tool content
         ]
         
         print("Action: Stripping tool content...")
@@ -4499,7 +4499,7 @@ class TestStripAllToolContent:
         assert result[0].content == "Hello"
         assert result[0].tool_calls is None
         assert result[1].tool_calls is None  # Stripped
-        assert result[2].content == "Continue"
+        assert result[2].content == "(empty placeholder)"
         assert result[2].tool_calls is None
         assert had_content is True
     
@@ -5507,7 +5507,7 @@ class TestBuildKiroPayloadIssue20:
                     "content": "Tool executed"
                 }]
             ),
-            UnifiedMessage(role="user", content="Continue")
+            UnifiedMessage(role="user", content="(empty placeholder)")
         ]
         
         tools = [UnifiedTool(
@@ -5558,7 +5558,7 @@ class TestBuildKiroPayloadIssue20:
                     "function": {"name": "some_tool", "arguments": "{}"}
                 }]
             ),
-            UnifiedMessage(role="user", content="Continue")
+            UnifiedMessage(role="user", content="(empty placeholder)")
         ]
         
         print("Action: Building Kiro payload with empty tools list...")

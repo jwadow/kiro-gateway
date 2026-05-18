@@ -33,14 +33,18 @@ git push origin your-branch
 
 ## Standards
 
-- **Tests required** - Every commit must include comprehensive tests
+- **English only** - All code, comments, docstrings, and variable names must be in English (except for specific cases like Unicode tests or multilingual examples)
 - **Type hints** - All functions must be typed
 - **Docstrings** - Google style with Args/Returns/Raises
 - **Logging** - Use loguru at key decision points
 - **Error handling** - Catch specific exceptions, add context
 - **No tech debt** - Clean up hardcoded values and duplication immediately
+- **Complete consistency** - Changes must be applied to BOTH OpenAI and Anthropic APIs, and to BOTH streaming and non-streaming modes
+- **Tests required** - Every commit must include comprehensive tests (edge cases, error scenarios, not just happy path). Check `tests/README.md` to find the appropriate existing `test_*.py` file
 
 ## Pull Requests
+
+**Your PR quality reflects your engagement with the project.** PRs without tests, with non-English code, or missing consistency across architecture suggest a quick hack and fix rather than thoughtful contribution. We review all PRs, but those demonstrating care for code quality, comprehensive testing, and architectural understanding receive priority attention and faster merges.
 
 **Before submitting:**
 - Tests pass (including edge cases)

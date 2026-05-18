@@ -33,8 +33,6 @@
 
 📦 **Claude Sonnet 4** — 이전 세대. 대부분의 사용 사례에서 여전히 강력하고 신뢰할 수 있음.
 
-📦 **Claude 3.7 Sonnet** — 레거시 모델. 하위 호환성을 위해 제공.
-
 💤 **GLM-5** — 오픈 MoE 모델 (744B 파라미터, 40B 활성). 복잡한 시스템 엔지니어링 및 장기 에이전트 작업을 위한 고급 모델.
 
 🐋 **DeepSeek-V3.2** — 오픈 MoE 모델 (685B 파라미터, 37B 활성). 코딩, 추론 및 일반 작업을 위한 균형 잡힌 성능.
@@ -55,6 +53,7 @@
 |------|------|
 | 🔌 **OpenAI 호환 API** | OpenAI 호환 도구와 함께 작동 |
 | 🔌 **Anthropic 호환 API** | 네이티브 `/v1/messages` 엔드포인트 |
+| 🔀 **다중 계정 지원** | 여러 계정 간의 지능형 페일오버 |
 | 🌐 **VPN/프록시 지원** | 제한된 네트워크용 HTTP/SOCKS5 프록시 |
 | 🧠 **확장 사고** | 추론 기능은 우리 프로젝트만의 독점 기능 |
 | 👁️ **비전 지원** | 모델에 이미지 전송 |
@@ -109,6 +108,8 @@ python main.py --port 9000
 ---
 
 ## ⚙️ 설정
+
+> 💡 **고급 사용자:** 다중 계정 지원을 찾고 있으신가요? 아래의 [계정 시스템](#-계정-시스템고급)을 참조하세요.
 
 ### 옵션 1: JSON 자격 증명 파일 (Kiro IDE / Enterprise)
 
@@ -258,6 +259,85 @@ PROXY_API_KEY="my-super-secret-password-123"
 - 다음으로의 요청 찾기: `prod.us-east-1.auth.desktop.kiro.dev/refreshToken`
 
 </details>
+
+---
+
+## 🔀 계정 시스템(고급)
+
+계정 시스템은 여러 Kiro 계정을 관리하고 장애 시 자동으로 페일오버하는 방법입니다. 향후 이 시스템이 자격 증명 설정용 `.env` 파일을 대체할 예정이지만, 현재는 선택 사항이며 여러 계정을 사용하려는 사용자를 위한 것입니다.
+
+### 필요한 이유
+
+여러 Kiro 계정이 있는 경우 게이트웨이는 계정이 일시적으로 사용 불가능할 때 자동으로 계정 간에 전환할 수 있습니다.
+
+이 시스템은 단일 계정에서도 작동합니다 — 전환 없이.
+
+### 활성화 방법
+
+`.env`에 추가:
+
+```env
+ACCOUNT_SYSTEM=true
+```
+
+**어떤 일이 발생하는가:**
+- 첫 번째 시작 시 `.env`의 자격 증명이 자동으로 `credentials.json`으로 마이그레이션됩니다 (한 번만).
+- 그 후 `.env`의 모든 계정 및 지역 설정은 무시됩니다.
+- 계정 관리는 `credentials.json`을 통해서만 수행됩니다.
+
+<details>
+<summary>📄 설정 예시</summary>
+
+**단일 계정:**
+```json
+[
+  {
+    "type": "json",
+    "path": "~/.aws/sso/cache/kiro-auth-token.json"
+  }
+]
+```
+
+**여러 계정:**
+```json
+[
+  {
+    "type": "json",
+    "path": "~/.aws/sso/cache/kiro-auth-token.json"
+  },
+  {
+    "type": "sqlite",
+    "path": "~/.local/share/kiro-cli/data.sqlite3"
+  },
+  {
+    "type": "refresh_token",
+    "refresh_token": "eyJhbGc...",
+    "profile_arn": "arn:aws:codewhisperer:us-east-1:..."
+  }
+]
+```
+
+**파일이 포함된 폴더:**
+```json
+[
+  {
+    "type": "json",
+    "path": "C:\\MyAccs\\kiro67"
+  }
+]
+```
+
+게이트웨이는 폴더의 모든 파일을 스캔하고 이를 별도의 계정으로 추가합니다.
+
+</details>
+
+### 페일오버 작동 방식
+
+한 계정이 오류를 반환하면 (429 속도 제한, 402 할당량 초과), 게이트웨이는 자동으로 목록의 다음 계정을 시도합니다. 계정이 연속으로 여러 번 실패하면 게이트웨이는 일시적으로 사용을 중지하고 정기적으로 복구되었는지 확인합니다.
+
+단일 계정의 경우 페일오버가 작동하지 않습니다 — Kiro API의 원본 오류를 받게 됩니다.
+
+완전한 설정 예시 (계정별 지역 설정 포함)는 [`credentials.json.example`](../../credentials.json.example)을 참조하세요.
 
 ---
 

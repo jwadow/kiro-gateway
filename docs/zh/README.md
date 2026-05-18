@@ -33,8 +33,6 @@
 
 📦 **Claude Sonnet 4** — 上一代模型。对于大多数用例仍然强大可靠。
 
-📦 **Claude 3.7 Sonnet** — 旧版模型。为向后兼容而保留。
-
 💤 **GLM-5** — 开源MoE模型（744B参数，40B活跃）。用于复杂系统工程和长期代理任务的先进模型。
 
 🐋 **DeepSeek-V3.2** — 开源MoE模型（685B参数，37B活跃）。编程、推理和通用任务的均衡性能。
@@ -55,6 +53,7 @@
 |------|------|
 | 🔌 **兼容 OpenAI 的 API** | 与任何兼容 OpenAI 的工具配合使用 |
 | 🔌 **兼容 Anthropic 的 API** | 原生 `/v1/messages` 端点 |
+| 🔀 **多账户支持** | 多个账户之间的智能故障转移 |
 | 🌐 **VPN/代理支持** | 用于受限网络的 HTTP/SOCKS5 代理 |
 | 🧠 **扩展思维** | 推理功能是我们项目的独家特性 |
 | 👁️ **视觉支持** | 向模型发送图像 |
@@ -109,6 +108,8 @@ python main.py --port 9000
 ---
 
 ## ⚙️ 配置
+
+> 💡 **高级用户：** 寻找多账户支持？请参阅下面的 [账户系统](#-账户系统高级)。
 
 ### 选项 1：JSON 凭据文件 (Kiro IDE / Enterprise)
 
@@ -258,6 +259,85 @@ PROXY_API_KEY="my-super-secret-password-123"
 - 查找发往以下地址的请求：`prod.us-east-1.auth.desktop.kiro.dev/refreshToken`
 
 </details>
+
+---
+
+## 🔀 账户系统（高级）
+
+账户系统是一种管理多个 Kiro 账户并实现自动故障转移的方式。未来，该系统将取代 `.env` 文件用于凭据配置，但目前它是可选的，适用于想要使用多个账户的用户。
+
+### 为什么需要
+
+如果您有多个 Kiro 账户，网关可以在一个账户暂时不可用时自动切换到另一个账户。
+
+该系统也适用于单个账户 — 只是没有切换功能。
+
+### 如何启用
+
+在您的 `.env` 中添加：
+
+```env
+ACCOUNT_SYSTEM=true
+```
+
+**会发生什么：**
+- 首次启动时，您的 `.env` 中的凭据会自动迁移到 `credentials.json`（仅一次）
+- 之后，`.env` 中的所有账户和区域设置都会被忽略
+- 账户管理仅通过 `credentials.json` 进行
+
+<details>
+<summary>📄 配置示例</summary>
+
+**单个账户：**
+```json
+[
+  {
+    "type": "json",
+    "path": "~/.aws/sso/cache/kiro-auth-token.json"
+  }
+]
+```
+
+**多个账户：**
+```json
+[
+  {
+    "type": "json",
+    "path": "~/.aws/sso/cache/kiro-auth-token.json"
+  },
+  {
+    "type": "sqlite",
+    "path": "~/.local/share/kiro-cli/data.sqlite3"
+  },
+  {
+    "type": "refresh_token",
+    "refresh_token": "eyJhbGc...",
+    "profile_arn": "arn:aws:codewhisperer:us-east-1:..."
+  }
+]
+```
+
+**包含文件的文件夹：**
+```json
+[
+  {
+    "type": "json",
+    "path": "C:\\MyAccs\\kiro67"
+  }
+]
+```
+
+网关将扫描文件夹中的所有文件并将其添加为单独的账户。
+
+</details>
+
+### 故障转移如何工作
+
+当一个账户返回错误（429 速率限制、402 配额超出）时，网关会自动尝试列表中的下一个账户。如果一个账户连续多次失败，网关会暂时停止使用它，并定期检查它是否已恢复。
+
+对于单个账户，故障转移不起作用 — 您会收到来自 Kiro API 的原始错误。
+
+完整的配置示例（包括每个账户的区域设置）请参见 [`credentials.json.example`](../../credentials.json.example)。
 
 ---
 

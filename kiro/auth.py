@@ -125,6 +125,7 @@ class KiroAuthManager:
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
         sqlite_db: Optional[str] = None,
+        api_region: Optional[str] = None,
     ):
         """
         Initializes the authentication manager.
@@ -138,6 +139,8 @@ class KiroAuthManager:
             client_secret: OAuth client secret (for AWS SSO OIDC, optional)
             sqlite_db: Path to kiro-cli SQLite database (optional)
                        Default location: ~/.local/share/kiro-cli/data.sqlite3
+            api_region: Q API region override (optional, per-account)
+                       If not specified, uses auto-detection or falls back to region
         """
         self._refresh_token = refresh_token
         self._profile_arn = profile_arn
@@ -183,14 +186,19 @@ class KiroAuthManager:
         self._detect_auth_type()
         
         # Determine final API region with priority hierarchy:
-        # 1. KIRO_API_REGION env var (explicit override) - highest priority
-        # 2. Auto-detected from credentials (SQLite ARN or JSON region)
-        # 3. SSO region (fallback)
-        # 4. Default region parameter (us-east-1)
+        # 1. Explicit api_region parameter (per-account) - HIGHEST
+        # 2. KIRO_API_REGION env var (global override)
+        # 3. Auto-detected from credentials (SQLite ARN or JSON region)
+        # 4. SSO region (fallback)
+        # 5. Default region parameter (us-east-1)
         api_region_override = os.getenv("KIRO_API_REGION")
         
-        if api_region_override:
-            # Explicit override from environment variable
+        if api_region:
+            # Explicit per-account override
+            final_api_region = api_region
+            logger.info(f"API region: {final_api_region} (from account config)")
+        elif api_region_override:
+            # Global env var override
             final_api_region = api_region_override
             logger.info(f"API region: {final_api_region} (from KIRO_API_REGION env var)")
         elif self._detected_api_region:
@@ -332,7 +340,7 @@ class KiroAuthManager:
                     if 'region' in registration_data and not self._sso_region:
                         self._sso_region = registration_data['region']
                         logger.debug(f"SSO region from device-registration: {self._sso_region}")
-            
+
             # Try to auto-detect API region from profile ARN in state table
             # This is separate from SSO region because q.amazonaws.com endpoints
             # only exist in specific regions (Issue #132, #133)
@@ -343,6 +351,9 @@ class KiroAuthManager:
                     profile_data = json.loads(profile_row[0])
                     arn = profile_data.get("arn", "")
                     if arn:
+                        if not self._profile_arn:
+                            self._profile_arn = arn
+                            logger.debug(f"Profile ARN from state table: {self._profile_arn}")
                         # ARN format: arn:aws:codewhisperer:REGION:account:profile/id
                         # Extract region from 4th component (index 3)
                         parts = arn.split(":")
@@ -359,7 +370,7 @@ class KiroAuthManager:
                 logger.debug(f"Failed to parse profile data from state table: {e}")
             except Exception as e:
                 logger.debug(f"Failed to auto-detect API region from profile ARN: {e}")
-            
+
             conn.close()
             logger.info(f"Credentials loaded from SQLite database: {db_path}")
             
