@@ -179,10 +179,10 @@ AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
 # Universal endpoint for all regions (us-east-1, eu-central-1, etc.)
 # See: https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/security-data-perimeter.html
 # Fixed in issue #58 - codewhisperer.{region}.amazonaws.com doesn't exist for non-us-east-1 regions
-KIRO_API_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
 # Host for Q API (ListAvailableModels)
-KIRO_Q_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
 # ==================================================================================================
 # Token Settings
@@ -217,12 +217,8 @@ BASE_RETRY_DELAY: float = 1.0
 # Why "hidden"? These models work but are not advertised by Kiro's /ListAvailableModels.
 # We expose them to our users because they're useful.
 HIDDEN_MODELS: Dict[str, str] = {
-    # Claude 3.7 Sonnet - legacy flagship model, still works!
-    # Hidden in Kiro API but functional. Great for users who prefer it.
-    "claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0",
-    
-    # Add other hidden/experimental models here as discovered.
-    # Example: "claude-secret-model": "INTERNAL_SECRET_MODEL_ID",
+    # Claude 3.7 Sonnet - legacy model, maps to "auto" on new runtime endpoint
+    # "claude-3.7-sonnet": "auto",
 }
 
 # ==================================================================================================
@@ -280,9 +276,17 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
     {"modelId": "claude-sonnet-4"},
-    {"modelId": "claude-haiku-4.5"},
     {"modelId": "claude-sonnet-4.5"},
+    {"modelId": "claude-sonnet-4.6"},
+    {"modelId": "claude-haiku-4.5"},
     {"modelId": "claude-opus-4.5"},
+    {"modelId": "claude-opus-4.6"},
+    {"modelId": "claude-opus-4.7"},
+    {"modelId": "deepseek-3.2"},
+    {"modelId": "glm-5"},
+    {"modelId": "minimax-m2.1"},
+    {"modelId": "minimax-m2.5"},
+    {"modelId": "qwen3-coder-next"},
 ]
 
 # ==================================================================================================
@@ -527,10 +531,59 @@ AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in ("t
 WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # ==================================================================================================
+# Account System Settings
+# ==================================================================================================
+
+# Enable account system with failover (default: false)
+# When false: uses first account without failover (legacy mode)
+# When true: enables full failover loop with Circuit Breaker
+ACCOUNT_SYSTEM: bool = os.getenv("ACCOUNT_SYSTEM", "false").lower() in ("true", "1", "yes")
+
+# Path to credentials configuration file
+ACCOUNTS_CONFIG_FILE: str = os.getenv("ACCOUNTS_CONFIG_FILE", "credentials.json")
+
+# Path to runtime state file
+ACCOUNTS_STATE_FILE: str = os.getenv("ACCOUNTS_STATE_FILE", "state.json")
+
+# ==================================================================================================
+# Circuit Breaker Settings
+# ==================================================================================================
+
+# Base recovery timeout in seconds (for exponential backoff)
+# Actual timeout = BASE * 2^(failures - 1), capped at BASE * MAX_MULTIPLIER
+# Examples with BASE=60s, MAX=1440x:
+#   1 failure: 1m, 2: 2m, 3: 4m, 4: 8m, 5: 16m, 6: 32m, 7: 1h, 8: 2h, 9: 4h, 10: 8.5h, 11: 17h, 12+: 1d (cap)
+ACCOUNT_RECOVERY_TIMEOUT: int = int(os.getenv("ACCOUNT_RECOVERY_TIMEOUT", "60"))
+
+# Maximum backoff multiplier (cap for exponential backoff)
+# With BASE=60s and MAX=1440, maximum cooldown is 60 * 1440 = 86400s = 1 day
+ACCOUNT_MAX_BACKOFF_MULTIPLIER: float = float(os.getenv("ACCOUNT_MAX_BACKOFF_MULTIPLIER", "1440.0"))
+
+# Probabilistic retry chance for "broken" accounts (0.0 - 1.0)
+# Even if account is broken and timeout hasn't passed, try with this probability
+# Default: 0.1 (10% chance) - prevents permanent "stuck" state
+ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(os.getenv("ACCOUNT_PROBABILISTIC_RETRY_CHANCE", "0.1"))
+
+# ==================================================================================================
+# Account Cache Settings
+# ==================================================================================================
+
+# Model cache TTL in seconds (12 hours)
+# Cache is refreshed only when account is used (not in background)
+ACCOUNT_CACHE_TTL: int = int(os.getenv("ACCOUNT_CACHE_TTL", "43200"))
+
+# ==================================================================================================
+# State Persistence Settings
+# ==================================================================================================
+
+# Interval for periodic state.json saving in seconds
+STATE_SAVE_INTERVAL_SECONDS: int = int(os.getenv("STATE_SAVE_INTERVAL_SECONDS", "10"))
+
+# ==================================================================================================
 # Application Version
 # ==================================================================================================
 
-APP_VERSION: str = "2.4-dev.7"
+APP_VERSION: str = "2.4.dev.13"
 APP_TITLE: str = "Kiro Gateway"
 APP_DESCRIPTION: str = "Proxy gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible. Made by @jwadow"
 

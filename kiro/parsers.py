@@ -356,7 +356,12 @@ class AwsEventStreamParser:
         # input can be string or object
         input_data = data.get('input', '')
         if isinstance(input_data, dict):
-            input_str = json.dumps(input_data)
+            if input_data:
+                # Non-empty dict: serialize it
+                input_str = json.dumps(input_data)
+            else:
+                # Empty dict {}: fragments will follow, use empty string
+                input_str = ''
         else:
             input_str = str(input_data) if input_data else ''
         
@@ -380,7 +385,10 @@ class AwsEventStreamParser:
             # input can be string or object
             input_data = data.get('input', '')
             if isinstance(input_data, dict):
-                input_str = json.dumps(input_data)
+                if input_data:
+                    input_str = json.dumps(input_data)
+                else:
+                    input_str = ''
             else:
                 input_str = str(input_data) if input_data else ''
             self.current_tool_call['function']['arguments'] += input_str
@@ -428,6 +436,7 @@ class AwsEventStreamParser:
                             f"Tool call truncated by Kiro API: "
                             f"tool='{tool_name}', id={tool_id}, size={truncation_info['size_bytes']} bytes, "
                             f"reason={truncation_info['reason']}. "
+                            f"This is a Kiro API limitation. "
                             f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
                         )
                     else:

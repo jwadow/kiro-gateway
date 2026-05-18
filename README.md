@@ -33,8 +33,6 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 
 📦 **Claude Sonnet 4** — Previous generation. Still powerful and reliable for most use cases.
 
-📦 **Claude 3.7 Sonnet** — Legacy model. Available for backward compatibility.
-
 💤 **GLM-5** — Open MoE model (744B params, 40B active). Advanced model for complex systems engineering and long-horizon agentic tasks.
 
 🐋 **DeepSeek-V3.2** — Open MoE model (685B params, 37B active). Balanced performance for coding, reasoning, and general tasks.
@@ -55,6 +53,7 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 |---------|-------------|
 | 🔌 **OpenAI-compatible API** | Works with any OpenAI-compatible tool |
 | 🔌 **Anthropic-compatible API** | Native `/v1/messages` endpoint |
+| 🔀 **Multi-Account Support** | Intelligent failover between multiple accounts |
 | 🌐 **VPN/Proxy Support** | HTTP/SOCKS5 proxy for restricted networks |
 | 🧠 **Extended Thinking** | Reasoning is exclusive to our project |
 | 👁️ **Vision Support** | Send images to model |
@@ -109,6 +108,8 @@ The server will be available at `http://localhost:8000`
 ---
 
 ## ⚙️ Configuration
+
+> 💡 **Advanced users:** Looking for multi-account support? See [Account System](#-account-system-advanced) below.
 
 ### Option 1: JSON Credentials File (Kiro IDE / Enterprise)
 
@@ -258,6 +259,85 @@ If you need to manually extract the refresh token (e.g., for debugging), you can
 - Look for requests to: `prod.us-east-1.auth.desktop.kiro.dev/refreshToken`
 
 </details>
+
+---
+
+## 🔀 Account System (Advanced)
+
+Account System is a way to manage multiple Kiro accounts with automatic failover. In the future, this system will replace `.env` file for credential configuration, but currently it's optional and intended for those who want to use multiple accounts.
+
+### Why You Need This
+
+If you have multiple Kiro accounts, the gateway can automatically switch between them when account is temporarily unavailable.
+
+The system works with a single account too — just without switching.
+
+### How to Enable
+
+Add to your `.env`:
+
+```env
+ACCOUNT_SYSTEM=true
+```
+
+**What happens:**
+- On first startup, your credentials from `.env` are automatically migrated to `credentials.json` (one-time)
+- After that, all account and region settings from `.env` are ignored
+- Account management only through `credentials.json`
+
+<details>
+<summary>📄 Configuration Examples</summary>
+
+**Single account:**
+```json
+[
+  {
+    "type": "json",
+    "path": "~/.aws/sso/cache/kiro-auth-token.json"
+  }
+]
+```
+
+**Multiple accounts:**
+```json
+[
+  {
+    "type": "json",
+    "path": "~/.aws/sso/cache/kiro-auth-token.json"
+  },
+  {
+    "type": "sqlite",
+    "path": "~/.local/share/kiro-cli/data.sqlite3"
+  },
+  {
+    "type": "refresh_token",
+    "refresh_token": "eyJhbGc...",
+    "profile_arn": "arn:aws:codewhisperer:us-east-1:..."
+  }
+]
+```
+
+**Folder with files:**
+```json
+[
+  {
+    "type": "json",
+    "path": "C:\\MyAccs\\kiro67"
+  }
+]
+```
+
+The gateway will scan all files in the folder and add them as separate accounts.
+
+</details>
+
+### How Failover Works
+
+When one account returns an error (429 rate limit, 402 quota exceeded), the gateway automatically tries the next account from the list. If an account fails several times in a row, the gateway temporarily stops using it and periodically checks if it has recovered.
+
+For a single account, failover doesn't work — you get the original error from Kiro API.
+
+For complete configuration examples (including per-account region settings), see [`credentials.json.example`](credentials.json.example).
 
 ---
 

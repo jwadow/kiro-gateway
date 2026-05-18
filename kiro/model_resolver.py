@@ -41,6 +41,30 @@ if TYPE_CHECKING:
     from kiro.cache import ModelInfoCache
 
 
+# Valid model IDs accepted by runtime.{region}.kiro.dev
+# Generated from FALLBACK_MODELS to maintain single source of truth
+from kiro.config import FALLBACK_MODELS
+
+VALID_RUNTIME_MODEL_IDS: set = {model["modelId"] for model in FALLBACK_MODELS}
+
+
+def to_runtime_model_id(normalized: str) -> str:
+    """
+    Pass-through function for runtime.kiro.dev model ID.
+    
+    Previously performed fallback to "auto" for unknown models, but this violated
+    the "gateway, not gatekeeper" principle. Now returns model as-is and lets
+    Kiro API decide if the model exists.
+    
+    Args:
+        normalized: Normalized model name
+    
+    Returns:
+        Model name as-is (no fallback)
+    """
+    return normalized
+
+
 @dataclass(frozen=True)
 class ModelResolution:
     """
@@ -103,7 +127,10 @@ def normalize_model_name(name: str) -> str:
     """
     if not name:
         return name
-    
+
+    # Strip context window suffix (e.g., [1m], [200k]) — client-side indicator, not a model ID
+    name = re.sub(r'\[\d+[mk]\]$', '', name, flags=re.IGNORECASE)
+
     # Lowercase for consistent matching
     name_lower = name.lower()
     
@@ -188,7 +215,8 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
         'CLAUDE_3_7_SONNET_20250219_V1_0'
     """
     normalized = normalize_model_name(model_name)
-    return hidden_models.get(normalized, normalized)
+    internal = hidden_models.get(normalized, normalized)
+    return to_runtime_model_id(internal)
 
 
 def extract_model_family(model_name: str) -> Optional[str]:
@@ -301,40 +329,42 @@ class ModelResolver:
         # Layer 2: Check dynamic cache (from /ListAvailableModels)
         if self.cache.is_valid_model(normalized):
             logger.debug(f"Model '{normalized}' found in dynamic cache")
+            runtime_id = to_runtime_model_id(normalized)
             return ModelResolution(
-                internal_id=normalized,
+                internal_id=runtime_id,
                 source="cache",
                 original_request=external_model,
                 normalized=normalized,
                 is_verified=True
             )
-        
+
         # Layer 3: Check hidden models
         if normalized in self.hidden_models:
             internal_id = self.hidden_models[normalized]
+            runtime_id = to_runtime_model_id(internal_id)
             logger.debug(
-                f"Model '{normalized}' found in hidden models → '{internal_id}'"
+                f"Model '{normalized}' found in hidden models → '{runtime_id}'"
             )
             return ModelResolution(
-                internal_id=internal_id,
+                internal_id=runtime_id,
                 source="hidden",
                 original_request=external_model,
                 normalized=normalized,
                 is_verified=True
             )
-        
-        # Layer 4: Pass-through - let Kiro decide!
-        # We don't know all models, Kiro might have hidden ones
+
+        # Layer 4: Pass-through - validate for runtime endpoint
+        runtime_id = to_runtime_model_id(normalized)
         logger.info(
             f"Model '{external_model}' (normalized: '{normalized}') not in cache, "
-            f"passing through to Kiro API"
+            f"mapped to runtime ID: '{runtime_id}'"
         )
         return ModelResolution(
-            internal_id=normalized,  # Send normalized name to Kiro
+            internal_id=runtime_id,
             source="passthrough",
             original_request=external_model,
             normalized=normalized,
-            is_verified=False  # Not verified locally, Kiro will judge
+            is_verified=False
         )
     
     def get_available_models(self) -> List[str]:

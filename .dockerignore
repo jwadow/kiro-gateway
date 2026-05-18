@@ -39,6 +39,8 @@ htmlcov
 .env
 .env.local
 .env.*.local
+credentials.json
+state.json
 
 # Documentation
 docs/

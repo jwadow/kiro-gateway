@@ -108,12 +108,16 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
     elif reason == "MONTHLY_REQUEST_COUNT":
         # Monthly request limit exceeded - account quota exhausted
         user_message = "Monthly request limit exceeded. Account has reached its monthly quota."
+    
+    elif reason == "INVALID_MODEL_ID":
+        # Invalid model name or subscription tier insufficient
+        user_message = "Invalid model ID or insufficient subscription level to use it."
 
     elif original_message == "Improperly formed request." and reason in (None, "UNKNOWN", "null"):
-        # Generic 400 error likely caused by payload exceeding ~615KB size limit
+        # Generic 400 error
         user_message = (
-            "Kiro API rejected the request (likely payload size exceeded ~615KB). "
-            "Use /compact or start a new session to reduce context size."
+            "Kiro API rejected the request. If problem persists, open issue with info and attached debug logs at:"
+            "https://github.com/jwadow/kiro-gateway/issues"
         )
 
     # Future error enhancements can be added here:

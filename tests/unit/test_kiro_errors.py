@@ -132,6 +132,123 @@ class TestEnhanceKiroErrorMonthlyLimit:
         assert "MONTHLY_REQUEST_COUNT" not in error_info.user_message
 
 
+class TestEnhanceKiroErrorInvalidModelId:
+    """Tests for INVALID_MODEL_ID error enhancement."""
+    
+    def test_invalid_model_id_enhanced_successfully(self):
+        """
+        What it does: Verifies INVALID_MODEL_ID is enhanced with user-friendly message.
+        Purpose: Ensure model availability error clearly indicates both possible causes.
+        """
+        print("Setup: Creating error JSON with INVALID_MODEL_ID...")
+        error_json = {
+            "message": "Invalid model ID. Please select a different model to continue.",
+            "reason": "INVALID_MODEL_ID"
+        }
+        
+        print("Action: Enhancing error...")
+        error_info = enhance_kiro_error(error_json)
+        
+        print("Verification: User message is enhanced...")
+        print(f"Comparing user_message: Expected 'Invalid model ID or insufficient subscription level to use it.', Got '{error_info.user_message}'")
+        assert error_info.user_message == "Invalid model ID or insufficient subscription level to use it."
+        assert error_info.reason == "INVALID_MODEL_ID"
+        assert error_info.original_message == "Invalid model ID. Please select a different model to continue."
+    
+    def test_invalid_model_id_preserves_original_message(self):
+        """
+        What it does: Verifies original message is preserved for logging.
+        Purpose: Ensure debugging information is not lost during enhancement.
+        """
+        print("Setup: Creating error JSON...")
+        error_json = {
+            "message": "Invalid model ID. Please select a different model to continue.",
+            "reason": "INVALID_MODEL_ID"
+        }
+        
+        print("Action: Enhancing error...")
+        error_info = enhance_kiro_error(error_json)
+        
+        print("Verification: Original message preserved...")
+        assert error_info.original_message == "Invalid model ID. Please select a different model to continue."
+        assert error_info.original_message != error_info.user_message
+    
+    def test_invalid_model_id_reason_string_correct(self):
+        """
+        What it does: Verifies reason is correctly preserved as string.
+        Purpose: Ensure reason field can be used for programmatic error handling.
+        """
+        print("Setup: Creating error JSON...")
+        error_json = {
+            "message": "Invalid model ID. Please select a different model to continue.",
+            "reason": "INVALID_MODEL_ID"
+        }
+        
+        print("Action: Enhancing error...")
+        error_info = enhance_kiro_error(error_json)
+        
+        print("Verification: Reason is correct string value...")
+        assert error_info.reason == "INVALID_MODEL_ID"
+        assert isinstance(error_info.reason, str)
+    
+    def test_invalid_model_id_no_reason_suffix(self):
+        """
+        What it does: Verifies enhanced message doesn't include (reason: ...) suffix.
+        Purpose: Ensure clean, user-friendly message without technical codes.
+        """
+        print("Setup: Creating error JSON...")
+        error_json = {
+            "message": "Invalid model ID. Please select a different model to continue.",
+            "reason": "INVALID_MODEL_ID"
+        }
+        
+        print("Action: Enhancing error...")
+        error_info = enhance_kiro_error(error_json)
+        
+        print("Verification: No (reason: ...) in user message...")
+        assert "(reason:" not in error_info.user_message
+        assert "INVALID_MODEL_ID" not in error_info.user_message
+    
+    def test_invalid_model_id_mentions_both_causes(self):
+        """
+        What it does: Verifies message mentions both possible causes (invalid ID and subscription).
+        Purpose: Ensure users understand both potential reasons for the error.
+        """
+        print("Setup: Creating error JSON...")
+        error_json = {
+            "message": "Invalid model ID. Please select a different model to continue.",
+            "reason": "INVALID_MODEL_ID"
+        }
+        
+        print("Action: Enhancing error...")
+        error_info = enhance_kiro_error(error_json)
+        
+        print("Verification: Message mentions both causes...")
+        message_lower = error_info.user_message.lower()
+        # Should mention "invalid" or "model id"
+        assert "invalid" in message_lower or "model id" in message_lower
+        # Should mention "subscription" or "level"
+        assert "subscription" in message_lower or "level" in message_lower
+    
+    def test_invalid_model_id_with_different_original_message(self):
+        """
+        What it does: Verifies enhancement works regardless of original message text.
+        Purpose: Ensure enhancement is based on reason code, not message text.
+        """
+        print("Setup: Creating error JSON with different original message...")
+        error_json = {
+            "message": "Model not found.",
+            "reason": "INVALID_MODEL_ID"
+        }
+        
+        print("Action: Enhancing error...")
+        error_info = enhance_kiro_error(error_json)
+        
+        print("Verification: Same enhanced message regardless of original...")
+        assert error_info.user_message == "Invalid model ID or insufficient subscription level to use it."
+        assert error_info.original_message == "Model not found."
+
+
 class TestEnhanceKiroErrorUnknown:
     """Tests for unknown error handling."""
     
@@ -487,8 +604,8 @@ class TestEnhanceImproperlyFormedRequest:
         }
         error_info = enhance_kiro_error(error_json)
 
-        assert "payload size exceeded" in error_info.user_message
-        assert "/compact" in error_info.user_message
+        assert "problem persists" in error_info.user_message
+        assert "jwadow/kiro-gateway" in error_info.user_message
         assert error_info.original_message == "Improperly formed request."
 
     def test_enhance_improperly_formed_request_unknown_reason(self):
@@ -496,7 +613,7 @@ class TestEnhanceImproperlyFormedRequest:
         error_json = {"message": "Improperly formed request."}
         error_info = enhance_kiro_error(error_json)
 
-        assert "payload size exceeded" in error_info.user_message
+        assert "problem persists" in error_info.user_message
 
     def test_improperly_formed_with_real_reason_not_enhanced(self):
         """If reason is a real code, don't apply the size-limit enhancement."""

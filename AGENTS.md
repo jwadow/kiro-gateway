@@ -50,8 +50,10 @@ This is a **reverse engineering project** for Kiro API (Amazon Q Developer). We 
    - If you can't think of ways to break your code, you haven't thought hard enough
    - Two basic tests are not testing - comprehensive coverage means testing every logical branch and failure mode
    - Tests are both documentation and a safety net - they should clearly show what the code does and prevent regressions
+   - Check `tests/README.md` to find the appropriate existing `test_*.py` file for your tests - avoid creating new test files unless adding a completely new module
 
 8. **Code Quality Standards**
+   - All code, comments, docstrings, and variable names must be in English (except for specific cases like Unicode tests or multilingual examples)
    - Comprehensive docstrings for all functions (Google style with Args/Returns/Raises)
    - Type hints are mandatory - every function parameter and return value must be typed
    - Logging at key decision points using loguru (INFO for business logic, DEBUG for technical details, ERROR for failures)
@@ -67,15 +69,35 @@ This is a **reverse engineering project** for Kiro API (Amazon Q Developer). We 
    - Documentation is part of the feature - if users can't figure it out, it doesn't work
    - Every error should guide the user toward a solution, not leave them confused
 
-10. **Feature Parity Between APIs**
+10. **Complete Feature Consistency**
    - When adding new functionality, implement it for BOTH OpenAI and Anthropic APIs
+   - Changes must be applied to BOTH streaming and non-streaming code paths
    - Both API surfaces must have equal capabilities - no fragmentation
-   - If a feature only makes sense for one API, document why explicitly
+   - Test coverage must include all combinations: OpenAI streaming/non-streaming, Anthropic streaming/non-streaming
+   - If a feature only makes sense for one API or one mode, document why explicitly
 
 11. **Pragmatic Transparency**
    - Transparency means being clear about modifications, not refusing to add useful features
    - Response enrichment (adding derived fields) is acceptable if it doesn't break compatibility
    - Clients can ignore added fields - original upstream data is always preserved
+
+### Code Review Reality Check
+
+**Your code quality reveals your approach.** Contributions missing tests, using non-English identifiers, or lacking consistency across architecture and both APIs and streaming modes indicate surface-level work - a quick hack and patch based on assumptions rather than understanding. Such PRs face significant scrutiny and likely rejection.
+
+**What we look for:**
+- Comprehensive tests that attempt to break the code, not just confirm it works
+- Complete consistency: changes applied to OpenAI + Anthropic, streaming + non-streaming
+- Evidence you studied the codebase (using search tools, reading related modules) rather than guessing
+- English-only code that integrates naturally with existing patterns
+
+**What signals low effort:**
+- "I'll add tests later" or minimal happy-path tests
+- Changes to only one API or only one mode
+- Non-English variable names or comments
+- Code that doesn't match project patterns because you didn't check them
+
+We can tell when you've used basic prompts for a quick fix versus when you've invested time understanding the architecture. The former gets rejected. The latter gets merged.
 
 ### About "Improperly formed request" Errors
 
@@ -241,6 +263,8 @@ kiro-gateway/
 │   ├── __init__.py                  # Package exports
 │   ├── config.py                    # Configuration and constants
 │   ├── auth.py                      # Authentication manager
+│   ├── account_manager.py           # Account system with Circuit Breaker, sticky behavior, lazy init
+│   ├── account_errors.py            # Account error classification
 │   ├── cache.py                     # Model metadata cache
 │   ├── model_resolver.py            # Dynamic model resolution
 │   ├── http_client.py               # HTTP client with retry logic
@@ -257,7 +281,12 @@ kiro-gateway/
 │   ├── models_openai.py             # OpenAI Pydantic models
 │   ├── models_anthropic.py          # Anthropic Pydantic models
 │   ├── network_errors.py            # Network error classification
+│   ├── kiro_errors.py               # Kiro API error enhancement
 │   ├── exceptions.py                # Exception handlers
+│   ├── payload_guards.py            # Request payload validation
+│   ├── truncation_state.py          # Truncation state tracking
+│   ├── truncation_recovery.py       # Truncation recovery system
+│   ├── mcp_tools.py                 # MCP tools (web_search)
 │   ├── debug_logger.py              # Debug logging system
 │   ├── debug_middleware.py          # Debug middleware
 │   ├── tokenizer.py                 # Token counting (tiktoken)

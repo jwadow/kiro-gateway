@@ -340,6 +340,30 @@ class AnthropicMessagesRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class AnthropicCountTokensRequest(BaseModel):
+    """
+    Request to Anthropic Count Tokens API (/v1/messages/count_tokens).
+    
+    Similar to AnthropicMessagesRequest but without generation parameters.
+    Used to estimate token count before making actual request.
+    
+    Attributes:
+        model: Model ID (e.g., "claude-sonnet-4-5")
+        messages: List of conversation messages
+        system: System prompt (optional, string or list of content blocks)
+        tools: List of available tools
+    """
+    
+    model: str
+    messages: List[AnthropicMessage] = Field(min_length=1)
+    
+    # Optional parameters - only those that affect token count
+    system: Optional[SystemPrompt] = None
+    tools: Optional[List[AnthropicTool]] = None
+    
+    model_config = {"extra": "allow"}
+
+
 # ==================================================================================================
 # Response Models
 # ==================================================================================================
