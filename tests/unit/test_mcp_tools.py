@@ -24,7 +24,7 @@ from kiro.mcp_tools import (
     extract_query_from_messages,
     handle_native_web_search,
     generate_anthropic_web_search_sse,
-    generate_openai_web_search_sse
+    generate_openai_web_search_sse,
 )
 
 
@@ -32,55 +32,58 @@ from kiro.mcp_tools import (
 # Tests for ID Generation
 # ==================================================================================================
 
+
 class TestIDGeneration:
     """Tests for random ID generation."""
-    
+
     def test_generate_random_id_length(self):
         """
         What it does: Verifies ID generation with exact length.
         Purpose: Ensure generate_random_id returns correct length.
         """
         print("Setup: Generating IDs of different lengths...")
-        
+
         print("Action: Generate ID of length 22...")
         id_22 = generate_random_id(22)
         print(f"Comparing length: Expected 22, Got {len(id_22)}")
         assert len(id_22) == 22
-        
+
         print("Action: Generate ID of length 8...")
         id_8 = generate_random_id(8)
         print(f"Comparing length: Expected 8, Got {len(id_8)}")
         assert len(id_8) == 8
-        
+
         print("Action: Generate ID of length 100...")
         id_100 = generate_random_id(100)
         print(f"Comparing length: Expected 100, Got {len(id_100)}")
         assert len(id_100) == 100
-    
+
     def test_generate_random_id_alphanumeric(self):
         """
         What it does: Verifies ID contains only alphanumeric characters.
         Purpose: Ensure no special characters in generated IDs.
         """
         print("Setup: Generating large ID to test character set...")
-        
+
         print("Action: Generate ID of length 1000...")
         random_id = generate_random_id(1000)
-        
+
         print(f"Checking if alphanumeric: {random_id[:50]}...")
         assert random_id.isalnum()
-    
+
     def test_generate_random_id_uniqueness(self):
         """
         What it does: Verifies IDs are unique (probabilistically).
         Purpose: Ensure randomness works correctly.
         """
         print("Setup: Generating multiple IDs...")
-        
+
         print("Action: Generate 100 IDs of length 22...")
         ids = [generate_random_id(22) for _ in range(100)]
-        
-        print(f"Comparing uniqueness: Generated {len(ids)} IDs, unique: {len(set(ids))}")
+
+        print(
+            f"Comparing uniqueness: Generated {len(ids)} IDs, unique: {len(set(ids))}"
+        )
         assert len(set(ids)) == len(ids)  # All should be unique
 
 
@@ -88,9 +91,10 @@ class TestIDGeneration:
 # Tests for MCP API Call
 # ==================================================================================================
 
+
 class TestCallKiroMCPAPI:
     """Tests for MCP API calls."""
-    
+
     @pytest.mark.asyncio
     async def test_mcp_api_success(self, mock_auth_manager):
         """
@@ -99,54 +103,58 @@ class TestCallKiroMCPAPI:
         """
         print("Setup: Mocking successful MCP API response...")
         query = "Python tutorials"
-        
+
         # Mock MCP response (CRITICAL: result.content[0].text is JSON STRING)
         mock_response_data = {
             "id": "web_search_tooluse_abc123_1234567890_xyz",
             "jsonrpc": "2.0",
             "result": {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps({
-                        "results": [
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
                             {
-                                "title": "Python Tutorial",
-                                "url": "https://python.org",
-                                "snippet": "Learn Python programming",
-                                "publishedDate": 1700000000000
+                                "results": [
+                                    {
+                                        "title": "Python Tutorial",
+                                        "url": "https://python.org",
+                                        "snippet": "Learn Python programming",
+                                        "publishedDate": 1700000000000,
+                                    }
+                                ],
+                                "totalResults": 1,
+                                "query": "Python tutorials",
                             }
-                        ],
-                        "totalResults": 1,
-                        "query": "Python tutorials"
-                    })
-                }],
-                "isError": False
-            }
+                        ),
+                    }
+                ],
+                "isError": False,
+            },
         }
-        
+
         # Mock httpx.AsyncClient - CRITICAL: json() must be async
         mock_response = Mock()
         mock_response.status_code = 200
         mock_response.json = Mock(return_value=mock_response_data)
-        
+
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
         mock_client.__aenter__.return_value.post = mock_post
-        
+
         print("Action: Calling call_kiro_mcp_api...")
         with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
-        
+
         print(f"Comparing tool_use_id: Got '{tool_use_id}'")
         assert tool_use_id is not None
         assert tool_use_id.startswith("srvtoolu_")
-        
+
         print(f"Comparing results: Got {results}")
         assert results is not None
         assert results["totalResults"] == 1
         assert results["results"][0]["title"] == "Python Tutorial"
         assert results["results"][0]["url"] == "https://python.org"
-    
+
     @pytest.mark.asyncio
     async def test_mcp_api_error_response(self, mock_auth_manager):
         """
@@ -155,30 +163,32 @@ class TestCallKiroMCPAPI:
         """
         print("Setup: Mocking MCP API error response...")
         query = "test"
-        
+
         # Mock error response
         mock_response_data = {
             "id": "web_search_tooluse_abc123_1234567890_xyz",
             "jsonrpc": "2.0",
-            "error": {"code": -32600, "message": "Invalid request"}
+            "error": {"code": -32600, "message": "Invalid request"},
         }
-        
+
         mock_response = Mock()
         mock_response.status_code = 200
         mock_response.json = Mock(return_value=mock_response_data)
-        
+
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
         mock_client.__aenter__.return_value.post = mock_post
-        
+
         print("Action: Calling call_kiro_mcp_api...")
         with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
-        
-        print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
+
+        print(
+            f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})"
+        )
         assert tool_use_id is None
         assert results is None
-    
+
     @pytest.mark.asyncio
     async def test_mcp_api_http_error(self, mock_auth_manager):
         """
@@ -187,22 +197,24 @@ class TestCallKiroMCPAPI:
         """
         print("Setup: Mocking HTTP 500 error...")
         query = "test"
-        
+
         mock_response = Mock()
         mock_response.status_code = 500
-        
+
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
         mock_client.__aenter__.return_value.post = mock_post
-        
+
         print("Action: Calling call_kiro_mcp_api...")
         with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
-        
-        print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
+
+        print(
+            f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})"
+        )
         assert tool_use_id is None
         assert results is None
-    
+
     @pytest.mark.asyncio
     async def test_mcp_api_timeout(self, mock_auth_manager):
         """
@@ -211,21 +223,23 @@ class TestCallKiroMCPAPI:
         """
         print("Setup: Mocking timeout exception...")
         query = "test"
-        
+
         import httpx
-        
+
         mock_post = AsyncMock(side_effect=httpx.TimeoutException("Timeout"))
         mock_client = AsyncMock()
         mock_client.__aenter__.return_value.post = mock_post
-        
+
         print("Action: Calling call_kiro_mcp_api...")
         with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
-        
-        print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
+
+        print(
+            f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})"
+        )
         assert tool_use_id is None
         assert results is None
-    
+
     @pytest.mark.asyncio
     async def test_mcp_api_json_decode_error(self, mock_auth_manager):
         """
@@ -234,31 +248,183 @@ class TestCallKiroMCPAPI:
         """
         print("Setup: Mocking malformed JSON response...")
         query = "test"
-        
+
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.json = Mock(side_effect=json.JSONDecodeError("Invalid JSON", "", 0))
-        
+        mock_response.json = Mock(
+            side_effect=json.JSONDecodeError("Invalid JSON", "", 0)
+        )
+
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
         mock_client.__aenter__.return_value.post = mock_post
-        
+
         print("Action: Calling call_kiro_mcp_api...")
         with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
-        
-        print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
+
+        print(
+            f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})"
+        )
         assert tool_use_id is None
         assert results is None
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_includes_profile_arn_when_available(self, mock_auth_manager):
+        """
+        What it does: Verifies profileArn is included in MCP request body.
+        Purpose: Regression test for issue #173 - runtime.kiro.dev/mcp requires profileArn.
+        """
+        print("Setup: Mocking MCP API with auth_manager that has profile_arn...")
+        query = "test query"
+
+        mock_response_data = {
+            "id": "test",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"results": [], "totalResults": 0}),
+                    }
+                ],
+                "isError": False,
+            },
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api with profile_arn set...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        # Verify the request body includes profileArn
+        call_args = mock_post.call_args
+        request_body = call_args.kwargs.get("json") or call_args[1].get("json")
+        print(f"Checking profileArn in request body: {request_body.get('profileArn')}")
+        assert "profileArn" in request_body
+        assert (
+            request_body["profileArn"]
+            == "arn:aws:codewhisperer:us-east-1:123456789:profile/test"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_no_profile_arn_when_missing(self):
+        """
+        What it does: Verifies MCP request omits profileArn when not available.
+        Purpose: Ensure Builder ID accounts (no profileArn) don't send empty string.
+        """
+        print("Setup: Creating auth_manager without profile_arn...")
+        from kiro.auth import KiroAuthManager
+        from datetime import datetime, timezone
+
+        manager = KiroAuthManager(
+            refresh_token="test_token", profile_arn=None, region="us-east-1"
+        )
+        manager._access_token = "test_access_token"
+        manager._expires_at = datetime.now(timezone.utc).replace(year=2099)
+
+        query = "test query"
+
+        mock_response_data = {
+            "id": "test",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"results": [], "totalResults": 0}),
+                    }
+                ],
+                "isError": False,
+            },
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api without profile_arn...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            with patch("kiro.mcp_tools.PROFILE_ARN", ""):
+                await call_kiro_mcp_api(query, manager)
+
+        # Verify profileArn is NOT in request body
+        call_args = mock_post.call_args
+        request_body = call_args.kwargs.get("json") or call_args[1].get("json")
+        print(f"Checking profileArn absent: {'profileArn' not in request_body}")
+        assert "profileArn" not in request_body
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_falls_back_to_env_profile_arn(self):
+        """
+        What it does: Verifies MCP uses PROFILE_ARN env when auth_manager has none.
+        Purpose: Ensure env fallback works for accounts with externally configured profileArn.
+        """
+        print("Setup: Creating auth_manager without profile_arn but env set...")
+        from kiro.auth import KiroAuthManager
+        from datetime import datetime, timezone
+
+        manager = KiroAuthManager(
+            refresh_token="test_token", profile_arn=None, region="us-east-1"
+        )
+        manager._access_token = "test_access_token"
+        manager._expires_at = datetime.now(timezone.utc).replace(year=2099)
+
+        query = "test query"
+
+        mock_response_data = {
+            "id": "test",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"results": [], "totalResults": 0}),
+                    }
+                ],
+                "isError": False,
+            },
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        env_arn = "arn:aws:codewhisperer:us-east-1:999999:profile/ENV_FALLBACK"
+        print(f"Action: Calling with PROFILE_ARN env = {env_arn}...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            with patch("kiro.mcp_tools.PROFILE_ARN", env_arn):
+                await call_kiro_mcp_api(query, manager)
+
+        call_args = mock_post.call_args
+        request_body = call_args.kwargs.get("json") or call_args[1].get("json")
+        print(f"Checking profileArn fallback: {request_body.get('profileArn')}")
+        assert request_body["profileArn"] == env_arn
 
 
 # ==================================================================================================
 # Tests for Search Summary Generation
 # ==================================================================================================
 
+
 class TestGenerateSearchSummary:
     """Tests for search summary formatting."""
-    
+
     def test_generate_summary_with_results(self):
         """
         What it does: Verifies summary formatting with results.
@@ -272,38 +438,38 @@ class TestGenerateSearchSummary:
                     "title": "Python.org",
                     "url": "https://python.org",
                     "snippet": "Official Python website with tutorials",
-                    "publishedDate": 1700000000000
+                    "publishedDate": 1700000000000,
                 },
                 {
                     "title": "Python Tutorial",
                     "url": "https://docs.python.org",
                     "snippet": "Complete Python documentation",
-                    "publishedDate": None  # No date
-                }
+                    "publishedDate": None,  # No date
+                },
             ],
-            "totalResults": 2
+            "totalResults": 2,
         }
-        
+
         print("Action: Generating summary...")
         summary = generate_search_summary(query, results)
-        
+
         print(f"Checking XML tags...")
         assert "<web_search>" in summary
         assert "</web_search>" in summary
-        
+
         print(f"Checking query in summary...")
         assert "Python" in summary
-        
+
         print(f"Checking first result...")
         assert "Python.org" in summary
         assert "https://python.org" in summary
         assert "Official Python website with tutorials" in summary
-        
+
         print(f"Checking second result...")
         assert "Python Tutorial" in summary
         assert "https://docs.python.org" in summary
         assert "Complete Python documentation" in summary
-    
+
     def test_generate_summary_no_results(self):
         """
         What it does: Verifies summary with empty results list.
@@ -312,21 +478,21 @@ class TestGenerateSearchSummary:
         print("Setup: Creating empty results...")
         query = "nonexistent"
         results = {"results": [], "totalResults": 0}
-        
+
         print("Action: Generating summary...")
         summary = generate_search_summary(query, results)
-        
+
         print(f"Checking XML tags...")
         assert "<web_search>" in summary
         assert "</web_search>" in summary
-        
+
         print(f"Checking query in summary...")
         assert "nonexistent" in summary
-        
+
         print(f"Summary content: {repr(summary)}")
         # Empty results list produces empty content between tags (no "No results found")
         assert "Search results for" in summary
-    
+
     def test_generate_summary_malformed_results(self):
         """
         What it does: Verifies handling of malformed results.
@@ -335,13 +501,13 @@ class TestGenerateSearchSummary:
         print("Setup: Creating malformed results...")
         query = "test"
         results = {"invalid": "structure"}
-        
+
         print("Action: Generating summary...")
         summary = generate_search_summary(query, results)
-        
+
         print(f"Checking for 'No results found'...")
         assert "No results found" in summary
-    
+
     def test_generate_summary_date_formatting(self):
         """
         What it does: Verifies date formatting from milliseconds timestamp.
@@ -351,22 +517,24 @@ class TestGenerateSearchSummary:
         query = "test"
         # 1700000000000 ms = 2023-11-14 22:13:20 UTC
         results = {
-            "results": [{
-                "title": "Test",
-                "url": "https://test.com",
-                "snippet": "Test snippet",
-                "publishedDate": 1700000000000
-            }],
-            "totalResults": 1
+            "results": [
+                {
+                    "title": "Test",
+                    "url": "https://test.com",
+                    "snippet": "Test snippet",
+                    "publishedDate": 1700000000000,
+                }
+            ],
+            "totalResults": 1,
         }
-        
+
         print("Action: Generating summary...")
         summary = generate_search_summary(query, results)
-        
+
         print(f"Checking date format...")
         # Should contain formatted date like "14 Nov 2023"
         assert "Nov 2023" in summary or "Ноя 2023" in summary  # Depends on locale
-    
+
     def test_generate_summary_full_snippet_no_truncation(self):
         """
         What it does: Verifies snippets are NOT truncated.
@@ -376,18 +544,20 @@ class TestGenerateSearchSummary:
         query = "test"
         long_snippet = "A" * 1000  # 1000 characters
         results = {
-            "results": [{
-                "title": "Test",
-                "url": "https://test.com",
-                "snippet": long_snippet,
-                "publishedDate": None
-            }],
-            "totalResults": 1
+            "results": [
+                {
+                    "title": "Test",
+                    "url": "https://test.com",
+                    "snippet": long_snippet,
+                    "publishedDate": None,
+                }
+            ],
+            "totalResults": 1,
         }
-        
+
         print("Action: Generating summary...")
         summary = generate_search_summary(query, results)
-        
+
         print(f"Checking snippet is NOT truncated...")
         assert long_snippet in summary
         assert len(long_snippet) == 1000  # Full length preserved
@@ -397,9 +567,10 @@ class TestGenerateSearchSummary:
 # Tests for Query Extraction
 # ==================================================================================================
 
+
 class TestExtractQueryFromMessages:
     """Tests for query extraction from messages."""
-    
+
     def test_extract_query_anthropic_string_content(self):
         """
         What it does: Extracts query from Anthropic string content.
@@ -407,14 +578,17 @@ class TestExtractQueryFromMessages:
         """
         print("Setup: Creating Anthropic message with string content...")
         from kiro.models_anthropic import AnthropicMessage
-        messages = [AnthropicMessage(role="user", content="Search for Python tutorials")]
-        
+
+        messages = [
+            AnthropicMessage(role="user", content="Search for Python tutorials")
+        ]
+
         print("Action: Extracting query...")
         query = extract_query_from_messages(messages, "anthropic")
-        
+
         print(f"Comparing query: Expected 'Search for Python tutorials', Got '{query}'")
         assert query == "Search for Python tutorials"
-    
+
     def test_extract_query_anthropic_list_content(self):
         """
         What it does: Extracts query from Anthropic list content.
@@ -422,17 +596,20 @@ class TestExtractQueryFromMessages:
         """
         print("Setup: Creating Anthropic message with list content...")
         from kiro.models_anthropic import AnthropicMessage, TextContentBlock
-        messages = [AnthropicMessage(
-            role="user",
-            content=[TextContentBlock(type="text", text="Python tutorials")]
-        )]
-        
+
+        messages = [
+            AnthropicMessage(
+                role="user",
+                content=[TextContentBlock(type="text", text="Python tutorials")],
+            )
+        ]
+
         print("Action: Extracting query...")
         query = extract_query_from_messages(messages, "anthropic")
-        
+
         print(f"Comparing query: Expected 'Python tutorials', Got '{query}'")
         assert query == "Python tutorials"
-    
+
     def test_extract_query_with_prefix(self):
         """
         What it does: Removes 'Perform a web search for the query:' prefix.
@@ -440,17 +617,19 @@ class TestExtractQueryFromMessages:
         """
         print("Setup: Creating message with prefix...")
         from kiro.models_anthropic import AnthropicMessage
-        messages = [AnthropicMessage(
-            role="user",
-            content="Perform a web search for the query: Python"
-        )]
-        
+
+        messages = [
+            AnthropicMessage(
+                role="user", content="Perform a web search for the query: Python"
+            )
+        ]
+
         print("Action: Extracting query...")
         query = extract_query_from_messages(messages, "anthropic")
-        
+
         print(f"Comparing query: Expected 'Python', Got '{query}'")
         assert query == "Python"
-    
+
     def test_extract_query_empty_messages(self):
         """
         What it does: Handles empty messages list.
@@ -458,38 +637,47 @@ class TestExtractQueryFromMessages:
         """
         print("Setup: Creating empty messages list...")
         messages = []
-        
+
         print("Action: Extracting query...")
         query = extract_query_from_messages(messages, "anthropic")
-        
+
         print(f"Comparing query: Expected None, Got {query}")
         assert query is None
-    
+
     def test_extract_query_no_text_content(self):
         """
         What it does: Handles messages without text content.
         Purpose: Ensure None is returned for non-text messages.
         """
         print("Setup: Creating message with image content...")
-        from kiro.models_anthropic import AnthropicMessage, ImageContentBlock, Base64ImageSource
-        messages = [AnthropicMessage(
-            role="user",
-            content=[ImageContentBlock(
-                type="image",
-                source=Base64ImageSource(
-                    type="base64",
-                    media_type="image/png",
-                    data="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-                )
-            )]
-        )]
-        
+        from kiro.models_anthropic import (
+            AnthropicMessage,
+            ImageContentBlock,
+            Base64ImageSource,
+        )
+
+        messages = [
+            AnthropicMessage(
+                role="user",
+                content=[
+                    ImageContentBlock(
+                        type="image",
+                        source=Base64ImageSource(
+                            type="base64",
+                            media_type="image/png",
+                            data="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+                        ),
+                    )
+                ],
+            )
+        ]
+
         print("Action: Extracting query...")
         query = extract_query_from_messages(messages, "anthropic")
-        
+
         print(f"Comparing query: Expected None or empty, Got '{query}'")
         assert query is None or query == ""
-    
+
     def test_extract_query_multiple_text_blocks(self):
         """
         What it does: Concatenates multiple text blocks.
@@ -497,17 +685,20 @@ class TestExtractQueryFromMessages:
         """
         print("Setup: Creating message with multiple text blocks...")
         from kiro.models_anthropic import AnthropicMessage, TextContentBlock
-        messages = [AnthropicMessage(
-            role="user",
-            content=[
-                TextContentBlock(type="text", text="Search for "),
-                TextContentBlock(type="text", text="Python tutorials")
-            ]
-        )]
-        
+
+        messages = [
+            AnthropicMessage(
+                role="user",
+                content=[
+                    TextContentBlock(type="text", text="Search for "),
+                    TextContentBlock(type="text", text="Python tutorials"),
+                ],
+            )
+        ]
+
         print("Action: Extracting query...")
         query = extract_query_from_messages(messages, "anthropic")
-        
+
         print(f"Comparing query: Expected 'Search for Python tutorials', Got '{query}'")
         assert query == "Search for Python tutorials"
 
@@ -516,9 +707,10 @@ class TestExtractQueryFromMessages:
 # Tests for SSE Emulation
 # ==================================================================================================
 
+
 class TestAnthropicSSEEmulation:
     """Tests for Anthropic SSE stream generation."""
-    
+
     @pytest.mark.asyncio
     async def test_generate_anthropic_sse_structure(self):
         """
@@ -530,26 +722,30 @@ class TestAnthropicSSEEmulation:
         query = "Python"
         tool_use_id = "srvtoolu_test123"
         results = {
-            "results": [{"title": "Test", "url": "https://test.com", "snippet": "Test"}],
-            "totalResults": 1
+            "results": [
+                {"title": "Test", "url": "https://test.com", "snippet": "Test"}
+            ],
+            "totalResults": 1,
         }
         input_tokens = 100
-        
+
         print("Action: Generating SSE stream...")
         events = []
-        async for event in generate_anthropic_web_search_sse(model, query, tool_use_id, results, input_tokens):
+        async for event in generate_anthropic_web_search_sse(
+            model, query, tool_use_id, results, input_tokens
+        ):
             events.append(event)
-        
+
         print(f"Comparing event count: Got {len(events)} events")
         assert len(events) >= 11  # At least 11 events (may have more text_delta chunks)
-        
+
         print("Checking event types...")
         event_types = []
         for event in events:
             if "event:" in event:
                 event_type = event.split("event:")[1].split("\n")[0].strip()
                 event_types.append(event_type)
-        
+
         print(f"Event types: {event_types}")
         assert "message_start" in event_types
         assert "content_block_start" in event_types
@@ -561,7 +757,7 @@ class TestAnthropicSSEEmulation:
 
 class TestOpenAISSEEmulation:
     """Tests for OpenAI SSE stream generation."""
-    
+
     @pytest.mark.asyncio
     async def test_generate_openai_sse_structure(self):
         """
@@ -573,30 +769,34 @@ class TestOpenAISSEEmulation:
         query = "Python"
         tool_use_id = "srvtoolu_test123"
         results = {
-            "results": [{"title": "Test", "url": "https://test.com", "snippet": "Test"}],
-            "totalResults": 1
+            "results": [
+                {"title": "Test", "url": "https://test.com", "snippet": "Test"}
+            ],
+            "totalResults": 1,
         }
         input_tokens = 100
-        
+
         print("Action: Generating SSE stream...")
         chunks = []
-        async for chunk in generate_openai_web_search_sse(model, query, tool_use_id, results, input_tokens):
+        async for chunk in generate_openai_web_search_sse(
+            model, query, tool_use_id, results, input_tokens
+        ):
             chunks.append(chunk)
-        
+
         print(f"Comparing chunk count: Got {len(chunks)} chunks")
         assert len(chunks) >= 3  # At least: role, content chunks, finish + [DONE]
-        
+
         print("Checking for [DONE] marker...")
         assert any("[DONE]" in chunk for chunk in chunks)
-        
+
         print("Checking for role delta (flexible matching)...")
         assert any('"role"' in chunk and '"assistant"' in chunk for chunk in chunks)
-        
+
         print("Checking for finish_reason (flexible matching)...")
         assert any('"finish_reason"' in chunk and '"stop"' in chunk for chunk in chunks)
-        
+
         print("Checking for data: prefix...")
         assert any(chunk.startswith("data:") for chunk in chunks)
-        
+
         print("Checking for usage information...")
         assert any('"usage"' in chunk for chunk in chunks)
