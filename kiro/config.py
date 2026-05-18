@@ -37,44 +37,45 @@ load_dotenv()
 def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
     """
     Read variable value from .env file without processing escape sequences.
-    
+
     This is necessary for correct handling of Windows paths where backslashes
     (e.g., D:\\Projects\\file.json) may be incorrectly interpreted
     as escape sequences (\\a -> bell, \\n -> newline, etc.).
-    
+
     Args:
         var_name: Environment variable name
         env_file: Path to .env file (default ".env")
-    
+
     Returns:
         Raw variable value or None if not found
     """
     env_path = Path(env_file)
     if not env_path.exists():
         return None
-    
+
     try:
         # Read file as-is, without interpretation
         content = env_path.read_text(encoding="utf-8")
-        
+
         # Search for variable considering different formats:
         # VAR="value" or VAR='value' or VAR=value
         # Pattern captures value with or without quotes
         pattern = rf'^{re.escape(var_name)}=(["\']?)(.+?)\1\s*$'
-        
+
         for line in content.splitlines():
             line = line.strip()
             if line.startswith("#") or not line:
                 continue
-            
+
             match = re.match(pattern, line)
             if match:
                 # Return value as-is, without processing escape sequences
                 return match.group(2)
     except Exception:
         pass
-    
+
     return None
+
 
 # ==================================================================================================
 # Server Settings
@@ -149,40 +150,65 @@ REGION: str = os.getenv("KIRO_REGION", "us-east-1")
 # Path to credentials file (optional, alternative to .env)
 # Read directly from .env to avoid escape sequence issues on Windows
 # (e.g., \a in path D:\Projects\adolf is interpreted as bell character)
-_raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv("KIRO_CREDS_FILE", "")
+_raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv(
+    "KIRO_CREDS_FILE", ""
+)
 # Normalize path for cross-platform compatibility
 KIRO_CREDS_FILE: str = str(Path(_raw_creds_file)) if _raw_creds_file else ""
 
 # Path to kiro-cli SQLite database (optional, for AWS SSO OIDC authentication)
 # Default location: ~/.local/share/kiro-cli/data.sqlite3 (Linux/macOS)
 # or ~/.local/share/amazon-q/data.sqlite3 (amazon-q-developer-cli)
-_raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
+_raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv(
+    "KIRO_CLI_DB_FILE", ""
+)
 KIRO_CLI_DB_FILE: str = str(Path(_raw_cli_db_file)) if _raw_cli_db_file else ""
 
 # Disable SQLite write-back (read-only mode)
 # When enabled, gateway will only read from kiro-cli database without modifying it.
 # Useful when kiro-cli is actively managing tokens and you don't want gateway to interfere.
 # Default: false (write-back enabled)
-SQLITE_READONLY: bool = os.getenv("SQLITE_READONLY", "false").lower() in ("true", "1", "yes")
+SQLITE_READONLY: bool = os.getenv("SQLITE_READONLY", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # ==================================================================================================
 # Kiro API URL Templates
 # ==================================================================================================
 
 # URL for token refresh (Kiro Desktop Auth)
-KIRO_REFRESH_URL_TEMPLATE: str = "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
+KIRO_REFRESH_URL_TEMPLATE: str = (
+    "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
+)
 
 # URL for token refresh (AWS SSO OIDC - used by kiro-cli)
 AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
+
+# Use legacy q.amazonaws.com endpoint instead of runtime.kiro.dev
+# Set to true for Builder ID (free tier) accounts that have no profileArn
+# See: https://github.com/jwadow/kiro-gateway/issues/168
+KIRO_USE_LEGACY_ENDPOINT: bool = os.getenv(
+    "KIRO_USE_LEGACY_ENDPOINT", "false"
+).lower() in ("true", "1", "yes")
 
 # Host for main API (generateAssistantResponse)
 # Universal endpoint for all regions (us-east-1, eu-central-1, etc.)
 # See: https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/security-data-perimeter.html
 # Fixed in issue #58 - codewhisperer.{region}.amazonaws.com doesn't exist for non-us-east-1 regions
-KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+KIRO_API_HOST_TEMPLATE: str = (
+    "https://q.{region}.amazonaws.com"
+    if KIRO_USE_LEGACY_ENDPOINT
+    else "https://runtime.{region}.kiro.dev"
+)
 
 # Host for Q API (ListAvailableModels)
-KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+KIRO_Q_HOST_TEMPLATE: str = (
+    "https://q.{region}.amazonaws.com"
+    if KIRO_USE_LEGACY_ENDPOINT
+    else "https://runtime.{region}.kiro.dev"
+)
 
 # ==================================================================================================
 # Token Settings
@@ -318,7 +344,9 @@ DEFAULT_MAX_INPUT_TOKENS: int = 200000
 # Maximum length of tool description in characters.
 # Descriptions longer than this limit will be moved to system prompt.
 # Set to 0 to disable (not recommended - will cause Kiro API errors).
-TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", "10000"))
+TOOL_DESCRIPTION_MAX_LENGTH: int = int(
+    os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", "10000")
+)
 
 # ==================================================================================================
 # Truncation Recovery Settings
@@ -330,7 +358,11 @@ TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", 
 # - For content: synthetic user message notifying about truncation
 # This helps the model understand and adapt to Kiro API limitations
 # Default: true (enabled)
-TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in ("true", "1", "yes")
+TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # ==================================================================================================
 # Logging Settings
@@ -388,16 +420,17 @@ def _warn_timeout_configuration():
     """
     Print warning if timeout configuration is suboptimal.
     Called at application startup.
-    
+
     FIRST_TOKEN_TIMEOUT should be less than STREAMING_READ_TIMEOUT:
     - FIRST_TOKEN_TIMEOUT: time to wait for model to START responding
     - STREAMING_READ_TIMEOUT: time to wait BETWEEN chunks during streaming
     """
     if FIRST_TOKEN_TIMEOUT >= STREAMING_READ_TIMEOUT:
         import sys
+
         YELLOW = "\033[93m"
         RESET = "\033[0m"
-        
+
         warning_text = f"""
 {YELLOW}⚠️  WARNING: Suboptimal timeout configuration detected.
     
@@ -415,6 +448,7 @@ def _warn_timeout_configuration():
 """
         print(warning_text, file=sys.stderr)
 
+
 # ==================================================================================================
 # Fake Reasoning Settings (Extended Thinking via Tag Injection)
 # ==================================================================================================
@@ -431,7 +465,13 @@ def _warn_timeout_configuration():
 # Default: true (enabled) - provides premium experience out of the box
 _FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
 # Default is True - if env var is not set or empty, enable fake reasoning
-FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in (
+    "false",
+    "0",
+    "no",
+    "disabled",
+    "off",
+)
 
 # Maximum thinking length in tokens (default budget when client doesn't specify).
 # This value is injected into the request as <max_thinking_length>{value}</max_thinking_length>
@@ -460,8 +500,15 @@ FAKE_REASONING_BUDGET_CAP: int = int(os.getenv("FAKE_REASONING_BUDGET_CAP", "100
 # - "strip_tags": Remove tags but keep thinking content in regular content
 #
 # Default: "as_reasoning_content"
-_FAKE_REASONING_HANDLING_RAW: str = os.getenv("FAKE_REASONING_HANDLING", "as_reasoning_content").lower()
-if _FAKE_REASONING_HANDLING_RAW in ("as_reasoning_content", "remove", "pass", "strip_tags"):
+_FAKE_REASONING_HANDLING_RAW: str = os.getenv(
+    "FAKE_REASONING_HANDLING", "as_reasoning_content"
+).lower()
+if _FAKE_REASONING_HANDLING_RAW in (
+    "as_reasoning_content",
+    "remove",
+    "pass",
+    "strip_tags",
+):
     FAKE_REASONING_HANDLING: str = _FAKE_REASONING_HANDLING_RAW
 else:
     FAKE_REASONING_HANDLING: str = "as_reasoning_content"
@@ -469,13 +516,20 @@ else:
 # List of opening tags to detect thinking blocks.
 # The parser will look for any of these tags at the start of the response.
 # Order matters - first match wins.
-FAKE_REASONING_OPEN_TAGS: List[str] = ["<thinking>", "<think>", "<reasoning>", "<thought>"]
+FAKE_REASONING_OPEN_TAGS: List[str] = [
+    "<thinking>",
+    "<think>",
+    "<reasoning>",
+    "<thought>",
+]
 
 # Maximum size of initial buffer for tag detection (characters).
 # If no thinking tag is found within this limit, content is treated as regular response.
 # Lower values = faster first token, but may miss tags with leading whitespace.
 # Default: 30 characters (enough for longest tag + some whitespace)
-FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_BUFFER_SIZE", "20"))
+FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(
+    os.getenv("FAKE_REASONING_INITIAL_BUFFER_SIZE", "20")
+)
 
 
 # ==================================================================================================
@@ -489,7 +543,11 @@ KIRO_MAX_PAYLOAD_BYTES: int = int(os.getenv("KIRO_MAX_PAYLOAD_BYTES", "600000"))
 # Auto-trim payload when over limit (default: false - disabled)
 # Enable this if you use many tools (30+) and hit "Improperly formed request" errors
 # When false, returns a clear error instead of trimming
-AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in ("true", "1", "yes")
+AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # ==================================================================================================
 # WebSearch Settings (MCP Tool Emulation)
@@ -500,7 +558,11 @@ AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in ("t
 # Model decides whether to use it or not
 #
 # Note: Native Anthropic server-side tools (Path A) work ALWAYS, regardless of this setting
-WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
+WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # ==================================================================================================
 # Account System Settings
@@ -509,7 +571,11 @@ WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("
 # Enable account system with failover (default: false)
 # When false: uses first account without failover (legacy mode)
 # When true: enables full failover loop with Circuit Breaker
-ACCOUNT_SYSTEM: bool = os.getenv("ACCOUNT_SYSTEM", "false").lower() in ("true", "1", "yes")
+ACCOUNT_SYSTEM: bool = os.getenv("ACCOUNT_SYSTEM", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # Path to credentials configuration file
 ACCOUNTS_CONFIG_FILE: str = os.getenv("ACCOUNTS_CONFIG_FILE", "credentials.json")
@@ -529,12 +595,16 @@ ACCOUNT_RECOVERY_TIMEOUT: int = int(os.getenv("ACCOUNT_RECOVERY_TIMEOUT", "60"))
 
 # Maximum backoff multiplier (cap for exponential backoff)
 # With BASE=60s and MAX=1440, maximum cooldown is 60 * 1440 = 86400s = 1 day
-ACCOUNT_MAX_BACKOFF_MULTIPLIER: float = float(os.getenv("ACCOUNT_MAX_BACKOFF_MULTIPLIER", "1440.0"))
+ACCOUNT_MAX_BACKOFF_MULTIPLIER: float = float(
+    os.getenv("ACCOUNT_MAX_BACKOFF_MULTIPLIER", "1440.0")
+)
 
 # Probabilistic retry chance for "broken" accounts (0.0 - 1.0)
 # Even if account is broken and timeout hasn't passed, try with this probability
 # Default: 0.1 (10% chance) - prevents permanent "stuck" state
-ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(os.getenv("ACCOUNT_PROBABILISTIC_RETRY_CHANCE", "0.1"))
+ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(
+    os.getenv("ACCOUNT_PROBABILISTIC_RETRY_CHANCE", "0.1")
+)
 
 # ==================================================================================================
 # Account Cache Settings
@@ -557,7 +627,9 @@ STATE_SAVE_INTERVAL_SECONDS: int = int(os.getenv("STATE_SAVE_INTERVAL_SECONDS", 
 
 APP_VERSION: str = "2.4.dev.13"
 APP_TITLE: str = "Kiro Gateway"
-APP_DESCRIPTION: str = "Proxy gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible. Made by @jwadow"
+APP_DESCRIPTION: str = (
+    "Proxy gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible. Made by @jwadow"
+)
 
 
 def get_kiro_refresh_url(region: str) -> str:
@@ -578,4 +650,3 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
-
