@@ -416,6 +416,58 @@ class TestCallKiroMCPAPI:
         print(f"Checking profileArn fallback: {request_body.get('profileArn')}")
         assert request_body["profileArn"] == env_arn
 
+    @pytest.mark.asyncio
+    async def test_mcp_api_uses_auth_manager_q_host_for_url(self, mock_auth_manager):
+        """
+        What it does: Verifies MCP URL is derived from auth_manager.q_host.
+        Purpose: Proves legacy endpoint flag (which changes q_host via config) affects MCP.
+        """
+        print("Setup: Checking MCP URL uses auth_manager.q_host...")
+        query = "test"
+
+        mock_response_data = {
+            "id": "test",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"results": [], "totalResults": 0}),
+                    }
+                ],
+                "isError": False,
+            },
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        # Verify with default q_host (runtime.kiro.dev)
+        print(f"auth_manager.q_host = {mock_auth_manager.q_host}")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        call_args = mock_post.call_args
+        called_url = (
+            call_args.kwargs.get("url") or call_args[0][0]
+            if call_args[0]
+            else call_args.kwargs.get("url")
+        )
+        # post is called with url as positional arg
+        actual_url = (
+            mock_post.call_args[0][0]
+            if mock_post.call_args[0]
+            else mock_post.call_args.kwargs.get("url")
+        )
+        print(f"MCP URL called: {actual_url}")
+        assert actual_url == f"{mock_auth_manager.q_host}/mcp"
+        assert "runtime" in actual_url or "amazonaws" in actual_url
+
 
 # ==================================================================================================
 # Tests for Search Summary Generation
