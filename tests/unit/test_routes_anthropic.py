@@ -527,6 +527,56 @@ class TestMessagesContentBlocks:
         print(f"Status: {response.status_code}")
         assert response.status_code != 422
 
+    def test_accepts_claude_code_server_tool_history(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies Claude Code server-side tool history blocks are accepted.
+        Purpose: Ensure Anthropic request validation allows server_tool_use and web_search_tool_result blocks.
+        """
+        print("Action: POST /v1/messages with Claude Code server tool history...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "Search the latest release notes."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "Need to search the web.",
+                                "signature": "",
+                            },
+                            {
+                                "type": "server_tool_use",
+                                "id": "srvtoolu_123",
+                                "name": "web_search",
+                                "input": {"query": "latest release notes"},
+                            },
+                            {
+                                "type": "web_search_tool_result",
+                                "tool_use_id": "srvtoolu_123",
+                                "content": [
+                                    {
+                                        "type": "web_search_result",
+                                        "title": "Release Notes",
+                                        "url": "https://example.com/releases",
+                                        "encrypted_content": "opaque",
+                                    }
+                                ],
+                            },
+                            {"type": "text", "text": "Search completed."},
+                        ],
+                    },
+                ],
+            },
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
+
 
 # =============================================================================
 # Tests for /v1/messages tool use

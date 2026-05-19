@@ -31,3 +31,6 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local Codex Python env cache
+.codex-python-env.local.json
