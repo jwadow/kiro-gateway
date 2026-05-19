@@ -268,6 +268,58 @@ class TestModelInfoCacheGetMaxInputTokens:
         assert max_tokens == DEFAULT_MAX_INPUT_TOKENS
 
 
+class TestModelInfoCacheGetTokenLimits:
+    """Tests for get_token_limits (raw tokenLimits passthrough)."""
+
+    @pytest.mark.asyncio
+    async def test_get_token_limits_returns_both_values(self, sample_models_data):
+        """
+        What it does: Verifies get_token_limits returns maxInputTokens and maxOutputTokens.
+        Purpose: Ensure raw limits are surfaced for /v1/models consumers.
+        """
+        cache = ModelInfoCache()
+        await cache.update(sample_models_data)
+
+        limits = cache.get_token_limits("claude-sonnet-4")
+        assert limits == {"maxInputTokens": 200000, "maxOutputTokens": 8192}
+
+    @pytest.mark.asyncio
+    async def test_get_token_limits_returns_none_for_unknown_model(self, sample_models_data):
+        """
+        What it does: Returns None when the model is not in the cache.
+        Purpose: Callers must distinguish "unknown" from "default".
+        """
+        cache = ModelInfoCache()
+        await cache.update(sample_models_data)
+
+        assert cache.get_token_limits("unknown-model") is None
+
+    @pytest.mark.asyncio
+    async def test_get_token_limits_returns_none_when_no_token_limits(self):
+        """
+        What it does: Returns None when the model entry has no tokenLimits.
+        """
+        cache = ModelInfoCache()
+        await cache.update([{"modelId": "bare-model"}])
+
+        assert cache.get_token_limits("bare-model") is None
+
+    @pytest.mark.asyncio
+    async def test_get_token_limits_skips_non_int_values(self):
+        """
+        What it does: Skips tokenLimits entries whose values are None or non-int.
+        Purpose: Upstream sometimes ships partial / null values; we must not propagate them.
+        """
+        cache = ModelInfoCache()
+        await cache.update([{
+            "modelId": "partial-model",
+            "tokenLimits": {"maxInputTokens": 500000, "maxOutputTokens": None},
+        }])
+
+        limits = cache.get_token_limits("partial-model")
+        assert limits == {"maxInputTokens": 500000}
+
+
 class TestModelInfoCacheIsEmpty:
     """Тесты проверки пустоты кэша."""
     

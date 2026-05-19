@@ -28,6 +28,7 @@ Contains all API endpoints:
 
 import json
 from datetime import datetime, timezone
+from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -143,13 +144,41 @@ async def get_models(request: Request):
         # Legacy: use resolver from first account
         account = request.app.state.account_manager.get_first_account()
         available_model_ids = account.model_resolver.get_available_models()
-    
+
+    # Merge tokenLimits from every initialized account's model_cache so the
+    # response exposes per-model ceilings (see OpenAIModel docstring).  If the
+    # same model appears across multiple accounts we keep the largest limits
+    # observed (callers care about "what's possible", not the strictest tier).
+    token_limits_by_model: Dict[str, Dict[str, int]] = {}
+    try:
+        for account in request.app.state.account_manager.iter_initialized_accounts():
+            cache = getattr(account, "model_cache", None)
+            if not cache:
+                continue
+            for mid in cache.get_all_model_ids():
+                limits = cache.get_token_limits(mid)
+                if not limits:
+                    continue
+                current = token_limits_by_model.setdefault(mid, {})
+                for src, dst in (
+                    ("maxInputTokens", "max_input_tokens"),
+                    ("maxOutputTokens", "max_output_tokens"),
+                ):
+                    val = limits.get(src)
+                    if isinstance(val, int) and val > current.get(dst, 0):
+                        current[dst] = val
+    except Exception as exc:  # pragma: no cover — defensive; never fail /v1/models
+        logger.warning(f"Failed to merge tokenLimits for /v1/models: {exc}")
+
     # Build OpenAI-compatible model list
     openai_models = [
         OpenAIModel(
             id=model_id,
             owned_by="anthropic",
-            description="Claude model via Kiro API"
+            description="Claude model via Kiro API",
+            context_length=token_limits_by_model.get(model_id, {}).get("max_input_tokens"),
+            max_input_tokens=token_limits_by_model.get(model_id, {}).get("max_input_tokens"),
+            max_output_tokens=token_limits_by_model.get(model_id, {}).get("max_output_tokens"),
         )
         for model_id in available_model_ids
     ]

@@ -879,6 +879,21 @@ class AccountManager:
             if account.auth_manager is not None:
                 return account
         raise RuntimeError("No initialized accounts available")
+
+    def iter_initialized_accounts(self):
+        """
+        Yield every account whose ``auth_manager`` has been initialized.
+
+        Public accessor intended for read-only introspection (e.g. building
+        the ``/v1/models`` response). Use this instead of reaching into
+        ``self._accounts`` directly.
+
+        Yields:
+            Account: initialized accounts, in insertion order.
+        """
+        for account in self._accounts.values():
+            if account.auth_manager is not None:
+                yield account
     
     def get_all_available_models(self) -> List[str]:
         """

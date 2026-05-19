@@ -380,6 +380,57 @@ class TestModelsEndpoint:
         for model in response.json()["data"]:
             assert model["owned_by"] == "anthropic"
 
+    def test_models_exposes_token_limits(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies /v1/models surfaces upstream tokenLimits as
+        context_length / max_input_tokens / max_output_tokens fields on each model.
+        Purpose: Lets OpenAI-compatible clients (e.g. gateways probing
+        /v1/models to size context windows) discover real per-model ceilings
+        instead of falling back to conservative defaults.
+        """
+        import asyncio
+        from unittest.mock import MagicMock
+        from kiro.cache import ModelInfoCache
+
+        # Stand up a fresh cache populated with a known model + tokenLimits.
+        cache = ModelInfoCache()
+        asyncio.run(cache.update([
+            {
+                "modelId": "claude-sonnet-4.5",
+                "displayName": "Claude Sonnet 4.5",
+                "tokenLimits": {"maxInputTokens": 200000, "maxOutputTokens": 8192},
+            },
+        ]))
+
+        fake_account = MagicMock()
+        fake_account.auth_manager = object()  # truthy — counts as initialized
+        fake_account.model_cache = cache
+        fake_account.model_resolver.get_available_models.return_value = ["claude-sonnet-4.5"]
+
+        original_mgr = test_client.app.state.account_manager
+        original_sys = test_client.app.state.account_system
+        fake_mgr = MagicMock()
+        fake_mgr.get_all_available_models.return_value = ["claude-sonnet-4.5"]
+        fake_mgr.iter_initialized_accounts.return_value = iter([fake_account])
+        test_client.app.state.account_manager = fake_mgr
+        test_client.app.state.account_system = True
+        try:
+            response = test_client.get(
+                "/v1/models",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            )
+        finally:
+            test_client.app.state.account_manager = original_mgr
+            test_client.app.state.account_system = original_sys
+
+        assert response.status_code == 200
+        models = {m["id"]: m for m in response.json()["data"]}
+        assert "claude-sonnet-4.5" in models
+        m = models["claude-sonnet-4.5"]
+        assert m["context_length"] == 200000
+        assert m["max_input_tokens"] == 200000
+        assert m["max_output_tokens"] == 8192
+
 
 # =============================================================================
 # Tests for chat completions endpoint (/v1/chat/completions)
