@@ -166,8 +166,8 @@ def extract_text_content(content: Any) -> str:
         text_parts = []
         for item in content:
             if isinstance(item, dict):
-                # Skip image and tool_reference blocks - they're handled separately
-                if item.get("type") in ("image", "image_url", "tool_reference"):
+                # Skip non-text blocks handled by adapter-specific extractors.
+                if item.get("type") in ("image", "image_url", "document", "tool_reference"):
                     continue
                 if item.get("type") == "text":
                     text_parts.append(item.get("text", ""))
