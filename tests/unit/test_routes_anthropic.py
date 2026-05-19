@@ -527,6 +527,37 @@ class TestMessagesContentBlocks:
         print(f"Status: {response.status_code}")
         assert response.status_code != 422
 
+    def test_accepts_redacted_thinking_content_block(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies redacted_thinking blocks are accepted.
+        Purpose: Ensure Claude Code replayed extended thinking does not fail validation.
+        """
+        print("Action: POST /v1/messages with redacted_thinking content block...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Previous answer"},
+                            {"type": "redacted_thinking", "data": "encrypted-payload"}
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": "Continue"
+                    }
+                ]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
+
 
 # =============================================================================
 # Tests for /v1/messages tool use

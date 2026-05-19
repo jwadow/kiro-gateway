@@ -32,6 +32,7 @@ from kiro.models_anthropic import (
     AnthropicMessage,
     AnthropicTool,
     TextContentBlock,
+    RedactedThinkingContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     SystemContentBlock,
@@ -111,6 +112,26 @@ class TestConvertAnthropicContentToText:
 
         print(f"Comparing result: Expected 'Hello World', Got '{result}'")
         assert result == "Hello World"
+
+    def test_ignores_redacted_thinking_blocks(self):
+        """
+        What it does: Verifies redacted_thinking payloads are not extracted as text.
+        Purpose: Accept Anthropic replay blocks without leaking opaque reasoning data to Kiro.
+        """
+        print("Setup: List with text and redacted_thinking blocks...")
+        content = [
+            TextContentBlock(text="Visible answer"),
+            RedactedThinkingContentBlock(data="encrypted-thinking-payload"),
+            {"type": "text", "text": " continues"},
+            {"type": "redacted_thinking", "data": "another-encrypted-payload"},
+        ]
+
+        print("Action: Extracting text...")
+        result = convert_anthropic_content_to_text(content)
+
+        print(f"Comparing result: Expected 'Visible answer continues', Got '{result}'")
+        assert result == "Visible answer continues"
+        assert "encrypted" not in result
 
     def test_handles_none(self):
         """

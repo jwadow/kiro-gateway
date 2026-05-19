@@ -19,6 +19,7 @@ from kiro.models_anthropic import (
     # Content blocks
     TextContentBlock,
     ThinkingContentBlock,
+    RedactedThinkingContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
@@ -386,6 +387,19 @@ class TestContentBlockUnion:
         print(f"Result: {block}")
         print(f"Comparing type: Expected 'tool_result', Got '{block.type}'")
         assert block.type == "tool_result"
+
+    def test_accepts_redacted_thinking_content_block(self):
+        """
+        What it does: Verifies ContentBlock accepts redacted_thinking blocks.
+        Purpose: Ensure replayed Anthropic extended thinking does not 422.
+        """
+        print("Setup: Creating RedactedThinkingContentBlock...")
+        block: ContentBlock = RedactedThinkingContentBlock(data="encrypted-payload")
+
+        print(f"Result: {block}")
+        print(f"Comparing type: Expected 'redacted_thinking', Got '{block.type}'")
+        assert block.type == "redacted_thinking"
+        assert block.data == "encrypted-payload"
 
 
 # ==================================================================================================
@@ -757,6 +771,41 @@ class TestThinkingContentBlock:
         
         print(f"ValidationError raised: {exc_info.value}")
         assert "thinking" in str(exc_info.value)
+
+
+# ==================================================================================================
+# Tests for RedactedThinkingContentBlock
+# ==================================================================================================
+
+class TestRedactedThinkingContentBlock:
+    """Tests for RedactedThinkingContentBlock Pydantic model."""
+
+    def test_valid_redacted_thinking_block(self):
+        """
+        What it does: Verifies creation of valid redacted_thinking content.
+        Purpose: Ensure Anthropic extended thinking replay blocks validate.
+        """
+        print("Setup: Creating RedactedThinkingContentBlock with valid data...")
+        block = RedactedThinkingContentBlock(data="encrypted-thinking-payload")
+
+        print(f"Result: {block}")
+        print(f"Comparing type: Expected 'redacted_thinking', Got '{block.type}'")
+        assert block.type == "redacted_thinking"
+        assert block.data == "encrypted-thinking-payload"
+
+    def test_requires_data(self):
+        """
+        What it does: Verifies data is required for redacted_thinking.
+        Purpose: Match Anthropic's block shape.
+        """
+        print("Setup: Attempting to create RedactedThinkingContentBlock without data...")
+
+        print("Action: Creating model (should raise ValidationError)...")
+        with pytest.raises(ValidationError) as exc_info:
+            RedactedThinkingContentBlock()
+
+        print(f"ValidationError raised: {exc_info.value}")
+        assert "data" in str(exc_info.value)
 
 
 # ==================================================================================================

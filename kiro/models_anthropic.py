@@ -65,6 +65,20 @@ class ThinkingContentBlock(BaseModel):
     signature: str = ""
 
 
+class RedactedThinkingContentBlock(BaseModel):
+    """
+    Redacted thinking content block in Anthropic format.
+
+    Claude may return encrypted reasoning when extended thinking is enabled.
+    Clients can replay these blocks in later requests; the gateway accepts
+    them for schema compatibility without exposing the opaque data as prompt
+    text.
+    """
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
+
+
 class ToolUseContentBlock(BaseModel):
     """
     Tool use content block in Anthropic format.
@@ -166,6 +180,7 @@ class ImageContentBlock(BaseModel):
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
+    RedactedThinkingContentBlock,
     ImageContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
