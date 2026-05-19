@@ -116,6 +116,18 @@ async def verify_anthropic_api_key(
 router = APIRouter(tags=["Anthropic API"])
 
 
+def request_has_document_content(request_data: AnthropicMessagesRequest) -> bool:
+    """Return True when the request contains Anthropic document blocks."""
+    for msg in request_data.messages:
+        if not isinstance(msg.content, list):
+            continue
+        for block in msg.content:
+            block_type = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+            if block_type == "document":
+                return True
+    return False
+
+
 @router.post("/v1/messages", dependencies=[Depends(verify_anthropic_api_key)])
 async def messages(
     request: Request,
@@ -253,7 +265,7 @@ async def messages(
     # ==============================================================================
     
     # Auto-inject web_search tool if enabled (Path B - MCP emulation)
-    if WEB_SEARCH_ENABLED:
+    if WEB_SEARCH_ENABLED and not request_has_document_content(request_data):
         if request_data.tools is None:
             request_data.tools = []
         

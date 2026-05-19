@@ -13,11 +13,14 @@ Tests for Anthropic Messages API to Kiro format conversion:
 """
 
 import pytest
+import base64
 from unittest.mock import patch, MagicMock
 
 from kiro.converters_anthropic import (
     convert_anthropic_content_to_text,
     extract_system_prompt,
+    build_tool_choice_prompt_addition,
+    extract_json_schema_output_config,
     extract_tool_results_from_anthropic_content,
     extract_images_from_tool_results,
     extract_tool_uses_from_anthropic_content,
@@ -36,6 +39,38 @@ from kiro.models_anthropic import (
     ToolResultContentBlock,
     SystemContentBlock,
 )
+
+
+def make_simple_pdf_base64(text: str) -> str:
+    stream = f"BT /F1 14 Tf 10 20 Td ({text}) Tj ET"
+    pdf = f"""%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 150 50] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length {len(stream)} >>
+stream
+{stream}
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+0
+%%EOF"""
+    return base64.b64encode(pdf.encode("latin-1")).decode("ascii")
 
 
 # ==================================================================================================
@@ -111,6 +146,34 @@ class TestConvertAnthropicContentToText:
 
         print(f"Comparing result: Expected 'Hello World', Got '{result}'")
         assert result == "Hello World"
+
+    def test_extracts_text_from_pdf_document_block(self):
+        """
+        What it does: Verifies PDF document content is exposed as prompt text.
+        Purpose: Ensure Anthropic document blocks are not silently dropped.
+        """
+        print("Setup: Anthropic document block with simple PDF...")
+        pdf_text = "hvoytest"
+        content = [
+            {"type": "text", "text": "Read this document."},
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": make_simple_pdf_base64(pdf_text),
+                },
+                "title": "fixture.pdf",
+            },
+        ]
+
+        print("Action: Extracting text...")
+        result = convert_anthropic_content_to_text(content)
+
+        print(f"Checking extracted PDF text is present: {result}")
+        assert "Read this document." in result
+        assert "Document: fixture.pdf" in result
+        assert pdf_text in result
 
     def test_handles_none(self):
         """
@@ -1884,3 +1947,106 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+    def test_pdf_document_block_reaches_kiro_payload(self):
+        """
+        What it does: Verifies document block text reaches current Kiro message.
+        Purpose: Ensure PDF document recognition probes have visible document text.
+        """
+        pdf_text = "hvoydoc"
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.6",
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "What text does this PDF contain?"},
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": make_simple_pdf_base64(pdf_text),
+                            },
+                        },
+                    ],
+                )
+            ],
+            max_tokens=128,
+            thinking={"type": "disabled"},
+        )
+
+        payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+        assert "What text does this PDF contain?" in content
+        assert pdf_text in content
+
+    def test_tool_choice_adds_structured_prompt_guidance(self):
+        """
+        What it does: Verifies tool_choice adds structured output guidance.
+        Purpose: Improve compatibility with Anthropic structured-output probes.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.6",
+            messages=[AnthropicMessage(role="user", content="Calculate 12*13")],
+            max_tokens=128,
+            tools=[
+                AnthropicTool(
+                    name="answer",
+                    description="Return the calculation result",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"result": {"type": "integer"}},
+                        "required": ["result"],
+                    },
+                )
+            ],
+            tool_choice={"type": "tool", "name": "answer"},
+            thinking={"type": "disabled"},
+        )
+
+        addition = build_tool_choice_prompt_addition(request)
+        assert "answer" in addition
+        assert "result" in addition
+
+        payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        context = payload["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+
+        assert "structured tool-style answer" in content
+        assert "Schema:" in content
+        assert context["tools"][0]["toolSpecification"]["name"] == "answer"
+
+    def test_output_config_json_schema_adds_text_json_guidance_and_disables_thinking(self):
+        """
+        What it does: Verifies Anthropic output_config json_schema affects prompt conversion.
+        Purpose: Hvoy-style structured probes parse text JSON, not tool_use blocks.
+        """
+        schema = {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string"},
+                "result": {"type": "integer"},
+            },
+            "required": ["expression", "result"],
+            "additionalProperties": False,
+        }
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.7",
+            messages=[AnthropicMessage(role="user", content="计算 68 乘以 76 等于多少")],
+            max_tokens=128,
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+        )
+
+        assert extract_json_schema_output_config(request) == schema
+
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+        assert "valid JSON object" in content
+        assert "JSON.parse" in content
+        assert "result" in content
+        assert "<thinking_mode>enabled</thinking_mode>" not in content

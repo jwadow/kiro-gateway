@@ -24,6 +24,9 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
+import base64
+import re
+import zlib
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -43,6 +46,201 @@ from kiro.converters_core import (
     extract_text_content,
     extract_images_from_content,
 )
+
+
+_PDF_TEXT_OPERAND_RE = re.compile(rb"\((?:\\.|[^\\()])*\)\s*Tj|\[(.*?)\]\s*TJ", re.DOTALL)
+_PDF_STRING_RE = re.compile(rb"\((?:\\.|[^\\()])*\)")
+
+
+def _decode_pdf_string(raw: bytes) -> str:
+    """Decode a simple PDF literal string."""
+    if raw.startswith(b"(") and raw.endswith(b")"):
+        raw = raw[1:-1]
+
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch != 0x5C:
+            out.append(ch)
+            i += 1
+            continue
+
+        i += 1
+        if i >= len(raw):
+            break
+        esc = raw[i]
+        mapping = {
+            ord("n"): ord("\n"),
+            ord("r"): ord("\r"),
+            ord("t"): ord("\t"),
+            ord("b"): ord("\b"),
+            ord("f"): ord("\f"),
+            ord("("): ord("("),
+            ord(")"): ord(")"),
+            ord("\\"): ord("\\"),
+        }
+        if esc in mapping:
+            out.append(mapping[esc])
+            i += 1
+        elif 48 <= esc <= 55:
+            octal = bytes([esc])
+            i += 1
+            for _ in range(2):
+                if i < len(raw) and 48 <= raw[i] <= 55:
+                    octal += bytes([raw[i]])
+                    i += 1
+                else:
+                    break
+            out.append(int(octal, 8))
+        else:
+            out.append(esc)
+            i += 1
+
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            return out.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return out.decode("latin-1", errors="ignore")
+
+
+def extract_text_from_pdf_base64(data: str) -> str:
+    """
+    Extract text from simple base64 PDF documents.
+
+    This intentionally covers lightweight, text-based PDFs without adding a
+    heavyweight parser dependency. Unsupported PDFs degrade to an empty string.
+    """
+    try:
+        pdf_bytes = base64.b64decode(data, validate=False)
+    except Exception as exc:
+        logger.debug(f"Failed to decode PDF document block: {exc}")
+        return ""
+
+    streams: List[bytes] = []
+    for match in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", pdf_bytes, re.DOTALL):
+        stream = match.group(1)
+        prefix = pdf_bytes[max(0, match.start() - 300):match.start()]
+        if b"FlateDecode" in prefix:
+            try:
+                stream = zlib.decompress(stream)
+            except Exception:
+                continue
+        streams.append(stream)
+
+    search_blobs = streams or [pdf_bytes]
+    text_parts: List[str] = []
+    for blob in search_blobs:
+        for match in _PDF_TEXT_OPERAND_RE.finditer(blob):
+            operand = match.group(0)
+            strings = _PDF_STRING_RE.findall(operand)
+            if not strings:
+                continue
+            decoded = "".join(_decode_pdf_string(s) for s in strings)
+            if decoded.strip():
+                text_parts.append(decoded)
+
+    return "\n".join(text_parts).strip()
+
+
+def extract_document_text_from_content(content: Any) -> str:
+    """Extract readable text from Anthropic document blocks."""
+    if not isinstance(content, list):
+        return ""
+
+    documents: List[str] = []
+    for block in content:
+        block_type = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+        if block_type != "document":
+            continue
+
+        source = block.get("source") if isinstance(block, dict) else getattr(block, "source", None)
+        title = block.get("title") if isinstance(block, dict) else getattr(block, "title", None)
+        if isinstance(source, dict):
+            media_type = source.get("media_type", "")
+            source_type = source.get("type", "")
+            data = source.get("data", "")
+        else:
+            media_type = getattr(source, "media_type", "")
+            source_type = getattr(source, "type", "")
+            data = getattr(source, "data", "")
+
+        if source_type != "base64" or not data:
+            continue
+
+        extracted = ""
+        if media_type == "application/pdf":
+            extracted = extract_text_from_pdf_base64(data)
+
+        if extracted:
+            label = f"Document: {title}" if title else "Document"
+            documents.append(f"[{label}]\n{extracted}")
+
+    return "\n\n".join(documents)
+
+
+def build_tool_choice_prompt_addition(request: AnthropicMessagesRequest) -> str:
+    """Create prompt guidance for Anthropic tool_choice semantics Kiro cannot natively enforce."""
+    if not request.tool_choice or not request.tools:
+        return ""
+
+    choice = request.tool_choice
+    choice_type = choice.get("type") if isinstance(choice, dict) else getattr(choice, "type", None)
+    tool_name = choice.get("name") if isinstance(choice, dict) else getattr(choice, "name", None)
+
+    if choice_type not in {"any", "tool"}:
+        return ""
+
+    selected_tool = None
+    if choice_type == "tool" and tool_name:
+        for tool in request.tools:
+            name = tool.get("name") if isinstance(tool, dict) else tool.name
+            if name == tool_name:
+                selected_tool = tool
+                break
+    elif request.tools:
+        selected_tool = request.tools[0]
+
+    if selected_tool is None:
+        return ""
+
+    name = selected_tool.get("name") if isinstance(selected_tool, dict) else selected_tool.name
+    schema = selected_tool.get("input_schema") if isinstance(selected_tool, dict) else selected_tool.input_schema
+    return (
+        "\n\nThe client requires a structured tool-style answer. "
+        f"Use the tool named `{name}` and provide arguments that strictly satisfy this JSON schema. "
+        "Do not include prose outside the structured answer.\n"
+        f"Schema: {schema}"
+    )
+
+
+def extract_json_schema_output_config(request: AnthropicMessagesRequest) -> Optional[Dict[str, Any]]:
+    """Extract Anthropic output_config.format json_schema when present."""
+    output_config = getattr(request, "output_config", None)
+    if not isinstance(output_config, dict):
+        return None
+
+    fmt = output_config.get("format")
+    if not isinstance(fmt, dict) or fmt.get("type") != "json_schema":
+        return None
+
+    schema = fmt.get("schema")
+    return schema if isinstance(schema, dict) else None
+
+
+def build_json_schema_prompt_addition(schema: Optional[Dict[str, Any]]) -> str:
+    """Create prompt guidance for Anthropic json_schema output_config."""
+    if not schema:
+        return ""
+
+    return (
+        "\n\nThe client requires a structured JSON response. "
+        "Return exactly one valid JSON object that strictly satisfies this JSON schema. "
+        "Do not include markdown fences, prose, comments, analysis, tool calls, or extra text. "
+        "The entire assistant response must be parseable by JSON.parse.\n"
+        f"JSON schema: {schema}"
+    )
 
 
 def convert_anthropic_content_to_text(content: Any) -> str:
@@ -70,6 +268,9 @@ def convert_anthropic_content_to_text(content: Any) -> str:
                     text_parts.append(block.get("text", ""))
             elif hasattr(block, "type") and block.type == "text":
                 text_parts.append(block.text)
+        document_text = extract_document_text_from_content(content)
+        if document_text:
+            text_parts.append("\n\n" + document_text)
         return "".join(text_parts)
 
     return str(content) if content else ""
@@ -459,6 +660,9 @@ def anthropic_to_kiro(
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
     system_prompt = extract_system_prompt(request.system)
+    system_prompt += build_tool_choice_prompt_addition(request)
+    json_schema = extract_json_schema_output_config(request)
+    system_prompt += build_json_schema_prompt_addition(json_schema)
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
@@ -466,6 +670,8 @@ def anthropic_to_kiro(
 
     # Extract thinking configuration from thinking parameter
     thinking_config = extract_thinking_config_from_anthropic(request)
+    if json_schema:
+        thinking_config = ThinkingConfig(enabled=False, budget_tokens=None)
 
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "
