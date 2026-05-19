@@ -517,6 +517,45 @@ VPN_PROXY_URL=192.168.1.100:8080
 | `/v1/models` | GET | 列出可用模型 |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/admin/accounts/usage` | GET | 账号池状态 + Kiro Credits 使用情况 |
+
+### 管理 API
+
+网关提供一个管理端点，用于监控账号状态和 Kiro Credits 使用情况。此端点**不属于** OpenAI/Anthropic API 规范，仅供运维人员和监控脚本使用。
+
+#### `GET /admin/accounts/usage`
+
+返回所有已配置 Kiro 账号的额度使用情况、订阅信息和熔断器状态。
+
+**鉴权：** 与主 API 相同的 `PROXY_API_KEY`（Bearer token）。
+
+**查询参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `account_id` | string | — | 按账号 ID（凭证文件路径）过滤单个账号 |
+| `force_refresh` | bool | `false` | 强制刷新缓存（每账号最短间隔 30 秒） |
+
+**示例：**
+
+```bash
+curl -s http://localhost:8000/admin/accounts/usage \
+  -H "Authorization: Bearer YOUR_PROXY_API_KEY" | jq .
+```
+
+**响应字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `accounts[].circuit_state` | `"healthy"\|"tripped"` | 熔断器状态（tripped = 连续失败 ≥3 次，处于退避冷却中） |
+| `accounts[].usage.current_usage` | float | 当前周期已用 Credits |
+| `accounts[].usage.usage_limit` | float | 当前周期 Credits 上限 |
+| `accounts[].usage.percent_used` | float | 使用百分比 |
+| `accounts[].usage.next_reset_at` | ISO 8601 | 下次重置时间 |
+| `accounts[].stale` | bool | 缓存无法刷新时为 true |
+| `accounts[].error` | string\|null | 最近一次请求失败的错误信息 |
+
+**缓存策略：** 使用量数据缓存 **5 分钟**，Profile 数据缓存 **24 小时**。Kiro API 异常时返回过期缓存并标记 `stale: true`。
 
 ---
 

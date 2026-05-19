@@ -517,6 +517,81 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/admin/accounts/usage` | GET | Account pool status + Kiro credits usage |
+
+### Admin API
+
+The gateway exposes a management endpoint for monitoring account status and Kiro credits. This endpoint is **not** part of the OpenAI/Anthropic API spec — it is intended for operators and monitoring scripts only.
+
+#### `GET /admin/accounts/usage`
+
+Returns usage limits, subscription info, and circuit-breaker state for all configured Kiro accounts.
+
+**Authentication:** Same `PROXY_API_KEY` as the main API (Bearer token).
+
+**Query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `account_id` | string | — | Filter to a single account by its ID (credential file path) |
+| `force_refresh` | bool | `false` | Bypass cache (min 30 s between forced refreshes per account) |
+
+**Example:**
+
+```bash
+curl -s http://localhost:8000/admin/accounts/usage \
+  -H "Authorization: Bearer YOUR_PROXY_API_KEY" | jq .
+```
+
+**Response:**
+
+```json
+{
+  "object": "list",
+  "fetched_at": "2026-05-10T12:00:00+00:00",
+  "accounts": [
+    {
+      "account_id": "/home/user/.aws/sso/cache/kiro-auth-token.json",
+      "enabled": true,
+      "circuit_state": "healthy",
+      "stats": {
+        "total_requests": 42,
+        "successful_requests": 41,
+        "failed_requests": 1
+      },
+      "profile": {
+        "arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/XXXXXXXX",
+        "profile_name": "my-kiro-profile",
+        "status": "ACTIVE"
+      },
+      "usage": {
+        "subscription_title": "KIRO POWER",
+        "subscription_type": "Q_DEVELOPER_STANDALONE_POWER",
+        "current_usage": 8181.27,
+        "usage_limit": 10000.0,
+        "percent_used": 81.81,
+        "unit": "Credits",
+        "currency": "USD",
+        "next_reset_at": "2026-06-01T00:00:00+00:00",
+        "days_until_reset": 22,
+        "overage": {
+          "charges": 0.0,
+          "rate": 0.04,
+          "cap": 10000.0,
+          "status": "DISABLED"
+        }
+      },
+      "stale": false,
+      "error": null
+    }
+  ]
+}
+```
+
+**Notes:**
+- Usage data is cached **5 minutes** per account; profile data **24 hours**
+- On Kiro API errors the last known value is returned with `"stale": true`
+- `circuit_state: "tripped"` means the account has ≥3 consecutive failures and is in backoff cooldown
 
 ---
 

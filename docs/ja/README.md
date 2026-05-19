@@ -517,6 +517,26 @@ VPN_PROXY_URL=192.168.1.100:8080
 | `/v1/models` | GET | 利用可能なモデル一覧 |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/admin/accounts/usage` | GET | アカウントプール状態 + Kiro Credits 使用状況 |
+
+### 管理 API
+
+ゲートウェイはアカウント状態と Kiro Credits 使用状況を監視するための管理エンドポイントを提供します。このエンドポイントは OpenAI/Anthropic API 仕様の一部では**ありません** — オペレーターや監視スクリプト専用です。
+
+#### `GET /admin/accounts/usage`
+
+設定済みの全 Kiro アカウントの使用制限、サブスクリプション情報、サーキットブレーカー状態を返します。
+
+**認証:** メイン API と同じ `PROXY_API_KEY`（Bearer トークン）。
+
+**クエリパラメータ:**
+
+| パラメータ | 型 | デフォルト | 説明 |
+|-----------|-----|-----------|------|
+| `account_id` | string | — | 単一アカウントでフィルタリング |
+| `force_refresh` | bool | `false` | キャッシュを強制更新（アカウントごとに最短 30 秒） |
+
+**キャッシュ:** 使用量データ — 5 分、プロファイルデータ — 24 時間。Kiro API エラー時は最後の既知の値を `"stale": true` で返します。
 
 ---
 

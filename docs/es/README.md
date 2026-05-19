@@ -517,6 +517,33 @@ Deja `VPN_PROXY_URL` vacío (por defecto) si no necesitas soporte proxy.
 | `/v1/models` | GET | Lista modelos disponibles |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/admin/accounts/usage` | GET | Estado del pool de cuentas + uso de Credits de Kiro |
+
+### API de Administración
+
+El gateway expone un endpoint de gestión para monitorear el estado de las cuentas y el uso de Credits de Kiro. Este endpoint **no** forma parte de la especificación OpenAI/Anthropic — está destinado únicamente a operadores y scripts de monitoreo.
+
+#### `GET /admin/accounts/usage`
+
+Devuelve los límites de uso, información de suscripción y estado del circuit-breaker para todas las cuentas Kiro configuradas.
+
+**Autenticación:** Mismo `PROXY_API_KEY` que la API principal (Bearer token).
+
+**Parámetros de consulta:**
+
+| Parámetro | Tipo | Por defecto | Descripción |
+|-----------|------|-------------|-------------|
+| `account_id` | string | — | Filtrar por una sola cuenta |
+| `force_refresh` | bool | `false` | Forzar actualización del caché (mín. 30 s por cuenta) |
+
+**Ejemplo:**
+
+```bash
+curl -s http://localhost:8000/admin/accounts/usage \
+  -H "Authorization: Bearer YOUR_PROXY_API_KEY" | jq .
+```
+
+**Caché:** Datos de uso — 5 minutos; datos de perfil — 24 horas. En caso de error de la API de Kiro, se devuelve el último valor conocido con `"stale": true`.
 
 ---
 

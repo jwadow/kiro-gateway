@@ -895,3 +895,7 @@ class AccountManager:
             if account.model_resolver:
                 all_models.update(account.model_resolver.get_available_models())
         return sorted(all_models)
+
+    def get_all_accounts(self) -> List["Account"]:
+        """Return all loaded accounts regardless of initialization state."""
+        return list(self._accounts.values())

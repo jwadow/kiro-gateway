@@ -905,3 +905,14 @@ class TestLifespanAccountManagerInit:
         print(f"Save calls: {len(save_calls)}")
         assert len(save_calls) >= 2
         print("✓ Final state save was performed on shutdown")
+
+
+class TestAdminRouteRegistered:
+    """Smoke test: admin route must be mounted and return 403 (not 404) without auth."""
+
+    def test_admin_usage_route_exists(self):
+        from fastapi.testclient import TestClient
+        from main import app
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/admin/accounts/usage")
+        assert resp.status_code == 403, f"Expected 403 (auth guard), got {resp.status_code}"

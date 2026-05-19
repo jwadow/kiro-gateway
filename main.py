@@ -86,6 +86,7 @@ from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
+from kiro.routes_admin import router as admin_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
 
@@ -498,7 +499,23 @@ async def lifespan(app: FastAPI):
     if not initialized:
         logger.error("Failed to initialize any account. Check your credentials.")
         raise RuntimeError("Failed to initialize any account")
-    
+
+    # Initialize remaining accounts in background (non-blocking)
+    remaining = [aid for aid in all_accounts if app.state.account_manager._accounts[aid].auth_manager is None]
+    if remaining:
+        async def _init_remaining():
+            for account_id in remaining:
+                try:
+                    success = await app.state.account_manager._initialize_account(account_id)
+                    if success:
+                        logger.info(f"Background-initialized account: {account_id}")
+                    else:
+                        logger.warning(f"Background init failed for account: {account_id}")
+                except Exception as exc:
+                    logger.warning(f"Background init error for account {account_id}: {exc}")
+        app.state._init_remaining_task = asyncio.create_task(_init_remaining())
+        logger.info(f"Queued background initialization for {len(remaining)} remaining account(s)")
+
     # Save initial state
     await app.state.account_manager._save_state()
     
@@ -520,6 +537,15 @@ async def lifespan(app: FastAPI):
         await save_task
     except asyncio.CancelledError:
         pass
+
+    # Cancel background account init task if still running
+    init_task = getattr(app.state, "_init_remaining_task", None)
+    if init_task and not init_task.done():
+        init_task.cancel()
+        try:
+            await init_task
+        except asyncio.CancelledError:
+            pass
     
     # Final state save
     await app.state.account_manager._save_state()
@@ -570,6 +596,9 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Admin API: /admin/accounts/usage
+app.include_router(admin_router)
 
 
 # --- Uvicorn log config ---

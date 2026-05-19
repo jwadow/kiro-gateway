@@ -517,6 +517,26 @@ Biarkan `VPN_PROXY_URL` kosong (default) jika Anda tidak memerlukan dukungan pro
 | `/v1/models` | GET | Daftar model yang tersedia |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/admin/accounts/usage` | GET | Status pool akun + penggunaan Credits Kiro |
+
+### API Admin
+
+Gateway menyediakan endpoint manajemen untuk memantau status akun dan penggunaan Credits Kiro. Endpoint ini **bukan** bagian dari spesifikasi OpenAI/Anthropic — hanya untuk operator dan skrip pemantauan.
+
+#### `GET /admin/accounts/usage`
+
+Mengembalikan batas penggunaan, informasi langganan, dan status circuit-breaker untuk semua akun Kiro yang dikonfigurasi.
+
+**Autentikasi:** `PROXY_API_KEY` yang sama dengan API utama (Bearer token).
+
+**Parameter query:**
+
+| Parameter | Tipe | Default | Deskripsi |
+|-----------|------|---------|-----------|
+| `account_id` | string | — | Filter ke satu akun |
+| `force_refresh` | bool | `false` | Paksa perbarui cache (min. 30 detik per akun) |
+
+**Cache:** Data penggunaan — 5 menit; data profil — 24 jam. Saat terjadi error API Kiro, nilai terakhir yang diketahui dikembalikan dengan `"stale": true`.
 
 ---
 

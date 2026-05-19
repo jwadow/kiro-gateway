@@ -1300,3 +1300,31 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+class TestGetAllAccounts:
+    """Tests for AccountManager.get_all_accounts() method."""
+
+    def test_get_all_accounts_returns_all(self, tmp_path):
+        import json
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([]))
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        manager._accounts["acct1"] = Account(id="acct1")
+        manager._accounts["acct2"] = Account(id="acct2")
+        accounts = manager.get_all_accounts()
+        assert len(accounts) == 2
+        assert all(hasattr(a, "id") for a in accounts)
+
+    def test_get_all_accounts_empty(self, tmp_path):
+        import json
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([]))
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        assert manager.get_all_accounts() == []

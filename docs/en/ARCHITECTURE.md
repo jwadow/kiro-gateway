@@ -678,7 +678,52 @@ TOOL_DESCRIPTION_MAX_LENGTH="10000"
 
 **Authentication:** `x-api-key: {PROXY_API_KEY}` + `anthropic-version: 2023-06-01`
 
-### 7.4 Format Comparison
+### 7.4 Admin Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/admin/accounts/usage` | GET | Account pool status + Kiro credits usage |
+
+**Authentication:** `Authorization: Bearer {PROXY_API_KEY}`
+
+**Query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `account_id` | string | — | Filter to a single account |
+| `force_refresh` | bool | `false` | Bypass cache (min 30 s per account) |
+
+**Response shape:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `object` | `"list"` | Always `"list"` |
+| `fetched_at` | ISO 8601 | Server time of response |
+| `accounts[].account_id` | string | Credential file path (account identifier) |
+| `accounts[].enabled` | bool | False if account failed to initialize |
+| `accounts[].circuit_state` | `"healthy"\|"tripped"` | Circuit-breaker state (tripped = ≥3 consecutive failures) |
+| `accounts[].stats` | object | Gateway-level request counters |
+| `accounts[].profile` | object\|null | Kiro profile info (cached 24 h) |
+| `accounts[].usage` | object\|null | Credits usage summary (cached 5 min) |
+| `accounts[].usage.current_usage` | float | Credits used this period |
+| `accounts[].usage.usage_limit` | float | Total credits limit for this period |
+| `accounts[].usage.percent_used` | float | `current_usage / usage_limit × 100` |
+| `accounts[].usage.next_reset_at` | ISO 8601 | Next billing period reset time |
+| `accounts[].stale` | bool | True if cached data could not be refreshed |
+| `accounts[].error` | string\|null | Error message if last fetch failed |
+
+**New module: `kiro/usage_limits.py`**
+
+| Symbol | Description |
+|--------|-------------|
+| `UsageCache` | Per-account TTL cache (5 min usage, 24 h profile) |
+| `UsageLimitsResult` | Dataclass wrapping raw `GetUsageLimits` response |
+| `ProfileResult` | Dataclass wrapping raw `GetProfile` response |
+| `fetch_usage_limits(auth_manager)` | Calls `GET /getUsageLimits`, returns `UsageLimitsResult` |
+| `fetch_profile(auth_manager)` | Calls `POST /GetProfile`, returns `ProfileResult` |
+| `AccountUsageService` | Singleton coordinating cache + per-account `asyncio.Lock` |
+
+### 7.5 Format Comparison
 
 | Aspect | OpenAI | Anthropic |
 |--------|--------|-----------|
