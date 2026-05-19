@@ -29,6 +29,8 @@ Contains all API endpoints:
 import json
 from datetime import datetime, timezone
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -63,16 +65,22 @@ except ImportError:
 
 # --- Security scheme ---
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+x_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 
-async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
+async def verify_api_key(
+    auth_header: Optional[str] = Security(api_key_header),
+    x_api_key: Optional[str] = Security(x_api_key_header),
+) -> bool:
     """
-    Verify API key in Authorization header.
+    Verify API key in Authorization or x-api-key header.
     
-    Expects format: "Bearer {PROXY_API_KEY}"
+    Supports OpenAI-style "Authorization: Bearer {PROXY_API_KEY}" and
+    Anthropic-style "x-api-key: {PROXY_API_KEY}" for model discovery clients.
     
     Args:
         auth_header: Authorization header value
+        x_api_key: x-api-key header value
     
     Returns:
         True if key is valid
@@ -80,10 +88,14 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
-    if not auth_header or auth_header != f"Bearer {PROXY_API_KEY}":
-        logger.warning("Access attempt with invalid API key.")
-        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
-    return True
+    if auth_header and auth_header == f"Bearer {PROXY_API_KEY}":
+        return True
+
+    if x_api_key and x_api_key == PROXY_API_KEY:
+        return True
+
+    logger.warning("Access attempt with invalid API key.")
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
 # --- Router ---

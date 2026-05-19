@@ -47,6 +47,20 @@ class TestVerifyApiKey:
         
         print(f"Comparing result: Expected True, Got {result}")
         assert result is True
+
+    @pytest.mark.asyncio
+    async def test_valid_x_api_key_returns_true(self):
+        """
+        What it does: Verifies that a valid x-api-key passes authentication.
+        Purpose: Support Anthropic-style model discovery clients.
+        """
+        print("Setup: Creating valid x-api-key...")
+
+        print("Action: Calling verify_api_key...")
+        result = await verify_api_key(None, PROXY_API_KEY)
+
+        print(f"Comparing result: Expected True, Got {result}")
+        assert result is True
     
     @pytest.mark.asyncio
     async def test_invalid_api_key_raises_401(self):
@@ -301,6 +315,21 @@ class TestModelsEndpoint:
             headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
         )
         
+        print(f"Result: {response.json()}")
+        assert response.status_code == 200
+        assert response.json()["object"] == "list"
+
+    def test_models_accepts_x_api_key(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies models endpoint accepts x-api-key auth.
+        Purpose: Ensure Anthropic channel model discovery can call /v1/models.
+        """
+        print("Action: GET /v1/models with valid x-api-key...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"x-api-key": valid_proxy_api_key}
+        )
+
         print(f"Result: {response.json()}")
         assert response.status_code == 200
         assert response.json()["object"] == "list"
