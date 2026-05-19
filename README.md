@@ -13,7 +13,7 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-Support_Development-ff69b4)](#-support-the-project)
 
-*Use Claude models from Kiro with Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue and other OpenAI or Anthropic compatible tools*
+_Use Claude models from Kiro with Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue and other OpenAI or Anthropic compatible tools_
 
 [Models](#-supported-models) • [Features](#-features) • [Quick Start](#-quick-start) • [Configuration](#%EF%B8%8F-configuration) • [💖 Sponsor](#-support-the-project)
 
@@ -49,27 +49,28 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 
 ## ✨ Features
 
-| Feature | Description |
-|---------|-------------|
-| 🔌 **OpenAI-compatible API** | Works with any OpenAI-compatible tool |
-| 🔌 **Anthropic-compatible API** | Native `/v1/messages` endpoint |
-| 🔀 **Multi-Account Support** | Intelligent failover between multiple accounts |
-| 🌐 **VPN/Proxy Support** | HTTP/SOCKS5 proxy for restricted networks |
-| 🧠 **Extended Thinking** | Reasoning is exclusive to our project |
-| 👁️ **Vision Support** | Send images to model |
-| 🔍 **Web Search** | Search the web for current information |
-| 🛠️ **Tool Calling** | Supports function calling |
-| 💬 **Full message history** | Passes complete conversation context |
-| 📡 **Streaming** | Full SSE streaming support |
-| 🔄 **Retry Logic** | Automatic retries on errors (403, 429, 5xx) |
-| 📋 **Extended model list** | Including versioned models |
-| 🔐 **Smart token management** | Automatic refresh before expiration |
+| Feature                         | Description                                    |
+| ------------------------------- | ---------------------------------------------- |
+| 🔌 **OpenAI-compatible API**    | Works with any OpenAI-compatible tool          |
+| 🔌 **Anthropic-compatible API** | Native `/v1/messages` endpoint                 |
+| 🔀 **Multi-Account Support**    | Intelligent failover between multiple accounts |
+| 🌐 **VPN/Proxy Support**        | HTTP/SOCKS5 proxy for restricted networks      |
+| 🧠 **Extended Thinking**        | Reasoning is exclusive to our project          |
+| 👁️ **Vision Support**           | Send images to model                           |
+| 🔍 **Web Search**               | Search the web for current information         |
+| 🛠️ **Tool Calling**             | Supports function calling                      |
+| 💬 **Full message history**     | Passes complete conversation context           |
+| 📡 **Streaming**                | Full SSE streaming support                     |
+| 🔄 **Retry Logic**              | Automatic retries on errors (403, 429, 5xx)    |
+| 📋 **Extended model list**      | Including versioned models                     |
+| 🔐 **Smart token management**   | Automatic refresh before expiration            |
 
 ---
 
 ## 🚀 Quick Start
 
 **Choose your deployment method:**
+
 - 🐍 **Native Python** - Full control, easy debugging
 - 🐳 **Docker** - Isolated environment, easy deployment → [jump to Docker](#-docker-deployment)
 
@@ -116,6 +117,7 @@ The server will be available at `http://localhost:8000`
 Specify the path to the credentials file:
 
 Works with:
+
 - **Kiro IDE** (standard) - for personal accounts
 - **Enterprise** - for corporate accounts with SSO
 
@@ -137,7 +139,7 @@ PROXY_API_KEY="my-super-secret-password-123"
   "expiresAt": "2025-01-12T23:00:00.000Z",
   "profileArn": "arn:aws:codewhisperer:us-east-1:...",
   "region": "us-east-1",
-  "clientIdHash": "abc123..."  // Optional: for corporate SSO setups
+  "clientIdHash": "abc123..." // Optional: for corporate SSO setups
 }
 ```
 
@@ -204,7 +206,6 @@ The gateway automatically detects the authentication type based on the credentia
 
 - **Kiro Desktop Auth** (default): Used when `clientId` and `clientSecret` are NOT present
   - Endpoint: `https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
-  
 - **AWS SSO (OIDC)**: Used when `clientId` and `clientSecret` ARE present
   - Endpoint: `https://oidc.{region}.amazonaws.com/token`
 
@@ -229,12 +230,13 @@ PROXY_API_KEY="my-super-secret-password-123"
 <details>
 <summary>📄 Database locations</summary>
 
-| CLI Tool | Database Path |
-|----------|---------------|
-| kiro-cli | `~/.local/share/kiro-cli/data.sqlite3` |
+| CLI Tool               | Database Path                          |
+| ---------------------- | -------------------------------------- |
+| kiro-cli               | `~/.local/share/kiro-cli/data.sqlite3` |
 | amazon-q-developer-cli | `~/.local/share/amazon-q/data.sqlite3` |
 
 The gateway reads credentials from the `auth_kv` table which stores:
+
 - `kirocli:odic:token` or `codewhisperer:odic:token` — access token, refresh token, expiration
 - `kirocli:odic:device-registration` or `codewhisperer:odic:device-registration` — client ID and secret
 
@@ -245,10 +247,12 @@ Both key formats are supported for compatibility with different kiro-cli version
 ### Getting Credentials
 
 **For Kiro IDE users:**
+
 - Log in to Kiro IDE and use Option 1 above (JSON credentials file)
 - The credentials file is created automatically after login
 
 **For Kiro CLI users:**
+
 - Log in with `kiro-cli login` and use Option 3 or Option 4 above
 - No manual token extraction needed!
 
@@ -256,6 +260,7 @@ Both key formats are supported for compatibility with different kiro-cli version
 <summary>🔧 Advanced: Manual token extraction</summary>
 
 If you need to manually extract the refresh token (e.g., for debugging), you can intercept Kiro IDE traffic:
+
 - Look for requests to: `prod.us-east-1.auth.desktop.kiro.dev/refreshToken`
 
 </details>
@@ -281,6 +286,7 @@ ACCOUNT_SYSTEM=true
 ```
 
 **What happens:**
+
 - On first startup, your credentials from `.env` are automatically migrated to `credentials.json` (one-time)
 - After that, all account and region settings from `.env` are ignored
 - Account management only through `credentials.json`
@@ -289,6 +295,7 @@ ACCOUNT_SYSTEM=true
 <summary>📄 Configuration Examples</summary>
 
 **Single account:**
+
 ```json
 [
   {
@@ -299,6 +306,7 @@ ACCOUNT_SYSTEM=true
 ```
 
 **Multiple accounts:**
+
 ```json
 [
   {
@@ -318,6 +326,7 @@ ACCOUNT_SYSTEM=true
 ```
 
 **Folder with files:**
+
 ```json
 [
   {
@@ -382,6 +391,7 @@ docker run -d \
 <summary>🔹 Using Credentials File</summary>
 
 **Linux/macOS:**
+
 ```bash
 docker run -d \
   -p 8000:8000 \
@@ -393,6 +403,7 @@ docker run -d \
 ```
 
 **Windows (PowerShell):**
+
 ```powershell
 docker run -d `
   -p 8000:8000 `
@@ -421,13 +432,13 @@ Edit `docker-compose.yml` and uncomment volume mounts for your OS:
 ```yaml
 volumes:
   # Kiro IDE credentials (choose your OS)
-  - ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro              # Linux/macOS
+  - ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro # Linux/macOS
   # - ${USERPROFILE}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro  # Windows
-  
+
   # kiro-cli database (choose your OS)
-  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
+  - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli # Linux/macOS
   # - ${USERPROFILE}/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Windows
-  
+
   # Debug logs (optional)
   - ./debug_logs:/app/debug_logs
 ```
@@ -486,16 +497,17 @@ VPN_PROXY_URL=192.168.1.100:8080
 
 ### When You Need This
 
-| Situation | Solution |
-|-----------|----------|
-| Connection timeouts to AWS | Use VPN/proxy to route traffic |
-| Corporate network restrictions | Configure your company's proxy |
-| Regional connectivity issues | Use a VPN service with proxy support |
-| Privacy requirements | Route through your own proxy server |
+| Situation                      | Solution                             |
+| ------------------------------ | ------------------------------------ |
+| Connection timeouts to AWS     | Use VPN/proxy to route traffic       |
+| Corporate network restrictions | Configure your company's proxy       |
+| Regional connectivity issues   | Use a VPN service with proxy support |
+| Privacy requirements           | Route through your own proxy server  |
 
 ### Popular VPN Software with Proxy Support
 
 Most VPN clients provide a local proxy server you can use:
+
 - **Sing-box** — Modern VPN client with HTTP/SOCKS5 proxy
 - **Clash** — Usually runs on `http://127.0.0.1:7890`
 - **V2Ray** — Configurable SOCKS5/HTTP proxy
@@ -510,13 +522,13 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 
 ### Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Health check |
-| `/health` | GET | Detailed health check |
-| `/v1/models` | GET | List available models |
-| `/v1/chat/completions` | POST | OpenAI Chat Completions API |
-| `/v1/messages` | POST | Anthropic Messages API |
+| Endpoint               | Method | Description                 |
+| ---------------------- | ------ | --------------------------- |
+| `/`                    | GET    | Health check                |
+| `/health`              | GET    | Detailed health check       |
+| `/v1/models`           | GET    | List available models       |
+| `/v1/chat/completions` | POST   | OpenAI Chat Completions API |
+| `/v1/messages`         | POST   | Anthropic Messages API      |
 
 ---
 
@@ -741,24 +753,24 @@ DEBUG_MODE=errors
 
 ### Debug Modes
 
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `off` | Disabled (default) | Production |
+| Mode     | Description                                   | Use Case                            |
+| -------- | --------------------------------------------- | ----------------------------------- |
+| `off`    | Disabled (default)                            | Production                          |
 | `errors` | Save logs only for failed requests (4xx, 5xx) | **Recommended for troubleshooting** |
-| `all` | Save logs for every request | Development/debugging |
+| `all`    | Save logs for every request                   | Development/debugging               |
 
 ### Debug Files
 
 When enabled, requests are logged to the `debug_logs/` folder:
 
-| File | Description |
-|------|-------------|
-| `request_body.json` | Incoming request from client (OpenAI format) |
-| `kiro_request_body.json` | Request sent to Kiro API |
-| `response_stream_raw.txt` | Raw stream from Kiro |
-| `response_stream_modified.txt` | Transformed stream (OpenAI format) |
-| `app_logs.txt` | Application logs for the request |
-| `error_info.json` | Error details (only on errors) |
+| File                           | Description                                  |
+| ------------------------------ | -------------------------------------------- |
+| `request_body.json`            | Incoming request from client (OpenAI format) |
+| `kiro_request_body.json`       | Request sent to Kiro API                     |
+| `response_stream_raw.txt`      | Raw stream from Kiro                         |
+| `response_stream_modified.txt` | Transformed stream (OpenAI format)           |
+| `app_logs.txt`                 | Application logs for the request             |
+| `error_info.json`              | Error details (only on errors)               |
 
 ---
 
@@ -800,11 +812,30 @@ KIRO_API_REGION="eu-central-1"
 
 ---
 
+**Error: "profileArn is required for this request"**
+
+Since May 2026, `runtime.kiro.dev` requires `profileArn` for all requests. If you are using a Builder ID (free tier) account that has no profileArn, switch to the legacy endpoint:
+
+```env
+KIRO_USE_LEGACY_ENDPOINT="true"
+```
+
+This is a compatibility fallback. Accounts with a valid profileArn (from credentials.json or Kiro IDE) should keep the default (`false`).
+
+---
+
+**Error: MCP web_search returns 400**
+
+The MCP endpoint at `runtime.kiro.dev/mcp` also requires `profileArn`. Ensure your credentials.json includes a `profile_arn` field, or set `PROFILE_ARN` in your `.env`. If you are a Builder ID user without profileArn, use the legacy endpoint fallback above.
+
+---
+
 ## 📜 License
 
 This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
 
 This means:
+
 - ✅ You can use, modify, and distribute this software
 - ✅ You can use it for commercial purposes
 - ⚠️ **You must disclose source code** when you distribute the software
@@ -820,6 +851,7 @@ AGPL-3.0 ensures that improvements to this software benefit the entire community
 ### Contributor License Agreement (CLA)
 
 By submitting a contribution to this project, you agree to the terms of our [Contributor License Agreement (CLA)](CLA.md). This ensures that:
+
 - You have the right to submit the contribution
 - You grant the maintainer rights to use and relicense your contribution
 - The project remains legally protected
@@ -846,13 +878,13 @@ Every contribution helps keep this project alive and growing
 
 ### 🪙 Or send crypto
 
-| Currency | Network | Address |
-|:--------:|:-------:|:--------|
-| **USDT** | TRC20 | `TSVtgRc9pkC1UgcbVeijBHjFmpkYHDRu26` |
-| **BTC** | Bitcoin | `12GZqxqpcBsqJ4Vf1YreLqwoMGvzBPgJq6` |
-| **ETH** | Ethereum | `0xc86eab3bba3bbaf4eb5b5fff8586f1460f1fd395` |
-| **SOL** | Solana | `9amykF7KibZmdaw66a1oqYJyi75fRqgdsqnG66AK3jvh` |
-| **TON** | TON | `UQBVh8T1H3GI7gd7b-_PPNnxHYYxptrcCVf3qQk5v41h3QTM` |
+| Currency | Network  | Address                                            |
+| :------: | :------: | :------------------------------------------------- |
+| **USDT** |  TRC20   | `TSVtgRc9pkC1UgcbVeijBHjFmpkYHDRu26`               |
+| **BTC**  | Bitcoin  | `12GZqxqpcBsqJ4Vf1YreLqwoMGvzBPgJq6`               |
+| **ETH**  | Ethereum | `0xc86eab3bba3bbaf4eb5b5fff8586f1460f1fd395`       |
+| **SOL**  |  Solana  | `9amykF7KibZmdaw66a1oqYJyi75fRqgdsqnG66AK3jvh`     |
+| **TON**  |   TON    | `UQBVh8T1H3GI7gd7b-_PPNnxHYYxptrcCVf3qQk5v41h3QTM` |
 
 </div>
 
