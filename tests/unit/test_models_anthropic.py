@@ -22,6 +22,9 @@ from kiro.models_anthropic import (
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchResultBlock,
+    WebSearchToolResultContentBlock,
     # Image models
     Base64ImageSource,
     URLImageSource,
@@ -1052,6 +1055,83 @@ class TestToolReferenceContentBlock:
 
         print(f"Comparing type: Expected 'tool_reference', Got '{block.type}'")
         assert block.type == "tool_reference"
+
+
+# ==================================================================================================
+# Tests for server-side tool history blocks
+# ==================================================================================================
+
+class TestServerToolHistoryBlocks:
+    """Tests for Anthropic server-side tool history blocks."""
+
+    def test_server_tool_use_content_block(self):
+        """
+        What it does: Verifies server_tool_use blocks from Claude Code history are accepted.
+        Purpose: Prevent 422 validation errors when native web_search history is replayed.
+        """
+        block = ServerToolUseContentBlock(
+            id="srvtoolu_123",
+            name="web_search",
+            input={"query": "latest release"},
+        )
+
+        assert block.type == "server_tool_use"
+        assert block.name == "web_search"
+        assert block.input["query"] == "latest release"
+
+    def test_web_search_tool_result_content_block(self):
+        """
+        What it does: Verifies web_search_tool_result blocks from Claude Code history are accepted.
+        Purpose: Prevent 422 validation errors when server-side search results are replayed.
+        """
+        block = WebSearchToolResultContentBlock(
+            tool_use_id="srvtoolu_123",
+            content=[
+                WebSearchResultBlock(
+                    title="Releases",
+                    url="https://github.com/example/project/releases",
+                    encrypted_content="opaque",
+                )
+            ],
+        )
+
+        assert block.type == "web_search_tool_result"
+        assert block.tool_use_id == "srvtoolu_123"
+        assert block.content[0].type == "web_search_result"
+
+    def test_anthropic_message_accepts_claude_code_server_tool_history(self):
+        """
+        What it does: Verifies Claude Code can replay thinking, server_tool_use, and web_search results.
+        Purpose: Match the history shape that previously failed with messages.N.content string_type.
+        """
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"type": "thinking", "thinking": "Need to search.", "signature": ""},
+                {
+                    "id": "srvtoolu_123",
+                    "type": "server_tool_use",
+                    "name": "web_search",
+                    "input": {"query": "CLI Proxy API releases"},
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_123",
+                    "content": [
+                        {
+                            "type": "web_search_result",
+                            "title": "Releases",
+                            "url": "https://github.com/router-for-me/CLIProxyAPI/releases",
+                            "encrypted_content": "opaque",
+                        }
+                    ],
+                },
+                {"type": "text", "text": "Search completed."},
+            ],
+        )
+
+        assert message.role == "assistant"
+        assert len(message.content) == 4
 
 
 # ==================================================================================================
