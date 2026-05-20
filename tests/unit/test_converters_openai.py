@@ -14,18 +14,153 @@ from unittest.mock import patch
 
 from kiro.converters_openai import (
     build_kiro_payload,
+    convert_responses_request_to_chat,
     convert_openai_messages_to_unified,
     convert_openai_tools_to_unified,
     _extract_images_from_tool_message,
     reasoning_effort_to_budget,
     extract_thinking_config_from_openai,
 )
-from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool, ToolFunction
+from kiro.models_openai import ChatMessage, ChatCompletionRequest, ResponsesRequest, Tool, ToolFunction
 
 
 # ==================================================================================================
 # Tests for convert_openai_messages_to_unified
 # ==================================================================================================
+
+class TestConvertResponsesRequestToChat:
+    """Tests for converting OpenAI Responses API requests to chat format."""
+
+    def test_converts_string_input_and_instructions(self):
+        """
+        What it does: Converts top-level instructions plus string input.
+        Purpose: Ensure simple Codex Desktop Responses requests reach Kiro as chat messages.
+        """
+        print("Setup: Responses request with instructions and string input...")
+        request = ResponsesRequest(
+            model="claude-sonnet-4-5",
+            instructions="You are a coding assistant.",
+            input="Inspect the repo.",
+        )
+
+        print("Action: Converting to chat request...")
+        chat_request = convert_responses_request_to_chat(request)
+
+        assert chat_request.messages[0].role == "system"
+        assert chat_request.messages[0].content == "You are a coding assistant."
+        assert chat_request.messages[1].role == "user"
+        assert chat_request.messages[1].content == "Inspect the repo."
+
+    def test_converts_response_message_content_blocks(self):
+        """
+        What it does: Converts Responses message content blocks.
+        Purpose: Preserve text from typed input_text blocks.
+        """
+        print("Setup: Responses request with typed message content...")
+        request = ResponsesRequest(
+            model="claude-sonnet-4-5",
+            input=[{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello from blocks"}],
+            }],
+        )
+
+        print("Action: Converting to chat request...")
+        chat_request = convert_responses_request_to_chat(request)
+
+        assert len(chat_request.messages) == 1
+        assert chat_request.messages[0].role == "user"
+        assert chat_request.messages[0].content == "Hello from blocks"
+
+    def test_converts_function_call_and_output_items(self):
+        """
+        What it does: Converts function_call and function_call_output items.
+        Purpose: Ensure Responses tool history maps onto chat tool calls/results.
+        """
+        print("Setup: Responses request with tool history...")
+        request = ResponsesRequest(
+            model="claude-sonnet-4-5",
+            input=[
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "read_file",
+                    "arguments": {"path": "README.md"},
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "file contents",
+                },
+            ],
+        )
+
+        print("Action: Converting to chat request...")
+        chat_request = convert_responses_request_to_chat(request)
+
+        assistant_message = chat_request.messages[0]
+        tool_message = chat_request.messages[1]
+        assert assistant_message.role == "assistant"
+        assert assistant_message.tool_calls[0]["id"] == "call_123"
+        assert assistant_message.tool_calls[0]["function"]["name"] == "read_file"
+        assert '"path": "README.md"' in assistant_message.tool_calls[0]["function"]["arguments"]
+        assert tool_message.role == "tool"
+        assert tool_message.tool_call_id == "call_123"
+        assert tool_message.content == "file contents"
+
+    def test_converts_flat_responses_tools(self):
+        """
+        What it does: Converts Responses API flat function tool definitions.
+        Purpose: Ensure Codex-style tools are available to Kiro.
+        """
+        print("Setup: Responses request with flat tools...")
+        request = ResponsesRequest(
+            model="claude-sonnet-4-5",
+            input="Use a tool.",
+            tools=[{
+                "type": "function",
+                "name": "shell",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+            }],
+        )
+
+        print("Action: Converting to chat request...")
+        chat_request = convert_responses_request_to_chat(request)
+
+        assert len(chat_request.tools) == 1
+        assert chat_request.tools[0].name == "shell"
+        assert chat_request.tools[0].input_schema["properties"]["cmd"]["type"] == "string"
+
+    def test_converts_responses_reasoning_effort(self):
+        """
+        What it does: Converts Responses reasoning.effort to chat reasoning_effort.
+        Purpose: Preserve upstream reasoning controls for Responses clients.
+        """
+        print("Setup: Responses request with reasoning effort...")
+        request = ResponsesRequest(
+            model="claude-sonnet-4-5",
+            input="Think briefly.",
+            reasoning={"effort": "low"},
+        )
+
+        print("Action: Converting to chat request...")
+        chat_request = convert_responses_request_to_chat(request)
+
+        assert chat_request.reasoning_effort == "low"
+
+    def test_rejects_empty_responses_input(self):
+        """
+        What it does: Rejects a Responses request without usable input.
+        Purpose: Prevent sending an empty message list to Kiro.
+        """
+        print("Setup: Empty Responses request...")
+        request = ResponsesRequest(model="claude-sonnet-4-5")
+
+        print("Action: Converting to chat request...")
+        with pytest.raises(ValueError, match="must include input"):
+            convert_responses_request_to_chat(request)
 
 class TestConvertOpenAIMessagesToUnified:
     """Tests for convert_openai_messages_to_unified function."""
