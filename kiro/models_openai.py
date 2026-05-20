@@ -180,7 +180,67 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     seed: Optional[int] = None
     parallel_tool_calls: Optional[bool] = None
-    
+
+    model_config = {"extra": "allow"}
+
+
+# ==================================================================================================
+# Models for /v1/responses endpoint
+# ==================================================================================================
+
+class ResponsesRequest(BaseModel):
+    """
+    Request for response generation in OpenAI Responses API format.
+
+    The Responses API accepts text or typed input items instead of the
+    Chat Completions ``messages`` array. This model intentionally keeps the
+    item schemas permissive so newer OpenAI clients can pass fields through
+    without failing validation at the gateway layer.
+
+    Attributes:
+        model: Model ID for generation.
+        input: Text, messages, function call outputs, or other response items.
+        instructions: Optional system/developer guidance.
+        stream: Use semantic Responses API streaming events.
+        tools: List of available tools in Responses API flat format.
+        tool_choice: Tool selection strategy.
+    """
+    model: str
+    input: Optional[Union[str, List[Any]]] = None
+    instructions: Optional[Union[str, List[Any]]] = None
+    stream: bool = False
+
+    # Generation parameters
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_output_tokens: Optional[int] = None
+    stop: Optional[Union[str, List[str]]] = None
+
+    # Tools (Responses API uses flat function tool definitions)
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    parallel_tool_calls: Optional[bool] = None
+
+    # Compatibility fields accepted by OpenAI Responses API.
+    background: Optional[bool] = None
+    conversation: Optional[Union[str, Dict[str, Any]]] = None
+    include: Optional[List[str]] = None
+    max_tool_calls: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+    previous_response_id: Optional[str] = None
+    prompt: Optional[Dict[str, Any]] = None
+    prompt_cache_key: Optional[str] = None
+    prompt_cache_retention: Optional[str] = None
+    reasoning: Optional[Dict[str, Any]] = None
+    safety_identifier: Optional[str] = None
+    service_tier: Optional[str] = None
+    store: Optional[bool] = True
+    stream_options: Optional[Dict[str, Any]] = None
+    text: Optional[Dict[str, Any]] = None
+    top_logprobs: Optional[int] = None
+    truncation: Optional[str] = "disabled"
+    user: Optional[str] = None
+
     model_config = {"extra": "allow"}
 
 

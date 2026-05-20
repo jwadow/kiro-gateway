@@ -29,13 +29,14 @@ Contains functions for:
 - Building Kiro payload from OpenAI requests
 """
 
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import get_model_id_for_kiro
-from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
+from kiro.models_openai import ChatMessage, ChatCompletionRequest, ResponsesRequest, Tool
 
 # Import from core - reuse shared logic
 from kiro.converters_core import (
@@ -384,6 +385,224 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
     )
     
     return ThinkingConfig(enabled=True, budget_tokens=budget)
+
+
+# ==================================================================================================
+# Responses API Processing
+# ==================================================================================================
+
+def _extract_responses_content_text(content: Any) -> str:
+    """
+    Extract text from Responses API content blocks.
+
+    Args:
+        content: A string, content block, or list of content blocks.
+
+    Returns:
+        Extracted text content.
+    """
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, dict):
+        block_type = content.get("type")
+        if block_type in {"input_text", "output_text", "text"}:
+            return str(content.get("text", ""))
+        if "content" in content:
+            return _extract_responses_content_text(content.get("content"))
+        return extract_text_content(content)
+
+    if isinstance(content, list):
+        parts = [_extract_responses_content_text(item) for item in content]
+        return "\n".join(part for part in parts if part)
+
+    return extract_text_content(content)
+
+
+def _responses_tool_call_to_chat(item: Dict[str, Any]) -> ChatMessage:
+    """
+    Convert a Responses API function_call item to an assistant chat message.
+
+    Args:
+        item: Responses API output item with type ``function_call``.
+
+    Returns:
+        ChatMessage with an OpenAI-compatible tool_calls entry.
+    """
+    call_id = item.get("call_id") or item.get("id") or ""
+    arguments = item.get("arguments", "{}")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False)
+
+    return ChatMessage(
+        role="assistant",
+        content=None,
+        tool_calls=[{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": item.get("name", ""),
+                "arguments": arguments,
+            },
+        }],
+    )
+
+
+def _responses_function_output_to_chat(item: Dict[str, Any]) -> ChatMessage:
+    """
+    Convert a Responses API function_call_output item to a tool chat message.
+
+    Args:
+        item: Responses API input item with type ``function_call_output``.
+
+    Returns:
+        ChatMessage with role ``tool``.
+    """
+    output = item.get("output", "")
+    if not isinstance(output, str):
+        output = json.dumps(output, ensure_ascii=False)
+
+    return ChatMessage(
+        role="tool",
+        content=output,
+        tool_call_id=item.get("call_id") or item.get("id") or "",
+    )
+
+
+def _responses_message_to_chat(item: Dict[str, Any]) -> Optional[ChatMessage]:
+    """
+    Convert a Responses API message item to a chat message.
+
+    Args:
+        item: Responses API message-like item.
+
+    Returns:
+        ChatMessage if the item carries a supported role, otherwise None.
+    """
+    role = item.get("role")
+    if role not in {"system", "developer", "user", "assistant", "tool"}:
+        return None
+
+    chat_role = "system" if role == "developer" else role
+    content = _extract_responses_content_text(item.get("content", ""))
+
+    return ChatMessage(
+        role=chat_role,
+        content=content,
+        tool_call_id=item.get("tool_call_id") or item.get("call_id"),
+    )
+
+
+def convert_responses_request_to_chat(request_data: ResponsesRequest) -> ChatCompletionRequest:
+    """
+    Convert an OpenAI Responses API request to Chat Completions format.
+
+    Args:
+        request_data: Responses API request.
+
+    Returns:
+        Equivalent ChatCompletionRequest for the existing OpenAI converter path.
+
+    Raises:
+        ValueError: If no usable input messages can be produced.
+    """
+    messages: List[ChatMessage] = []
+
+    if request_data.instructions:
+        messages.append(ChatMessage(
+            role="system",
+            content=_extract_responses_content_text(request_data.instructions),
+        ))
+
+    if isinstance(request_data.input, str):
+        messages.append(ChatMessage(role="user", content=request_data.input))
+    elif isinstance(request_data.input, list):
+        for item in request_data.input:
+            if isinstance(item, str):
+                messages.append(ChatMessage(role="user", content=item))
+                continue
+
+            if not isinstance(item, dict):
+                messages.append(ChatMessage(role="user", content=extract_text_content(item)))
+                continue
+
+            item_type = item.get("type")
+            if item_type == "function_call":
+                messages.append(_responses_tool_call_to_chat(item))
+            elif item_type == "function_call_output":
+                messages.append(_responses_function_output_to_chat(item))
+            elif item_type in {"message", "input_message", "output_message"} or "role" in item:
+                chat_message = _responses_message_to_chat(item)
+                if chat_message is not None:
+                    messages.append(chat_message)
+            elif item_type in {"input_text", "output_text", "text"}:
+                messages.append(ChatMessage(role="user", content=_extract_responses_content_text(item)))
+            elif item_type == "reasoning":
+                logger.debug("Skipping Responses reasoning item while converting request history")
+            else:
+                logger.debug(f"Skipping unsupported Responses input item type: {item_type}")
+
+    if not messages:
+        raise ValueError("Responses request must include input text or at least one message item")
+
+    tools = None
+    if request_data.tools:
+        tools = []
+        for tool in request_data.tools:
+            if tool.get("type") != "function":
+                logger.debug(f"Skipping unsupported Responses tool type: {tool.get('type')}")
+                continue
+            tools.append(Tool(
+                type="function",
+                name=tool.get("name"),
+                description=tool.get("description"),
+                input_schema=tool.get("parameters"),
+            ))
+
+    reasoning_effort = None
+    if request_data.reasoning:
+        effort = request_data.reasoning.get("effort")
+        if effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+            reasoning_effort = effort
+
+    return ChatCompletionRequest(
+        model=request_data.model,
+        messages=messages,
+        stream=request_data.stream,
+        temperature=request_data.temperature,
+        top_p=request_data.top_p,
+        max_tokens=request_data.max_output_tokens,
+        stop=request_data.stop,
+        tools=tools,
+        tool_choice=request_data.tool_choice,
+        parallel_tool_calls=request_data.parallel_tool_calls,
+        stream_options=request_data.stream_options,
+        user=request_data.user,
+        reasoning_effort=reasoning_effort,
+    )
+
+
+def build_kiro_payload_from_responses(
+    request_data: ResponsesRequest,
+    conversation_id: str,
+    profile_arn: str
+) -> dict:
+    """
+    Build a Kiro API payload from an OpenAI Responses API request.
+
+    Args:
+        request_data: Request in Responses API format.
+        conversation_id: Unique conversation ID.
+        profile_arn: AWS CodeWhisperer profile ARN.
+
+    Returns:
+        Payload dictionary for POST request to Kiro API.
+
+    Raises:
+        ValueError: If no usable input messages can be produced.
+    """
+    chat_request = convert_responses_request_to_chat(request_data)
+    return build_kiro_payload(chat_request, conversation_id, profile_arn)
 
 
 # ==================================================================================================

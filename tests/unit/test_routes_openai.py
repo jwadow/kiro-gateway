@@ -424,6 +424,123 @@ class TestChatCompletionsAuthentication:
         assert response.status_code == 401
 
 
+class TestResponsesAuthentication:
+    """Tests for authentication on /v1/responses endpoint."""
+
+    def test_responses_requires_authentication(self, test_client):
+        """
+        What it does: Verifies Responses endpoint requires authentication.
+        Purpose: Ensure protected endpoint is secured.
+        """
+        print("Action: POST /v1/responses without auth...")
+        response = test_client.post(
+            "/v1/responses",
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Hello",
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 401
+
+    def test_responses_rejects_invalid_key(self, test_client, invalid_proxy_api_key):
+        """
+        What it does: Verifies Responses endpoint rejects invalid API key.
+        Purpose: Ensure authentication is enforced.
+        """
+        print("Action: POST /v1/responses with invalid key...")
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {invalid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Hello",
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 401
+
+
+class TestResponsesValidation:
+    """Tests for request validation on /v1/responses endpoint."""
+
+    def test_validates_missing_model(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies missing model field is rejected.
+        Purpose: Ensure model is required.
+        """
+        print("Action: POST /v1/responses without model...")
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={"input": "Hello"}
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 422
+
+    def test_rejects_empty_input_with_actionable_400(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies empty Responses input returns a gateway validation error.
+        Purpose: Avoid forwarding empty requests to Kiro.
+        """
+        print("Action: POST /v1/responses without input...")
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={"model": "claude-sonnet-4-5"}
+        )
+
+        print(f"Status: {response.status_code}, Body: {response.json()}")
+        assert response.status_code == 400
+        assert "must include input" in response.json()["detail"]
+
+    def test_accepts_valid_string_input_format(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies valid string input passes Pydantic validation.
+        Purpose: Ensure basic Responses API requests are accepted.
+        """
+        print("Action: POST /v1/responses with string input...")
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Hello",
+                "stream": False,
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
+
+    def test_accepts_responses_function_tool_format(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies flat Responses API function tools pass validation.
+        Purpose: Ensure Codex Desktop tool definitions are accepted.
+        """
+        print("Action: POST /v1/responses with flat function tool...")
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Use a tool.",
+                "tools": [{
+                    "type": "function",
+                    "name": "shell",
+                    "description": "Run a command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                }],
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
+
+
 class TestChatCompletionsValidation:
     """Tests for request validation on /v1/chat/completions endpoint."""
     
@@ -825,6 +942,17 @@ class TestRouterIntegration:
         
         print(f"Found routes: {routes}")
         assert "/v1/chat/completions" in routes
+
+    def test_router_has_responses_endpoint(self):
+        """
+        What it does: Verifies Responses endpoint is registered.
+        Purpose: Ensure Codex Desktop can call the Responses API path.
+        """
+        print("Checking: Router endpoints...")
+        routes = [route.path for route in router.routes]
+
+        print(f"Found routes: {routes}")
+        assert "/v1/responses" in routes
     
     def test_root_endpoint_uses_get_method(self):
         """
@@ -877,6 +1005,19 @@ class TestRouterIntegration:
                 assert "POST" in route.methods
                 return
         pytest.fail("Chat completions endpoint not found")
+
+    def test_responses_endpoint_uses_post_method(self):
+        """
+        What it does: Verifies Responses endpoint uses POST method.
+        Purpose: Ensure correct HTTP method for OpenAI-compatible clients.
+        """
+        print("Checking: HTTP methods...")
+        for route in router.routes:
+            if route.path == "/v1/responses":
+                print(f"Route /v1/responses methods: {route.methods}")
+                assert "POST" in route.methods
+                return
+        pytest.fail("Responses endpoint not found")
 
 
 # =============================================================================

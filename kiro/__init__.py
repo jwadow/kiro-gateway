@@ -61,6 +61,7 @@ from kiro.config import (
 # Models
 from kiro.models_openai import (
     ChatCompletionRequest,
+    ResponsesRequest,
     ChatMessage,
     OpenAIModel,
     ModelList,
@@ -84,6 +85,10 @@ from kiro.streaming_openai import (
     stream_kiro_to_openai,
     collect_stream_response,
 )
+from kiro.streaming_responses import (
+    stream_kiro_to_responses,
+    collect_responses_response,
+)
 
 # Exceptions
 from kiro.exceptions import (
@@ -94,43 +99,46 @@ from kiro.exceptions import (
 __all__ = [
     # Version
     "__version__",
-    
+
     # Main classes
     "KiroAuthManager",
     "ModelInfoCache",
     "KiroHttpClient",
     "ModelResolver",
     "router",
-    
+
     # Configuration
     "PROXY_API_KEY",
     "REGION",
     "HIDDEN_MODELS",
     "APP_VERSION",
-    
+
     # Model resolution
     "normalize_model_name",
     "get_model_id_for_kiro",
-    
+
     # Models
     "ChatCompletionRequest",
+    "ResponsesRequest",
     "ChatMessage",
     "OpenAIModel",
     "ModelList",
-    
+
     # Converters
     "build_kiro_payload",
     "extract_text_content",
     "merge_adjacent_messages",
-    
+
     # Parsers
     "AwsEventStreamParser",
     "parse_bracket_tool_calls",
-    
+
     # Streaming
     "stream_kiro_to_openai",
     "collect_stream_response",
-    
+    "stream_kiro_to_responses",
+    "collect_responses_response",
+
     # Exceptions
     "validation_exception_handler",
     "sanitize_validation_errors",
