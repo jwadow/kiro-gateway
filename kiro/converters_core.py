@@ -1030,9 +1030,31 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
             )
             
             if not has_preceding_assistant:
-                # We cannot create a valid synthetic assistant message because we don't know
-                # the original tool name and arguments. Kiro API validates tool names.
-                # Convert tool_results to text to preserve context for the model.
+                # Search backwards for a matching assistant with tool_calls
+                # This handles cases where user messages are interleaved between
+                # function_call and function_call_output (e.g., Codex Responses API)
+                tool_result_ids = {tr.get('tool_use_id') for tr in msg.tool_results}
+                matching_idx = None
+                for idx in range(len(result) - 1, -1, -1):
+                    candidate = result[idx]
+                    if candidate.role == "assistant" and candidate.tool_calls:
+                        candidate_ids = {tc.get('id') for tc in candidate.tool_calls}
+                        if tool_result_ids & candidate_ids:
+                            matching_idx = idx
+                            break
+                
+                if matching_idx is not None:
+                    # Found matching assistant further back - reorder by inserting
+                    # the tool_result message right after the matching assistant
+                    logger.debug(
+                        f"Reordering {len(msg.tool_results)} tool_results to follow "
+                        f"matching assistant at position {matching_idx}. "
+                        f"Tool IDs: {[tr.get('tool_use_id', 'unknown') for tr in msg.tool_results]}"
+                    )
+                    result.insert(matching_idx + 1, msg)
+                    continue
+                
+                # No matching assistant found anywhere - convert to text
                 logger.debug(
                     f"Converting {len(msg.tool_results)} orphaned tool_results to text "
                     f"(no preceding assistant message with tool_calls). "
