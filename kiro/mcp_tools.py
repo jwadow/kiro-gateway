@@ -147,12 +147,19 @@ async def call_kiro_mcp_api(
     try:
         token = await auth_manager.get_access_token()
         
-        # EXACT headers from architecture
+        # EXACT headers from architecture + profileArn (required by runtime.kiro.dev)
         headers = {
             "Authorization": f"Bearer {token}",
             "x-amzn-codewhisperer-optout": "false",
             "Content-Type": "application/json"
         }
+        
+        # Add profileArn if available (required by runtime.kiro.dev)
+        from kiro.config import PROFILE_ARN
+        profile_arn = auth_manager.profile_arn or PROFILE_ARN or ""
+        if profile_arn:
+            headers["x-amzn-codewhisperer-profile-arn"] = profile_arn
+            mcp_request["profileArn"] = profile_arn
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")

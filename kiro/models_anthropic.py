@@ -221,7 +221,7 @@ class AnthropicTool(BaseModel):
     type: Optional[str] = None
     
     # Common fields
-    name: str
+    name: Optional[str] = None
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None  # Now optional for server-side tools
     
@@ -235,11 +235,16 @@ class AnthropicTool(BaseModel):
     
     @model_validator(mode="after")
     def validate_tool_consistency(self):
-        """Validate that user-defined tools have input_schema."""
+        """Validate that user-defined tools have input_schema and name."""
         is_server_side = self.type is not None
         
         if not is_server_side:
-            # User-defined tool: input_schema is required
+            # User-defined tool: name and input_schema are required
+            if not self.name:
+                raise ValueError(
+                    "name is required for user-defined tools "
+                    "(those without a 'type' field)"
+                )
             if self.input_schema is None:
                 raise ValueError(
                     "input_schema is required for user-defined tools "
