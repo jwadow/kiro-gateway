@@ -133,7 +133,8 @@ async def call_kiro_mcp_api(
         "params": {
             "name": "web_search",
             "arguments": {"query": query}
-        }
+        },
+        "profileArn": auth_manager.profile_arn or ""
     }
     
     # Log MCP request
