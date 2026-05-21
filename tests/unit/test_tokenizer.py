@@ -10,8 +10,11 @@ Tests:
 - Request token estimation (estimate_request_tokens)
 - Claude correction coefficient (CLAUDE_CORRECTION_FACTOR)
 - Fallback when tiktoken is unavailable
+- Repo-local tiktoken BPE cache and retry-on-network-error
 """
 
+import os
+import sys
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -979,6 +982,126 @@ class TestGetEncoding:
                     pass
         finally:
             tokenizer_module._encoding = original_encoding
+
+
+class TestEncodingCacheAndRetry:
+    """Tests for repo-local BPE cache directory and retry-on-network-error."""
+
+    def test_local_cache_dir_set_on_import(self):
+        """
+        What it does: Verifies tokenizer module pins TIKTOKEN_CACHE_DIR to a
+        repo-local `.tiktoken_cache` directory on import.
+        Purpose: Ensure cl100k_base.tiktoken is cached persistently so the
+        ~1.6 MB blob is fetched at most once per repo. Without this, every
+        fresh working copy re-downloads from openaipublic.blob.core.windows.net
+        and is exposed to IncompleteRead drops.
+        """
+        cache_dir = os.environ.get("TIKTOKEN_CACHE_DIR")
+        assert cache_dir, "TIKTOKEN_CACHE_DIR should be set after importing kiro.tokenizer"
+        assert cache_dir.rstrip(os.sep).endswith(".tiktoken_cache"), (
+            f"Expected cache dir to end in .tiktoken_cache, got: {cache_dir!r}"
+        )
+
+    def test_network_failure_is_not_cached(self):
+        """
+        What it does: Simulates a network error during cl100k_base download
+        and verifies `_encoding` is left as None so the next call retries.
+        Purpose: A single transient CDN failure (IncompleteRead, TLS reset,
+        timeout) must not permanently demote the process to the length-based
+        fallback. This guards against the regression where every later
+        request silently lost tiktoken precision.
+        """
+        import kiro.tokenizer as tokenizer_module
+
+        original_encoding = tokenizer_module._encoding
+        tokenizer_module._encoding = None
+        try:
+            with patch("tiktoken.get_encoding", side_effect=ConnectionError("simulated IncompleteRead")):
+                result = _get_encoding()
+
+            assert result is None, "Network failure should yield None to caller"
+            assert tokenizer_module._encoding is None, (
+                "Network failure must not be cached — next call must retry"
+            )
+        finally:
+            tokenizer_module._encoding = original_encoding
+
+    def test_retry_after_network_failure_succeeds(self):
+        """
+        What it does: First call fails with a network error; second call
+        succeeds and the result is cached.
+        Purpose: Validate the full recovery path users hit after the CDN
+        becomes reachable again, including that the successful encoding is
+        memoised so subsequent calls don't refetch.
+        """
+        import kiro.tokenizer as tokenizer_module
+
+        original_encoding = tokenizer_module._encoding
+        tokenizer_module._encoding = None
+
+        fake_encoding = MagicMock(name="cl100k_base_encoding")
+        fake_encoding.encode.return_value = [1, 2, 3]
+
+        calls = {"count": 0}
+
+        def flaky_get_encoding(name):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise ConnectionError("simulated IncompleteRead")
+            return fake_encoding
+
+        try:
+            with patch("tiktoken.get_encoding", side_effect=flaky_get_encoding):
+                first = _get_encoding()
+                assert first is None, "First (failing) call should return None"
+                assert tokenizer_module._encoding is None, "First failure must not be cached"
+
+                second = _get_encoding()
+                assert second is fake_encoding, "Second call should recover and return encoding"
+                assert tokenizer_module._encoding is fake_encoding, "Recovered encoding must be cached"
+
+                third = _get_encoding()
+                assert third is fake_encoding, "Cached encoding should be reused"
+                assert calls["count"] == 2, (
+                    "tiktoken.get_encoding should be invoked exactly twice "
+                    "(one failure + one success), not on every call"
+                )
+        finally:
+            tokenizer_module._encoding = original_encoding
+
+    def test_import_error_is_cached_permanently(self):
+        """
+        What it does: When tiktoken itself is missing, `_encoding` is set to
+        False so subsequent calls return None without re-attempting the import.
+        Purpose: ImportError is a permanent condition (the package will not
+        appear mid-process) and is the one case where caching the disabled
+        state is correct — in contrast to transient network failures.
+        """
+        import kiro.tokenizer as tokenizer_module
+
+        original_encoding = tokenizer_module._encoding
+        original_tiktoken = sys.modules.get("tiktoken")
+        tokenizer_module._encoding = None
+        try:
+            # Putting None into sys.modules makes `import tiktoken` raise ImportError.
+            with patch.dict(sys.modules, {"tiktoken": None}):
+                first = _get_encoding()
+                assert first is None, "Missing tiktoken should yield None"
+                assert tokenizer_module._encoding is False, (
+                    "ImportError must be cached (sentinel False) to skip retry"
+                )
+
+                # Second call must short-circuit on the cached sentinel,
+                # not attempt the import again.
+                with patch("builtins.__import__", side_effect=AssertionError(
+                    "import tiktoken must not be retried after a cached ImportError"
+                )):
+                    second = _get_encoding()
+                assert second is None
+        finally:
+            tokenizer_module._encoding = original_encoding
+            if original_tiktoken is not None:
+                sys.modules["tiktoken"] = original_tiktoken
 
 
 class TestTokenizerIntegration:
