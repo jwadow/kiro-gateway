@@ -33,11 +33,29 @@ more than GPT-4 (cl100k_base). This is due to differences in BPE vocabularies.
 """
 
 import json
+import os
 from typing import List, Dict, Any, Optional
 from loguru import logger
 
-# Lazy loading of tiktoken to speed up import
+# Lazy loading of tiktoken to speed up import.
+#
+# Sentinel values for _encoding:
+#   None  -> not yet initialised; try again on next call
+#   False -> tiktoken module itself is unavailable; permanently fall back
+#   <obj> -> usable tiktoken Encoding instance
 _encoding = None
+
+# Pin tiktoken's BPE cache to a repo-local directory so cl100k_base.tiktoken
+# (~1.6 MB) is fetched at most once and reused across restarts. Without this,
+# every fresh container or working copy re-downloads from
+# openaipublic.blob.core.windows.net, which has been observed to drop the
+# connection mid-transfer (IncompleteRead). Respect TIKTOKEN_CACHE_DIR if the
+# operator has already set one explicitly.
+_LOCAL_TIKTOKEN_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".tiktoken_cache",
+)
+os.environ.setdefault("TIKTOKEN_CACHE_DIR", _LOCAL_TIKTOKEN_CACHE_DIR)
 
 # Correction coefficient for Claude models
 # Claude tokenizes text approximately 15% more than GPT-4 (cl100k_base)
@@ -48,30 +66,52 @@ CLAUDE_CORRECTION_FACTOR = 1.15
 def _get_encoding():
     """
     Lazy initialization of tokenizer.
-    
+
     Uses cl100k_base - encoding for GPT-4/ChatGPT,
     which is close enough to Claude tokenization.
-    
+
+    Caching strategy:
+        - A successful encoding is cached for the lifetime of the process.
+        - An ``ImportError`` is cached (``_encoding = False``) because a missing
+          tiktoken package will not appear mid-process.
+        - Any other exception (network error fetching the BPE blob, corrupt
+          cache file, ...) is NOT cached, so the next caller retries. A single
+          transient ``IncompleteRead`` from the Azure CDN must not permanently
+          demote the whole process to the length-based fallback.
+
     Returns:
         tiktoken.Encoding or None if tiktoken is unavailable
     """
     global _encoding
-    if _encoding is None:
-        try:
-            import tiktoken
-            _encoding = tiktoken.get_encoding("cl100k_base")
-            logger.debug("[Tokenizer] Initialized tiktoken with cl100k_base encoding")
-        except ImportError:
-            logger.warning(
-                "[Tokenizer] tiktoken not installed. "
-                "Token counting will use fallback estimation. "
-                "Install with: pip install tiktoken"
-            )
-            _encoding = False  # Marker that import failed
-        except Exception as e:
-            logger.error(f"[Tokenizer] Failed to initialize tiktoken: {e}")
-            _encoding = False
-    return _encoding if _encoding else None
+    if _encoding is not None:
+        return _encoding if _encoding else None
+
+    try:
+        import tiktoken
+    except ImportError:
+        logger.warning(
+            "[Tokenizer] tiktoken not installed. "
+            "Token counting will use fallback estimation. "
+            "Install with: pip install tiktoken"
+        )
+        _encoding = False  # tiktoken truly missing — fall back permanently
+        return None
+
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    except Exception as e:
+        # Most commonly: network failure pulling cl100k_base.tiktoken from
+        # openaipublic.blob.core.windows.net (IncompleteRead, timeout, TLS
+        # error). Leave _encoding=None so the next call retries instead of
+        # silently degrading to the fallback heuristic forever.
+        logger.error(
+            f"[Tokenizer] Failed to initialize tiktoken (will retry on next call): {e}"
+        )
+        return None
+
+    _encoding = encoding
+    logger.debug("[Tokenizer] Initialized tiktoken with cl100k_base encoding")
+    return _encoding
 
 
 def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
