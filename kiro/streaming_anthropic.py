@@ -347,6 +347,10 @@ async def stream_kiro_to_anthropic(
                 tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
                 tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
                 
+                # Reverse-map truncated tool names back to originals
+                from kiro.converters_core import get_original_tool_name
+                tool_name = get_original_tool_name(tool_name)
+                
                 # ==============================================================================
                 # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
                 # ==============================================================================

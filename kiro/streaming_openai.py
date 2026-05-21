@@ -192,6 +192,10 @@ async def stream_kiro_to_openai_internal(
                 if tool:
                     tool_name = (tool.get("function") or {}).get("name", "") or tool.get("name", "")
                 
+                # Reverse-map truncated tool names back to originals
+                from kiro.converters_core import get_original_tool_name
+                tool_name = get_original_tool_name(tool_name)
+                
                 # ==============================================================================
                 # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
                 # ==============================================================================
@@ -335,6 +339,10 @@ async def stream_kiro_to_openai_internal(
                 # Use "or" for protection against explicit None in values
                 tool_name = func.get("name") or ""
                 tool_args = func.get("arguments") or "{}"
+                
+                # Reverse-map truncated tool names back to originals
+                from kiro.converters_core import get_original_tool_name
+                tool_name = get_original_tool_name(tool_name)
                 
                 logger.debug(f"Tool call [{idx}] '{tool_name}': id={tc.get('id')}, args_length={len(tool_args)}")
                 
