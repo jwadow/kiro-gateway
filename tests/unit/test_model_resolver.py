@@ -629,6 +629,86 @@ class TestGetModelIdForKiro:
         print(f"Comparing result: Expected 'claude-unknown-model' (pass-through), Got '{result}'")
         assert result == "claude-unknown-model"
 
+    def test_resolves_alias_before_normalization(self):
+        """
+        What it does: Resolves MODEL_ALIASES before normalizing the model name.
+        Goal: Check that aliases are resolved first in the resolution chain.
+        """
+        from unittest.mock import patch
+        
+        aliases = {"kiro-sonnet": "claude-sonnet-4.5"}
+        
+        print("Action: get_model_id_for_kiro('kiro-sonnet', {}) with alias...")
+        with patch("kiro.config.MODEL_ALIASES", aliases):
+            result = get_model_id_for_kiro("kiro-sonnet", {})
+        
+        print(f"Comparing result: Expected 'claude-sonnet-4.5', Got '{result}'")
+        assert result == "claude-sonnet-4.5"
+
+    def test_alias_resolution_then_normalization(self):
+        """
+        What it does: Resolves alias, then normalizes the result.
+        Goal: Check full chain: alias → normalize → hidden lookup.
+        """
+        from unittest.mock import patch
+        
+        # Alias points to unnormalized name, should still work
+        aliases = {"my-haiku": "claude-haiku-4-5"}
+        
+        print("Action: get_model_id_for_kiro('my-haiku', {}) with alias to unnormalized...")
+        with patch("kiro.config.MODEL_ALIASES", aliases):
+            result = get_model_id_for_kiro("my-haiku", {})
+        
+        print(f"Comparing result: Expected 'claude-haiku-4.5' (normalized), Got '{result}'")
+        assert result == "claude-haiku-4.5"
+
+    def test_alias_to_hidden_model(self):
+        """
+        What it does: Alias resolves to a hidden model.
+        Goal: Check chain: alias → normalize → hidden lookup → internal ID.
+        """
+        from unittest.mock import patch
+        
+        aliases = {"my-special": "claude-3.7-sonnet"}
+        hidden = {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_INTERNAL"}
+        
+        print("Action: get_model_id_for_kiro('my-special', hidden) with alias to hidden...")
+        with patch("kiro.config.MODEL_ALIASES", aliases):
+            result = get_model_id_for_kiro("my-special", hidden)
+        
+        print(f"Comparing result: Expected 'CLAUDE_3_7_SONNET_INTERNAL', Got '{result}'")
+        assert result == "CLAUDE_3_7_SONNET_INTERNAL"
+
+    def test_non_aliased_model_unchanged(self):
+        """
+        What it does: Non-aliased models work normally.
+        Goal: Check that alias resolution doesn't break normal models.
+        """
+        from unittest.mock import patch
+        
+        aliases = {"kiro-sonnet": "claude-sonnet-4.5"}
+        
+        print("Action: get_model_id_for_kiro('claude-opus-4.5', {}) without alias...")
+        with patch("kiro.config.MODEL_ALIASES", aliases):
+            result = get_model_id_for_kiro("claude-opus-4.5", {})
+        
+        print(f"Comparing result: Expected 'claude-opus-4.5', Got '{result}'")
+        assert result == "claude-opus-4.5"
+
+    def test_empty_aliases_dict(self):
+        """
+        What it does: Empty aliases dict doesn't break resolution.
+        Goal: Check graceful handling of empty aliases.
+        """
+        from unittest.mock import patch
+        
+        print("Action: get_model_id_for_kiro('claude-sonnet-4-5', {}) with empty aliases...")
+        with patch("kiro.config.MODEL_ALIASES", {}):
+            result = get_model_id_for_kiro("claude-sonnet-4-5", {})
+        
+        print(f"Comparing result: Expected 'claude-sonnet-4.5' (normalized), Got '{result}'")
+        assert result == "claude-sonnet-4.5"
+
 
 # =============================================================================
 # TestModelResolver - Tests for ModelResolver class

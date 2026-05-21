@@ -192,20 +192,20 @@ def normalize_model_name(name: str) -> str:
 def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str:
     """
     Get the model ID to send to Kiro API.
-    
+
     This is a simple helper for converters that don't have access to the full
-    ModelResolver. It normalizes the name and checks hidden models.
-    
+    ModelResolver. It resolves aliases, normalizes the name, and checks hidden models.
+
     For hidden models (like claude-3.7-sonnet), returns the internal Kiro ID.
     For regular models, returns the normalized name.
-    
+
     Args:
         model_name: External model name from client
         hidden_models: Dict mapping display names to internal Kiro IDs
-    
+
     Returns:
         Model ID to send to Kiro API
-    
+
     Examples:
         >>> get_model_id_for_kiro("claude-haiku-4-5-20251001", {})
         'claude-haiku-4.5'
@@ -214,7 +214,14 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
         >>> get_model_id_for_kiro("claude-3-7-sonnet", {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"})
         'CLAUDE_3_7_SONNET_20250219_V1_0'
     """
-    normalized = normalize_model_name(model_name)
+    from kiro.config import MODEL_ALIASES
+    
+    # Resolve alias first
+    resolved_model = MODEL_ALIASES.get(model_name, model_name)
+    if resolved_model != model_name:
+        logger.debug(f"Alias resolved: '{model_name}' → '{resolved_model}'")
+    
+    normalized = normalize_model_name(resolved_model)
     internal = hidden_models.get(normalized, normalized)
     return to_runtime_model_id(internal)
 
