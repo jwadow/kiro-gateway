@@ -43,7 +43,7 @@ class TestVerifyApiKey:
         valid_header = f"Bearer {PROXY_API_KEY}"
         
         print("Action: Calling verify_api_key...")
-        result = await verify_api_key(valid_header)
+        result = await verify_api_key(auth_header=valid_header, x_api_key=None)
         
         print(f"Comparing result: Expected True, Got {result}")
         assert result is True
@@ -59,7 +59,7 @@ class TestVerifyApiKey:
         
         print("Action: Calling verify_api_key with invalid key...")
         with pytest.raises(HTTPException) as exc_info:
-            await verify_api_key(invalid_header)
+            await verify_api_key(auth_header=invalid_header, x_api_key=None)
         
         print(f"Checking: HTTPException with status 401...")
         assert exc_info.value.status_code == 401
@@ -75,7 +75,7 @@ class TestVerifyApiKey:
         
         print("Action: Calling verify_api_key with None...")
         with pytest.raises(HTTPException) as exc_info:
-            await verify_api_key(None)
+            await verify_api_key(auth_header=None, x_api_key=None)
         
         print(f"Checking: HTTPException with status 401...")
         assert exc_info.value.status_code == 401
@@ -90,7 +90,7 @@ class TestVerifyApiKey:
         
         print("Action: Calling verify_api_key with empty string...")
         with pytest.raises(HTTPException) as exc_info:
-            await verify_api_key("")
+            await verify_api_key(auth_header="", x_api_key=None)
         
         print(f"Checking: HTTPException with status 401...")
         assert exc_info.value.status_code == 401
@@ -106,7 +106,7 @@ class TestVerifyApiKey:
         
         print("Action: Calling verify_api_key...")
         with pytest.raises(HTTPException) as exc_info:
-            await verify_api_key(wrong_format)
+            await verify_api_key(auth_header=wrong_format, x_api_key=None)
         
         print(f"Checking: HTTPException with status 401...")
         assert exc_info.value.status_code == 401
@@ -122,7 +122,7 @@ class TestVerifyApiKey:
         
         print("Action: Calling verify_api_key...")
         with pytest.raises(HTTPException) as exc_info:
-            await verify_api_key(malformed)
+            await verify_api_key(auth_header=malformed, x_api_key=None)
         
         print(f"Checking: HTTPException with status 401...")
         assert exc_info.value.status_code == 401
@@ -138,7 +138,7 @@ class TestVerifyApiKey:
         
         print("Action: Calling verify_api_key...")
         with pytest.raises(HTTPException) as exc_info:
-            await verify_api_key(lowercase)
+            await verify_api_key(auth_header=lowercase, x_api_key=None)
         
         print(f"Checking: HTTPException with status 401...")
         assert exc_info.value.status_code == 401
@@ -147,6 +147,88 @@ class TestVerifyApiKey:
 # =============================================================================
 # Tests for root endpoint (/)
 # =============================================================================
+    @pytest.mark.asyncio
+    async def test_valid_x_api_key_returns_true(self):
+        """
+        What it does: Verifies that a valid x-api-key header passes authentication.
+        Purpose: Ensure clients sending Anthropic-style x-api-key (e.g. hermes-cli
+                 with api_mode: anthropic_messages) can also reach OpenAI-shaped
+                 endpoints like /v1/models without sending a separate Bearer token.
+        """
+        print("Setup: Creating valid x-api-key (no Authorization)...")
+
+        print("Action: Calling verify_api_key with x-api-key only...")
+        result = await verify_api_key(auth_header=None, x_api_key=PROXY_API_KEY)
+
+        print(f"Comparing result: Expected True, Got {result}")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_invalid_x_api_key_raises_401(self):
+        """
+        What it does: Verifies that an invalid x-api-key is rejected.
+        Purpose: Ensure unauthorized access via x-api-key is blocked.
+        """
+        print("Setup: Creating invalid x-api-key...")
+
+        print("Action: Calling verify_api_key with invalid x-api-key...")
+        with pytest.raises(HTTPException) as exc_info:
+            await verify_api_key(auth_header=None, x_api_key="wrong_key_12345")
+
+        print("Checking: HTTPException with status 401...")
+        assert exc_info.value.status_code == 401
+        assert "Invalid or missing API Key" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_bearer_takes_precedence_over_x_api_key(self):
+        """
+        What it does: Verifies Authorization: Bearer is checked before x-api-key.
+        Purpose: Ensure a valid Bearer token wins even if x-api-key is wrong.
+                 The OpenAI route prefers its native header to keep the original
+                 behavior unchanged for existing OpenAI-style clients.
+        """
+        print("Setup: Valid Bearer + invalid x-api-key...")
+        valid_header = f"Bearer {PROXY_API_KEY}"
+
+        print("Action: Calling verify_api_key with both headers...")
+        result = await verify_api_key(auth_header=valid_header, x_api_key="wrong_key")
+
+        print(f"Comparing result: Expected True, Got {result}")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_x_api_key_used_when_bearer_invalid(self):
+        """
+        What it does: Verifies x-api-key is accepted when Bearer is invalid.
+        Purpose: Ensure fallback works when client sends bad Bearer but valid
+                 x-api-key (e.g. misconfigured client with leftover Bearer header).
+        """
+        print("Setup: Invalid Bearer + valid x-api-key...")
+
+        print("Action: Calling verify_api_key with both headers, only x-api-key valid...")
+        result = await verify_api_key(auth_header="Bearer wrong", x_api_key=PROXY_API_KEY)
+
+        print(f"Comparing result: Expected True, Got {result}")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_missing_both_headers_raises_401(self):
+        """
+        What it does: Verifies request with no auth headers at all is rejected.
+        Purpose: Ensure unauthenticated requests can not slip through when both
+                 header check paths are present.
+        """
+        print("Setup: No headers provided...")
+
+        print("Action: Calling verify_api_key with None for both...")
+        with pytest.raises(HTTPException) as exc_info:
+            await verify_api_key(auth_header=None, x_api_key=None)
+
+        print("Checking: HTTPException with status 401...")
+        assert exc_info.value.status_code == 401
+
+
+
 
 class TestRootEndpoint:
     """Tests for the GET / endpoint."""
