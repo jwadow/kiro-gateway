@@ -135,6 +135,11 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+
+    # Add profileArn if available (required for Enterprise accounts)
+    # profileArn goes at the top level of the request body, not inside params
+    if auth_manager.profile_arn:
+        mcp_request["profileArn"] = auth_manager.profile_arn
     
     # Log MCP request
     try:
@@ -161,7 +166,7 @@ async def call_kiro_mcp_api(
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                logger.error(f"MCP API error: {response.status_code} - {response.text[:500]}")
                 return None, None
             
             mcp_response = response.json()

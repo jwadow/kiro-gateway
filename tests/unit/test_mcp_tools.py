@@ -234,22 +234,108 @@ class TestCallKiroMCPAPI:
         """
         print("Setup: Mocking malformed JSON response...")
         query = "test"
-        
+
         mock_response = Mock()
         mock_response.status_code = 200
         mock_response.json = Mock(side_effect=json.JSONDecodeError("Invalid JSON", "", 0))
-        
+
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
         mock_client.__aenter__.return_value.post = mock_post
-        
+
         print("Action: Calling call_kiro_mcp_api...")
         with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
-        
+
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
         assert tool_use_id is None
         assert results is None
+
+    @pytest.mark.asyncio
+    async def test_mcp_request_includes_profile_arn_when_set(self, mock_auth_manager):
+        """
+        What it does: Verifies profileArn is added to the top-level MCP request body
+        when auth_manager has a profile ARN (Enterprise / KIRO_DESKTOP accounts).
+        Purpose: Without profileArn, MCP web_search calls fail for Enterprise accounts.
+        """
+        print("Setup: Mocking MCP response and capturing request body...")
+        query = "Python"
+
+        # mock_auth_manager fixture has profile_arn set
+        assert mock_auth_manager.profile_arn is not None
+
+        mock_response_data = {
+            "id": "web_search_tooluse_capture_1234567890_xyz",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"results": [], "totalResults": 0, "query": query})
+                }],
+                "isError": False
+            }
+        }
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api with Enterprise auth_manager...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        print("Inspecting captured request body...")
+        assert mock_post.await_count == 1
+        sent_body = mock_post.await_args.kwargs["json"]
+
+        print(f"Comparing top-level profileArn: Got '{sent_body.get('profileArn')}'")
+        assert sent_body.get("profileArn") == mock_auth_manager.profile_arn
+
+        print("Verifying profileArn is at top level, NOT inside params...")
+        assert "profileArn" not in sent_body.get("params", {})
+
+    @pytest.mark.asyncio
+    async def test_mcp_request_omits_profile_arn_when_unset(self, mock_auth_manager):
+        """
+        What it does: Verifies profileArn is NOT added to the MCP request body
+        when auth_manager has no profile ARN (free / non-Enterprise accounts).
+        Purpose: Avoid sending an empty/None profileArn for accounts that don't have one.
+        """
+        print("Setup: Clearing profile_arn on auth_manager...")
+        mock_auth_manager._profile_arn = None
+        query = "Python"
+
+        mock_response_data = {
+            "id": "web_search_tooluse_capture_1234567890_xyz",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"results": [], "totalResults": 0, "query": query})
+                }],
+                "isError": False
+            }
+        }
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api with auth_manager lacking profile_arn...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        print("Inspecting captured request body...")
+        sent_body = mock_post.await_args.kwargs["json"]
+
+        print(f"Checking profileArn absent: keys = {list(sent_body.keys())}")
+        assert "profileArn" not in sent_body
 
 
 # ==================================================================================================
