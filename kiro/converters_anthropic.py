@@ -39,6 +39,8 @@ from kiro.converters_core import (
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
+    build_native_thinking_config,
+    reasoning_effort_to_budget,
     build_kiro_payload,
     extract_text_content,
     extract_images_from_content,
@@ -376,6 +378,7 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     
     Handles thinking parameter:
     - {"type": "enabled", "budget_tokens": N} → enabled with budget
+    - {"type": "adaptive", "effort": "max"} → enabled with effort-based budget
     - {"type": "disabled"} → disabled
     - None → enabled with default budget
     
@@ -400,6 +403,11 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         >>> request.thinking = {"type": "enabled", "budget_tokens": 8000}
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=8000)
+
+        >>> # Adaptive effort translated to gateway fake thinking budget
+        >>> request.thinking = {"type": "adaptive", "effort": "max"}
+        >>> extract_thinking_config_from_anthropic(request)
+        ThinkingConfig(enabled=True, budget_tokens=4096)
     """
     if not request.thinking:
         # No thinking specified → use defaults
@@ -422,6 +430,31 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
             logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
         return ThinkingConfig(enabled=True, budget_tokens=budget)
     
+    if thinking_type == "adaptive":
+        effort = request.thinking.get("effort")
+        if not effort:
+            logger.debug("Extracted adaptive thinking config from Anthropic without effort")
+            return ThinkingConfig(enabled=True, budget_tokens=None)
+
+        if effort == "none":
+            logger.debug("Extracted adaptive thinking config from Anthropic: effort='none'")
+            return ThinkingConfig(enabled=False, budget_tokens=None)
+
+        try:
+            budget = reasoning_effort_to_budget(request.max_tokens, effort)
+        except ValueError:
+            logger.warning(
+                f"Unsupported Anthropic adaptive thinking effort '{effort}'. "
+                "Using default fake thinking budget."
+            )
+            return ThinkingConfig(enabled=True, budget_tokens=None)
+
+        logger.debug(
+            f"Extracted adaptive thinking config from Anthropic: effort='{effort}', "
+            f"max_tokens={request.max_tokens}, budget={budget}"
+        )
+        return ThinkingConfig(enabled=True, budget_tokens=budget)
+
     # Unknown type → use defaults
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
@@ -466,12 +499,24 @@ def anthropic_to_kiro(
 
     # Extract thinking configuration from thinking parameter
     thinking_config = extract_thinking_config_from_anthropic(request)
+    native_effort: Optional[str] = None
+    native_display: Optional[str] = None
+    if isinstance(request.thinking, dict) and request.thinking.get("type") == "adaptive":
+        native_effort = request.thinking.get("effort") or "high"
+        native_display = request.thinking.get("display")
+    native_thinking_config = build_native_thinking_config(model_id, native_effort)
+    if native_display in ("summarized", "omitted"):
+        native_thinking_config.display = native_display
+    if native_thinking_config.enabled:
+        # Native adaptive thinking supersedes fake tag injection for this request.
+        thinking_config = ThinkingConfig(enabled=False, budget_tokens=None)
 
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"native_thinking_enabled={native_thinking_config.enabled}, native_effort={native_thinking_config.effort}"
     )
 
     # Use core function to build payload
@@ -483,6 +528,7 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        native_thinking_config=native_thinking_config,
     )
 
     return result.payload

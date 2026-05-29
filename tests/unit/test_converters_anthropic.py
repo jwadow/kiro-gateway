@@ -1813,6 +1813,46 @@ class TestExtractThinkingConfigFromAnthropic:
         assert config.enabled is True
         assert config.budget_tokens is None
     
+    def test_thinking_adaptive_max_effort(self):
+        """
+        What it does: Verifies adaptive thinking with effort="max" uses the full output budget.
+        Purpose: Ensure Anthropic clients can request maximum fake thinking depth.
+        """
+        print("Creating request with thinking={'type': 'adaptive', 'effort': 'max'}...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=4096,
+            thinking={"type": "adaptive", "effort": "max"}
+        )
+
+        print("Extracting thinking config...")
+        config = extract_thinking_config_from_anthropic(request)
+
+        print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
+        assert config.enabled is True
+        assert config.budget_tokens == 4096
+
+    def test_thinking_adaptive_invalid_effort_uses_default(self):
+        """
+        What it does: Verifies unknown adaptive effort falls back to the default budget.
+        Purpose: Ensure malformed clients do not crash payload conversion.
+        """
+        print("Creating request with thinking={'type': 'adaptive', 'effort': 'ultra'}...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=4096,
+            thinking={"type": "adaptive", "effort": "ultra"}
+        )
+
+        print("Extracting thinking config...")
+        config = extract_thinking_config_from_anthropic(request)
+
+        print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
+        assert config.enabled is True
+        assert config.budget_tokens is None
+
     def test_thinking_disabled(self):
         """
         What it does: Verifies ThinkingConfig(enabled=False) when thinking.type="disabled"
@@ -1884,3 +1924,37 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+    def test_native_adaptive_thinking_fields_supersede_fake_tags(self, monkeypatch):
+        """
+        What it does: Verifies Anthropic adaptive thinking maps to native Kiro fields.
+        Purpose: Ensure native reasoningContentEvent support works for Anthropic API clients.
+        """
+        print("Enabling native thinking auto mode...")
+        monkeypatch.setattr("kiro.converters_core.KIRO_NATIVE_THINKING_MODE", "auto")
+        monkeypatch.setattr("kiro.converters_core.KIRO_NATIVE_THINKING_DISPLAY", "summarized")
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
+
+        print("Creating adaptive thinking request...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            messages=[AnthropicMessage(role="user", content="Test message")],
+            max_tokens=1024,
+            thinking={"type": "adaptive", "effort": "max", "display": "summarized"}
+        )
+
+        print("Calling anthropic_to_kiro...")
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-opus-4.8"):
+            payload = anthropic_to_kiro(request, "test-conv-native", "arn:aws:test")
+
+        print("Checking native thinking fields...")
+        assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert payload["output_config"] == {"effort": "max"}
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert user_input["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert user_input["outputConfig"] == {"effort": "max"}
+
+        print("Checking fake thinking tags were not injected...")
+        content = user_input["content"]
+        assert not content.startswith("<thinking_mode>enabled</thinking_mode>")
+        assert not content.startswith("<max_thinking_length>")

@@ -76,6 +76,7 @@ class KiroEvent:
         context_usage_percentage: Context usage percentage (for context_usage events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
         is_last_thinking_chunk: Whether this is the last thinking chunk
+        is_native_thinking: Whether thinking came from Kiro native reasoning events
     """
     type: str
     content: Optional[str] = None
@@ -85,6 +86,7 @@ class KiroEvent:
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
+    is_native_thinking: bool = False
 
 
 @dataclass
@@ -280,6 +282,24 @@ async def _process_chunk(
         
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
+
+        elif event["type"] == "thinking":
+            if event["data"]:
+                yield KiroEvent(
+                    type="thinking",
+                    thinking_content=event["data"],
+                    is_first_thinking_chunk=event.get("is_first", False),
+                    is_native_thinking=event.get("is_native", False),
+                )
+
+        elif event["type"] == "thinking_signature":
+            logger.debug("Received native thinking signature from Kiro stream")
+            yield KiroEvent(
+                type="thinking",
+                thinking_content="",
+                is_last_thinking_chunk=True,
+                is_native_thinking=True,
+            )
 
 
 # ==================================================================================================

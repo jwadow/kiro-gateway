@@ -41,6 +41,8 @@ from kiro.config import (
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_MAX_TOKENS,
     FAKE_REASONING_BUDGET_CAP,
+    KIRO_NATIVE_THINKING_DISPLAY,
+    KIRO_NATIVE_THINKING_MODE,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
@@ -78,6 +80,174 @@ class ThinkingConfig:
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+
+
+@dataclass
+class NativeThinkingConfig:
+    """
+    Native Kiro/Claude adaptive thinking configuration.
+
+    Attributes:
+        enabled: Whether to add native adaptive thinking fields.
+        effort: Adaptive thinking effort level.
+        display: Whether upstream should return summarized or omitted thinking text.
+    """
+    enabled: bool = False
+    effort: Optional[str] = None
+    display: str = "summarized"
+
+
+REASONING_EFFORT_BUDGET_RATIOS: Dict[str, float] = {
+    "none": 0.0,      # 0% - thinking disabled by API adapters
+    "minimal": 0.10,  # 10% - minimal reasoning
+    "low": 0.20,      # 20% - quick reasoning
+    "medium": 0.50,   # 50% - balanced reasoning
+    "high": 0.80,     # 80% - deep reasoning
+    "xhigh": 0.95,    # 95% - near-maximum reasoning depth
+    "max": 1.0,       # 100% - maximum reasoning depth
+}
+
+
+NATIVE_THINKING_SUPPORTED_MODELS = (
+    "claude-opus-4.8",
+    "claude-opus-4.7",
+    "claude-opus-4.6",
+    "claude-sonnet-4.6",
+)
+
+
+def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
+    """
+    Convert a reasoning effort level to a fake thinking token budget.
+
+    Args:
+        max_tokens: Maximum output tokens for the request.
+        effort: Reasoning effort level.
+
+    Returns:
+        Thinking budget in tokens.
+
+    Raises:
+        ValueError: If the effort level is not supported.
+    """
+    try:
+        ratio = REASONING_EFFORT_BUDGET_RATIOS[effort]
+    except KeyError as exc:
+        supported_efforts = ", ".join(sorted(REASONING_EFFORT_BUDGET_RATIOS))
+        raise ValueError(
+            f"Unsupported reasoning effort '{effort}'. Supported values: {supported_efforts}"
+        ) from exc
+
+    return int(max_tokens * ratio)
+
+
+def supports_native_adaptive_thinking(model_id: str) -> bool:
+    """
+    Check whether a Kiro model is known to support native adaptive thinking.
+
+    Args:
+        model_id: Internal Kiro model ID.
+
+    Returns:
+        True when native adaptive thinking should be attempted.
+    """
+    normalized_model = model_id.lower()
+    return any(model in normalized_model for model in NATIVE_THINKING_SUPPORTED_MODELS)
+
+
+def normalize_native_thinking_effort(effort: Optional[str]) -> Optional[str]:
+    """
+    Normalize client effort values to Claude adaptive thinking effort values.
+
+    Args:
+        effort: Client-provided effort level.
+
+    Returns:
+        Native effort level, or None if the value disables or cannot map to native thinking.
+    """
+    if effort is None:
+        return None
+
+    if effort == "none":
+        return None
+
+    if effort == "minimal":
+        return "low"
+
+    if effort in ("low", "medium", "high", "xhigh", "max"):
+        return effort
+
+    logger.warning(f"Unsupported native thinking effort '{effort}'. Native thinking disabled.")
+    return None
+
+
+def build_native_thinking_config(model_id: str, effort: Optional[str]) -> NativeThinkingConfig:
+    """
+    Build native adaptive thinking configuration from model and client effort.
+
+    Args:
+        model_id: Internal Kiro model ID.
+        effort: Client effort level.
+
+    Returns:
+        NativeThinkingConfig for payload construction.
+    """
+    if KIRO_NATIVE_THINKING_MODE == "off":
+        return NativeThinkingConfig(enabled=False)
+
+    if not supports_native_adaptive_thinking(model_id):
+        return NativeThinkingConfig(enabled=False)
+
+    native_effort = normalize_native_thinking_effort(effort)
+    if native_effort is None:
+        if KIRO_NATIVE_THINKING_MODE != "force":
+            return NativeThinkingConfig(enabled=False)
+        native_effort = "high"
+
+    return NativeThinkingConfig(
+        enabled=True,
+        effort=native_effort,
+        display=KIRO_NATIVE_THINKING_DISPLAY,
+    )
+
+
+def apply_native_thinking_fields(
+    payload: Dict[str, Any],
+    native_thinking_config: Optional[NativeThinkingConfig],
+) -> None:
+    """
+    Add native Kiro/Claude adaptive thinking fields to the payload in-place.
+
+    Args:
+        payload: Kiro API payload.
+        native_thinking_config: Native thinking configuration.
+    """
+    if not native_thinking_config or not native_thinking_config.enabled:
+        return
+
+    payload["thinking"] = {
+        "type": "adaptive",
+        "display": native_thinking_config.display,
+    }
+    payload["output_config"] = {
+        "effort": native_thinking_config.effort or "high",
+    }
+    user_input_message = (
+        payload.get("conversationState", {})
+        .get("currentMessage", {})
+        .get("userInputMessage", {})
+    )
+    user_input_message["thinking"] = {
+        "type": "adaptive",
+        "display": native_thinking_config.display,
+    }
+    user_input_message["outputConfig"] = {
+        "effort": native_thinking_config.effort or "high",
+    }
+    logger.info(
+        f"Native adaptive thinking enabled: effort={payload['output_config']['effort']}, "
+        f"display={payload['thinking']['display']}"
+    )
 
 
 @dataclass
@@ -1409,7 +1579,8 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    native_thinking_config: Optional[NativeThinkingConfig] = None,
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1425,6 +1596,7 @@ def build_kiro_payload(
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
         thinking_config: Thinking configuration from API adapter
+        native_thinking_config: Native adaptive thinking configuration
     
     Returns:
         KiroPayloadResult with payload and tool documentation
@@ -1575,6 +1747,8 @@ def build_kiro_payload(
             }
         }
     }
+
+    apply_native_thinking_fields(payload, native_thinking_config)
     
     # Add history only if not empty
     if history:

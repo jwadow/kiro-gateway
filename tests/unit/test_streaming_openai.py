@@ -458,6 +458,56 @@ class TestStreamingOpenaiThinkingContent:
         assert len(content_chunks) >= 1
         print("✓ Thinking yielded as content")
 
+    @pytest.mark.asyncio
+    async def test_yields_native_thinking_with_visible_tags_in_pass_mode(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Wraps native Kiro thinking chunks in visible tags for pass mode.
+        Goal: Ensure OpenCode-compatible streams visibly separate reasoning from answers.
+        """
+        print("Setup: Mock stream with native thinking content...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="thinking",
+                thinking_content="Let me think",
+                is_first_thinking_chunk=True,
+                is_native_thinking=True,
+            )
+            yield KiroEvent(
+                type="thinking",
+                thinking_content=" through it.",
+                is_native_thinking=True,
+            )
+            yield KiroEvent(
+                type="thinking",
+                thinking_content="",
+                is_last_thinking_chunk=True,
+                is_native_thinking=True,
+            )
+            yield KiroEvent(type="content", content="Here is my answer")
+
+        print("Action: Streaming native thinking to OpenAI content in pass mode...")
+        chunks = []
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_openai.FAKE_REASONING_HANDLING', 'pass'):
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-opus-4.8",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+
+        joined_chunks = "".join(chunks)
+        print(f"Received {len(chunks)} chunks")
+
+        assert "<thinking>" in joined_chunks
+        assert "Let me think" in joined_chunks
+        assert "</thinking>" in joined_chunks
+        print("✓ Native thinking yielded as visible tagged content")
+
 
 # ==================================================================================================
 # Tests for None protection in tool calls

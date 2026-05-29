@@ -246,6 +246,8 @@ class AwsEventStreamParser:
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
+        ('{"text":', 'thinking'),
+        ('{"signature":', 'thinking_signature'),
     ]
     
     def __init__(self):
@@ -254,6 +256,7 @@ class AwsEventStreamParser:
         self.last_content: Optional[str] = None  # For deduplicating repeating content
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
+        self.native_thinking_started = False
     
     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
         """
@@ -328,6 +331,18 @@ class AwsEventStreamParser:
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
+        elif event_type == 'thinking':
+            is_first = not self.native_thinking_started
+            self.native_thinking_started = True
+            return {
+                "type": "thinking",
+                "data": data.get('text', ''),
+                "is_first": is_first,
+                "is_native": True,
+            }
+        elif event_type == 'thinking_signature':
+            self.native_thinking_started = False
+            return {"type": "thinking_signature", "data": data.get('signature', '')}
         
         return None
     
@@ -567,3 +582,4 @@ class AwsEventStreamParser:
         self.last_content = None
         self.current_tool_call = None
         self.tool_calls = []
+        self.native_thinking_started = False

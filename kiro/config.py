@@ -479,6 +479,26 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_
 
 
 # ==================================================================================================
+# Native Thinking Settings (Kiro/Claude Adaptive Thinking)
+# ==================================================================================================
+
+# Experimental native thinking pass-through for Kiro models that expose Claude adaptive thinking.
+#
+# Modes:
+# - "off": Disabled (default, preserves existing fake reasoning behavior)
+# - "auto": Enable only when the client explicitly requests a reasoning effort
+# - "force": Enable for supported models even when the client does not send an effort
+KIRO_NATIVE_THINKING_MODE: str = os.getenv("KIRO_NATIVE_THINKING_MODE", "off").lower()
+if KIRO_NATIVE_THINKING_MODE not in ("off", "auto", "force"):
+    KIRO_NATIVE_THINKING_MODE = "off"
+
+# Claude Opus 4.8/4.7 default to omitted thinking text unless display is explicitly summarized.
+KIRO_NATIVE_THINKING_DISPLAY: str = os.getenv("KIRO_NATIVE_THINKING_DISPLAY", "summarized").lower()
+if KIRO_NATIVE_THINKING_DISPLAY not in ("summarized", "omitted"):
+    KIRO_NATIVE_THINKING_DISPLAY = "summarized"
+
+
+# ==================================================================================================
 # Payload Size Guard Settings
 # ==================================================================================================
 
