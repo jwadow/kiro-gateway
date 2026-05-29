@@ -120,6 +120,46 @@ PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
 #   VPN_PROXY_URL=192.168.1.100:8080  (defaults to http://)
 VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
 
+
+# ==================================================================================================
+# Kirolink Fallback Settings (for inline token refresh)
+# ==================================================================================================
+
+# Enable kirolink subprocess fallback when HTTP token refresh fails
+# When enabled, shells out to `kirolink refresh` with exponential backoff
+KIROLINK_REFRESH_ENABLED: bool = os.getenv("KIROLINK_REFRESH_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# Initial backoff delay for kirolink retries (seconds)
+KIROLINK_RETRY_DELAY: int = int(os.getenv("KIROLINK_RETRY_DELAY", "15"))
+
+# Maximum number of kirolink retry attempts
+KIROLINK_MAX_RETRIES: int = int(os.getenv("KIROLINK_MAX_RETRIES", "5"))
+
+
+# ==================================================================================================
+# Optimistic 429 Failover Settings
+# ==================================================================================================
+
+# When enabled, skip exponential backoff on 429 and return immediately for failover
+# Only effective with ACCOUNT_SYSTEM=true and multiple accounts
+OPTIMISTIC_429_FAILOVER: bool = os.getenv("OPTIMISTIC_429_FAILOVER", "true").lower() in ("true", "1", "yes")
+
+
+# ==================================================================================================
+# Streaming Connection Pool Settings
+# ==================================================================================================
+
+# Enable streaming connection pool (opt-in, disabled by default)
+# When disabled, uses per-request httpx clients (existing behavior)
+STREAMING_POOL_ENABLED: bool = os.getenv("STREAMING_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
+
+# Maximum number of pooled streaming clients
+STREAMING_POOL_SIZE: int = int(os.getenv("STREAMING_POOL_SIZE", "8"))
+
+# Keepalive seconds for pooled streaming connections
+STREAMING_POOL_KEEPALIVE: int = int(os.getenv("STREAMING_POOL_KEEPALIVE", "30"))
+
+
 # ==================================================================================================
 # Kiro API Credentials
 # ==================================================================================================
@@ -175,14 +215,43 @@ KIRO_REFRESH_URL_TEMPLATE: str = "https://prod.{region}.auth.desktop.kiro.dev/re
 # URL for token refresh (AWS SSO OIDC - used by kiro-cli)
 AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
 
+# ==================================================================================================
+# PKCE OAuth Settings (Browser-based login)
+# ==================================================================================================
+
+# URL for OAuth sign-in page (browser redirect target)
+KIRO_OAUTH_SIGNIN_URL: str = "https://app.kiro.dev/signin"
+
+# URL for PKCE token exchange (POST with code + code_verifier)
+KIRO_OAUTH_TOKEN_URL_TEMPLATE: str = "https://prod.{region}.auth.desktop.kiro.dev/oauth/token"
+
+# Timeout for PKCE OAuth flow (seconds) — how long to wait for user to complete browser login
+PKCE_OAUTH_TIMEOUT: int = int(os.getenv("PKCE_OAUTH_TIMEOUT", "300"))
+
+# Redirect source identifier for PKCE callback
+PKCE_REDIRECT_FROM: str = "KiroIDE"
+
+# Use legacy q.amazonaws.com endpoint instead of runtime.kiro.dev
+# Since May 2026, runtime.kiro.dev requires profileArn for ALL requests.
+# Builder ID (free tier) accounts have no profileArn and cannot use it.
+# Set to "true" for Builder ID accounts that get "profileArn is required" errors.
+# See: https://github.com/jwadow/kiro-gateway/issues/168
+KIRO_USE_LEGACY_ENDPOINT: bool = os.getenv("KIRO_USE_LEGACY_ENDPOINT", "false").lower() in ("true", "1", "yes")
+
 # Host for main API (generateAssistantResponse)
 # Universal endpoint for all regions (us-east-1, eu-central-1, etc.)
 # See: https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/security-data-perimeter.html
 # Fixed in issue #58 - codewhisperer.{region}.amazonaws.com doesn't exist for non-us-east-1 regions
-KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+if KIRO_USE_LEGACY_ENDPOINT:
+    KIRO_API_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+else:
+    KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
 # Host for Q API (ListAvailableModels)
-KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+if KIRO_USE_LEGACY_ENDPOINT:
+    KIRO_Q_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+else:
+    KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
 # ==================================================================================================
 # Token Settings
@@ -568,6 +637,11 @@ def get_kiro_refresh_url(region: str) -> str:
 def get_aws_sso_oidc_url(region: str) -> str:
     """Return AWS SSO OIDC token URL for the specified region."""
     return AWS_SSO_OIDC_URL_TEMPLATE.format(region=region)
+
+
+def get_kiro_oauth_token_url(region: str) -> str:
+    """Return Kiro OAuth token exchange URL for the specified region."""
+    return KIRO_OAUTH_TOKEN_URL_TEMPLATE.format(region=region)
 
 
 def get_kiro_api_host(region: str) -> str:

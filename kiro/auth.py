@@ -32,10 +32,17 @@ import json
 import os
 import re
 import sqlite3
+import base64
+import hashlib
+import secrets
+import urllib.parse
+import webbrowser
 from datetime import datetime, timezone, timedelta
 from enum import Enum
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Optional
+from threading import Event
+from typing import Any, Optional
 
 import httpx
 from loguru import logger
@@ -43,6 +50,13 @@ from loguru import logger
 from kiro.config import (
     TOKEN_REFRESH_THRESHOLD,
     SQLITE_READONLY,
+    KIROLINK_REFRESH_ENABLED,
+    KIROLINK_RETRY_DELAY,
+    KIROLINK_MAX_RETRIES,
+    KIRO_OAUTH_SIGNIN_URL,
+    KIRO_OAUTH_TOKEN_URL_TEMPLATE,
+    PKCE_OAUTH_TIMEOUT,
+    PKCE_REDIRECT_FROM,
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
@@ -80,6 +94,63 @@ class AuthType(Enum):
     """
     KIRO_DESKTOP = "kiro_desktop"
     AWS_SSO_OIDC = "aws_sso_oidc"
+    PKCE_OAUTH = "pkce_oauth"  # Browser-based PKCE OAuth login
+
+
+class _PKCERedirectHandler(BaseHTTPRequestHandler):
+    """
+    Ephemeral HTTP request handler for PKCE OAuth callback.
+    
+    Captures the authorization code from Kiro's redirect
+    and signals the waiting PKCE flow to continue.
+    
+    Class Attributes:
+        auth_code: Captured authorization code (set on successful callback)
+        state: Expected state parameter (CSRF protection)
+        received: threading.Event signaled when callback is received
+    """
+    auth_code: Optional[str] = None
+    state: str = ""
+    received: Event = Event()
+    
+    def do_GET(self) -> None:
+        """Handle GET request — parse code + state from query params."""
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        
+        received_code = params.get("code", [None])[0]
+        received_state = params.get("state", [None])[0]
+        
+        if received_code and received_state == self.__class__.state:
+            self.__class__.auth_code = received_code
+            self.__class__.received.set()
+            self._respond_success()
+        else:
+            self._respond_error("Invalid state or missing code")
+    
+    def _respond_success(self) -> None:
+        """Send success HTML response to browser tab."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(
+            b"<html><body><h1>Authentication successful!</h1>"
+            b"<p>You can close this tab and return to the terminal.</p></body></html>"
+        )
+    
+    def _respond_error(self, message: str) -> None:
+        """Send error HTML response to browser tab."""
+        self.send_response(400)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(
+            f"<html><body><h1>Authentication failed</h1>"
+            f"<p>{message}</p></body></html>".encode()
+        )
+    
+    def log_message(self, format: str, *args: Any) -> None:
+        """Suppress default HTTP server logging (we use loguru)."""
+        pass
 
 
 class KiroAuthManager:
@@ -231,6 +302,23 @@ class KiroAuthManager:
             f"q_host={self._q_host}"
         )
     
+    @staticmethod
+    def _pkce_generate_challenge() -> tuple[str, str, str]:
+        """
+        Generate PKCE verifier, challenge, and state for OAuth flow.
+        
+        Uses S256 method: challenge = base64url(SHA256(verifier)).
+        Matches sionex-code/opencode-proxy-api pattern.
+        
+        Returns:
+            Tuple of (verifier, challenge, state)
+        """
+        verifier = secrets.token_urlsafe(32)
+        sha256 = hashlib.sha256(verifier.encode('utf-8')).digest()
+        challenge = base64.urlsafe_b64encode(sha256).decode('utf-8').rstrip('=')
+        state = secrets.token_urlsafe(16)
+        return verifier, challenge, state
+
     def _detect_auth_type(self) -> None:
         """
         Detects authentication type based on available credentials.
@@ -908,20 +996,37 @@ class KiroAuthManager:
                 if e.response.status_code == 400 and self._sqlite_db:
                     logger.warning(
                         "Token refresh failed with 400 after SQLite reload. "
-                        "This may happen if kiro-cli refreshed tokens in memory without persisting."
+                        "Attempting kirolink fallback..."
                     )
-                    # Check if access_token is still usable
+
+                    # Try kirolink fallback before giving up
+                    kirolink_ok = await self._refresh_via_kirolink()
+                    if kirolink_ok:
+                        # Reload credentials from SQLite after kirolink refresh
+                        self._load_credentials_from_sqlite(self._sqlite_db)
+                        if self._access_token and not self.is_token_expiring_soon():
+                            return self._access_token
+
+                    # Graceful degradation: use existing token if still valid
                     if self._access_token and not self.is_token_expired():
                         logger.warning(
                             "Using existing access_token until it expires. "
                             "Run 'kiro-cli login' when convenient to refresh credentials."
                         )
                         return self._access_token
-                    else:
+
+                    # LAST RESORT: PKCE OAuth browser login
+                    logger.warning(
+                        "All refresh methods failed. Attempting PKCE OAuth browser login..."
+                    )
+                    try:
+                        return await self._pkce_oauth_flow()
+                    except (TimeoutError, ValueError) as pkce_err:
+                        logger.error(f"PKCE OAuth failed: {pkce_err}")
                         raise ValueError(
-                            "Token expired and refresh failed. "
+                            "Token expired and all refresh methods failed. "
                             "Please run 'kiro-cli login' to refresh your credentials."
-                        )
+                        ) from pkce_err
                 # Non-SQLite mode or non-400 error - propagate the exception
                 raise
             except Exception:
@@ -929,7 +1034,15 @@ class KiroAuthManager:
                 raise
             
             if not self._access_token:
-                raise ValueError("Failed to obtain access token")
+                logger.warning("No access token available. Attempting PKCE OAuth browser login...")
+                try:
+                    return await self._pkce_oauth_flow()
+                except (TimeoutError, ValueError) as pkce_err:
+                    logger.error(f"PKCE OAuth failed: {pkce_err}")
+                    raise ValueError(
+                        "Failed to obtain access token. "
+                        "Please run 'kiro-cli login' to authenticate."
+                    ) from pkce_err
             
             return self._access_token
     
@@ -945,7 +1058,240 @@ class KiroAuthManager:
         async with self._lock:
             await self._refresh_token_request()
             return self._access_token
+
+    async def _refresh_via_kirolink(self) -> bool:
+        """
+        Fallback: refresh token via 'kirolink refresh' subprocess.
+
+        Shells out to 'kirolink refresh' with exponential backoff
+        when the HTTP refresh endpoint fails. This mirrors the
+        hermes-billing-proxy pattern of using the CLI as a fallback
+        auth source.
+
+        Only effective when kirolink binary is available on PATH.
+
+        Returns:
+            True if refresh succeeded, False after exhausting retries
+        """
+        if not KIROLINK_REFRESH_ENABLED:
+            logger.debug("Kirolink refresh fallback disabled via config")
+            return False
+
+        for attempt in range(KIROLINK_MAX_RETRIES):
+            try:
+                logger.info(
+                    f"Attempting kirolink refresh fallback "
+                    f"(attempt {attempt + 1}/{KIROLINK_MAX_RETRIES})"
+                )
+
+                proc = await asyncio.create_subprocess_exec(
+                    "kirolink", "refresh",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                returncode = await proc.wait()
+
+                if returncode == 0:
+                    logger.info("Kirolink refresh succeeded")
+                    return True
+
+                logger.warning(
+                    f"Kirolink refresh returned code {returncode}"
+                )
+
+            except FileNotFoundError:
+                logger.warning(
+                    "kirolink binary not found on PATH, "
+                    "cannot use fallback refresh"
+                )
+                return False
+            except Exception as e:
+                logger.error(f"Kirolink refresh failed with error: {e}")
+
+            if attempt < KIROLINK_MAX_RETRIES - 1:
+                delay = KIROLINK_RETRY_DELAY * (2 ** attempt)
+                logger.warning(
+                    f"Retrying kirolink refresh in {delay}s "
+                    f"(attempt {attempt + 1}/{KIROLINK_MAX_RETRIES})"
+                )
+                await asyncio.sleep(delay)
+
+        logger.error(
+            f"Kirolink refresh failed after {KIROLINK_MAX_RETRIES} attempts"
+        )
+        return False
+
+    async def _pkce_exchange_code(self, code: str, verifier: str, redirect_uri: str) -> str:
+        """
+        Exchange authorization code for access/refresh tokens via PKCE.
+        
+        POSTs to Kiro OAuth token endpoint with code + verifier.
+        Stores tokens in credentials file upon success.
+        
+        Args:
+            code: Authorization code from callback
+            verifier: PKCE code verifier (original secret)
+            redirect_uri: Redirect URI used in auth request
+        
+        Returns:
+            Access token
+        
+        Raises:
+            ValueError: If token exchange fails
+        """
+        token_url = f"https://prod.{self._region}.auth.desktop.kiro.dev/oauth/token"
+        
+        payload = {
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": redirect_uri,
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+        }
+        
+        logger.info("Exchanging authorization code for tokens...")
+        
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(token_url, json=payload, headers=headers)
+            
+            if response.status_code == 400:
+                # Try alternate redirect_uri (without login_option suffix)
+                logger.warning("Token exchange failed with 400, retrying with simplified redirect_uri")
+                payload["redirect_uri"] = redirect_uri
+                response = await client.post(token_url, json=payload, headers=headers)
+            
+            if not response.is_success:
+                raise ValueError(
+                    f"Token exchange failed: HTTP {response.status_code} {response.text}"
+                )
+            
+            data = response.json()
+            if "data" in data and isinstance(data["data"], dict):
+                data = data["data"]
+        
+        new_access_token = data.get("accessToken") or data.get("access_token")
+        new_refresh_token = data.get("refreshToken") or data.get("refresh_token")
+        new_profile_arn = data.get("profileArn") or data.get("profile_arn")
+        expires_in = data.get("expiresIn", 3600)
+        
+        if not new_access_token:
+            raise ValueError(f"Token exchange response missing accessToken: {data}")
+        
+        self._access_token = new_access_token
+        if new_refresh_token:
+            self._refresh_token = new_refresh_token
+        if new_profile_arn:
+            self._profile_arn = new_profile_arn
+        
+        self._expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
+        
+        logger.info(f"PKCE OAuth successful, token expires: {self._expires_at.isoformat()}")
+        
+        # Switch to KIRO_DESKTOP for refresh compatibility (uses same /refreshToken endpoint)
+        self._auth_type = AuthType.KIRO_DESKTOP
+        
+        # Save to file
+        if not self._creds_file:
+            default_creds = Path.home() / ".kiro" / "credentials.json"
+            default_creds.parent.mkdir(parents=True, exist_ok=True)
+            self._creds_file = str(default_creds)
+        
+        self._save_credentials_to_file()
+        
+        return self._access_token
     
+    async def _pkce_oauth_flow(self) -> str:
+        """
+        Perform PKCE OAuth flow: browser login → code exchange → token storage.
+        
+        Flow:
+        1. Generate PKCE verifier, challenge, and state
+        2. Spawn ephemeral HTTP server on random port
+        3. Construct auth URL and open browser
+        4. Wait for callback (or timeout)
+        5. Exchange authorization code for tokens
+        6. Store tokens in credentials file
+        7. Return access token
+        
+        This is the LAST resort fallback — invoked only when all other
+        auth methods have failed.
+        
+        Returns:
+            Valid access token
+        
+        Raises:
+            TimeoutError: If user doesn't complete browser login within timeout
+            ValueError: If token exchange fails
+        """
+        # Generate PKCE params
+        verifier, challenge, state = self._pkce_generate_challenge()
+        
+        # Configure redirect handler
+        _PKCERedirectHandler.auth_code = None
+        _PKCERedirectHandler.state = state
+        _PKCERedirectHandler.received.clear()
+        
+        # Spawn ephemeral HTTP server on random port
+        server = HTTPServer(("127.0.0.1", 0), _PKCERedirectHandler)
+        port = server.server_address[1]
+        redirect_uri = f"http://127.0.0.1:{port}"
+        
+        # Build auth URL
+        params = {
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": redirect_uri,
+            "redirect_from": "KiroIDE",
+        }
+        auth_url = f"https://app.kiro.dev/signin?{urllib.parse.urlencode(params)}"
+        
+        logger.info("=== PKCE OAuth Login Required ===")
+        logger.info(f"Opening browser to: https://app.kiro.dev/signin")
+        logger.info(f"Full auth URL: {auth_url}")
+        logger.info(f"Listening for callback on {redirect_uri}")
+        logger.info("If browser doesn't open, copy the URL above and paste in a browser.")
+        
+        # Open browser in a thread (non-blocking)
+        def _open_browser():
+            try:
+                webbrowser.open(auth_url)
+            except Exception:
+                pass  # Browser open failure is non-fatal (user can copy URL)
+        
+        import threading as _threading
+        browser_thread = _threading.Thread(target=_open_browser, daemon=True)
+        browser_thread.start()
+        
+        # Run server in a thread and wait for callback
+        server_thread = _threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        
+        try:
+            received = _PKCERedirectHandler.received.wait(timeout=PKCE_OAUTH_TIMEOUT)
+            if not received:
+                server.shutdown()
+                raise TimeoutError(
+                    f"PKCE OAuth timed out after {PKCE_OAUTH_TIMEOUT}s. "
+                    f"Run 'kiro-cli login' manually or retry."
+                )
+        except TimeoutError:
+            raise
+        except Exception as e:
+            server.shutdown()
+            raise ValueError(f"PKCE OAuth failed: {e}")
+        
+        server.shutdown()
+        
+        code = _PKCERedirectHandler.auth_code
+        if not code:
+            raise ValueError("No authorization code received")
+        
+        return await self._pkce_exchange_code(code, verifier, redirect_uri)
+
     @property
     def profile_arn(self) -> Optional[str]:
         """AWS CodeWhisperer profile ARN."""

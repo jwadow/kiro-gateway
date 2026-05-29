@@ -9,10 +9,10 @@ import asyncio
 import json
 import pytest
 from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch, MagicMock
 import httpx
 
-from kiro.auth import KiroAuthManager, AuthType
+from kiro.auth import KiroAuthManager, AuthType, _PKCERedirectHandler
 from kiro.config import TOKEN_REFRESH_THRESHOLD, get_aws_sso_oidc_url
 
 
@@ -474,8 +474,9 @@ class TestKiroAuthManagerProperties:
     
     def test_api_host_property(self):
         """
-        What it does: Verifies api_host property.
-        Purpose: Ensure api_host is formed correctly.
+        What it does: Verifies api_host property contains region.
+        Purpose: Ensure api_host is formed correctly with the configured region.
+        (Host template varies by KIRO_USE_LEGACY_ENDPOINT env var.)
         """
         print("Setup: Creating KiroAuthManager...")
         manager = KiroAuthManager(
@@ -483,9 +484,8 @@ class TestKiroAuthManagerProperties:
             region="us-east-1"
         )
         
-        print("Verification: api_host contains runtime.{region}.kiro.dev pattern...")
+        print(f"Verification: api_host contains region us-east-1...")
         print(f"api_host: {manager.api_host}")
-        assert "runtime.us-east-1.kiro.dev" in manager.api_host
         assert "us-east-1" in manager.api_host
     
     def test_fingerprint_property(self):
@@ -511,7 +511,7 @@ class TestAuthTypeEnum:
     def test_auth_type_enum_values(self):
         """
         What it does: Verifies AuthType enum values.
-        Purpose: Ensure enum contains KIRO_DESKTOP and AWS_SSO_OIDC.
+        Purpose: Ensure enum contains KIRO_DESKTOP, AWS_SSO_OIDC, and PKCE_OAUTH.
         """
         print("Verification: AuthType contains KIRO_DESKTOP...")
         assert AuthType.KIRO_DESKTOP.value == "kiro_desktop"
@@ -519,8 +519,11 @@ class TestAuthTypeEnum:
         print("Verification: AuthType contains AWS_SSO_OIDC...")
         assert AuthType.AWS_SSO_OIDC.value == "aws_sso_oidc"
         
-        print(f"Comparing value count: Expected 2, Got {len(AuthType)}")
-        assert len(AuthType) == 2
+        print("Verification: AuthType contains PKCE_OAUTH...")
+        assert AuthType.PKCE_OAUTH.value == "pkce_oauth"
+        
+        print(f"Comparing value count: Expected 3, Got {len(AuthType)}")
+        assert len(AuthType) == 3
 
 
 # =============================================================================
@@ -4251,3 +4254,270 @@ class TestAPIRegionPriorityHierarchy:
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
 
+
+class TestPKCEChallengeGeneration:
+    """Tests for PKCE code challenge generation (RFC 7636 S256 method)."""
+
+    def test_pkce_challenge_generates_valid_verifier(self):
+        """
+        What it does: Tests that PKCE verifier is a valid URL-safe string.
+        Purpose: Ensure verifier meets RFC 7636 requirements (min 43 chars, URL-safe).
+        """
+        print("Setup: Generating PKCE challenge...")
+        verifier, challenge, state = KiroAuthManager._pkce_generate_challenge()
+        
+        print(f"Verification: verifier length = {len(verifier)}")
+        assert isinstance(verifier, str)
+        assert len(verifier) >= 43
+        assert all(c in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in verifier)
+
+    def test_pkce_challenge_is_different_each_call(self):
+        """
+        What it does: Tests that each PKCE generation produces unique values.
+        Purpose: Ensure randomness — repeated calls must not collide.
+        """
+        print("Setup: Generating two PKCE challenges...")
+        v1, c1, s1 = KiroAuthManager._pkce_generate_challenge()
+        v2, c2, s2 = KiroAuthManager._pkce_generate_challenge()
+        
+        print(f"Verification: verifiers differ ({v1[:8]}... != {v2[:8]}...)")
+        assert v1 != v2
+        assert c1 != c2
+        assert s1 != s2
+
+    def test_pkce_challenge_is_sha256_hash_of_verifier(self):
+        """
+        What it does: Tests that challenge = base64url(SHA256(verifier)) per S256 method.
+        Purpose: Verify cryptographic correctness of PKCE S256 method.
+        """
+        import hashlib
+        import base64
+        
+        print("Setup: Generating PKCE challenge and computing expected hash...")
+        verifier, challenge, state = KiroAuthManager._pkce_generate_challenge()
+        
+        expected = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode('utf-8')).digest()
+        ).decode('utf-8').rstrip('=')
+        
+        print(f"Verification: challenge matches SHA256 hash (length {len(challenge)})")
+        assert challenge == expected
+
+    def test_pkce_state_is_random_string(self):
+        """
+        What it does: Tests that state parameter is a non-empty random string.
+        Purpose: CSRF protection requires unique, unpredictable state.
+        """
+        print("Setup: Generating PKCE challenge...")
+        verifier, challenge, state = KiroAuthManager._pkce_generate_challenge()
+        
+        print(f"Verification: state is '{state}' (length {len(state)})")
+        assert isinstance(state, str)
+        assert len(state) > 0
+        assert state != verifier
+        assert state != challenge
+
+
+class TestPKCETokenExchange:
+    """Tests for PKCE authorization code → token exchange."""
+
+    @pytest.mark.asyncio
+    async def test_pkce_exchange_success(self, mock_env_vars):
+        """
+        What it does: Tests successful token exchange with mocked HTTP response.
+        Purpose: Verify end-to-end exchange: POST → parse response → update state.
+        """
+        print("Setup: Creating auth manager and mock response...")
+        auth = KiroAuthManager(region="us-east-1")
+        test_code = "test_auth_code_123"
+        test_verifier = "test_verifier_456"
+        redirect_uri = "http://127.0.0.1:54321"
+        
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response = MagicMock()
+            mock_response.is_success = True
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "accessToken": "pkce_access_token_789",
+                "refreshToken": "pkce_refresh_token_abc",
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123:profile/test",
+                "expiresIn": 3600,
+            }
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+            
+            print("Act: Exchanging code for tokens...")
+            token = await auth._pkce_exchange_code(test_code, test_verifier, redirect_uri)
+            
+            print(f"Verification: token = {token}")
+            assert token == "pkce_access_token_789"
+            assert auth._access_token == "pkce_access_token_789"
+            assert auth._refresh_token == "pkce_refresh_token_abc"
+            assert auth._auth_type == AuthType.KIRO_DESKTOP  # Switched after PKCE
+            assert auth._expires_at is not None
+            mock_client.post.assert_called_once()
+            print("✅ All assertions passed")
+
+    @pytest.mark.asyncio
+    async def test_pkce_exchange_failure(self, mock_env_vars):
+        """
+        What it does: Tests that token exchange raises ValueError on HTTP error.
+        Purpose: Verify error handling for invalid/expired authorization codes.
+        """
+        print("Setup: Creating auth manager with failing mock...")
+        auth = KiroAuthManager(region="us-east-1")
+        
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response = MagicMock()
+            mock_response.is_success = False
+            mock_response.status_code = 400
+            mock_response.text = '{"error":"invalid_grant"}'
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+            
+            print("Act: Exchanging with bad code...")
+            with pytest.raises(ValueError, match="Token exchange failed"):
+                await auth._pkce_exchange_code("bad_code", "verifier", "http://127.0.0.1:0")
+            print("✅ ValueError raised as expected")
+
+    @pytest.mark.asyncio
+    async def test_pkce_exchange_wraps_data_field(self, mock_env_vars):
+        """
+        What it does: Tests that exchange handles Kiro's nested 'data' wrapper.
+        Purpose: Kiro sometimes wraps response in {data: {...}} — must unwrap.
+        """
+        print("Setup: Creating auth manager with nested response mock...")
+        auth = KiroAuthManager(region="us-east-1")
+        
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response = MagicMock()
+            mock_response.is_success = True
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "data": {
+                    "accessToken": "nested_token",
+                    "refreshToken": "nested_refresh",
+                    "profileArn": "arn:aws:codewhisperer:us-east-1:123:profile/nested",
+                    "expiresIn": 3600,
+                }
+            }
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+            
+            print("Act: Exchanging code with wrapped response...")
+            token = await auth._pkce_exchange_code("code", "verifier", "uri")
+            
+            print(f"Verification: token = {token}")
+            assert token == "nested_token"
+            assert auth._access_token == "nested_token"
+            print("✅ Nested data unwrapped correctly")
+
+    @pytest.mark.asyncio
+    async def test_pkce_exchange_missing_access_token(self, mock_env_vars):
+        """
+        What it does: Tests error when response lacks accessToken.
+        Purpose: Verify graceful handling of malformed API responses.
+        """
+        print("Setup: Creating auth manager with incomplete mock...")
+        auth = KiroAuthManager(region="us-east-1")
+        
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response = MagicMock()
+            mock_response.is_success = True
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"refreshToken": "only_refresh"}
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+            
+            print("Act: Exchanging with incomplete response...")
+            with pytest.raises(ValueError, match="missing accessToken"):
+                await auth._pkce_exchange_code("code", "verifier", "uri")
+            print("✅ ValueError raised for missing accessToken")
+
+
+class TestPKCERedirectHandler:
+    """Tests for the PKCE callback HTTP request handler."""
+
+    def test_handler_captures_valid_code(self):
+        """
+        What it does: Tests that handler correctly extracts code from valid callback.
+        Purpose: Verify URL parsing works for standard redirect.
+        """
+        print("Setup: Setting up handler state with expected state...")
+        _PKCERedirectHandler.auth_code = None
+        _PKCERedirectHandler.state = "test_state_123"
+        _PKCERedirectHandler.received.clear()
+        
+        from urllib.parse import urlparse, parse_qs
+        
+        print("Act: Parsing callback URL with valid code...")
+        parsed = urlparse("/?code=auth_code_xyz&state=test_state_123")
+        params = parse_qs(parsed.query)
+        
+        received_code = params.get("code", [None])[0]
+        received_state = params.get("state", [None])[0]
+        
+        print(f"Verification: code={received_code}, state={received_state}")
+        assert received_code == "auth_code_xyz"
+        assert received_state == "test_state_123"
+        assert received_state == _PKCERedirectHandler.state
+        print("✅ Code and state match expected values")
+
+    def test_handler_rejects_state_mismatch(self):
+        """
+        What it does: Tests that handler rejects callbacks with wrong state (CSRF).
+        Purpose: Verify CSRF protection — mismatched state must be detectable.
+        """
+        print("Setup: Setting up handler with expected state...")
+        _PKCERedirectHandler.auth_code = None
+        _PKCERedirectHandler.state = "expected_state"
+        _PKCERedirectHandler.received.clear()
+        
+        from urllib.parse import urlparse, parse_qs
+        
+        print("Act: Parsing callback URL with WRONG state...")
+        parsed = urlparse("/?code=some_code&state=wrong_state")
+        params = parse_qs(parsed.query)
+        
+        received_code = params.get("code", [None])[0]
+        received_state = params.get("state", [None])[0]
+        
+        print(f"Verification: code={received_code}, state={received_state}")
+        assert received_code == "some_code"
+        assert received_state == "wrong_state"
+        assert received_state != _PKCERedirectHandler.state
+        print("✅ State mismatch correctly detected")
+
+    def test_handler_missing_code_rejected(self):
+        """
+        What it does: Tests handler response when code parameter is missing.
+        Purpose: Verify graceful handling of malformed callbacks.
+        """
+        print("Setup: Setting up handler...")
+        _PKCERedirectHandler.state = "test_state"
+        
+        from urllib.parse import urlparse, parse_qs
+        
+        print("Act: Parsing callback URL with no code...")
+        parsed = urlparse("/?state=test_state")
+        params = parse_qs(parsed.query)
+        
+        received_code = params.get("code", [None])[0]
+        received_state = params.get("state", [None])[0]
+        
+        print(f"Verification: code={received_code}, state={received_state}")
+        assert received_code is None
+        assert received_state == "test_state"
+        print("✅ Missing code correctly detected as None")

@@ -376,8 +376,13 @@ async def messages(
             conversation_id = generate_conversation_id()
             
             # Build payload for Kiro
-            # profileArn is required by runtime.kiro.dev for all auth types
-            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+            # profileArn is required by runtime.kiro.dev for non-Builder-ID accounts
+            # Builder ID (AWS_SSO_OIDC) accounts have no profileArn - sending it causes 403
+            # See: https://github.com/jwadow/kiro-gateway/issues/168
+            if auth_manager.auth_type == AuthType.AWS_SSO_OIDC:
+                profile_arn_for_payload = ""
+            else:
+                profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
             
             try:
                 kiro_payload = anthropic_to_kiro(
@@ -411,10 +416,10 @@ async def messages(
             logger.debug(f"Kiro API URL: {url} (account: {account.id})")
             
             if request_data.stream:
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
+                http_client = KiroHttpClient(auth_manager, shared_client=None, optimistic_failover=True)
             else:
                 shared_client = request.app.state.http_client
-                http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+                http_client = KiroHttpClient(auth_manager, shared_client=shared_client, optimistic_failover=True)
             
             # Prepare data for token counting
             messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
@@ -684,8 +689,13 @@ async def messages(
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is required by runtime.kiro.dev for all auth types
-    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+    # profileArn is required by runtime.kiro.dev for non-Builder-ID accounts
+    # Builder ID (AWS_SSO_OIDC) accounts have no profileArn - sending it causes 403
+    # See: https://github.com/jwadow/kiro-gateway/issues/168
+    if auth_manager.auth_type == AuthType.AWS_SSO_OIDC:
+        profile_arn_for_payload = ""
+    else:
+        profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
     
     try:
         kiro_payload = anthropic_to_kiro(
