@@ -474,8 +474,9 @@ class TestKiroAuthManagerProperties:
     
     def test_api_host_property(self):
         """
-        What it does: Verifies api_host property.
-        Purpose: Ensure api_host is formed correctly.
+        What it does: Verifies api_host property contains region.
+        Purpose: Ensure api_host is formed correctly with the configured region.
+        (Host template varies by KIRO_USE_LEGACY_ENDPOINT env var.)
         """
         print("Setup: Creating KiroAuthManager...")
         manager = KiroAuthManager(
@@ -483,9 +484,8 @@ class TestKiroAuthManagerProperties:
             region="us-east-1"
         )
         
-        print("Verification: api_host contains runtime.{region}.kiro.dev pattern...")
+        print(f"Verification: api_host contains region us-east-1...")
         print(f"api_host: {manager.api_host}")
-        assert "runtime.us-east-1.kiro.dev" in manager.api_host
         assert "us-east-1" in manager.api_host
     
     def test_fingerprint_property(self):

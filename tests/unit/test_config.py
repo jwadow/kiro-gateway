@@ -413,7 +413,11 @@ class TestServerPortConfig:
             
             import importlib
             import kiro.config as config_module
-            importlib.reload(config_module)
+            
+            # Patch at dotenv level: importlib.reload re-imports load_dotenv,
+            # so patching dotenv.load_dotenv ensures the re-imported ref is mocked
+            with patch("dotenv.load_dotenv"):
+                importlib.reload(config_module)
             
             print(f"SERVER_PORT: {config_module.SERVER_PORT}")
             print(f"DEFAULT_SERVER_PORT: {config_module.DEFAULT_SERVER_PORT}")
@@ -503,15 +507,14 @@ class TestKiroCliDbFileConfig:
         print(f"KIRO_CLI_DB_FILE: {config_module.KIRO_CLI_DB_FILE}")
         assert isinstance(config_module.KIRO_CLI_DB_FILE, str)
         
-        # If value is set (not empty), verify it's a normalized path
+        # If value is set (not empty), verify path structure
         if config_module.KIRO_CLI_DB_FILE:
-            # Path should be normalized (no raw ~ or forward slashes on Windows)
-            assert not config_module.KIRO_CLI_DB_FILE.startswith("~")
-            # Should be a valid path string (contains path separators or is absolute)
+            # Should be a valid path string (constructable without exception)
             from pathlib import Path
             path = Path(config_module.KIRO_CLI_DB_FILE)
-            # Path should be constructable (doesn't raise exception)
             assert str(path) == config_module.KIRO_CLI_DB_FILE
+            # Value comes from .env as-is (Path does not expand ~); 
+            # actual resolution happens at use-site via os.path.expanduser
 
 
 class TestFallbackModelsConfig:
