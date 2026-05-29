@@ -183,11 +183,14 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Normally "user" or "assistant", but accepted as a
+            free-form string because some clients (e.g. Claude Code) send other
+            roles such as "system" inside the messages array. Unknown roles are
+            normalized to "user" downstream by normalize_message_roles().
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: str
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

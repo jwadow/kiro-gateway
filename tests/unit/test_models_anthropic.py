@@ -623,6 +623,81 @@ class TestAnthropicMessagesRequestWithImages:
 
 
 # ==================================================================================================
+# Tests for inline non-standard message roles (Issue #190)
+# ==================================================================================================
+
+class TestAnthropicMessageInlineRoles:
+    """
+    Tests for AnthropicMessage with inline non-standard roles.
+
+    These tests verify the fix for Issue #190 - 422 Validation Error
+    when newer Claude Code clients inline a message with role "system"
+    inside the messages array.
+
+    The role field is intentionally a free-form str: unknown roles such
+    as "system" and "developer" are normalized to "user" downstream by
+    converters_core.normalize_message_roles().
+    """
+
+    def test_message_with_system_role_validates(self):
+        """
+        What it does: Verifies AnthropicMessage accepts role "system".
+        Purpose: This is the PRIMARY test for Issue #190 fix.
+
+        Before the fix, this raised a ValidationError because role was
+        declared as Literal["user", "assistant"].
+        """
+        print("Setup: Creating AnthropicMessage with role 'system'...")
+        message = AnthropicMessage(
+            role="system",
+            content="<system-reminder>context blob</system-reminder>"
+        )
+
+        print(f"Comparing role: Expected 'system', Got '{message.role}'")
+        assert message.role == "system"
+        assert message.content == "<system-reminder>context blob</system-reminder>"
+
+    def test_message_with_developer_role_validates(self):
+        """
+        What it does: Verifies other non-standard roles also validate.
+        Purpose: Ensure the field is leniently typed, not just patched
+        for the single "system" value.
+        """
+        print("Setup: Creating AnthropicMessage with role 'developer'...")
+        message = AnthropicMessage(role="developer", content="some context")
+
+        print(f"Comparing role: Expected 'developer', Got '{message.role}'")
+        assert message.role == "developer"
+
+    def test_standard_roles_still_validate(self):
+        """
+        What it does: Verifies user/assistant roles are unaffected.
+        Purpose: Guard against regressions in the common path.
+        """
+        assert AnthropicMessage(role="user", content="hi").role == "user"
+        assert AnthropicMessage(role="assistant", content="hello").role == "assistant"
+
+    def test_request_with_inline_system_message_validates(self):
+        """
+        What it does: Verifies the exact Issue #190 request validates.
+        Purpose: End-to-end validation for the failing Claude Code payload
+        that carries an inline role "system" message at index 1.
+        """
+        print("Setup: Creating request with inline 'system' role message...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=16,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "<system-reminder>...</system-reminder>"},
+            ],
+        )
+
+        print(f"Comparing roles: Got {[m.role for m in request.messages]}")
+        assert [m.role for m in request.messages] == ["user", "system"]
+
+
+# ==================================================================================================
 # Tests for TextContentBlock
 # ==================================================================================================
 
