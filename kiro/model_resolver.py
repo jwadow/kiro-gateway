@@ -131,7 +131,39 @@ def normalize_model_name(name: str) -> str:
     # Strip context window suffix (e.g., [1m], [200k]) — client-side indicator, not a model ID
     name = re.sub(r'\[\d+[mk]\]$', '', name, flags=re.IGNORECASE)
 
-    # Lowercase for consistent matching
+    # Step 1a: Strip known provider prefixes
+    # Handles: "anthropic/claude-sonnet-4.5", "kiro/claude-haiku-4.5", etc.
+    provider_prefixes = ["anthropic/", "kiro/", "amazon/", "bedrock/"]
+    name_lower = name.lower()
+    for prefix in provider_prefixes:
+        if name_lower.startswith(prefix):
+            name = name[len(prefix):]
+            name_lower = name.lower()
+            logger.debug(f"Stripped prefix '{prefix}', normalized to: {name}")
+            break
+
+    # Step 1b: Reorder "claude-MAJOR-MINOR-VARIANT" to "claude-VARIANT-MAJOR.MINOR"
+    # Handles: "claude-4-5-sonnet" -> "claude-sonnet-4.5", "claude-4-opus" -> "claude-opus-4"
+    # Does NOT match dotted versions like "claude-3.7-sonnet" (already correct Kiro format)
+    # Groups: prefix="claude", major="4", minor="5" or None, variant="sonnet" or "opus" or "haiku"
+    reorder_match = re.match(
+        r'^(claude)-(\d+)-('
+        r'haiku|sonnet|opus'
+        r')(?:-(\d+))?$',
+        name_lower
+    )
+    if reorder_match:
+        prefix = reorder_match.group(1)    # claude
+        version = reorder_match.group(2)   # 4.5 or 4
+        variant = reorder_match.group(3)   # sonnet
+        qualifier = reorder_match.group(4) # optional numeric suffix
+        result = f"{prefix}-{variant}-{version}"
+        if qualifier:
+            result = f"{result}-{qualifier}"
+        logger.debug(f"Reordered '{name}' -> '{result}'")
+        return result
+
+    # Lowercase for consistent matching (may have changed after prefix strip)
     name_lower = name.lower()
     
     # Pattern 1: Standard format - claude-{family}-{major}-{minor}(-{suffix})?

@@ -38,10 +38,39 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import (
+    MAX_RETRIES,
+    BASE_RETRY_DELAY,
+    FIRST_TOKEN_MAX_RETRIES,
+    STREAMING_READ_TIMEOUT,
+    STREAMING_POOL_ENABLED,
+    STREAMING_POOL_SIZE,
+    STREAMING_POOL_KEEPALIVE,
+)
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+from kiro.streaming_pool import StreamingPool
+
+
+# Module-level streaming pool (lazy initialized)
+_streaming_pool: Optional[StreamingPool] = None
+
+
+def _get_streaming_pool() -> StreamingPool:
+    """Get or create the shared streaming pool singleton."""
+    global _streaming_pool
+    if _streaming_pool is None:
+        _streaming_pool = StreamingPool(
+            max_size=STREAMING_POOL_SIZE,
+            keepalive=STREAMING_POOL_KEEPALIVE,
+        )
+        logger.info(
+            f"StreamingPool initialized "
+            f"(max_size={STREAMING_POOL_SIZE}, "
+            f"keepalive={STREAMING_POOL_KEEPALIVE}s)"
+        )
+    return _streaming_pool
 
 
 class KiroHttpClient:
@@ -79,7 +108,8 @@ class KiroHttpClient:
     def __init__(
         self,
         auth_manager: KiroAuthManager,
-        shared_client: Optional[httpx.AsyncClient] = None
+        shared_client: Optional[httpx.AsyncClient] = None,
+        optimistic_failover: bool = False,
     ):
         """
         Initializes the HTTP client.
@@ -89,11 +119,14 @@ class KiroHttpClient:
             shared_client: Optional shared httpx.AsyncClient for connection pooling.
                           If provided, this client will be used instead of creating
                           a new one. The shared client will NOT be closed by close().
+            optimistic_failover: When True, skip backoff on 429 for immediate failover
         """
         self.auth_manager = auth_manager
         self._shared_client = shared_client
         self._owns_client = shared_client is None
         self.client: Optional[httpx.AsyncClient] = shared_client
+        self._optimistic_failover = optimistic_failover
+        self._from_pool = False
     
     async def _get_client(self, stream: bool = False) -> httpx.AsyncClient:
         """
@@ -101,6 +134,10 @@ class KiroHttpClient:
         
         If a shared client was provided at initialization, it is returned as-is.
         Otherwise, creates a new client with appropriate timeout configuration.
+        
+        When streaming pool is enabled and stream=True, clients are acquired from
+        the pool instead of being created fresh. This avoids TCP connection overhead
+        while still preventing CLOSE_WAIT leaks (errored clients are evicted).
         
         httpx timeouts:
         - connect: TCP handshake (DNS + TCP SYN/ACK)
@@ -126,34 +163,47 @@ class KiroHttpClient:
         # Create new client if needed (per-request mode)
         if self.client is None or self.client.is_closed:
             if stream:
-                # For streaming:
-                # - connect: 30 sec (TCP connection, usually < 1 sec)
-                # - read: STREAMING_READ_TIMEOUT (300 sec) - model may "think" between chunks
-                # - write/pool: standard values
-                timeout_config = httpx.Timeout(
-                    connect=30.0,
-                    read=STREAMING_READ_TIMEOUT,
-                    write=30.0,
-                    pool=30.0
-                )
-                logger.debug(f"Creating streaming HTTP client (read_timeout={STREAMING_READ_TIMEOUT}s)")
+                if STREAMING_POOL_ENABLED:
+                    # Acquire from pool (reuses healthy clients, creates new if needed)
+                    pool = _get_streaming_pool()
+                    self.client = await pool.acquire()
+                    self._from_pool = True
+                    logger.debug("Acquired streaming client from pool")
+                else:
+                    # For streaming:
+                    # - connect: 30 sec (TCP connection, usually < 1 sec)
+                    # - read: STREAMING_READ_TIMEOUT (300 sec) - model may "think" between chunks
+                    # - write/pool: standard values
+                    timeout_config = httpx.Timeout(
+                        connect=30.0,
+                        read=STREAMING_READ_TIMEOUT,
+                        write=30.0,
+                        pool=30.0
+                    )
+                    logger.debug(f"Creating streaming HTTP client (read_timeout={STREAMING_READ_TIMEOUT}s)")
+                    self.client = httpx.AsyncClient(timeout=timeout_config, follow_redirects=True)
             else:
                 # For regular requests: single timeout of 300 sec
                 timeout_config = httpx.Timeout(timeout=300.0)
                 logger.debug("Creating non-streaming HTTP client (timeout=300s)")
-            
-            self.client = httpx.AsyncClient(timeout=timeout_config, follow_redirects=True)
+                self.client = httpx.AsyncClient(timeout=timeout_config, follow_redirects=True)
         return self.client
     
-    async def close(self) -> None:
+    async def close(self, errored: bool = False) -> None:
         """
-        Closes the HTTP client if this instance owns it.
+        Closes or releases the HTTP client.
         
-        If using a shared client, this method does nothing - the shared client
+        If the client was acquired from the streaming pool, it is returned
+        to the pool (or evicted if errored). Otherwise, the client is closed.
+        
+        When using a shared client, this method does nothing - the shared client
         should be closed by the application lifecycle manager.
         
         Uses graceful exception handling to prevent errors during cleanup
         from masking the original exception in finally blocks.
+        
+        Args:
+            errored: If True and client was from pool, evict instead of release
         """
         # Don't close shared clients - they're managed by the application
         if not self._owns_client:
@@ -161,7 +211,15 @@ class KiroHttpClient:
         
         if self.client and not self.client.is_closed:
             try:
-                await self.client.aclose()
+                if self._from_pool:
+                    pool = _get_streaming_pool()
+                    await pool.release(self.client, errored=errored)
+                    logger.debug(
+                        "Returned streaming client to pool "
+                        f"(errored={errored})"
+                    )
+                else:
+                    await self.client.aclose()
             except Exception as e:
                 # Log but don't propagate - we're in cleanup code
                 # Propagating here could mask the original exception
@@ -244,9 +302,16 @@ class KiroHttpClient:
                     await self.auth_manager.force_refresh()
                     continue
                 
-                # 429 - rate limit, wait and retry
+                # 429 - rate limit, wait and retry (or failover immediately)
                 if response.status_code == 429:
                     last_response = response  # Сохраняем для возврата после exhaustion
+                    if self._optimistic_failover:
+                        logger.warning(
+                            f"Received 429 with optimistic failover enabled, "
+                            f"returning to caller for account rotation "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        return response  # Let route handler try next account
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)

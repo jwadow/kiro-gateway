@@ -267,6 +267,14 @@ class AccountManager:
                 logger.debug(f"Added account: {account_id}")
                 continue  # Skip path processing for refresh_token
             
+            # For pkce type, no path required (creates creds on first login via browser)
+            if cred_type == "pkce":
+                import uuid
+                account_id = f"pkce_{uuid.uuid4().hex[:16]}"
+                self._accounts[account_id] = Account(id=account_id)
+                logger.debug(f"Added PKCE account: {account_id}")
+                continue
+            
             # Handle folder scanning for json/sqlite types
             expanded_path = Path(path).expanduser()
             if expanded_path.is_dir():
@@ -489,6 +497,12 @@ class AccountManager:
                     profile_arn=creds_config.get("profile_arn"),
                     region=creds_config.get("region", "us-east-1"),
                     api_region=creds_config.get("api_region")
+                )
+            elif cred_type == "pkce":
+                auth_manager = KiroAuthManager(
+                    region=creds_config.get("region", "us-east-1"),
+                    api_region=creds_config.get("api_region"),
+                    creds_file=creds_config.get("path"),
                 )
             else:
                 logger.error(f"Unknown credential type: {cred_type}")
