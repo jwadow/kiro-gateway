@@ -525,6 +525,41 @@ class TestAnthropicMessageWithImages:
 
 
 # ==================================================================================================
+# Tests for AnthropicMessage role validation
+# ==================================================================================================
+
+class TestAnthropicMessageRole:
+    """
+    Tests for AnthropicMessage role acceptance.
+
+    Anthropic spec only defines 'user' and 'assistant' for inline messages
+    (system is a top-level field on the request). Some clients (notably
+    Claude Code on certain model ids) emit 'system' inline; we accept it at
+    the schema layer and rely on normalize_message_roles in the conversion
+    pipeline to collapse it to 'user'.
+    """
+
+    def test_accepts_user_role(self):
+        message = AnthropicMessage(role="user", content="hi")
+        assert message.role == "user"
+
+    def test_accepts_assistant_role(self):
+        message = AnthropicMessage(role="assistant", content="hi")
+        assert message.role == "assistant"
+
+    def test_accepts_system_role(self):
+        """Client-compat: inline 'system' role must validate; normalization happens downstream."""
+        message = AnthropicMessage(role="system", content="some reminder text")
+        assert message.role == "system"
+        assert message.content == "some reminder text"
+
+    def test_rejects_unknown_role(self):
+        """Roles outside {user, assistant, system} still fail fast at the boundary."""
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role="developer", content="hi")
+
+
+# ==================================================================================================
 # Tests for AnthropicMessagesRequest with Image Content
 # ==================================================================================================
 

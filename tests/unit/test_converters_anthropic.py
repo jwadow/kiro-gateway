@@ -1471,6 +1471,42 @@ class TestAnthropicToKiro:
         assert "userInputMessage" in result["conversationState"]["currentMessage"]
         assert result["profileArn"] == "arn:aws:test"
 
+    def test_inline_system_role_is_normalized_to_user(self):
+        """
+        What it does: Verifies that an inline 'system' role in messages is
+        accepted and normalized to 'user' downstream.
+        Purpose: Some clients (e.g., Claude Code on certain model ids) emit
+        a 'system' message inline rather than using the top-level system
+        field. The schema accepts it; normalize_message_roles collapses it
+        to 'user' so the upstream Kiro payload only contains user/assistant.
+        """
+        print("Setup: Request with inline system message between user turns...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            messages=[
+                AnthropicMessage(role="user", content="hello"),
+                AnthropicMessage(role="system", content="<reminder>be concise</reminder>"),
+                AnthropicMessage(role="user", content="ok thanks"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-4.8",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        print(f"Result: {result}")
+        history = result["conversationState"].get("history", [])
+        print(f"History entries: {len(history)}")
+        for entry in history:
+            assert "userInputMessage" in entry or "assistantResponseMessage" in entry, (
+                f"Unexpected history entry shape: {entry}"
+            )
+
     def test_includes_system_prompt(self):
         """
         What it does: Verifies that system prompt is included.

@@ -183,11 +183,16 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Anthropic spec only defines 'user' and 'assistant'
+            for messages (system is a top-level field), but some clients
+            (notably Claude Code on certain model ids) emit inline 'system'
+            messages. We accept it here and rely on
+            ``normalize_message_roles`` in the conversion pipeline to collapse
+            it to 'user' before reaching upstream Kiro.
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
