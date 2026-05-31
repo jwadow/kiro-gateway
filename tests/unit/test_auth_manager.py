@@ -661,7 +661,35 @@ class TestKiroAuthManagerSqliteCredentials:
         print("Verification: Fallback refresh_token is used...")
         print(f"Comparing refresh_token: Expected 'fallback_token', Got '{manager._refresh_token}'")
         assert manager._refresh_token == "fallback_token"
-    
+
+    def test_load_credentials_closes_connection_on_midread_exception(self, temp_sqlite_db):
+        """
+        What it does: Forces an exception during the SQLite read and verifies
+        the connection is still closed via try/finally (#84).
+        Purpose: A query/parse failure mid-load must not leak the SQLite
+        connection. Without the finally block, an exception raised after
+        sqlite3.connect() but before conn.close() leaks a file handle for the
+        lifetime of the process.
+        """
+        import sqlite3 as _sqlite3
+        from unittest.mock import MagicMock, patch
+
+        fake_conn = MagicMock(name="sqlite_connection")
+        fake_cursor = MagicMock(name="sqlite_cursor")
+        fake_conn.cursor.return_value = fake_cursor
+        # Blow up on the very first query to simulate a corrupt/locked DB mid-read.
+        fake_cursor.execute.side_effect = _sqlite3.OperationalError("database is locked")
+
+        print("Setup: Creating manager, then forcing a mid-read SQLite failure...")
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
+
+        with patch("sqlite3.connect", return_value=fake_conn):
+            # Should swallow the error (logged) and NOT raise to the caller.
+            manager._load_credentials_from_sqlite(temp_sqlite_db)
+
+        print("Verification: connection.close() called despite the exception...")
+        fake_conn.close.assert_called_once()
+
     def test_load_credentials_from_sqlite_loads_token_data(self, temp_sqlite_db):
         """
         What it does: Verifies loading token data from SQLite.
@@ -1271,8 +1299,10 @@ class TestKiroAuthManagerSsoRegionSeparation:
     
     def test_api_region_uses_sso_region_as_fallback_when_no_profile_arn(self, temp_sqlite_db):
         """
-        What it does: Verifies API region uses SSO region as fallback when profile ARN is not available.
-        Purpose: Ensure graceful fallback when state table doesn't exist or profile key is missing.
+        What it does: Verifies the API region defaults to us-east-1 (NOT the SSO
+        region) when no verified profile ARN is available.
+        Purpose: Per #81, the SSO/auth region must not drive the Q API host,
+        since that region is frequently unreachable; us-east-1 is universal.
         """
         print(f"Setup: Creating KiroAuthManager with SQLite (SSO region=eu-west-1, no profile ARN)...")
         manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
@@ -1285,12 +1315,13 @@ class TestKiroAuthManagerSsoRegionSeparation:
         print(f"Comparing _detected_api_region: Expected None, Got '{manager._detected_api_region}'")
         assert manager._detected_api_region is None
         
-        print("Verification: API region uses SSO region as fallback...")
+        print("Verification: API region defaults to us-east-1, NOT the SSO region (#81)...")
         print(f"api_host: {manager._api_host}")
-        assert "eu-west-1" in manager._api_host
+        assert "us-east-1" in manager._api_host
+        assert "eu-west-1" not in manager._api_host
         
         print(f"q_host: {manager._q_host}")
-        assert "eu-west-1" in manager._q_host
+        assert "us-east-1" in manager._q_host
     
     def test_sso_region_stored_separately_from_api_region(self, temp_sqlite_db):
         """
@@ -1402,8 +1433,10 @@ class TestKiroAuthManagerSsoRegionSeparation:
     
     def test_refresh_url_uses_sso_region_when_loading_from_sqlite(self, temp_sqlite_db):
         """
-        What it does: Verifies refresh_url uses SSO region for OIDC token refresh.
-        Purpose: Ensure OIDC token refresh goes to correct regional endpoint.
+        What it does: Verifies refresh_url uses SSO region for OIDC token refresh,
+        while the API host defaults to us-east-1 (#81).
+        Purpose: OIDC token refresh must go to the regional SSO endpoint, but the
+        SSO region must NOT drive the Q API host.
         """
         print(f"Setup: Creating KiroAuthManager with SQLite (SSO region=eu-west-1)...")
         manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
@@ -1416,9 +1449,10 @@ class TestKiroAuthManagerSsoRegionSeparation:
         print(f"_refresh_url: {manager._refresh_url}")
         assert "eu-west-1" in manager._refresh_url
         
-        print("Verification: API hosts use SSO region as fallback (no profile ARN)...")
-        assert "eu-west-1" in manager._api_host
-        assert "eu-west-1" in manager._q_host
+        print("Verification: API hosts default to us-east-1, NOT the SSO region (#81)...")
+        assert "us-east-1" in manager._api_host
+        assert "us-east-1" in manager._q_host
+        assert "eu-west-1" not in manager._api_host
     
     @pytest.mark.asyncio
     async def test_refresh_token_aws_sso_oidc_uses_memory_token_first(
@@ -2149,6 +2183,43 @@ class TestKiroAuthManagerSaveCredentialsToSqlite:
         
         print("Verification: No exception raised...")
         assert True
+
+    def test_save_credentials_closes_connection_on_midwrite_exception(self, tmp_path):
+        """
+        What it does: Forces an exception during the SQLite write and verifies
+        the connection is still closed via try/finally (#84).
+        Purpose: A failure while merging/writing tokens (locked DB, disk error)
+        must not leak the SQLite connection. Guards the write-back path that
+        runs on every token refresh.
+        """
+        import sqlite3 as _sqlite3
+        from unittest.mock import MagicMock, patch
+
+        # Create a real DB file so the existence check passes.
+        db_file = tmp_path / "data_close_guard.sqlite3"
+        real_conn = _sqlite3.connect(str(db_file))
+        real_conn.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        real_conn.commit()
+        real_conn.close()
+
+        manager = KiroAuthManager(refresh_token="seed")
+        manager._sqlite_db = str(db_file)
+        manager._sqlite_token_key = "kirocli:social:token"
+        manager._access_token = "rotated_access"
+        manager._refresh_token = "rotated_refresh"
+
+        fake_conn = MagicMock(name="sqlite_connection")
+        fake_cursor = MagicMock(name="sqlite_cursor")
+        fake_conn.cursor.return_value = fake_cursor
+        fake_cursor.execute.side_effect = _sqlite3.OperationalError("disk I/O error")
+
+        print("Action: Forcing a mid-write SQLite failure...")
+        with patch("sqlite3.connect", return_value=fake_conn):
+            # Error is logged and swallowed, not raised.
+            manager._save_credentials_to_sqlite()
+
+        print("Verification: connection.close() called despite the exception...")
+        fake_conn.close.assert_called_once()
 
 
 # =============================================================================
@@ -3944,8 +4015,10 @@ class TestAPIRegionAutoDetectionSQLite:
     
     def test_api_region_fallback_when_no_state_table(self, temp_sqlite_db):
         """
-        What it does: Verifies graceful fallback when state table doesn't exist.
-        Purpose: Ensure backward compatibility with databases without state table.
+        What it does: Verifies API region defaults to us-east-1 when state table
+        doesn't exist (no verified profile ARN).
+        Purpose: Per #81, the SSO region must not drive the API host; us-east-1
+        is the universal fallback.
         """
         print("Setup: Creating KiroAuthManager with SQLite without state table...")
         manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
@@ -3954,17 +4027,20 @@ class TestAPIRegionAutoDetectionSQLite:
         print(f"Comparing _detected_api_region: Expected None, Got '{manager._detected_api_region}'")
         assert manager._detected_api_region is None
         
-        print("Verification: API hosts use SSO region as fallback...")
+        print("Verification: SSO region still loaded for OIDC refresh...")
         print(f"Comparing _sso_region: Expected 'eu-west-1', Got '{manager._sso_region}'")
         assert manager._sso_region == "eu-west-1"
         
+        print("Verification: API host defaults to us-east-1, NOT the SSO region (#81)...")
         print(f"api_host: {manager._api_host}")
-        assert "eu-west-1" in manager._api_host
+        assert "us-east-1" in manager._api_host
+        assert "eu-west-1" not in manager._api_host
     
     def test_api_region_fallback_when_no_profile_key(self, temp_sqlite_db_with_empty_state_table):
         """
-        What it does: Verifies graceful fallback when profile key is missing from state table.
-        Purpose: Ensure robustness when state table exists but has no profile.
+        What it does: Verifies API region defaults to us-east-1 when the profile
+        key is missing from the state table (no verified ARN).
+        Purpose: Per #81, the SSO region must not drive the API host.
         """
         print("Setup: Creating KiroAuthManager with empty state table...")
         manager = KiroAuthManager(sqlite_db=temp_sqlite_db_with_empty_state_table)
@@ -3973,17 +4049,20 @@ class TestAPIRegionAutoDetectionSQLite:
         print(f"Comparing _detected_api_region: Expected None, Got '{manager._detected_api_region}'")
         assert manager._detected_api_region is None
         
-        print("Verification: API hosts use SSO region as fallback...")
+        print("Verification: SSO region still loaded for OIDC refresh...")
         print(f"Comparing _sso_region: Expected 'us-west-2', Got '{manager._sso_region}'")
         assert manager._sso_region == "us-west-2"
         
+        print("Verification: API host defaults to us-east-1, NOT the SSO region (#81)...")
         print(f"api_host: {manager._api_host}")
-        assert "us-west-2" in manager._api_host
+        assert "us-east-1" in manager._api_host
+        assert "us-west-2" not in manager._api_host
     
     def test_api_region_invalid_arn_format(self, temp_sqlite_db_with_invalid_arn):
         """
-        What it does: Verifies handling of invalid ARN formats.
-        Purpose: Ensure invalid ARNs are ignored and fallback is used.
+        What it does: Verifies invalid ARN formats are ignored and the API region
+        defaults to us-east-1 (not the SSO region).
+        Purpose: Per #81, an unverified region must not drive the API host.
         """
         print(f"Setup: Creating KiroAuthManager with invalid ARN...")
         manager = KiroAuthManager(sqlite_db=temp_sqlite_db_with_invalid_arn)
@@ -3992,17 +4071,20 @@ class TestAPIRegionAutoDetectionSQLite:
         print(f"Comparing _detected_api_region: Expected None, Got '{manager._detected_api_region}'")
         assert manager._detected_api_region is None
         
-        print("Verification: API hosts use SSO region as fallback...")
+        print("Verification: SSO region still loaded for OIDC refresh...")
         print(f"Comparing _sso_region: Expected 'ap-southeast-1', Got '{manager._sso_region}'")
         assert manager._sso_region == "ap-southeast-1"
         
+        print("Verification: API host defaults to us-east-1, NOT the SSO region (#81)...")
         print(f"api_host: {manager._api_host}")
-        assert "ap-southeast-1" in manager._api_host
+        assert "us-east-1" in manager._api_host
+        assert "ap-southeast-1" not in manager._api_host
     
     def test_api_region_malformed_json_in_state_table(self, temp_sqlite_db_with_malformed_state_json):
         """
-        What it does: Verifies handling of malformed JSON in state table.
-        Purpose: Ensure graceful error handling without crashing.
+        What it does: Verifies malformed JSON in the state table is ignored and
+        the API region defaults to us-east-1 (not the SSO region).
+        Purpose: Per #81, an unverified region must not drive the API host.
         """
         print("Setup: Creating KiroAuthManager with malformed state JSON...")
         manager = KiroAuthManager(sqlite_db=temp_sqlite_db_with_malformed_state_json)
@@ -4011,12 +4093,14 @@ class TestAPIRegionAutoDetectionSQLite:
         print(f"Comparing _detected_api_region: Expected None, Got '{manager._detected_api_region}'")
         assert manager._detected_api_region is None
         
-        print("Verification: API hosts use SSO region as fallback...")
+        print("Verification: SSO region still loaded for OIDC refresh...")
         print(f"Comparing _sso_region: Expected 'ap-south-1', Got '{manager._sso_region}'")
         assert manager._sso_region == "ap-south-1"
         
+        print("Verification: API host defaults to us-east-1, NOT the SSO region (#81)...")
         print(f"api_host: {manager._api_host}")
-        assert "ap-south-1" in manager._api_host
+        assert "us-east-1" in manager._api_host
+        assert "ap-south-1" not in manager._api_host
 
 
 # =============================================================================
@@ -4031,27 +4115,31 @@ class TestAPIRegionAutoDetectionJSON:
     
     def test_api_region_from_json_region_field(self, temp_creds_file):
         """
-        What it does: Verifies region field from JSON is used as API region.
-        Purpose: Ensure JSON region is detected and used for API calls.
+        What it does: Verifies the JSON `region` field populates the SSO region
+        only, and the API region defaults to us-east-1 (#81).
+        Purpose: The JSON region is the auth region, not a verified Q API region,
+        so it must not drive the API host.
         """
         print(f"Setup: Creating KiroAuthManager with JSON credentials...")
         manager = KiroAuthManager(creds_file=temp_creds_file)
         
-        print("Verification: Region detected from JSON...")
-        print(f"Comparing _detected_api_region: Expected 'us-east-1', Got '{manager._detected_api_region}'")
-        assert manager._detected_api_region == "us-east-1"
+        print("Verification: JSON region is SSO-only, not detected as API region...")
+        print(f"Comparing _detected_api_region: Expected None, Got '{manager._detected_api_region}'")
+        assert manager._detected_api_region is None
         
         print(f"Comparing _sso_region: Expected 'us-east-1', Got '{manager._sso_region}'")
         assert manager._sso_region == "us-east-1"
         
-        print("Verification: API hosts use detected region...")
+        print("Verification: API hosts default to us-east-1...")
         print(f"api_host: {manager._api_host}")
         assert "us-east-1" in manager._api_host
     
     def test_api_region_json_env_var_override(self, temp_creds_file, monkeypatch):
         """
-        What it does: Verifies KIRO_API_REGION env var overrides JSON region.
-        Purpose: Ensure manual override has highest priority.
+        What it does: Verifies KIRO_API_REGION env var drives the API host while
+        the JSON region remains SSO-only (#81).
+        Purpose: Ensure the explicit env override has highest priority and the
+        JSON region no longer auto-detects as the API region.
         """
         print("Setup: Setting KIRO_API_REGION env var...")
         monkeypatch.setenv("KIRO_API_REGION", "eu-central-1")
@@ -4059,14 +4147,47 @@ class TestAPIRegionAutoDetectionJSON:
         print(f"Setup: Creating KiroAuthManager with JSON (region=us-east-1)...")
         manager = KiroAuthManager(creds_file=temp_creds_file)
         
-        print("Verification: Region detected from JSON...")
-        print(f"Comparing _detected_api_region: Expected 'us-east-1', Got '{manager._detected_api_region}'")
-        assert manager._detected_api_region == "us-east-1"
+        print("Verification: JSON region is SSO-only, not detected as API region...")
+        print(f"Comparing _detected_api_region: Expected None, Got '{manager._detected_api_region}'")
+        assert manager._detected_api_region is None
         
-        print("Verification: But API hosts use env var override...")
+        print("Verification: API hosts use env var override...")
         print(f"api_host: {manager._api_host}")
         assert "eu-central-1" in manager._api_host
         assert "us-east-1" not in manager._api_host
+
+    def test_non_us_east_1_json_region_does_not_break_api_host(self, tmp_path):
+        """
+        What it does: A JSON credentials file with a non-us-east-1 region keeps
+        that region for SSO/OIDC refresh but leaves the API host at us-east-1.
+        Purpose: Direct regression for #81 - previously a non-us-east-1 region in
+        the credentials file forced an unreachable regional API host, breaking
+        all requests even though us-east-1 works.
+        """
+        import json as _json
+        creds_file = tmp_path / "kiro-auth-token-eu.json"
+        creds_file.write_text(_json.dumps({
+            "accessToken": "tok",
+            "refreshToken": "rtok",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "region": "eu-central-1",
+        }))
+
+        print("Setup: KiroAuthManager with JSON region=eu-central-1 (no profile ARN)...")
+        manager = KiroAuthManager(creds_file=str(creds_file))
+
+        print("Verification: SSO region keeps eu-central-1 for OIDC refresh...")
+        assert manager._sso_region == "eu-central-1"
+        assert "eu-central-1" in manager._refresh_url
+
+        print("Verification: JSON region is NOT treated as a verified API region...")
+        assert manager._detected_api_region is None
+
+        print("Verification: API host stays at us-east-1 (the universal endpoint)...")
+        assert "us-east-1" in manager._api_host
+        assert "us-east-1" in manager._q_host
+        assert "eu-central-1" not in manager._api_host
+        assert "eu-central-1" not in manager._q_host
 
 
 # =============================================================================
@@ -4138,14 +4259,15 @@ class TestAPIRegionPriorityHierarchy:
     
     def test_auth_manager_api_region_parameter(self, temp_creds_file, monkeypatch):
         """
-        What it does: Verifies api_region parameter has highest priority.
-        Purpose: Ensure per-account api_region override works correctly.
+        What it does: Verifies the api_region parameter has highest priority.
+        Purpose: Ensure per-account api_region override wins over env var, and
+        the JSON region no longer auto-detects as the API region (#81).
         """
         print("Setup: Setting KIRO_API_REGION env var to us-west-1...")
         monkeypatch.setenv("KIRO_API_REGION", "us-west-1")
         
         print("Setup: Creating KiroAuthManager with api_region=eu-central-1...")
-        print("  - JSON file has region=us-east-1 (detected)")
+        print("  - JSON file has region=us-east-1 (SSO-only)")
         print("  - KIRO_API_REGION env var=us-west-1")
         print("  - api_region parameter=eu-central-1 (should win)")
         manager = KiroAuthManager(
@@ -4153,11 +4275,11 @@ class TestAPIRegionPriorityHierarchy:
             api_region="eu-central-1"
         )
         
-        print("Verification: Region detected from JSON...")
-        print(f"Comparing _detected_api_region: Expected 'us-east-1', Got '{manager._detected_api_region}'")
-        assert manager._detected_api_region == "us-east-1"
+        print("Verification: JSON region is SSO-only, not detected as API region...")
+        print(f"Comparing _detected_api_region: Expected None, Got '{manager._detected_api_region}'")
+        assert manager._detected_api_region is None
         
-        print("Verification: But API hosts use api_region parameter (highest priority)...")
+        print("Verification: API hosts use api_region parameter (highest priority)...")
         print(f"api_host: {manager._api_host}")
         assert "eu-central-1" in manager._api_host
         assert "us-west-1" not in manager._api_host

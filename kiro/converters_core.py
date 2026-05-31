@@ -30,6 +30,7 @@ The core layer provides a unified interface that API-specific adapters use
 to convert their formats to Kiro API format.
 """
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,6 +42,8 @@ from kiro.config import (
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_MAX_TOKENS,
     FAKE_REASONING_BUDGET_CAP,
+    KIRO_NATIVE_THINKING_DISPLAY,
+    KIRO_NATIVE_THINKING_MODE,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
@@ -78,6 +81,189 @@ class ThinkingConfig:
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+
+
+@dataclass
+class NativeThinkingConfig:
+    """
+    Native Kiro/Claude adaptive thinking configuration.
+
+    Attributes:
+        enabled: Whether to add native adaptive thinking fields.
+        effort: Adaptive thinking effort level.
+        display: Whether upstream should return summarized or omitted thinking text.
+    """
+    enabled: bool = False
+    effort: Optional[str] = None
+    display: str = "summarized"
+
+
+REASONING_EFFORT_BUDGET_RATIOS: Dict[str, float] = {
+    "none": 0.0,      # 0% - thinking disabled by API adapters
+    "minimal": 0.10,  # 10% - minimal reasoning
+    "low": 0.20,      # 20% - quick reasoning
+    "medium": 0.50,   # 50% - balanced reasoning
+    "high": 0.80,     # 80% - deep reasoning
+    "xhigh": 0.95,    # 95% - near-maximum reasoning depth
+    "max": 1.0,       # 100% - maximum reasoning depth
+}
+
+
+NATIVE_THINKING_SUPPORTED_MODELS = (
+    "claude-opus-4.8",
+    "claude-opus-4.7",
+    "claude-opus-4.6",
+    "claude-sonnet-4.6",
+)
+
+
+def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
+    """
+    Convert a reasoning effort level to a fake thinking token budget.
+
+    Uses a percentage-based approach that adapts to different max_tokens
+    limits, so the thinking budget scales proportionally with the output limit.
+
+    Args:
+        max_tokens: Maximum output tokens for the request.
+        effort: Reasoning effort level.
+
+    Returns:
+        Thinking budget in tokens.
+
+    Raises:
+        ValueError: If the effort level is not supported.
+
+    Examples:
+        >>> reasoning_effort_to_budget(4096, "high")
+        3276
+        >>> reasoning_effort_to_budget(10000, "medium")
+        5000
+    """
+    try:
+        ratio = REASONING_EFFORT_BUDGET_RATIOS[effort]
+    except KeyError as exc:
+        supported_efforts = ", ".join(sorted(REASONING_EFFORT_BUDGET_RATIOS))
+        raise ValueError(
+            f"Unsupported reasoning effort '{effort}'. Supported values: {supported_efforts}"
+        ) from exc
+
+    return int(max_tokens * ratio)
+
+
+def supports_native_adaptive_thinking(model_id: str) -> bool:
+    """
+    Check whether a Kiro model is known to support native adaptive thinking.
+
+    Args:
+        model_id: Internal Kiro model ID.
+
+    Returns:
+        True when native adaptive thinking should be attempted.
+    """
+    normalized_model = model_id.lower()
+    return any(model in normalized_model for model in NATIVE_THINKING_SUPPORTED_MODELS)
+
+
+def normalize_native_thinking_effort(effort: Optional[str]) -> Optional[str]:
+    """
+    Normalize client effort values to Claude adaptive thinking effort values.
+
+    Args:
+        effort: Client-provided effort level.
+
+    Returns:
+        Native effort level, or None if the value disables or cannot map to
+        native thinking.
+    """
+    if effort is None:
+        return None
+
+    if effort == "none":
+        return None
+
+    if effort == "minimal":
+        return "low"
+
+    if effort in ("low", "medium", "high", "xhigh", "max"):
+        return effort
+
+    logger.warning(f"Unsupported native thinking effort '{effort}'. Native thinking disabled.")
+    return None
+
+
+def build_native_thinking_config(model_id: str, effort: Optional[str]) -> NativeThinkingConfig:
+    """
+    Build native adaptive thinking configuration from model and client effort.
+
+    Respects KIRO_NATIVE_THINKING_MODE: "off" disables it entirely, "auto" only
+    enables when the client requests an effort on a supported model, and "force"
+    enables on supported models even without a client effort (defaulting to
+    "high").
+
+    Args:
+        model_id: Internal Kiro model ID.
+        effort: Client effort level.
+
+    Returns:
+        NativeThinkingConfig for payload construction.
+    """
+    if KIRO_NATIVE_THINKING_MODE == "off":
+        return NativeThinkingConfig(enabled=False)
+
+    if not supports_native_adaptive_thinking(model_id):
+        return NativeThinkingConfig(enabled=False)
+
+    native_effort = normalize_native_thinking_effort(effort)
+    if native_effort is None:
+        if KIRO_NATIVE_THINKING_MODE != "force":
+            return NativeThinkingConfig(enabled=False)
+        native_effort = "high"
+
+    return NativeThinkingConfig(
+        enabled=True,
+        effort=native_effort,
+        display=KIRO_NATIVE_THINKING_DISPLAY,
+    )
+
+
+def apply_native_thinking_fields(
+    payload: Dict[str, Any],
+    native_thinking_config: Optional[NativeThinkingConfig],
+) -> None:
+    """
+    Add native Kiro/Claude adaptive thinking fields to the payload in-place.
+
+    Args:
+        payload: Kiro API payload.
+        native_thinking_config: Native thinking configuration.
+    """
+    if not native_thinking_config or not native_thinking_config.enabled:
+        return
+
+    payload["thinking"] = {
+        "type": "adaptive",
+        "display": native_thinking_config.display,
+    }
+    payload["output_config"] = {
+        "effort": native_thinking_config.effort or "high",
+    }
+    user_input_message = (
+        payload.get("conversationState", {})
+        .get("currentMessage", {})
+        .get("userInputMessage", {})
+    )
+    user_input_message["thinking"] = {
+        "type": "adaptive",
+        "display": native_thinking_config.display,
+    }
+    user_input_message["outputConfig"] = {
+        "effort": native_thinking_config.effort or "high",
+    }
+    logger.info(
+        f"Native adaptive thinking enabled: effort={payload['output_config']['effort']}, "
+        f"display={payload['thinking']['display']}"
+    )
 
 
 @dataclass
@@ -166,8 +352,8 @@ def extract_text_content(content: Any) -> str:
         text_parts = []
         for item in content:
             if isinstance(item, dict):
-                # Skip image and tool_reference blocks - they're handled separately
-                if item.get("type") in ("image", "image_url", "tool_reference"):
+                # Skip non-text blocks handled by adapter-specific extractors.
+                if item.get("type") in ("image", "image_url", "document", "tool_reference"):
                     continue
                 if item.get("type") == "text":
                     text_parts.append(item.get("text", ""))
@@ -441,7 +627,7 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     Sanitizes JSON Schema from fields that Kiro API doesn't accept.
     
     Kiro API returns 400 "Improperly formed request" error if:
-    - required is an empty array []
+    - required is not a non-empty array
     - additionalProperties is present in schema
     
     This function recursively processes the schema and removes problematic fields.
@@ -458,9 +644,11 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     result = {}
     
     for key, value in schema.items():
-        # Skip empty required arrays
-        if key == "required" and isinstance(value, list) and len(value) == 0:
-            continue
+        # Skip invalid or empty required values. Bedrock requires an array
+        # when this field is present, and Kiro rejects empty arrays.
+        if key == "required":
+            if not isinstance(value, list) or len(value) == 0:
+                continue
         
         # Skip additionalProperties - Kiro API doesn't support it
         if key == "additionalProperties":
@@ -557,46 +745,63 @@ def process_tools_with_long_descriptions(
     return processed_tools if processed_tools else None, tool_documentation
 
 
+# Global mapping for tool name truncation (short_name -> original_name).
+# Kiro enforces a 64-char tool-name limit; rather than rejecting requests we
+# shorten long names and restore them on the response path. This is process-wide
+# shared state; md5 suffixes keep shortened names collision-resistant.
+_tool_name_map: Dict[str, str] = {}
+
+
+def _shorten_tool_name(name: str) -> str:
+    """
+    Shorten a tool name to fit the 64-char Kiro API limit using a hash suffix.
+
+    Args:
+        name: Original tool name.
+
+    Returns:
+        The original name if within the limit, otherwise the first 56 chars
+        plus an underscore and a 7-char md5 suffix for uniqueness.
+    """
+    if len(name) <= 64:
+        return name
+    h = hashlib.md5(name.encode()).hexdigest()[:7]
+    return name[:56] + "_" + h
+
+
+def get_original_tool_name(short_name: str) -> str:
+    """
+    Reverse-map a shortened tool name back to its original.
+
+    Args:
+        short_name: Possibly-shortened tool name from an upstream response.
+
+    Returns:
+        The original tool name if a mapping exists, otherwise ``short_name``.
+    """
+    return _tool_name_map.get(short_name, short_name)
+
+
 def validate_tool_names(tools: Optional[List[UnifiedTool]]) -> None:
     """
-    Validates tool names against Kiro API 64-character limit.
-    
-    Logs WARNING for each problematic tool and raises ValueError
-    with complete list of violations.
-    
+    Truncates tool names that exceed the Kiro API 64-character limit.
+
+    Instead of rejecting requests, long names are shortened with a hash suffix
+    and a reverse mapping is stored (see ``_tool_name_map``) so streamed
+    responses can restore the original names via ``get_original_tool_name``.
+
     Args:
-        tools: List of tools to validate
-    
-    Raises:
-        ValueError: If any tool name exceeds 64 characters
-    
-    Example:
-        >>> validate_tool_names([UnifiedTool(name="short_name", description="test")])
-        # No error
-        >>> validate_tool_names([UnifiedTool(name="a" * 70, description="test")])
-        # Raises ValueError with detailed message
+        tools: List of tools to validate/fix (mutated in place).
     """
     if not tools:
         return
-    
-    problematic_tools = []
+
     for tool in tools:
         if len(tool.name) > 64:
-            problematic_tools.append((tool.name, len(tool.name)))
-    
-    if problematic_tools:
-        # Build detailed error message for client (no logging here - routes will log)
-        tool_list = "\n".join([
-            f"  - '{name}' ({length} characters)"
-            for name, length in problematic_tools
-        ])
-        
-        raise ValueError(
-            f"Tool name(s) exceed Kiro API limit of 64 characters:\n"
-            f"{tool_list}\n\n"
-            f"Solution: Use shorter tool names (max 64 characters).\n"
-            f"Example: 'get_user_data' instead of 'get_authenticated_user_profile_data_with_extended_information_about_it'"
-        )
+            short = _shorten_tool_name(tool.name)
+            _tool_name_map[short] = tool.name
+            logger.info(f"Truncated tool name '{tool.name}' -> '{short}'")
+            tool.name = short
 
 
 def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dict[str, Any]]:
@@ -1030,6 +1235,31 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
             )
             
             if not has_preceding_assistant:
+                # Search backwards for a matching assistant with tool_calls.
+                # Handles cases where user messages are interleaved between
+                # function_call and function_call_output (e.g. Codex Responses API).
+                tool_result_ids = {tr.get('tool_use_id') for tr in msg.tool_results}
+                matching_idx = None
+                for idx in range(len(result) - 1, -1, -1):
+                    candidate = result[idx]
+                    if candidate.role == "assistant" and candidate.tool_calls:
+                        candidate_ids = {tc.get('id') for tc in candidate.tool_calls}
+                        if tool_result_ids & candidate_ids:
+                            matching_idx = idx
+                            break
+
+                if matching_idx is not None:
+                    # Found a matching assistant further back - reorder by inserting
+                    # the tool_result message right after the matching assistant.
+                    logger.debug(
+                        f"Reordering {len(msg.tool_results)} tool_results to follow "
+                        f"matching assistant at position {matching_idx}. "
+                        f"Tool IDs: {[tr.get('tool_use_id', 'unknown') for tr in msg.tool_results]}"
+                    )
+                    result.insert(matching_idx + 1, msg)
+                    continue
+
+                # No matching assistant found anywhere - convert to text.
                 # We cannot create a valid synthetic assistant message because we don't know
                 # the original tool name and arguments. Kiro API validates tool names.
                 # Convert tool_results to text to preserve context for the model.
@@ -1409,7 +1639,8 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    native_thinking_config: Optional["NativeThinkingConfig"] = None,
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1444,7 +1675,7 @@ def build_kiro_payload(
         full_system_prompt = full_system_prompt + tool_documentation if full_system_prompt else tool_documentation.strip()
     
     # Add thinking mode legitimization to system prompt if enabled
-    thinking_system_addition = get_thinking_system_prompt_addition()
+    thinking_system_addition = get_thinking_system_prompt_addition() if thinking_config.enabled else ""
     if thinking_system_addition:
         full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
     
@@ -1576,6 +1807,8 @@ def build_kiro_payload(
         }
     }
     
+    apply_native_thinking_fields(payload, native_thinking_config)
+
     # Add history only if not empty
     if history:
         payload["conversationState"]["history"] = history

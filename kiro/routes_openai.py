@@ -27,7 +27,13 @@ Contains all API endpoints:
 """
 
 import json
+import time
 from datetime import datetime, timezone
+from typing import Dict, Optional
+
+# Consecutive-failure count at which an account's circuit is considered tripped.
+# Mirrors the threshold used by the admin usage endpoint for a consistent view.
+CIRCUIT_TRIP_THRESHOLD = 3
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -43,12 +49,14 @@ from kiro.models_openai import (
     OpenAIModel,
     ModelList,
     ChatCompletionRequest,
+    ResponsesRequest,
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
-from kiro.converters_openai import build_kiro_payload
+from kiro.converters_openai import build_kiro_payload, convert_responses_request_to_chat
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
+from kiro.streaming_responses import collect_responses_response, stream_kiro_to_responses
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
@@ -62,28 +70,46 @@ except ImportError:
 
 
 # --- Security scheme ---
+# Authorization: Bearer (OpenAI native)
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+# x-api-key (Anthropic native) — for clients that auto-detect the auth header
+# by api_mode and send x-api-key for /v1/models too (e.g. hermes-cli with
+# api_mode: anthropic_messages). See #162, #188.
+x_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 
-async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
+async def verify_api_key(
+    auth_header: Optional[str] = Security(api_key_header),
+    x_api_key: Optional[str] = Security(x_api_key_header),
+) -> bool:
     """
-    Verify API key in Authorization header.
-    
-    Expects format: "Bearer {PROXY_API_KEY}"
-    
+    Verify API key for OpenAI-compatible endpoints.
+
+    Supports two authentication methods:
+    1. ``Authorization: Bearer {PROXY_API_KEY}`` (OpenAI native)
+    2. ``x-api-key: {PROXY_API_KEY}`` (Anthropic native, for clients that
+       send the same header for both /v1/models and /v1/messages)
+
     Args:
         auth_header: Authorization header value
-    
+        x_api_key: x-api-key header value
+
     Returns:
         True if key is valid
-    
+
     Raises:
-        HTTPException: 401 if key is invalid or missing
+        HTTPException: 401 if neither header has a valid key
     """
-    if not auth_header or auth_header != f"Bearer {PROXY_API_KEY}":
-        logger.warning("Access attempt with invalid API key.")
-        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
-    return True
+    # Check Authorization: Bearer first (OpenAI native)
+    if auth_header and auth_header == f"Bearer {PROXY_API_KEY}":
+        return True
+
+    # Fall back to x-api-key (Anthropic native)
+    if x_api_key and x_api_key == PROXY_API_KEY:
+        return True
+
+    logger.warning("Access attempt with invalid API key.")
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
 # --- Router ---
@@ -106,18 +132,65 @@ async def root():
 
 
 @router.get("/health")
-async def health():
+async def health(request: Request):
     """
-    Detailed health check.
-    
+    Detailed health check with runtime and account-pool diagnostics.
+
+    Reports liveness plus optional, best-effort operational signals so
+    operators and uptime probes can see version, uptime, and account-pool
+    health at a glance. All pool/runtime fields are computed defensively:
+    if the account system is not ready they are simply omitted, and the
+    endpoint always returns 200 with at least status/version/timestamp.
+
+    Args:
+        request: FastAPI Request for accessing app.state.
+
     Returns:
-        Status, timestamp and version
+        A JSON-serializable dict with status, version, timestamp, uptime,
+        and (when available) account-pool summary.
     """
-    return {
+    payload: Dict[str, object] = {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
+
+    # Uptime (best-effort; start_time is set in the lifespan startup).
+    start_time = getattr(request.app.state, "start_time", None)
+    if isinstance(start_time, (int, float)):
+        payload["uptime_seconds"] = round(time.time() - start_time, 3)
+
+    # Account-pool summary (best-effort; never fail the health check).
+    account_system = getattr(request.app.state, "account_system", None)
+    payload["account_system"] = bool(account_system)
+
+    manager = getattr(request.app.state, "account_manager", None)
+    if manager is not None:
+        try:
+            accounts = manager.get_all_accounts()
+            initialized = sum(1 for a in accounts if a.auth_manager is not None)
+            healthy = sum(
+                1 for a in accounts
+                if a.auth_manager is not None and a.failures < CIRCUIT_TRIP_THRESHOLD
+            )
+            pool = {
+                "total": len(accounts),
+                "initialized": initialized,
+                "healthy": healthy,
+            }
+            try:
+                pool["models_available"] = len(manager.get_all_available_models())
+            except (AttributeError, RuntimeError) as exc:
+                logger.debug(f"/health: could not collect available models: {exc}")
+            payload["accounts"] = pool
+
+            # Degraded (not unhealthy) when accounts exist but none are usable.
+            if accounts and healthy == 0:
+                payload["status"] = "degraded"
+        except (AttributeError, RuntimeError) as exc:
+            logger.debug(f"/health: account pool summary unavailable: {exc}")
+
+    return payload
 
 @router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
 async def get_models(request: Request):
@@ -143,13 +216,41 @@ async def get_models(request: Request):
         # Legacy: use resolver from first account
         account = request.app.state.account_manager.get_first_account()
         available_model_ids = account.model_resolver.get_available_models()
-    
+
+    # Merge tokenLimits from every initialized account's model_cache so the
+    # response exposes per-model ceilings (see OpenAIModel docstring). If the
+    # same model appears across multiple accounts we keep the largest limits
+    # observed (callers care about "what's possible", not the strictest tier).
+    token_limits_by_model: Dict[str, Dict[str, int]] = {}
+    try:
+        for account in request.app.state.account_manager.iter_initialized_accounts():
+            cache = getattr(account, "model_cache", None)
+            if not cache:
+                continue
+            for mid in cache.get_all_model_ids():
+                limits = cache.get_token_limits(mid)
+                if not limits:
+                    continue
+                current = token_limits_by_model.setdefault(mid, {})
+                for src, dst in (
+                    ("maxInputTokens", "max_input_tokens"),
+                    ("maxOutputTokens", "max_output_tokens"),
+                ):
+                    val = limits.get(src)
+                    if isinstance(val, int) and val > current.get(dst, 0):
+                        current[dst] = val
+    except Exception as exc:  # pragma: no cover — defensive; never fail /v1/models
+        logger.warning(f"Failed to merge tokenLimits for /v1/models: {exc}")
+
     # Build OpenAI-compatible model list
     openai_models = [
         OpenAIModel(
             id=model_id,
             owned_by="anthropic",
-            description="Claude model via Kiro API"
+            description="Claude model via Kiro API",
+            context_length=token_limits_by_model.get(model_id, {}).get("max_input_tokens"),
+            max_input_tokens=token_limits_by_model.get(model_id, {}).get("max_input_tokens"),
+            max_output_tokens=token_limits_by_model.get(model_id, {}).get("max_output_tokens"),
         )
         for model_id in available_model_ids
     ]
@@ -323,8 +424,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             conversation_id = generate_conversation_id()
             
             # Build payload for Kiro
-            # profileArn is required by runtime.kiro.dev for all auth types
-            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+            # profileArn handling by auth type (see #168, #150):
+            # - Builder ID (AWS_SSO_OIDC) has no native profileArn; sending it
+            #   causes a 403, so only an explicitly configured PROFILE_ARN is used.
+            # - Kiro Desktop / Enterprise IDE: use native profileArn, fall back to env.
+            if auth_manager.auth_type == AuthType.AWS_SSO_OIDC:
+                profile_arn_for_payload = PROFILE_ARN or ""
+            else:
+                profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
             
             try:
                 kiro_payload = build_kiro_payload(
@@ -571,8 +678,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is required by runtime.kiro.dev for all auth types
-    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+    # profileArn handling by auth type (see #168, #150):
+    # - Builder ID (AWS_SSO_OIDC) has no native profileArn; sending it
+    #   causes a 403, so only an explicitly configured PROFILE_ARN is used.
+    # - Kiro Desktop / Enterprise IDE: use native profileArn, fall back to env.
+    if auth_manager.auth_type == AuthType.AWS_SSO_OIDC:
+        profile_arn_for_payload = PROFILE_ARN or ""
+    else:
+        profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
     
     try:
         kiro_payload = build_kiro_payload(
@@ -765,6 +878,331 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         # Log access log for internal error
         logger.error(f"HTTP 500 - POST /v1/chat/completions - {str(e)[:100]}")
         # Flush debug logs on internal error ("errors" mode)
+        if debug_logger:
+            debug_logger.flush_on_error(500, str(e))
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+
+def _profile_arn_for_auth(auth_manager: KiroAuthManager) -> str:
+    """
+    Resolve the profileArn to send for the given auth type.
+
+    Builder ID (AWS_SSO_OIDC) accounts have no native profileArn; sending one
+    causes a 403 (see #168), so only an explicitly configured PROFILE_ARN is
+    used. Other auth types use the native profileArn with an env fallback.
+
+    Args:
+        auth_manager: The selected account's auth manager.
+
+    Returns:
+        The profileArn string to embed in the Kiro payload (may be empty).
+    """
+    if auth_manager.auth_type == AuthType.AWS_SSO_OIDC:
+        return PROFILE_ARN or ""
+    return auth_manager.profile_arn or PROFILE_ARN or ""
+
+
+@router.post("/v1/responses", dependencies=[Depends(verify_api_key)])
+async def responses(request: Request, request_data: ResponsesRequest):
+    """
+    Responses endpoint - compatible with OpenAI Responses API.
+
+    Accepts Responses API input items and translates them to Kiro API through
+    the existing Chat Completions conversion path. Supports streaming semantic
+    Responses API SSE events and non-streaming response objects.
+
+    Args:
+        request: FastAPI Request for accessing app.state.
+        request_data: Request in OpenAI Responses API format.
+
+    Returns:
+        StreamingResponse for streaming mode.
+        JSONResponse for non-streaming mode.
+
+    Raises:
+        HTTPException: On validation or API errors.
+    """
+    logger.info(f"Request to /v1/responses (model={request_data.model}, stream={request_data.stream})")
+
+    try:
+        chat_request = convert_responses_request_to_chat(request_data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    async def send_with_account(auth_manager, model_cache, account_id=None):
+        """Send a Responses request through a selected account."""
+        conversation_id = generate_conversation_id()
+        profile_arn_for_payload = _profile_arn_for_auth(auth_manager)
+
+        try:
+            kiro_payload = build_kiro_payload(
+                chat_request,
+                conversation_id,
+                profile_arn_for_payload
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        try:
+            kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
+            if debug_logger:
+                debug_logger.log_kiro_request_body(kiro_request_body)
+        except Exception as e:
+            logger.warning(f"Failed to log Kiro request: {e}")
+
+        url = f"{auth_manager.api_host}/generateAssistantResponse"
+        if account_id:
+            logger.debug(f"Kiro API URL: {url} (account: {account_id})")
+        else:
+            logger.debug(f"Kiro API URL: {url}")
+
+        if request_data.stream:
+            http_client = KiroHttpClient(auth_manager, shared_client=None)
+        else:
+            shared_client = request.app.state.http_client
+            http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+
+        try:
+            response = await http_client.request_with_retry(
+                "POST",
+                url,
+                kiro_payload,
+                stream=True
+            )
+        except HTTPException:
+            await http_client.close()
+            raise
+        except Exception:
+            await http_client.close()
+            raise
+
+        messages_for_tokenizer = [msg.model_dump() for msg in chat_request.messages]
+        tools_for_tokenizer = [tool.model_dump() for tool in chat_request.tools] if chat_request.tools else None
+
+        if response.status_code == 200:
+            if request_data.stream:
+                async def stream_wrapper():
+                    streaming_error = None
+                    client_disconnected = False
+                    try:
+                        async for chunk in stream_kiro_to_responses(
+                            http_client.client,
+                            response,
+                            request_data.model,
+                            model_cache,
+                            auth_manager,
+                            request_messages=messages_for_tokenizer,
+                            request_tools=tools_for_tokenizer
+                        ):
+                            yield chunk
+                    except GeneratorExit:
+                        client_disconnected = True
+                        logger.debug("Client disconnected during Responses streaming")
+                    except Exception as e:
+                        streaming_error = e
+                        try:
+                            yield "data: [DONE]\n\n"
+                        except Exception:
+                            pass
+                        raise
+                    finally:
+                        await http_client.close()
+                        if streaming_error:
+                            error_type = type(streaming_error).__name__
+                            error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
+                            logger.error(f"HTTP 500 - POST /v1/responses (streaming) - [{error_type}] {error_msg[:100]}")
+                        elif client_disconnected:
+                            logger.info("HTTP 200 - POST /v1/responses (streaming) - client disconnected")
+                        else:
+                            logger.info("HTTP 200 - POST /v1/responses (streaming) - completed")
+                        if debug_logger:
+                            if streaming_error:
+                                debug_logger.flush_on_error(500, str(streaming_error))
+                            else:
+                                debug_logger.discard_buffers()
+
+                return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
+
+            responses_response = await collect_responses_response(
+                http_client.client,
+                response,
+                request_data.model,
+                model_cache,
+                auth_manager,
+                request_messages=messages_for_tokenizer,
+                request_tools=tools_for_tokenizer
+            )
+
+            await http_client.close()
+            logger.info("HTTP 200 - POST /v1/responses (non-streaming) - completed")
+
+            if debug_logger:
+                debug_logger.discard_buffers()
+
+            return JSONResponse(content=responses_response)
+
+        try:
+            error_content = await response.aread()
+        except Exception:
+            error_content = b"Unknown error"
+
+        await http_client.close()
+        error_text = error_content.decode('utf-8', errors='replace')
+        error_reason = None
+        error_message = error_text
+
+        try:
+            error_json = json.loads(error_text)
+            from kiro.kiro_errors import enhance_kiro_error
+            error_info = enhance_kiro_error(error_json)
+            error_reason = error_info.reason
+            error_message = error_info.user_message
+            logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+        return {
+            "status_code": response.status_code,
+            "message": error_message,
+            "reason": error_reason,
+        }
+
+    if request.app.state.account_system:
+        from kiro.account_errors import classify_error, ErrorType
+
+        account_manager = request.app.state.account_manager
+        all_accounts = list(account_manager._accounts.keys())
+        max_attempts = len(all_accounts) * 2
+        tried_accounts = set()
+        last_error_message = None
+        last_error_status = None
+
+        for _ in range(max_attempts):
+            account = await account_manager.get_next_account(
+                request_data.model,
+                exclude_accounts=tried_accounts
+            )
+
+            if account is None:
+                if len(all_accounts) == 1:
+                    raise HTTPException(
+                        status_code=last_error_status or 503,
+                        detail=last_error_message or "Account unavailable"
+                    )
+
+                detail = "No available accounts for this model."
+                if last_error_message:
+                    detail += f" Error from last account: {last_error_message}"
+                raise HTTPException(status_code=503, detail=detail)
+
+            tried_accounts.add(account.id)
+
+            try:
+                result = await send_with_account(account.auth_manager, account.model_cache, account.id)
+
+                if isinstance(result, (JSONResponse, StreamingResponse)):
+                    await account_manager.report_success(account.id, request_data.model)
+                    return result
+
+                last_error_status = result["status_code"]
+                last_error_message = result["message"]
+                error_type = classify_error(last_error_status, result["reason"])
+
+                await account_manager.report_failure(
+                    account.id,
+                    request_data.model,
+                    error_type,
+                    last_error_status,
+                    result["reason"]
+                )
+
+                if error_type == ErrorType.FATAL:
+                    logger.warning(f"HTTP {last_error_status} - POST /v1/responses - {last_error_message[:100]}")
+                    if debug_logger:
+                        debug_logger.flush_on_error(last_error_status, last_error_message)
+                    return JSONResponse(
+                        status_code=last_error_status,
+                        content={
+                            "error": {
+                                "message": last_error_message,
+                                "type": "kiro_api_error",
+                                "code": last_error_status,
+                            }
+                        }
+                    )
+
+                if len(all_accounts) == 1:
+                    break
+
+            except HTTPException as e:
+                if e.status_code in (502, 504):
+                    await account_manager.report_failure(
+                        account.id,
+                        request_data.model,
+                        ErrorType.RECOVERABLE,
+                        e.status_code,
+                        None
+                    )
+
+                    last_error_message = str(e.detail)
+                    last_error_status = e.status_code
+
+                    if len(all_accounts) == 1:
+                        break
+
+                    logger.warning(f"Network error on account {account.id}, trying next account")
+                    continue
+
+                logger.error(f"HTTP {e.status_code} - POST /v1/responses - {e.detail}")
+                if debug_logger:
+                    debug_logger.flush_on_error(e.status_code, str(e.detail))
+                raise
+
+        if len(all_accounts) == 1:
+            raise HTTPException(
+                status_code=last_error_status,
+                detail=last_error_message
+            )
+
+        detail = "All accounts failed after full circle."
+        if last_error_message:
+            detail += f" Error from last account: {last_error_message}"
+        raise HTTPException(status_code=503, detail=detail)
+
+    account = request.app.state.account_manager.get_first_account()
+    if not account.auth_manager:
+        logger.error("No initialized accounts available (legacy mode)")
+        raise HTTPException(503, "No initialized accounts available")
+
+    try:
+        result = await send_with_account(account.auth_manager, account.model_cache)
+        if isinstance(result, (JSONResponse, StreamingResponse)):
+            return result
+
+        logger.warning(f"HTTP {result['status_code']} - POST /v1/responses - {result['message'][:100]}")
+        if debug_logger:
+            debug_logger.flush_on_error(result["status_code"], result["message"])
+        return JSONResponse(
+            status_code=result["status_code"],
+            content={
+                "error": {
+                    "message": result["message"],
+                    "type": "kiro_api_error",
+                    "code": result["status_code"],
+                }
+            }
+        )
+
+    except HTTPException as e:
+        if e.status_code in (502, 504):
+            logger.warning("Network error (legacy mode, no failover available)")
+        logger.error(f"HTTP {e.status_code} - POST /v1/responses - {e.detail}")
+        if debug_logger:
+            debug_logger.flush_on_error(e.status_code, str(e.detail))
+        raise
+    except Exception as e:
+        logger.error(f"Internal error: {e}", exc_info=True)
+        logger.error(f"HTTP 500 - POST /v1/responses - {str(e)[:100]}")
         if debug_logger:
             debug_logger.flush_on_error(500, str(e))
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")

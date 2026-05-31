@@ -135,6 +135,11 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+
+    # Add profileArn if available (required for Enterprise accounts, see #168, #173).
+    # profileArn goes at the top level of the request body, not inside params.
+    if auth_manager.profile_arn:
+        mcp_request["profileArn"] = auth_manager.profile_arn
     
     # Log MCP request
     try:
@@ -147,21 +152,32 @@ async def call_kiro_mcp_api(
     try:
         token = await auth_manager.get_access_token()
         
-        # EXACT headers from architecture
+        # EXACT headers from architecture + profileArn (required by runtime.kiro.dev)
         headers = {
             "Authorization": f"Bearer {token}",
             "x-amzn-codewhisperer-optout": "false",
             "Content-Type": "application/json"
         }
+
+        # Add profileArn header for runtime.kiro.dev / Enterprise accounts.
+        # The body-level profileArn is set above; runtime.kiro.dev also expects it
+        # as a header. Fall back to the env-configured PROFILE_ARN when the auth
+        # manager has none (#168, #173, #181).
+        from kiro.config import PROFILE_ARN
+        profile_arn = auth_manager.profile_arn or PROFILE_ARN or ""
+        if profile_arn:
+            headers["x-amzn-codewhisperer-profile-arn"] = profile_arn
+            mcp_request["profileArn"] = profile_arn
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        from kiro.config import get_ssl_verify
+        async with httpx.AsyncClient(timeout=60.0, verify=get_ssl_verify()) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                logger.error(f"MCP API error: {response.status_code} - {response.text[:500]}")
                 return None, None
             
             mcp_response = response.json()

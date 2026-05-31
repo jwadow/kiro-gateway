@@ -25,6 +25,11 @@ from kiro.converters_anthropic import (
     convert_anthropic_tools,
     anthropic_to_kiro,
     extract_thinking_config_from_anthropic,
+    extract_text_from_pdf_base64,
+    extract_documents_from_anthropic_content,
+    build_tool_choice_prompt_addition,
+    extract_json_schema_output_config,
+    build_json_schema_prompt_addition,
 )
 from kiro.converters_core import UnifiedMessage, UnifiedTool
 from kiro.models_anthropic import (
@@ -32,6 +37,7 @@ from kiro.models_anthropic import (
     AnthropicMessage,
     AnthropicTool,
     TextContentBlock,
+    RedactedThinkingContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     SystemContentBlock,
@@ -111,6 +117,27 @@ class TestConvertAnthropicContentToText:
 
         print(f"Comparing result: Expected 'Hello World', Got '{result}'")
         assert result == "Hello World"
+
+    def test_ignores_redacted_thinking_blocks(self):
+        """
+        What it does: Verifies redacted_thinking payloads are not extracted as text.
+        Purpose: Accept Anthropic replay blocks without leaking opaque reasoning
+        data into the prompt sent to Kiro (#164).
+        """
+        print("Setup: List with text and redacted_thinking blocks...")
+        content = [
+            TextContentBlock(text="Visible answer"),
+            RedactedThinkingContentBlock(data="encrypted-thinking-payload"),
+            {"type": "text", "text": " continues"},
+            {"type": "redacted_thinking", "data": "another-encrypted-payload"},
+        ]
+
+        print("Action: Extracting text...")
+        result = convert_anthropic_content_to_text(content)
+
+        print(f"Comparing result: Expected 'Visible answer continues', Got '{result}'")
+        assert result == "Visible answer continues"
+        assert "encrypted" not in result
 
     def test_handles_none(self):
         """
@@ -943,6 +970,207 @@ class TestExtractToolUsesFromAnthropicContent:
 # ==================================================================================================
 
 
+class TestDocumentExtraction:
+    """Tests for Anthropic document block extraction (PDF/text -> prompt text)."""
+
+    # Minimal hand-crafted PDF containing the literal "Hello PDF World" in a
+    # Tj text operator. Recoverable by pypdf and by the regex fallback.
+    _MINIMAL_PDF_BYTES = (
+        b"%PDF-1.4\n"
+        b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+        b"/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"
+        b"4 0 obj<</Length 46>>stream\n"
+        b"BT /F1 24 Tf 100 700 Td (Hello PDF World) Tj ET\n"
+        b"endstream endobj\n"
+        b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n"
+        b"%%EOF"
+    )
+
+    def _b64(self, raw: bytes) -> str:
+        import base64
+        return base64.b64encode(raw).decode("ascii")
+
+    def test_extracts_text_from_pdf_base64(self):
+        """
+        What it does: Extracts text from a base64 PDF document.
+        Purpose: Core of Issue #176 - Claude Code attaches PDFs as document
+        blocks; the gateway must surface their text since Kiro has no native
+        document input.
+        """
+        print("Action: extracting text from a minimal PDF...")
+        result = extract_text_from_pdf_base64(self._b64(self._MINIMAL_PDF_BYTES))
+        print(f"Extracted: {result!r}")
+        assert "Hello PDF World" in result
+
+    def test_invalid_pdf_returns_placeholder_not_raise(self):
+        """
+        What it does: Garbage PDF bytes yield a placeholder string, no exception.
+        Purpose: A malformed document must never crash the request pipeline.
+        """
+        result = extract_text_from_pdf_base64(self._b64(b"not a real pdf"))
+        print(f"Extracted: {result!r}")
+        assert isinstance(result, str)
+        assert result.startswith("[PDF")
+
+    def test_document_block_pdf_is_labeled(self):
+        """
+        What it does: A document block with a PDF source becomes labeled text.
+        Purpose: Output is attributed so the model knows it is a document.
+        """
+        content = [{
+            "type": "document",
+            "title": "Report",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": self._b64(self._MINIMAL_PDF_BYTES),
+            },
+        }]
+        result = extract_documents_from_anthropic_content(content)
+        print(f"Extracted: {result!r}")
+        assert "[Document: Report]" in result
+        assert "Hello PDF World" in result
+
+    def test_text_plain_document_extracted(self):
+        """
+        What it does: A base64 text/plain document is decoded to its content.
+        Purpose: Non-PDF text documents are still surfaced.
+        """
+        content = [{
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "text/plain",
+                "data": self._b64("plain notes here".encode("utf-8")),
+            },
+        }]
+        result = extract_documents_from_anthropic_content(content)
+        assert "plain notes here" in result
+
+    def test_unsupported_media_type_reports_bytes(self):
+        """
+        What it does: An unsupported media type yields a byte-count placeholder.
+        Purpose: Avoid silently dropping unknown documents.
+        """
+        content = [{
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/zip",
+                "data": self._b64(b"PK\x03\x04somezip"),
+            },
+        }]
+        result = extract_documents_from_anthropic_content(content)
+        assert "unsupported for application/zip" in result
+
+    def test_url_document_source_unsupported_note(self):
+        """
+        What it does: A URL document source produces a 'not supported' note.
+        Purpose: Kiro Gateway does not fetch remote documents.
+        """
+        content = [{
+            "type": "document",
+            "source": {"type": "url", "url": "https://example.com/doc.pdf"},
+        }]
+        result = extract_documents_from_anthropic_content(content)
+        assert "not supported" in result
+        assert "https://example.com/doc.pdf" in result
+
+    def test_document_nested_in_tool_result_extracted(self):
+        """
+        What it does: A document nested inside a tool_result is extracted.
+        Purpose: Tools may return documents; their text must be surfaced too.
+        """
+        content = [{
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": [
+                {"type": "text", "text": "see attached"},
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "text/plain",
+                        "data": self._b64("nested doc body".encode("utf-8")),
+                    },
+                },
+            ],
+        }]
+        result = extract_documents_from_anthropic_content(content)
+        assert "nested doc body" in result
+
+    def test_no_documents_returns_empty(self):
+        """
+        What it does: Content without document blocks yields an empty string.
+        Purpose: The extractor must be a no-op for ordinary messages.
+        """
+        assert extract_documents_from_anthropic_content([{"type": "text", "text": "hi"}]) == ""
+        assert extract_documents_from_anthropic_content("just a string") == ""
+
+
+class TestStructuredOutputPromptAdditions:
+    """Tests for tool_choice / json_schema prompt guidance (#163)."""
+
+    def test_tool_choice_any_addition_names_first_tool(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=64,
+            messages=[AnthropicMessage(role="user", content="hi")],
+            tools=[AnthropicTool(name="get_weather", description="d", input_schema={"type": "object"})],
+            tool_choice={"type": "any"},
+        )
+        addition = build_tool_choice_prompt_addition(request)
+        assert "get_weather" in addition
+
+    def test_tool_choice_specific_tool_addition(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=64,
+            messages=[AnthropicMessage(role="user", content="hi")],
+            tools=[
+                AnthropicTool(name="a", description="d", input_schema={"type": "object"}),
+                AnthropicTool(name="b", description="d", input_schema={"type": "object"}),
+            ],
+            tool_choice={"type": "tool", "name": "b"},
+        )
+        addition = build_tool_choice_prompt_addition(request)
+        assert "`b`" in addition
+
+    def test_tool_choice_auto_no_addition(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=64,
+            messages=[AnthropicMessage(role="user", content="hi")],
+            tools=[AnthropicTool(name="a", description="d", input_schema={"type": "object"})],
+            tool_choice={"type": "auto"},
+        )
+        assert build_tool_choice_prompt_addition(request) == ""
+
+    def test_json_schema_output_config_extracted_and_prompted(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=64,
+            messages=[AnthropicMessage(role="user", content="hi")],
+            output_config={"format": {"type": "json_schema", "schema": {"type": "object"}}},
+        )
+        schema = extract_json_schema_output_config(request)
+        assert schema == {"type": "object"}
+        addition = build_json_schema_prompt_addition(schema)
+        assert "valid JSON object" in addition
+
+    def test_json_schema_absent_returns_none(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=64,
+            messages=[AnthropicMessage(role="user", content="hi")],
+        )
+        assert extract_json_schema_output_config(request) is None
+        assert build_json_schema_prompt_addition(None) == ""
+
+
 class TestConvertAnthropicMessages:
     """Tests for convert_anthropic_messages function."""
 
@@ -1470,6 +1698,42 @@ class TestAnthropicToKiro:
         assert "currentMessage" in result["conversationState"]
         assert "userInputMessage" in result["conversationState"]["currentMessage"]
         assert result["profileArn"] == "arn:aws:test"
+
+    def test_inline_system_role_is_normalized_to_user(self):
+        """
+        What it does: Verifies that an inline 'system' role in messages is
+        accepted and normalized to 'user' downstream.
+        Purpose: Some clients (e.g., Claude Code on certain model ids) emit
+        a 'system' message inline rather than using the top-level system
+        field. The schema accepts it; normalize_message_roles collapses it
+        to 'user' so the upstream Kiro payload only contains user/assistant.
+        """
+        print("Setup: Request with inline system message between user turns...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            messages=[
+                AnthropicMessage(role="user", content="hello"),
+                AnthropicMessage(role="system", content="<reminder>be concise</reminder>"),
+                AnthropicMessage(role="user", content="ok thanks"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-4.8",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        print(f"Result: {result}")
+        history = result["conversationState"].get("history", [])
+        print(f"History entries: {len(history)}")
+        for entry in history:
+            assert "userInputMessage" in entry or "assistantResponseMessage" in entry, (
+                f"Unexpected history entry shape: {entry}"
+            )
 
     def test_includes_system_prompt(self):
         """

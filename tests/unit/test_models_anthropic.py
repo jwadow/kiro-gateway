@@ -19,6 +19,7 @@ from kiro.models_anthropic import (
     # Content blocks
     TextContentBlock,
     ThinkingContentBlock,
+    RedactedThinkingContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
@@ -387,6 +388,60 @@ class TestContentBlockUnion:
         print(f"Comparing type: Expected 'tool_result', Got '{block.type}'")
         assert block.type == "tool_result"
 
+    def test_accepts_redacted_thinking_content_block(self):
+        """
+        What it does: Verifies ContentBlock accepts redacted_thinking blocks.
+        Purpose: Ensure replayed Anthropic extended thinking does not 422 (#164).
+        """
+        print("Setup: Creating RedactedThinkingContentBlock...")
+        block: ContentBlock = RedactedThinkingContentBlock(data="encrypted-opaque-payload")
+
+        print(f"Result: {block}")
+        assert block.type == "redacted_thinking"
+        assert block.data == "encrypted-opaque-payload"
+
+    def test_message_with_redacted_thinking_validates(self):
+        """
+        What it does: A message carrying a redacted_thinking block validates.
+        Purpose: Clients replay these blocks; the schema must accept them.
+        """
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "text", "text": "answer"},
+            ],
+        )
+        assert message.content[0].type == "redacted_thinking"
+        assert message.content[1].type == "text"
+
+    def test_accepts_server_tool_use_and_web_search_result_blocks(self):
+        """
+        What it does: A message replaying Anthropic server-side tool history
+        (server_tool_use + web_search_tool_result) validates without a 422.
+        Purpose: Claude Code includes these blocks in assistant history after
+        native web_search runs; the gateway must accept them (#177).
+        """
+        print("Setup: assistant message with server tool history blocks...")
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"type": "text", "text": "Let me search."},
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "kiro"}},
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srv_1",
+                    "content": [
+                        {"type": "web_search_result", "title": "Kiro", "url": "https://example.com"},
+                    ],
+                },
+            ],
+        )
+        assert message.content[1].type == "server_tool_use"
+        assert message.content[1].name == "web_search"
+        assert message.content[2].type == "web_search_tool_result"
+        assert message.content[2].tool_use_id == "srv_1"
+
 
 # ==================================================================================================
 # Tests for AnthropicMessage with Image Content (Issue #30 fix verification)
@@ -620,6 +675,184 @@ class TestAnthropicMessagesRequestWithImages:
         assert request.messages[2].content == "Can you describe it in more detail?"
         
         print("Multi-turn conversation with images validated successfully!")
+
+
+# ==================================================================================================
+# Tests for inline non-standard message roles (Issue #190)
+# ==================================================================================================
+
+class TestAnthropicMessageInlineRoles:
+    """
+    Tests for AnthropicMessage with inline non-standard roles.
+
+    These tests verify the fix for Issue #190 - 422 Validation Error
+    when newer Claude Code clients inline a message with role "system"
+    inside the messages array.
+
+    The role field is intentionally a free-form str: unknown roles such
+    as "system" and "developer" are normalized to "user" downstream by
+    converters_core.normalize_message_roles(). This is strictly broader
+    than hardcoding a closed Literal set, so novel roles never 422.
+    """
+
+    def test_message_with_system_role_validates(self):
+        """
+        What it does: Verifies AnthropicMessage accepts role "system".
+        Purpose: This is the PRIMARY test for the Issue #190 fix.
+
+        Before the fix, this raised a ValidationError because role was
+        declared as Literal["user", "assistant"].
+        """
+        print("Setup: Creating AnthropicMessage with role 'system'...")
+        message = AnthropicMessage(
+            role="system",
+            content="<system-reminder>context blob</system-reminder>"
+        )
+
+        print(f"Comparing role: Expected 'system', Got '{message.role}'")
+        assert message.role == "system"
+        assert message.content == "<system-reminder>context blob</system-reminder>"
+
+    def test_message_with_developer_role_validates(self):
+        """
+        What it does: Verifies other non-standard roles also validate.
+        Purpose: Ensure the field is leniently typed, not just patched
+        for the single "system" value. normalize_message_roles() collapses
+        any non user/assistant role to "user" downstream.
+        """
+        print("Setup: Creating AnthropicMessage with role 'developer'...")
+        message = AnthropicMessage(role="developer", content="some context")
+
+        print(f"Comparing role: Expected 'developer', Got '{message.role}'")
+        assert message.role == "developer"
+
+    def test_standard_roles_still_validate(self):
+        """
+        What it does: Verifies user/assistant roles are unaffected.
+        Purpose: Guard against regressions in the common path.
+        """
+        assert AnthropicMessage(role="user", content="hi").role == "user"
+        assert AnthropicMessage(role="assistant", content="hello").role == "assistant"
+
+    def test_request_with_inline_system_message_validates(self):
+        """
+        What it does: Verifies the exact Issue #190 request validates.
+        Purpose: End-to-end validation for the failing Claude Code payload
+        that carries an inline role "system" message at index 1.
+        """
+        print("Setup: Creating request with inline 'system' role message...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=16,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "<system-reminder>...</system-reminder>"},
+            ],
+        )
+
+        print(f"Comparing roles: Got {[m.role for m in request.messages]}")
+        assert [m.role for m in request.messages] == ["user", "system"]
+
+
+# ==================================================================================================
+# Tests for unknown content block sanitization (Issue #82 / forward-compat)
+# ==================================================================================================
+
+class TestUnknownContentBlockSanitization:
+    """
+    Tests for downgrading unknown content blocks to text blocks.
+
+    Some clients emit content blocks whose ``type`` is not part of the
+    Anthropic spec. Rather than 422-ing the whole request, the gateway
+    downgrades unknown blocks to text (preserving identifying info) via a
+    model_validator(mode="before"). Known types pass through untouched.
+    """
+
+    def test_unknown_top_level_block_downgraded_to_text(self):
+        """
+        What it does: An unknown block type in a message's content list is
+        converted to a text block instead of failing validation.
+        Purpose: Forward-compatibility with new/unsupported block kinds.
+        """
+        print("Setup: Message with an unknown 'mystery_widget' block...")
+        message = AnthropicMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "hi"},
+                {"type": "mystery_widget", "text": "payload"},
+            ],
+        )
+
+        assert message.content[0].type == "text"
+        assert message.content[0].text == "hi"
+        # Unknown block downgraded, identifying info preserved.
+        assert message.content[1].type == "text"
+        assert message.content[1].text == "[mystery_widget: payload]"
+
+    def test_unknown_block_without_text_uses_type_only(self):
+        """
+        What it does: An unknown block with no text/name fields produces a
+        bare "[type]" text marker.
+        Purpose: Avoid dropping the block silently; keep a breadcrumb.
+        """
+        message = AnthropicMessage(
+            role="user",
+            content=[{"type": "weird_thing"}],
+        )
+        assert message.content[0].type == "text"
+        assert message.content[0].text == "[weird_thing]"
+
+    def test_known_blocks_pass_through_untouched(self):
+        """
+        What it does: Known block types are not altered by the sanitizer.
+        Purpose: Guard against over-eager downgrading of valid content.
+        """
+        message = AnthropicMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "keep me"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
+            ],
+        )
+        assert message.content[0].type == "text"
+        assert message.content[0].text == "keep me"
+        assert message.content[1].type == "image"
+
+    def test_string_content_is_not_sanitized(self):
+        """
+        What it does: A plain string content is left as-is.
+        Purpose: The sanitizer only applies to list content, not strings.
+        """
+        message = AnthropicMessage(role="user", content="just a string")
+        assert message.content == "just a string"
+
+    def test_unknown_inner_block_in_tool_result_downgraded(self):
+        """
+        What it does: An unknown block inside a tool_result content list is
+        downgraded to text.
+        Purpose: Tool results carrying future inner block kinds stay usable
+        instead of failing the whole request.
+        """
+        print("Setup: tool_result with an unknown inner block...")
+        block = ToolResultContentBlock(
+            tool_use_id="toolu_1",
+            content=[
+                {"type": "text", "text": "ok"},
+                {"type": "future_block", "name": "thing"},
+            ],
+        )
+        assert block.content[0].type == "text"
+        assert block.content[0].text == "ok"
+        assert block.content[1].type == "text"
+        assert block.content[1].text == "[future_block: thing]"
+
+    def test_tool_result_string_content_untouched(self):
+        """
+        What it does: A string tool_result content is preserved.
+        Purpose: The common (string) case must not be altered.
+        """
+        block = ToolResultContentBlock(tool_use_id="toolu_2", content="plain result")
+        assert block.content == "plain result"
 
 
 # ==================================================================================================
@@ -1154,6 +1387,34 @@ class TestAnthropicTool:
         
         print(f"Comparing max_uses: Expected 5, Got {tool.max_uses}")
         assert tool.max_uses == 5
+
+    def test_server_side_tool_without_name_valid(self):
+        """
+        What it does: A server-side tool (with a type field) is valid even
+        without a name.
+        Purpose: Per #181, name is optional for server-side tools; only
+        user-defined tools (no type) require a name.
+        """
+        print("Setup: Creating server-side tool without a name...")
+        tool = AnthropicTool(type="web_search_20250305", max_uses=3)
+
+        print(f"Comparing type: Expected 'web_search_20250305', Got '{tool.type}'")
+        assert tool.type == "web_search_20250305"
+        print(f"Comparing name: Expected None, Got {tool.name}")
+        assert tool.name is None
+
+    def test_user_defined_tool_without_name_invalid(self):
+        """
+        What it does: A user-defined tool (no type) without a name is rejected.
+        Purpose: Ensure the name requirement still applies to user-defined tools
+        even though the field is now Optional at the schema level (#181).
+        """
+        print("Setup: Attempting to create user-defined tool without name...")
+        with pytest.raises(ValidationError) as exc_info:
+            AnthropicTool(input_schema={"type": "object"})
+
+        print(f"ValidationError raised: {exc_info.value}")
+        assert "name" in str(exc_info.value)
     
     def test_user_defined_tool_without_input_schema_invalid(self):
         """

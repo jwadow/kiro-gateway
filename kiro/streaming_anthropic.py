@@ -165,6 +165,7 @@ async def stream_kiro_to_anthropic(
     output_tokens = 0
     full_content = ""
     full_thinking_content = ""
+    content_streamed = False  # True once a real content/thinking/tool block has been emitted
     
     # NOTE: Anthropic streaming spec requires input_tokens in message_start (beginning),
     # but Kiro API provides accurate context_usage at the end of stream.
@@ -200,7 +201,42 @@ async def stream_kiro_to_anthropic(
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
-    
+
+    async def iter_events_with_dropout_guard() -> AsyncGenerator[KiroEvent, None]:
+        """
+        Wrap parse_kiro_stream to tolerate mid-stream connection drops.
+
+        The Kiro API may close the TCP connection mid-stream during chunked
+        transfer, surfacing as httpx.RemoteProtocolError / httpx.ReadError
+        while iterating the byte stream (#129).
+
+        If the drop happens after content has already been streamed to the
+        client, the error is logged and iteration stops cleanly so the caller
+        can close open content blocks and emit a proper message_delta +
+        message_stop. If it happens before any content was streamed, the error
+        is re-raised to preserve first-token error handling.
+
+        Yields:
+            KiroEvent objects from parse_kiro_stream.
+
+        Raises:
+            httpx.RemoteProtocolError: If the drop occurs before any content.
+            httpx.ReadError: If the drop occurs before any content.
+        """
+        try:
+            async for inner_event in parse_kiro_stream(response, first_token_timeout):
+                yield inner_event
+        except (httpx.RemoteProtocolError, httpx.ReadError) as drop_error:
+            if not content_streamed:
+                raise
+            logger.warning(
+                "Kiro API dropped the connection mid-stream "
+                "([{}] {}); finalizing Anthropic stream gracefully.",
+                type(drop_error).__name__,
+                str(drop_error) or "(empty message)",
+            )
+            return
+
     try:
         # Send message_start event
         yield format_sse_event("message_start", {
@@ -220,7 +256,8 @@ async def stream_kiro_to_anthropic(
             }
         })
         
-        async for event in parse_kiro_stream(response, first_token_timeout):
+        # iter_events_with_dropout_guard tolerates mid-stream connection drops (#129)
+        async for event in iter_events_with_dropout_guard():
             if event.type == "content":
                 content = event.content or ""
                 full_content += content
@@ -249,6 +286,7 @@ async def stream_kiro_to_anthropic(
                 
                 # Send content delta
                 if content:
+                    content_streamed = True
                     yield format_sse_event("content_block_delta", {
                         "type": "content_block_delta",
                         "index": text_block_index,
@@ -279,6 +317,7 @@ async def stream_kiro_to_anthropic(
                         thinking_block_started = True
                     
                     if thinking_content:
+                        content_streamed = True
                         yield format_sse_event("content_block_delta", {
                             "type": "content_block_delta",
                             "index": thinking_block_index,
@@ -313,6 +352,7 @@ async def stream_kiro_to_anthropic(
                         text_block_started = True
                     
                     if thinking_content:
+                        content_streamed = True
                         yield format_sse_event("content_block_delta", {
                             "type": "content_block_delta",
                             "index": text_block_index,
@@ -346,6 +386,10 @@ async def stream_kiro_to_anthropic(
                 tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
                 tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
                 tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
+
+                # Reverse-map truncated tool names back to originals (#182)
+                from kiro.converters_core import get_original_tool_name
+                tool_name = get_original_tool_name(tool_name)
                 
                 # ==============================================================================
                 # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
@@ -449,6 +493,7 @@ async def stream_kiro_to_anthropic(
                         # Events: content_block_delta (text_delta) - stream summary
                         summary = generate_search_summary(query, results)
                         chunk_size = 100
+                        content_streamed = True
                         for i in range(0, len(summary), chunk_size):
                             chunk = summary[i:i + chunk_size]
                             yield format_sse_event("content_block_delta", {
@@ -483,6 +528,7 @@ async def stream_kiro_to_anthropic(
                         tool_input = {}
                 
                 # Send tool_use block start
+                content_streamed = True
                 yield format_sse_event("content_block_start", {
                     "type": "content_block_start",
                     "index": current_block_index,
@@ -622,7 +668,12 @@ async def stream_kiro_to_anthropic(
             )
         
         # Calculate output tokens
-        output_tokens = count_tokens(full_content + full_thinking_content)
+        # Calculate output tokens (include tool_use block content)
+        tool_content = ""
+        for tb in tool_blocks:
+            tool_content += json.dumps(tb.get("input", {}), ensure_ascii=False)
+            tool_content += tb.get("name", "")
+        output_tokens = count_tokens(full_content + full_thinking_content + tool_content)
         
         # Calculate total tokens from context usage if available
         if context_usage_percentage is not None:
@@ -804,7 +855,13 @@ async def collect_anthropic_response(
         })
     
     # Calculate output tokens
-    output_tokens = count_tokens(result.content + result.thinking_content)
+    # Calculate output tokens (include tool_use block content)
+    tool_content = ""
+    for tc in (result.tool_calls or []):
+        func = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+        tool_content += func.get("name") or ""
+        tool_content += func.get("arguments") or ""
+    output_tokens = count_tokens(result.content + result.thinking_content + tool_content)
     
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:

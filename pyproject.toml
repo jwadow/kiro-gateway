@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kiro-gateway"
+dynamic = ["version"]
+description = "OpenAI- and Anthropic-compatible gateway for Kiro (Amazon Q Developer / AWS CodeWhisperer)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Jwadow" }]
+keywords = ["kiro", "amazon-q", "codewhisperer", "openai", "anthropic", "proxy", "gateway"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "loguru",
+    "python-dotenv",
+    "tiktoken",
+    "pypdf",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "hypothesis",
+    "pytest-cov",
+]
+
+[project.urls]
+Homepage = "https://github.com/jwadow/kiro-gateway"
+Repository = "https://github.com/jwadow/kiro-gateway"
+Issues = "https://github.com/jwadow/kiro-gateway/issues"
+
+[project.scripts]
+kiro-gateway = "main:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "hypothesis",
+    "pytest-cov",
+]
+
+[tool.hatch.version]
+path = "kiro/config.py"
+pattern = "APP_VERSION: str = \"(?P<version>[^\"]+)\""
+
+[tool.hatch.build.targets.wheel]
+packages = ["kiro"]
+force-include = { "main.py" = "main.py" }
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/kiro",
+    "/main.py",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/pytest.ini",
+    "/requirements.txt",
+]
+
+[tool.uv]
+package = true

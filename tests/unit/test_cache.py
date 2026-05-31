@@ -267,6 +267,50 @@ class TestModelInfoCacheGetMaxInputTokens:
         print(f"Сравниваем max_tokens: Ожидалось {DEFAULT_MAX_INPUT_TOKENS}, Получено {max_tokens}")
         assert max_tokens == DEFAULT_MAX_INPUT_TOKENS
 
+    @pytest.mark.asyncio
+    async def test_get_token_limits_returns_raw_limits(self, sample_models_data):
+        """
+        What it does: get_token_limits returns the raw maxInputTokens/maxOutputTokens.
+        Purpose: PR #156 - /v1/models exposes real per-model ceilings, so callers
+        can distinguish a real limit from the DEFAULT_MAX_INPUT_TOKENS fallback.
+        """
+        cache = ModelInfoCache()
+        await cache.update([{
+            "modelId": "claude-sonnet-4",
+            "tokenLimits": {"maxInputTokens": 200000, "maxOutputTokens": 8192},
+        }])
+
+        limits = cache.get_token_limits("claude-sonnet-4")
+        assert limits == {"maxInputTokens": 200000, "maxOutputTokens": 8192}
+
+    @pytest.mark.asyncio
+    async def test_get_token_limits_none_for_unknown_or_missing(self):
+        """
+        What it does: get_token_limits returns None for unknown models or models
+        without tokenLimits (no DEFAULT fallback, unlike get_max_input_tokens).
+        Purpose: Let callers treat "unknown" distinctly from "default".
+        """
+        cache = ModelInfoCache()
+        await cache.update([{"modelId": "no-limits"}])
+
+        assert cache.get_token_limits("unknown-model") is None
+        assert cache.get_token_limits("no-limits") is None
+
+    @pytest.mark.asyncio
+    async def test_get_token_limits_ignores_non_int_values(self):
+        """
+        What it does: Non-integer tokenLimits values are dropped.
+        Purpose: Guard against malformed upstream metadata leaking into the API.
+        """
+        cache = ModelInfoCache()
+        await cache.update([{
+            "modelId": "partial",
+            "tokenLimits": {"maxInputTokens": 100000, "maxOutputTokens": None},
+        }])
+
+        limits = cache.get_token_limits("partial")
+        assert limits == {"maxInputTokens": 100000}
+
 
 class TestModelInfoCacheIsEmpty:
     """Тесты проверки пустоты кэша."""

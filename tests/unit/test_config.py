@@ -7,6 +7,7 @@ Verifies loading settings from environment variables.
 
 import pytest
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -512,6 +513,202 @@ class TestKiroCliDbFileConfig:
             path = Path(config_module.KIRO_CLI_DB_FILE)
             # Path should be constructable (doesn't raise exception)
             assert str(path) == config_module.KIRO_CLI_DB_FILE
+
+
+class TestLegacyEndpointConfig:
+    """Tests for the KIRO_USE_LEGACY_ENDPOINT toggle (#175 -> #168, #173)."""
+
+    def test_default_uses_runtime_kiro_dev(self, monkeypatch):
+        """
+        What it does: With the toggle unset, hosts default to runtime.kiro.dev.
+        Purpose: Preserve the existing default endpoint behavior.
+        """
+        print("Setup: Removing KIRO_USE_LEGACY_ENDPOINT...")
+        monkeypatch.delenv("KIRO_USE_LEGACY_ENDPOINT", raising=False)
+
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        try:
+            assert config_module.KIRO_USE_LEGACY_ENDPOINT is False
+            assert "runtime" in config_module.KIRO_API_HOST_TEMPLATE
+            assert "kiro.dev" in config_module.KIRO_Q_HOST_TEMPLATE
+            assert config_module.get_kiro_api_host("us-east-1") == "https://runtime.us-east-1.kiro.dev"
+        finally:
+            reload(config_module)
+
+    def test_legacy_endpoint_switches_to_amazonaws(self, monkeypatch):
+        """
+        What it does: With the toggle on, hosts switch to q.{region}.amazonaws.com.
+        Purpose: Builder ID accounts hitting runtime.kiro.dev regressions can opt
+        into the legacy endpoint.
+        """
+        print("Setup: Setting KIRO_USE_LEGACY_ENDPOINT=true...")
+        monkeypatch.setenv("KIRO_USE_LEGACY_ENDPOINT", "true")
+
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        try:
+            assert config_module.KIRO_USE_LEGACY_ENDPOINT is True
+            assert config_module.get_kiro_api_host("us-east-1") == "https://q.us-east-1.amazonaws.com"
+            assert config_module.get_kiro_q_host("eu-central-1") == "https://q.eu-central-1.amazonaws.com"
+        finally:
+            monkeypatch.delenv("KIRO_USE_LEGACY_ENDPOINT", raising=False)
+            reload(config_module)
+
+
+class TestSslRenegotiationConfig:
+    """Tests for the KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION toggle (#187)."""
+
+    def test_legacy_renegotiation_default_false(self, monkeypatch):
+        """
+        What it does: With the env var unset, the flag defaults to False.
+        Purpose: The insecure legacy renegotiation must be off by default.
+        """
+        monkeypatch.delenv("KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION", raising=False)
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        try:
+            assert config_module.KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION is False
+        finally:
+            reload(config_module)
+
+    def test_get_ssl_verify_default_returns_true(self, monkeypatch):
+        """
+        What it does: Default config -> get_ssl_verify() returns True.
+        Purpose: Preserve httpx's secure default (full verification).
+        """
+        monkeypatch.delenv("KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION", raising=False)
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        try:
+            config_module.get_ssl_verify.cache_clear()
+            assert config_module.get_ssl_verify() is True
+        finally:
+            config_module.get_ssl_verify.cache_clear()
+            reload(config_module)
+
+    def test_get_ssl_verify_enabled_returns_context_with_legacy_option(self, monkeypatch):
+        """
+        What it does: With the flag on, get_ssl_verify returns an SSLContext that
+        has the legacy renegotiation option set, while keeping cert verification.
+        Purpose: The opt-in must relax only renegotiation, not certificate checks.
+        """
+        import ssl
+        monkeypatch.setenv("KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION", "true")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        try:
+            config_module.get_ssl_verify.cache_clear()
+            ctx = config_module.get_ssl_verify()
+            assert isinstance(ctx, ssl.SSLContext)
+            legacy_bit = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+            assert ctx.options & legacy_bit
+            # Certificate verification stays ON.
+            assert ctx.verify_mode == ssl.CERT_REQUIRED
+            assert ctx.check_hostname is True
+        finally:
+            monkeypatch.delenv("KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION", raising=False)
+            config_module.get_ssl_verify.cache_clear()
+            reload(config_module)
+
+    def test_parsing_variants(self, monkeypatch):
+        """
+        What it does: Truthy strings enable the flag; falsy/empty disable it.
+        Purpose: Mirror the parsing of other boolean env toggles.
+        """
+        from importlib import reload
+        import kiro.config as config_module
+        try:
+            for truthy in ("true", "1", "yes", "TRUE"):
+                monkeypatch.setenv("KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION", truthy)
+                reload(config_module)
+                assert config_module.KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION is True, truthy
+            for falsy in ("false", "0", "no", ""):
+                monkeypatch.setenv("KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION", falsy)
+                reload(config_module)
+                assert config_module.KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION is False, falsy
+        finally:
+            monkeypatch.delenv("KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION", raising=False)
+            reload(config_module)
+
+
+class TestNormalizeConfigPath:
+    """Tests for cross-platform configuration path normalization."""
+    
+    def test_expands_windows_percent_environment_variables(self, monkeypatch):
+        """
+        What it does: Verifies Windows-style %VAR% path expansion.
+        Purpose: Ensure Windows users can paste LOCALAPPDATA-based paths.
+        """
+        print("Setup: Setting LOCALAPPDATA for Windows-style path expansion...")
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\tester\AppData\Local")
+        from kiro.config import normalize_config_path
+        
+        result = normalize_config_path(r"%LOCALAPPDATA%\Kiro-Cli\data.sqlite3")
+        expected = str(Path(r"C:\Users\tester\AppData\Local\Kiro-Cli\data.sqlite3"))
+        
+        print(f"Normalized path: {result}")
+        assert result == expected
+    
+    def test_expands_user_home_paths(self, monkeypatch, tmp_path):
+        """
+        What it does: Verifies tilde expansion in configuration paths.
+        Purpose: Preserve existing Linux, macOS, and Windows home path support.
+        """
+        print("Setup: Setting HOME and USERPROFILE for tilde expansion...")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        from kiro.config import normalize_config_path
+        
+        result = normalize_config_path("~/.aws/sso/cache/token.json")
+        
+        print(f"Normalized path: {result}")
+        assert result == str(Path.home() / ".aws" / "sso" / "cache" / "token.json")
+    
+    def test_strips_accidental_wrapping_quotes(self):
+        """
+        What it does: Verifies paths remain usable when copied with quotes.
+        Purpose: Avoid false missing-file warnings for quoted shell values.
+        """
+        print("Setup: Normalizing a quoted Windows path...")
+        from kiro.config import normalize_config_path
+        
+        result = normalize_config_path('"C:/Users/tester/AppData/Local/Kiro-Cli/data.sqlite3"')
+        
+        print(f"Normalized path: {result}")
+        assert result == str(Path("C:/Users/tester/AppData/Local/Kiro-Cli/data.sqlite3"))
+
+    def test_empty_path_returns_empty_string(self):
+        """
+        What it does: Empty/None input yields an empty string, never raising.
+        Purpose: Unconfigured optional paths must stay falsy so existence
+        checks and bool() guards keep working unchanged.
+        """
+        from kiro.config import normalize_config_path
+
+        assert normalize_config_path("") == ""
+        assert normalize_config_path(None) == ""
+
+    def test_unknown_windows_var_left_literal(self, monkeypatch):
+        """
+        What it does: An undefined %VAR% is left untouched rather than blanked.
+        Purpose: A missing env var must not silently collapse a path to a
+        misleading partial value; surfacing the literal aids debugging.
+        """
+        monkeypatch.delenv("DEFINITELY_NOT_SET", raising=False)
+        from kiro.config import normalize_config_path
+
+        result = normalize_config_path(r"%DEFINITELY_NOT_SET%\Kiro-Cli\data.sqlite3")
+
+        print(f"Normalized path: {result}")
+        assert "%DEFINITELY_NOT_SET%" in result
 
 
 class TestFallbackModelsConfig:

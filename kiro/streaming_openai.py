@@ -117,7 +117,8 @@ async def stream_kiro_to_openai_internal(
     completion_id = generate_completion_id()
     created_time = int(time.time())
     first_chunk = True
-    
+    content_streamed = False  # True once any delta has been sent to the client
+
     metering_data = None
     context_usage_percentage = None
     full_content = ""
@@ -126,10 +127,45 @@ async def stream_kiro_to_openai_internal(
     streaming_error_occurred = False
     tool_calls_from_stream = []
     
+    async def iter_events_with_dropout_guard() -> AsyncGenerator[KiroEvent, None]:
+        """
+        Wrap parse_kiro_stream to tolerate mid-stream connection drops.
+
+        The Kiro API may close the TCP connection mid-stream during chunked
+        transfer, surfacing as httpx.RemoteProtocolError / httpx.ReadError
+        while iterating the byte stream (#129).
+
+        If the drop happens after content has already been streamed to the
+        client, the error is logged and iteration stops cleanly so the caller
+        can emit a proper terminal chunk. If it happens before any content was
+        streamed, the error is re-raised to preserve first-token error handling.
+
+        Yields:
+            KiroEvent objects from parse_kiro_stream.
+
+        Raises:
+            httpx.RemoteProtocolError: If the drop occurs before any content.
+            httpx.ReadError: If the drop occurs before any content.
+        """
+        try:
+            async for inner_event in parse_kiro_stream(response, first_token_timeout):
+                yield inner_event
+        except (httpx.RemoteProtocolError, httpx.ReadError) as drop_error:
+            if not content_streamed:
+                raise
+            logger.warning(
+                "Kiro API dropped the connection mid-stream "
+                "([{}] {}); finalizing OpenAI stream gracefully.",
+                type(drop_error).__name__,
+                str(drop_error) or "(empty message)",
+            )
+            return
+
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
         # This handles AWS SSE parsing, first token timeout, and thinking parser
-        async for event in parse_kiro_stream(response, first_token_timeout):
+        # iter_events_with_dropout_guard tolerates mid-stream connection drops (#129)
+        async for event in iter_events_with_dropout_guard():
             if event.type == "content" and event.content:
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
@@ -153,15 +189,23 @@ async def stream_kiro_to_openai_internal(
                 if debug_logger:
                     debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
                 
+                content_streamed = True
                 yield chunk_text
             
-            elif event.type == "thinking" and event.thinking_content:
+            elif event.type == "thinking" and (event.thinking_content or event.is_last_thinking_chunk):
                 # Accumulate thinking content
-                full_thinking_content += event.thinking_content
+                full_thinking_content += event.thinking_content or ""
                 
                 # Send as reasoning_content or content based on mode
                 if FAKE_REASONING_HANDLING == "as_reasoning_content":
                     delta = {"reasoning_content": event.thinking_content}
+                elif event.is_native_thinking and FAKE_REASONING_HANDLING == "pass":
+                    thinking_text = event.thinking_content or ""
+                    if event.is_first_thinking_chunk:
+                        thinking_text = f"<thinking>{thinking_text}"
+                    if event.is_last_thinking_chunk:
+                        thinking_text = f"{thinking_text}</thinking>"
+                    delta = {"content": thinking_text}
                 else:
                     delta = {"content": event.thinking_content}
                 
@@ -182,6 +226,7 @@ async def stream_kiro_to_openai_internal(
                 if debug_logger:
                     debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
                 
+                content_streamed = True
                 yield chunk_text
             
             elif event.type == "tool_use" and event.tool_use:
@@ -191,6 +236,10 @@ async def stream_kiro_to_openai_internal(
                 tool_name = ""
                 if tool:
                     tool_name = (tool.get("function") or {}).get("name", "") or tool.get("name", "")
+
+                # Reverse-map truncated tool names back to originals (#182)
+                from kiro.converters_core import get_original_tool_name
+                tool_name = get_original_tool_name(tool_name)
                 
                 # ==============================================================================
                 # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
@@ -251,6 +300,7 @@ async def stream_kiro_to_openai_internal(
                                 if debug_logger:
                                     debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
                                 
+                                content_streamed = True
                                 yield chunk_text
                             
                             # Accumulate for token counting
@@ -301,8 +351,13 @@ async def stream_kiro_to_openai_internal(
         else:
             finish_reason = "stop"
         
-        # Count completion_tokens (output) using tiktoken
-        completion_tokens = count_tokens(full_content + full_thinking_content)
+        # Count completion_tokens (output) using tiktoken (include tool_use content)
+        tool_content = ""
+        for tc in all_tool_calls:
+            func = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            tool_content += func.get("name") or ""
+            tool_content += func.get("arguments") or ""
+        completion_tokens = count_tokens(full_content + full_thinking_content + tool_content)
         
         # Calculate total_tokens based on context_usage_percentage from Kiro API
         # context_usage shows TOTAL percentage of context usage (input + output)

@@ -46,6 +46,7 @@ from kiro.config import DEBUG_MODE
 # These are the main API endpoints that process user requests
 LOGGED_ENDPOINTS = frozenset({
     "/v1/chat/completions",  # OpenAI-compatible endpoint
+    "/v1/responses",         # OpenAI Responses-compatible endpoint
     "/v1/messages",          # Anthropic-compatible endpoint
 })
 

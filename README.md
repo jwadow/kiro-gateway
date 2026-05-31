@@ -512,11 +512,13 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Health check |
-| `/health` | GET | Detailed health check |
-| `/v1/models` | GET | List available models |
+| `/` | GET | Liveness check (status + version) |
+| `/health` | GET | Detailed health: version, uptime, and account-pool summary (total/initialized/healthy, models available). Returns `status: "degraded"` when accounts exist but none are usable. Best-effort fields are omitted if the account system is not ready. |
+| `/v1/models` | GET | List available models (includes upstream token limits) |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
+| `/v1/responses` | POST | OpenAI Responses API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/admin/accounts/usage` | GET | Per-account credits/usage and pool status (requires API key) |
 
 ---
 
@@ -727,6 +729,65 @@ with client.messages.stream(
 
 ---
 
+## 🔍 Web Search
+
+The gateway can give models access to live web results, even though Kiro itself
+does not expose a public web-search tool. It works through Kiro's internal MCP
+API and is exposed to clients in two ways.
+
+### Enabling it
+
+Web search is **enabled by default**. Control it with one environment variable:
+
+```env
+# Enable web_search tool auto-injection (default: true)
+WEB_SEARCH_ENABLED=true
+```
+
+Set `WEB_SEARCH_ENABLED=false` to stop the gateway from auto-injecting the tool.
+
+### How it works
+
+- **Path B — auto-injected tool (OpenAI & Anthropic):** When `WEB_SEARCH_ENABLED=true`,
+  the gateway automatically adds a `web_search` function tool to every request
+  (unless your request already defines one). The model decides whether to call
+  it. When it does, the gateway intercepts the `web_search` call, queries Kiro's
+  MCP API, and streams the results back as normal assistant content wrapped in
+  `<web_search>...</web_search>` tags. No tool result needs to be sent back by
+  your client — the gateway resolves the call internally.
+- **Path A — native Anthropic web search:** If your client sends a native
+  Anthropic server-side `web_search` tool (e.g. `{"type": "web_search_20250305"}`),
+  the gateway routes it to the same MCP API and returns proper
+  `server_tool_use` / `web_search_tool_result` blocks. This path works **always**,
+  regardless of `WEB_SEARCH_ENABLED`.
+
+### Using it from a client (opencode, OpenAI SDK, etc.)
+
+Because the tool is auto-injected, most clients need **no special configuration** —
+just ask a question that requires fresh information and let the model call the
+tool. For example, with the OpenAI API:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "What is the latest stable Python release? Search the web."}],
+    "stream": true
+  }'
+```
+
+The model will emit a `web_search` tool call, the gateway runs the search, and
+the answer (including a `<web_search>` results block) is streamed back in the
+same response. The same applies to OpenCode and other OpenAI/Anthropic-compatible
+tools — no MCP server setup is required on the client side.
+
+> 💡 If a client already provides its own `web_search` tool, the gateway does not
+> inject a duplicate and respects the client's definition.
+
+---
+
 ## 🔧 Debugging
 
 Debug logging is **disabled by default**. To enable, add to your `.env`:
@@ -797,6 +858,31 @@ Your SSO region may differ from the Q API region. The gateway auto-detects this 
 ```env
 KIRO_API_REGION="eu-central-1"
 ```
+
+---
+
+**Requests blocked / "Improperly formed request" or empty responses with Claude Code (upstream risk control)**
+
+Symptoms: requests that previously worked start failing, you see persistent
+`Improperly formed request` errors, empty/blocked responses, or accounts being
+throttled — often specifically when driving the gateway with agentic clients
+like Claude Code.
+
+This is an **upstream Amazon risk-control limitation**, not a gateway bug. Amazon
+applies server-side risk/abuse controls to Kiro (Amazon Q) accounts, and those
+controls can tighten without notice. The gateway is a transparent proxy and
+cannot bypass or disable Amazon's risk control — there is no configuration flag
+or code change that lifts these restrictions.
+
+What you can safely do:
+- Reduce request volume and concurrency; aggressive agentic loops are more likely
+  to trip risk control.
+- Spread load across multiple accounts using the [Account System](#-account-system-advanced),
+  which fails over when an account is restricted (this distributes usage, it does
+  **not** circumvent risk control).
+- Wait and retry later — restrictions are sometimes temporary.
+
+There is currently **no code-side mitigation** that removes the limitation itself.
 
 ---
 

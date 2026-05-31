@@ -458,6 +458,56 @@ class TestStreamingOpenaiThinkingContent:
         assert len(content_chunks) >= 1
         print("✓ Thinking yielded as content")
 
+    @pytest.mark.asyncio
+    async def test_yields_native_thinking_with_visible_tags_in_pass_mode(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Wraps native Kiro thinking chunks in visible tags for pass mode.
+        Goal: Ensure OpenCode-compatible streams visibly separate reasoning from answers.
+        """
+        print("Setup: Mock stream with native thinking content...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="thinking",
+                thinking_content="Let me think",
+                is_first_thinking_chunk=True,
+                is_native_thinking=True,
+            )
+            yield KiroEvent(
+                type="thinking",
+                thinking_content=" through it.",
+                is_native_thinking=True,
+            )
+            yield KiroEvent(
+                type="thinking",
+                thinking_content="",
+                is_last_thinking_chunk=True,
+                is_native_thinking=True,
+            )
+            yield KiroEvent(type="content", content="Here is my answer")
+
+        print("Action: Streaming native thinking to OpenAI content in pass mode...")
+        chunks = []
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_openai.FAKE_REASONING_HANDLING', 'pass'):
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-opus-4.8",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+
+        joined_chunks = "".join(chunks)
+        print(f"Received {len(chunks)} chunks")
+
+        assert "<thinking>" in joined_chunks
+        assert "Let me think" in joined_chunks
+        assert "</thinking>" in joined_chunks
+        print("✓ Native thinking yielded as visible tagged content")
+
 
 # ==================================================================================================
 # Tests for None protection in tool calls
@@ -1234,6 +1284,111 @@ class TestStreamingOpenaiErrorHandling:
         print(f"Caught exception: {exc_info.value}")
         assert "Original error" in str(exc_info.value)
         print("✓ Original error not masked by aclose error")
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_remote_protocol_error_finalizes_gracefully(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Finalizes the stream gracefully when Kiro drops the
+            connection mid-stream with httpx.RemoteProtocolError (#129).
+        Goal: Verify content already streamed is followed by a proper terminal
+            chunk (finish_reason) and [DONE], without an unhandled exception.
+        """
+        import httpx
+
+        print("Setup: Mock stream that yields content then drops mid-stream...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial answer")
+            raise httpx.RemoteProtocolError("peer closed connection without sending complete message body (incomplete chunked read)")
+
+        print("Action: Streaming to OpenAI format with mid-stream drop...")
+        chunks = []
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        print(f"Received {len(chunks)} chunks")
+
+        # Content delta should have been emitted
+        assert any('"Partial answer"' in c for c in chunks)
+        # Stream must terminate cleanly with a finish_reason chunk + [DONE]
+        assert chunks[-1] == "data: [DONE]\n\n"
+        final_chunk = chunks[-2]
+        assert '"finish_reason"' in final_chunk
+        assert '"finish_reason": null' not in final_chunk
+        # Response must be closed
+        mock_response.aclose.assert_called()
+        print("✓ Mid-stream RemoteProtocolError finalized gracefully")
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_read_error_finalizes_gracefully(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Finalizes the stream gracefully when Kiro drops the
+            connection mid-stream with httpx.ReadError (#129).
+        Goal: Verify ReadError is treated like RemoteProtocolError once content
+            has already been streamed.
+        """
+        import httpx
+
+        print("Setup: Mock stream that yields content then raises ReadError...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hello")
+            yield KiroEvent(type="content", content=" there")
+            raise httpx.ReadError("connection broken")
+
+        print("Action: Streaming to OpenAI format with mid-stream ReadError...")
+        chunks = []
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        print(f"Received {len(chunks)} chunks")
+
+        assert chunks[-1] == "data: [DONE]\n\n"
+        assert '"finish_reason"' in chunks[-2]
+        print("✓ Mid-stream ReadError finalized gracefully")
+
+    @pytest.mark.asyncio
+    async def test_remote_protocol_error_before_content_is_propagated(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Propagates httpx.RemoteProtocolError when it occurs before
+            any content was streamed (#129).
+        Goal: Verify first-token error handling is preserved - a drop before any
+            content must NOT be silently finalized.
+        """
+        import httpx
+
+        print("Setup: Mock stream that drops before any content...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            raise httpx.RemoteProtocolError("peer closed connection")
+            yield  # Make it a generator
+
+        print("Action: Streaming to OpenAI format with pre-content drop...")
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(httpx.RemoteProtocolError):
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        pass
+
+        # Response must still be closed
+        mock_response.aclose.assert_called()
+        print("✓ Pre-content RemoteProtocolError propagated correctly")
 
 
 # ==================================================================================================

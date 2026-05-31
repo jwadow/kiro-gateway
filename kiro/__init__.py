@@ -61,6 +61,7 @@ from kiro.config import (
 # Models
 from kiro.models_openai import (
     ChatCompletionRequest,
+    ResponsesRequest,
     ChatMessage,
     OpenAIModel,
     ModelList,
@@ -83,6 +84,10 @@ from kiro.parsers import (
 from kiro.streaming_openai import (
     stream_kiro_to_openai,
     collect_stream_response,
+)
+from kiro.streaming_responses import (
+    stream_kiro_to_responses,
+    collect_responses_response,
 )
 
 # Exceptions
@@ -114,6 +119,7 @@ __all__ = [
     
     # Models
     "ChatCompletionRequest",
+    "ResponsesRequest",
     "ChatMessage",
     "OpenAIModel",
     "ModelList",
@@ -130,6 +136,8 @@ __all__ = [
     # Streaming
     "stream_kiro_to_openai",
     "collect_stream_response",
+    "stream_kiro_to_responses",
+    "collect_responses_response",
     
     # Exceptions
     "validation_exception_handler",

@@ -339,10 +339,13 @@ class TestMessagesValidation:
     
     def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies a non-standard message role is accepted (not 422).
+        Purpose: Per the Issue #190 fix, role is a free-form str. Unknown roles
+        (e.g. 'invalid_role', 'system', 'developer') are normalized to 'user'
+        downstream by normalize_message_roles(), so the request must not be
+        rejected with a 422 validation error at the schema boundary.
         """
-        print("Action: POST /v1/messages with invalid role...")
+        print("Action: POST /v1/messages with a non-standard role...")
         response = test_client.post(
             "/v1/messages",
             headers={"x-api-key": valid_proxy_api_key},
@@ -354,8 +357,9 @@ class TestMessagesValidation:
         )
         
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
+        # Free-form role: schema accepts it, normalization happens downstream.
+        # The key guarantee is that it is NOT a 422 schema validation error.
+        assert response.status_code != 422
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """

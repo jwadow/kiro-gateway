@@ -39,6 +39,12 @@ from kiro.converters_core import (
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
+    NativeThinkingConfig,
+    reasoning_effort_to_budget,
+    supports_native_adaptive_thinking,
+    normalize_native_thinking_effort,
+    build_native_thinking_config,
+    apply_native_thinking_fields,
 )
 
 # Test data for images - 1x1 pixel JPEG
@@ -2562,6 +2568,113 @@ class TestEnsureAssistantBeforeToolResults:
 # Tests for sanitize_json_schema
 # ==================================================================================================
 
+class TestNativeThinkingConfig:
+    """Tests for native Kiro/Claude adaptive thinking helpers (#192)."""
+
+    def test_reasoning_effort_to_budget_known_levels(self):
+        """
+        What it does: Maps effort levels to percentage-based budgets.
+        Purpose: Budget must scale with max_tokens per the documented ratios.
+        """
+        assert reasoning_effort_to_budget(4096, "high") == int(4096 * 0.80)
+        assert reasoning_effort_to_budget(10000, "medium") == 5000
+        assert reasoning_effort_to_budget(1000, "max") == 1000
+        assert reasoning_effort_to_budget(1000, "none") == 0
+
+    def test_reasoning_effort_to_budget_unknown_raises(self):
+        """
+        What it does: Unknown effort levels raise ValueError.
+        Purpose: Callers rely on this to fall back to a default budget.
+        """
+        with pytest.raises(ValueError):
+            reasoning_effort_to_budget(1000, "bogus")
+
+    def test_supports_native_adaptive_thinking(self):
+        """
+        What it does: Detects models known to support adaptive thinking.
+        Purpose: Native fields must only be added for supported models.
+        """
+        assert supports_native_adaptive_thinking("claude-opus-4.8") is True
+        assert supports_native_adaptive_thinking("CLAUDE-SONNET-4.6") is True
+        assert supports_native_adaptive_thinking("claude-haiku-4.5") is False
+
+    def test_normalize_native_thinking_effort(self):
+        """
+        What it does: Normalizes client effort values to native effort levels.
+        Purpose: 'minimal' maps to 'low', 'none'/unknown disable native thinking.
+        """
+        assert normalize_native_thinking_effort(None) is None
+        assert normalize_native_thinking_effort("none") is None
+        assert normalize_native_thinking_effort("minimal") == "low"
+        assert normalize_native_thinking_effort("high") == "high"
+        assert normalize_native_thinking_effort("max") == "max"
+        assert normalize_native_thinking_effort("weird") is None
+
+    def test_build_native_thinking_config_off_by_default(self):
+        """
+        What it does: With mode 'off', native thinking is always disabled.
+        Purpose: Default behavior must preserve existing fake-reasoning flow.
+        """
+        from unittest.mock import patch
+        with patch("kiro.converters_core.KIRO_NATIVE_THINKING_MODE", "off"):
+            cfg = build_native_thinking_config("claude-opus-4.8", "high")
+        assert cfg.enabled is False
+
+    def test_build_native_thinking_config_auto_requires_effort(self):
+        """
+        What it does: In 'auto' mode, native thinking needs a client effort.
+        Purpose: Without an explicit effort, auto mode stays disabled.
+        """
+        from unittest.mock import patch
+        with patch("kiro.converters_core.KIRO_NATIVE_THINKING_MODE", "auto"):
+            enabled = build_native_thinking_config("claude-opus-4.8", "high")
+            disabled = build_native_thinking_config("claude-opus-4.8", None)
+            unsupported = build_native_thinking_config("claude-haiku-4.5", "high")
+        assert enabled.enabled is True
+        assert enabled.effort == "high"
+        assert disabled.enabled is False
+        assert unsupported.enabled is False
+
+    def test_build_native_thinking_config_force_defaults_high(self):
+        """
+        What it does: In 'force' mode, supported models enable without effort.
+        Purpose: Force mode defaults the effort to 'high'.
+        """
+        from unittest.mock import patch
+        with patch("kiro.converters_core.KIRO_NATIVE_THINKING_MODE", "force"):
+            cfg = build_native_thinking_config("claude-opus-4.8", None)
+            unsupported = build_native_thinking_config("claude-haiku-4.5", None)
+        assert cfg.enabled is True
+        assert cfg.effort == "high"
+        assert unsupported.enabled is False
+
+    def test_apply_native_thinking_fields_noop_when_disabled(self):
+        """
+        What it does: A disabled config leaves the payload unchanged.
+        Purpose: Guard against accidentally adding thinking fields.
+        """
+        payload = {"conversationState": {"currentMessage": {"userInputMessage": {}}}}
+        apply_native_thinking_fields(payload, NativeThinkingConfig(enabled=False))
+        assert "thinking" not in payload
+        assert "output_config" not in payload
+
+    def test_apply_native_thinking_fields_adds_top_level_and_message(self):
+        """
+        What it does: An enabled config adds adaptive thinking + effort fields
+        both at the payload top level and inside userInputMessage.
+        Purpose: Kiro expects the fields in both places.
+        """
+        payload = {"conversationState": {"currentMessage": {"userInputMessage": {}}}}
+        cfg = NativeThinkingConfig(enabled=True, effort="max", display="omitted")
+        apply_native_thinking_fields(payload, cfg)
+
+        assert payload["thinking"] == {"type": "adaptive", "display": "omitted"}
+        assert payload["output_config"] == {"effort": "max"}
+        uim = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert uim["thinking"] == {"type": "adaptive", "display": "omitted"}
+        assert uim["outputConfig"] == {"effort": "max"}
+
+
 class TestSanitizeJsonSchema:
     """
     Tests for sanitize_json_schema function.
@@ -2615,6 +2728,51 @@ class TestSanitizeJsonSchema:
         print("Action: Sanitizing schema...")
         result = sanitize_json_schema(schema)
         
+        print(f"Result: {result}")
+        print("Checking that required is removed...")
+        assert "required" not in result
+        assert result["type"] == "object"
+        assert result["properties"] == {}
+
+    def test_removes_null_required_value(self):
+        """
+        What it does: Verifies removal of null required value.
+        Purpose: Ensure required: None is removed from schema.
+
+        Bedrock rejects tool schemas with required: null because required must
+        be an array when present.
+        """
+        print("Setup: Schema with null required...")
+        schema = {
+            "type": "object",
+            "properties": {},
+            "required": None
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        print("Checking that required is removed...")
+        assert "required" not in result
+        assert result["type"] == "object"
+        assert result["properties"] == {}
+
+    def test_removes_non_array_required_value(self):
+        """
+        What it does: Verifies removal of non-array required value.
+        Purpose: Ensure invalid required values are removed from schema.
+        """
+        print("Setup: Schema with non-array required...")
+        schema = {
+            "type": "object",
+            "properties": {},
+            "required": "location"
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
         print(f"Result: {result}")
         print("Checking that required is removed...")
         assert "required" not in result
@@ -2711,6 +2869,31 @@ class TestSanitizeJsonSchema:
         nested = result["properties"]["nested"]
         assert "required" not in nested
         assert "additionalProperties" not in nested
+
+    def test_recursively_removes_null_required_value(self):
+        """
+        What it does: Verifies recursive removal of null required values.
+        Purpose: Ensure nested schemas with required: None are sanitized.
+        """
+        print("Setup: Schema with nested null required...")
+        schema = {
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "properties": {},
+                    "required": None
+                }
+            }
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        print("Checking nested object...")
+        nested = result["properties"]["nested"]
+        assert "required" not in nested
     
     def test_sanitizes_items_in_lists(self):
         """
@@ -3500,6 +3683,29 @@ class TestConvertToolsToKiroFormat:
         schema = result[0]["toolSpecification"]["inputSchema"]["json"]
         assert "required" not in schema
         assert "additionalProperties" not in schema
+
+    def test_sanitizes_null_required_in_input_schema(self):
+        """
+        What it does: Verifies null required values are removed from input schema.
+        Purpose: Ensure Bedrock receives a valid tool inputSchema.
+        """
+        print("Setup: Tool with null required...")
+        tools = [UnifiedTool(
+            name="test_tool",
+            description="Test",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "required": None
+            }
+        )]
+
+        print("Action: Converting tools...")
+        result = convert_tools_to_kiro_format(tools)
+
+        print(f"Result: {result}")
+        schema = result[0]["toolSpecification"]["inputSchema"]["json"]
+        assert "required" not in schema
 
 
 # ==================================================================================================
@@ -5986,72 +6192,75 @@ class TestValidateToolNames:
             print(f"ERROR: Validation failed: {e}")
             raise AssertionError("64-character names should be accepted")
     
-    def test_rejects_65_character_name(self):
+    def test_truncates_65_character_name(self):
         """
-        What it does: Verifies that 65-character names are rejected.
-        Purpose: Ensure names exceeding limit are caught.
+        What it does: Verifies that a 65-character name is truncated, not rejected.
+        Purpose: Per #182, long names are shortened in place (with a reverse
+        mapping) instead of failing the request with a ValueError.
         """
+        from kiro.converters_core import validate_tool_names, get_original_tool_name
+
         print("Setup: Tool with 65-character name...")
         name_65 = "a" * 65
         tools = [UnifiedTool(name=name_65, description="Test")]
-        
+
         print(f"Tool name length: {len(name_65)}")
-        print("Action: Validating tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            print("ERROR: Validation passed but should have failed")
-            raise AssertionError("65-character names should be rejected")
-        except ValueError as e:
-            print(f"Validation correctly rejected: {str(e)[:100]}...")
-            assert "exceed Kiro API limit" in str(e)
-            assert name_65 in str(e)
-    
-    def test_rejects_very_long_tool_names(self):
+        print("Action: Validating tool names (should truncate, not raise)...")
+        validate_tool_names(tools)
+
+        assert len(tools[0].name) <= 64, "Name should be truncated to <= 64 chars"
+        assert tools[0].name != name_65, "Name should have been changed"
+        # Reverse mapping restores the original name on the response path.
+        assert get_original_tool_name(tools[0].name) == name_65
+
+    def test_truncates_very_long_tool_names(self):
         """
-        What it does: Verifies that very long tool names are rejected.
-        Purpose: Ensure the validation works for extreme cases.
+        What it does: Verifies very long names are truncated to the 64-char limit.
+        Purpose: Ensure extreme cases are shortened deterministically.
         """
+        from kiro.converters_core import validate_tool_names, get_original_tool_name
+
         print("Setup: Tool with 100-character name...")
         name_100 = "mcp__GitHub__" + "a" * 87
         tools = [UnifiedTool(name=name_100, description="Test")]
-        
+
         print(f"Tool name length: {len(name_100)}")
-        print("Action: Validating tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            raise AssertionError("Very long names should be rejected")
-        except ValueError as e:
-            print(f"Validation correctly rejected: {str(e)[:100]}...")
-            assert "exceed Kiro API limit" in str(e)
-            assert "100 characters" in str(e)
-    
-    def test_rejects_multiple_long_names(self):
+        print("Action: Validating tool names (should truncate)...")
+        validate_tool_names(tools)
+
+        assert len(tools[0].name) <= 64
+        assert get_original_tool_name(tools[0].name) == name_100
+
+    def test_truncates_multiple_long_names_uniquely(self):
         """
-        What it does: Verifies that all long names are listed in error message.
-        Purpose: Ensure user sees all problematic tools at once.
+        What it does: Verifies multiple long names are each truncated and remain
+        distinct, while short names are left untouched.
+        Purpose: Guard against collisions when several long names share a prefix.
         """
+        from kiro.converters_core import validate_tool_names, get_original_tool_name
+
         print("Setup: Multiple tools with long names...")
+        long_a = "a" * 65
+        long_b = "b" * 70
         tools = [
-            UnifiedTool(name="a" * 65, description="Test 1"),
+            UnifiedTool(name=long_a, description="Test 1"),
             UnifiedTool(name="short", description="Test 2"),
-            UnifiedTool(name="b" * 70, description="Test 3")
+            UnifiedTool(name=long_b, description="Test 3"),
         ]
-        
-        print("Action: Validating tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            raise AssertionError("Should reject multiple long names")
-        except ValueError as e:
-            error_msg = str(e)
-            print(f"Error message: {error_msg[:200]}...")
-            
-            print("Checking that both long names are listed...")
-            assert "65 characters" in error_msg
-            assert "70 characters" in error_msg
-    
+
+        print("Action: Validating tool names (should truncate)...")
+        validate_tool_names(tools)
+
+        # Long names truncated and still distinct.
+        assert len(tools[0].name) <= 64
+        assert len(tools[2].name) <= 64
+        assert tools[0].name != tools[2].name
+        # Short name untouched.
+        assert tools[1].name == "short"
+        # Reverse mapping restores both originals.
+        assert get_original_tool_name(tools[0].name) == long_a
+        assert get_original_tool_name(tools[2].name) == long_b
+
     def test_handles_none_tools(self):
         """
         What it does: Verifies that None tools list is handled gracefully.
@@ -6084,60 +6293,55 @@ class TestValidateToolNames:
             print(f"ERROR: Unexpected exception: {e}")
             raise AssertionError("Empty list should be handled gracefully")
     
-    def test_error_message_includes_solution(self):
+    def test_truncated_name_within_limit_and_reversible(self):
         """
-        What it does: Verifies that error message includes solution guidance.
-        Purpose: Ensure user knows how to fix the problem.
+        What it does: Verifies a truncated name fits the limit and reverse-maps.
+        Purpose: Per #182, replace the old reject-with-guidance behavior with
+        transparent truncation that can be undone on the response path.
         """
+        from kiro.converters_core import validate_tool_names, get_original_tool_name
+
         print("Setup: Tool with long name...")
-        tools = [UnifiedTool(name="mcp__GitHub__" + "a" * 60, description="Test")]
-        
-        print("Action: Validating tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            raise AssertionError("Should reject long name")
-        except ValueError as e:
-            error_msg = str(e)
-            print(f"Error message: {error_msg[:300]}...")
-            
-            print("Checking that error message includes solution...")
-            assert "Solution:" in error_msg
-            assert "64 characters" in error_msg
-            assert "Example:" in error_msg
-    
+        original = "mcp__GitHub__" + "a" * 60
+        tools = [UnifiedTool(name=original, description="Test")]
+
+        print("Action: Validating tool names (should truncate)...")
+        validate_tool_names(tools)
+
+        assert len(tools[0].name) <= 64
+        assert get_original_tool_name(tools[0].name) == original
+
     def test_real_world_mcp_tool_names(self):
         """
-        What it does: Verifies rejection of real MCP tool names from Issue #41.
-        Purpose: Ensure the fix works for actual problematic tool names.
+        What it does: Verifies real MCP tool names from Issue #41 are truncated
+        to the 64-char limit and remain reversible, instead of being rejected.
+        Purpose: Ensure the fix works for actual problematic tool names (#41, #182).
         """
+        from kiro.converters_core import validate_tool_names, get_original_tool_name
+
         print("Setup: Real MCP tool names from Issue #41...")
         problematic_names = [
             "mcp__GitHub__check_if_a_person_is_followed_by_the_authenticated_user",
             "mcp__GitHub__check_if_a_repository_is_starred_by_the_authenticated_user",
             "mcp__GitHub__remove_interaction_restrictions_from_your_public_repositories",
         ]
-        
+
         tools = [UnifiedTool(name=name, description="Test") for name in problematic_names]
-        
-        print("Action: Validating real MCP tool names (should raise ValueError)...")
-        try:
-            from kiro.converters_core import validate_tool_names
-            validate_tool_names(tools)
-            raise AssertionError("Should reject real MCP tool names")
-        except ValueError as e:
-            error_msg = str(e)
-            print(f"Error message length: {len(error_msg)} chars")
-            print(f"Error message: {error_msg[:400]}...")
-            
-            print("Checking that all problematic names are listed...")
-            for name in problematic_names:
-                assert name in error_msg, f"Tool name '{name}' should be in error message"
-            
-            print("Checking that character counts are shown...")
-            assert "68 characters" in error_msg
-            assert "71 characters" in error_msg
-            assert "74 characters" in error_msg
+
+        print("Action: Validating real MCP tool names (should truncate)...")
+        validate_tool_names(tools)
+
+        truncated_names = [t.name for t in tools]
+        print(f"Truncated names: {truncated_names}")
+
+        # Every name now fits the limit and is distinct.
+        for short in truncated_names:
+            assert len(short) <= 64
+        assert len(set(truncated_names)) == len(truncated_names), "Truncated names must stay unique"
+
+        # Each truncated name reverse-maps to its original.
+        for short, original in zip(truncated_names, problematic_names):
+            assert get_original_tool_name(short) == original
 
 
 # ==================================================================================================

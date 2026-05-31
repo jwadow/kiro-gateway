@@ -43,10 +43,12 @@ from loguru import logger
 from kiro.config import (
     TOKEN_REFRESH_THRESHOLD,
     SQLITE_READONLY,
+    normalize_config_path,
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
     get_aws_sso_oidc_url,
+    get_ssl_verify,
 )
 from kiro.utils import get_machine_fingerprint
 
@@ -202,15 +204,15 @@ class KiroAuthManager:
             final_api_region = api_region_override
             logger.info(f"API region: {final_api_region} (from KIRO_API_REGION env var)")
         elif self._detected_api_region:
-            # Auto-detected from credentials (SQLite profile ARN or JSON region field)
+            # Verified API region (e.g. SQLite profile ARN). The JSON `region`
+            # field no longer populates this — it is SSO-only (issue #81).
             final_api_region = self._detected_api_region
             logger.info(f"API region: {final_api_region} (auto-detected from credentials)")
-        elif self._sso_region:
-            # Fallback to SSO region
-            final_api_region = self._sso_region
-            logger.info(f"API region: {final_api_region} (using SSO region as fallback)")
         else:
-            # Final fallback to default region
+            # Default API region. We deliberately do NOT fall back to the SSO
+            # region: the SSO/auth region is frequently unreachable as a Q API
+            # host, while the default (us-east-1) is the universally available
+            # endpoint (issue #81). OIDC token refresh still uses the SSO region.
             final_api_region = region
             logger.info(f"API region: {final_api_region} (using default)")
         
@@ -268,110 +270,112 @@ class KiroAuthManager:
             db_path: Path to SQLite database file
         """
         try:
-            path = Path(db_path).expanduser()
+            path = Path(normalize_config_path(db_path))
             if not path.exists():
                 logger.warning(f"SQLite database not found: {db_path}")
                 return
             
             conn = sqlite3.connect(str(path))
-            cursor = conn.cursor()
-            
-            # Try all possible token keys in priority order
-            token_row = None
-            for key in SQLITE_TOKEN_KEYS:
-                cursor.execute("SELECT value FROM auth_kv WHERE key = ?", (key,))
-                token_row = cursor.fetchone()
-                if token_row:
-                    self._sqlite_token_key = key  # Remember which key we loaded from
-                    logger.debug(f"Loaded credentials from SQLite key: {key}")
-                    break
-            
-            if token_row:
-                token_data = json.loads(token_row[0])
-                if token_data:
-                    # Load token fields (using snake_case as in Rust struct)
-                    if 'access_token' in token_data:
-                        self._access_token = token_data['access_token']
-                    if 'refresh_token' in token_data:
-                        self._refresh_token = token_data['refresh_token']
-                    if 'profile_arn' in token_data:
-                        self._profile_arn = token_data['profile_arn']
-                    if 'region' in token_data:
-                        # Store SSO region for OIDC token refresh
-                        # Note: API region is determined separately (see __init__ for priority logic)
-                        self._sso_region = token_data['region']
-                        logger.debug(f"SSO region from SQLite: {self._sso_region}")
-                    
-                    # Load scopes if available
-                    if 'scopes' in token_data:
-                        self._scopes = token_data['scopes']
-                    
-                    # Parse expires_at (RFC3339 format)
-                    if 'expires_at' in token_data:
-                        try:
-                            expires_str = token_data['expires_at']
-                            # Handle various ISO 8601 formats
-                            if expires_str.endswith('Z'):
-                                expires_str = expires_str.replace('Z', '+00:00')
-                            # Python 3.10 fromisoformat supports max 6 decimal places (microseconds)
-                            # kiro-cli writes nanoseconds (9 digits) — truncate to 6
-                            expires_str = re.sub(r'(\.\d{6})\d+', r'\1', expires_str)
-                            self._expires_at = datetime.fromisoformat(expires_str)
-                        except Exception as e:
-                            logger.warning(f"Failed to parse expires_at from SQLite: {e}")
-            
-            # Load device registration (client_id, client_secret) - try all possible keys
-            registration_row = None
-            for key in SQLITE_REGISTRATION_KEYS:
-                cursor.execute("SELECT value FROM auth_kv WHERE key = ?", (key,))
-                registration_row = cursor.fetchone()
-                if registration_row:
-                    logger.debug(f"Loaded device registration from SQLite key: {key}")
-                    break
-            
-            if registration_row:
-                registration_data = json.loads(registration_row[0])
-                if registration_data:
-                    if 'client_id' in registration_data:
-                        self._client_id = registration_data['client_id']
-                    if 'client_secret' in registration_data:
-                        self._client_secret = registration_data['client_secret']
-                    # SSO region from registration (fallback if not in token data)
-                    if 'region' in registration_data and not self._sso_region:
-                        self._sso_region = registration_data['region']
-                        logger.debug(f"SSO region from device-registration: {self._sso_region}")
-
-            # Try to auto-detect API region from profile ARN in state table
-            # This is separate from SSO region because q.amazonaws.com endpoints
-            # only exist in specific regions (Issue #132, #133)
             try:
-                cursor.execute("SELECT value FROM state WHERE key = 'api.codewhisperer.profile'")
-                profile_row = cursor.fetchone()
-                if profile_row:
-                    profile_data = json.loads(profile_row[0])
-                    arn = profile_data.get("arn", "")
-                    if arn:
-                        if not self._profile_arn:
-                            self._profile_arn = arn
-                            logger.debug(f"Profile ARN from state table: {self._profile_arn}")
-                        # ARN format: arn:aws:codewhisperer:REGION:account:profile/id
-                        # Extract region from 4th component (index 3)
-                        parts = arn.split(":")
-                        if len(parts) >= 4 and parts[3]:
-                            # Validate region format (e.g., us-east-1, eu-central-1)
-                            if re.match(r'^[a-z]+-[a-z]+-\d+$', parts[3]):
-                                self._detected_api_region = parts[3]
-                                logger.info(f"API region auto-detected from profile ARN: {parts[3]}")
-                            else:
-                                logger.debug(f"Invalid region format in ARN: {parts[3]}")
-            except sqlite3.Error as e:
-                logger.debug(f"Failed to read state table from SQLite: {e}")
-            except json.JSONDecodeError as e:
-                logger.debug(f"Failed to parse profile data from state table: {e}")
-            except Exception as e:
-                logger.debug(f"Failed to auto-detect API region from profile ARN: {e}")
+                cursor = conn.cursor()
 
-            conn.close()
+                # Try all possible token keys in priority order
+                token_row = None
+                for key in SQLITE_TOKEN_KEYS:
+                    cursor.execute("SELECT value FROM auth_kv WHERE key = ?", (key,))
+                    token_row = cursor.fetchone()
+                    if token_row:
+                        self._sqlite_token_key = key  # Remember which key we loaded from
+                        logger.debug(f"Loaded credentials from SQLite key: {key}")
+                        break
+
+                if token_row:
+                    token_data = json.loads(token_row[0])
+                    if token_data:
+                        # Load token fields (using snake_case as in Rust struct)
+                        if 'access_token' in token_data:
+                            self._access_token = token_data['access_token']
+                        if 'refresh_token' in token_data:
+                            self._refresh_token = token_data['refresh_token']
+                        if 'profile_arn' in token_data:
+                            self._profile_arn = token_data['profile_arn']
+                        if 'region' in token_data:
+                            # Store SSO region for OIDC token refresh
+                            # Note: API region is determined separately (see __init__ for priority logic)
+                            self._sso_region = token_data['region']
+                            logger.debug(f"SSO region from SQLite: {self._sso_region}")
+
+                        # Load scopes if available
+                        if 'scopes' in token_data:
+                            self._scopes = token_data['scopes']
+
+                        # Parse expires_at (RFC3339 format)
+                        if 'expires_at' in token_data:
+                            try:
+                                expires_str = token_data['expires_at']
+                                # Handle various ISO 8601 formats
+                                if expires_str.endswith('Z'):
+                                    expires_str = expires_str.replace('Z', '+00:00')
+                                # Python 3.10 fromisoformat supports max 6 decimal places (microseconds)
+                                # kiro-cli writes nanoseconds (9 digits) — truncate to 6
+                                expires_str = re.sub(r'(\.\d{6})\d+', r'\1', expires_str)
+                                self._expires_at = datetime.fromisoformat(expires_str)
+                            except Exception as e:
+                                logger.warning(f"Failed to parse expires_at from SQLite: {e}")
+
+                # Load device registration (client_id, client_secret) - try all possible keys
+                registration_row = None
+                for key in SQLITE_REGISTRATION_KEYS:
+                    cursor.execute("SELECT value FROM auth_kv WHERE key = ?", (key,))
+                    registration_row = cursor.fetchone()
+                    if registration_row:
+                        logger.debug(f"Loaded device registration from SQLite key: {key}")
+                        break
+
+                if registration_row:
+                    registration_data = json.loads(registration_row[0])
+                    if registration_data:
+                        if 'client_id' in registration_data:
+                            self._client_id = registration_data['client_id']
+                        if 'client_secret' in registration_data:
+                            self._client_secret = registration_data['client_secret']
+                        # SSO region from registration (fallback if not in token data)
+                        if 'region' in registration_data and not self._sso_region:
+                            self._sso_region = registration_data['region']
+                            logger.debug(f"SSO region from device-registration: {self._sso_region}")
+
+                # Try to auto-detect API region from profile ARN in state table
+                # This is separate from SSO region because q.amazonaws.com endpoints
+                # only exist in specific regions (Issue #132, #133)
+                try:
+                    cursor.execute("SELECT value FROM state WHERE key = 'api.codewhisperer.profile'")
+                    profile_row = cursor.fetchone()
+                    if profile_row:
+                        profile_data = json.loads(profile_row[0])
+                        arn = profile_data.get("arn", "")
+                        if arn:
+                            if not self._profile_arn:
+                                self._profile_arn = arn
+                                logger.debug(f"Profile ARN from state table: {self._profile_arn}")
+                            # ARN format: arn:aws:codewhisperer:REGION:account:profile/id
+                            # Extract region from 4th component (index 3)
+                            parts = arn.split(":")
+                            if len(parts) >= 4 and parts[3]:
+                                # Validate region format (e.g., us-east-1, eu-central-1)
+                                if re.match(r'^[a-z]+-[a-z]+-\d+$', parts[3]):
+                                    self._detected_api_region = parts[3]
+                                    logger.info(f"API region auto-detected from profile ARN: {parts[3]}")
+                                else:
+                                    logger.debug(f"Invalid region format in ARN: {parts[3]}")
+                except sqlite3.Error as e:
+                    logger.debug(f"Failed to read state table from SQLite: {e}")
+                except json.JSONDecodeError as e:
+                    logger.debug(f"Failed to parse profile data from state table: {e}")
+                except Exception as e:
+                    logger.debug(f"Failed to auto-detect API region from profile ARN: {e}")
+            finally:
+                conn.close()
+
             logger.info(f"Credentials loaded from SQLite database: {db_path}")
             
         except sqlite3.Error as e:
@@ -405,7 +409,7 @@ class KiroAuthManager:
             file_path: Path to JSON file
         """
         try:
-            path = Path(file_path).expanduser()
+            path = Path(normalize_config_path(file_path))
             if not path.exists():
                 logger.warning(f"Credentials file not found: {file_path}")
                 return
@@ -421,11 +425,16 @@ class KiroAuthManager:
             if 'profileArn' in data:
                 self._profile_arn = data['profileArn']
             if 'region' in data:
-                # Store as SSO region for OIDC token refresh
+                # Store as SSO region for OIDC/desktop token refresh ONLY.
+                # The JSON `region` is the auth region and is NOT a verified Q API
+                # region, so it must not drive the API host. runtime.{region}.kiro.dev
+                # (and codewhisperer.{region}.amazonaws.com) only exist for specific
+                # regions; a non-us-east-1 value here previously made all requests fail
+                # even though us-east-1 works (issue #81; see also #58/#132/#133).
+                # API region defaults to us-east-1 unless KIRO_API_REGION env or the
+                # per-account `api_region` parameter explicitly overrides it.
                 self._sso_region = data['region']
-                # Also use as detected API region (can be overridden by KIRO_API_REGION env var)
-                self._detected_api_region = data['region']
-                logger.debug(f"Region from JSON credentials: {data['region']}")
+                logger.debug(f"SSO region from JSON credentials: {data['region']}")
             
             # Load clientIdHash and device registration for Enterprise Kiro IDE
             if 'clientIdHash' in data:
@@ -496,7 +505,7 @@ class KiroAuthManager:
             return
         
         try:
-            path = Path(self._creds_file).expanduser()
+            path = Path(normalize_config_path(self._creds_file))
             
             # Read existing data
             existing_data = {}
@@ -545,37 +554,37 @@ class KiroAuthManager:
             return
         
         try:
-            path = Path(self._sqlite_db).expanduser()
+            path = Path(normalize_config_path(self._sqlite_db))
             if not path.exists():
                 logger.warning(f"SQLite database not found for writing: {self._sqlite_db}")
                 return
             
             # Use timeout to avoid blocking if database is locked
             conn = sqlite3.connect(str(path), timeout=5.0)
-            cursor = conn.cursor()
-            
-            # Try to save to the known key first (if we have it)
-            if self._sqlite_token_key:
-                if self._try_save_to_key(cursor, self._sqlite_token_key):
-                    conn.commit()
-                    conn.close()
-                    logger.debug(f"Credentials saved to SQLite key: {self._sqlite_token_key} (merged)")
-                    return
-                else:
-                    logger.warning(f"Failed to save to primary key: {self._sqlite_token_key}, trying fallback")
-            
-            # Fallback: try all keys (for edge cases where source key is unknown or deleted)
-            for key in SQLITE_TOKEN_KEYS:
-                if self._try_save_to_key(cursor, key):
-                    conn.commit()
-                    conn.close()
-                    logger.debug(f"Credentials saved to SQLite key: {key} (fallback, merged)")
-                    return
-            
-            # If we get here, no keys were updated
-            conn.close()
-            logger.warning(f"Failed to save credentials to SQLite: no matching keys found")
-            
+            try:
+                cursor = conn.cursor()
+
+                # Try to save to the known key first (if we have it)
+                if self._sqlite_token_key:
+                    if self._try_save_to_key(cursor, self._sqlite_token_key):
+                        conn.commit()
+                        logger.debug(f"Credentials saved to SQLite key: {self._sqlite_token_key} (merged)")
+                        return
+                    else:
+                        logger.warning(f"Failed to save to primary key: {self._sqlite_token_key}, trying fallback")
+
+                # Fallback: try all keys (for edge cases where source key is unknown or deleted)
+                for key in SQLITE_TOKEN_KEYS:
+                    if self._try_save_to_key(cursor, key):
+                        conn.commit()
+                        logger.debug(f"Credentials saved to SQLite key: {key} (fallback, merged)")
+                        return
+
+                # If we get here, no keys were updated
+                logger.warning(f"Failed to save credentials to SQLite: no matching keys found")
+            finally:
+                conn.close()
+
         except sqlite3.Error as e:
             logger.error(f"SQLite error saving credentials: {e}")
         except Exception as e:
@@ -705,7 +714,7 @@ class KiroAuthManager:
             "User-Agent": f"KiroIDE-0.7.45-{self._fingerprint}",
         }
         
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, verify=get_ssl_verify()) as client:
             response = await client.post(self._refresh_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -822,7 +831,7 @@ class KiroAuthManager:
         logger.debug(f"AWS SSO OIDC refresh request: url={url}, sso_region={sso_region}, "
                      f"api_region={self._region}, client_id={self._client_id[:8]}...")
         
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, verify=get_ssl_verify()) as client:
             response = await client.post(url, json=payload, headers=headers)
             
             # Log response details for debugging (especially on errors)

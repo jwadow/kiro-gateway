@@ -140,6 +140,35 @@ class ModelInfoCache:
         if model and model.get("tokenLimits"):
             return model["tokenLimits"].get("maxInputTokens") or DEFAULT_MAX_INPUT_TOKENS
         return DEFAULT_MAX_INPUT_TOKENS
+
+    def get_token_limits(self, model_id: str) -> Optional[Dict[str, int]]:
+        """
+        Returns raw tokenLimits for the model, as reported by Kiro's
+        ListAvailableModels (``{"maxInputTokens": int, "maxOutputTokens": int}``).
+
+        Unlike :meth:`get_max_input_tokens`, this does not fall back to the
+        ``DEFAULT_MAX_INPUT_TOKENS`` constant — callers that want the *real*
+        upstream ceiling (for example, the OpenAI-compatible ``/v1/models``
+        response) can distinguish "unknown" from "default".
+
+        Args:
+            model_id: Model ID
+
+        Returns:
+            Dict with integer ``maxInputTokens`` / ``maxOutputTokens`` keys
+            (either may be missing), or ``None`` if the model is unknown or
+            has no ``tokenLimits`` metadata.
+        """
+        model = self._cache.get(model_id)
+        if not model:
+            return None
+        tl = model.get("tokenLimits") or {}
+        out: Dict[str, int] = {}
+        for key in ("maxInputTokens", "maxOutputTokens"):
+            val = tl.get(key)
+            if isinstance(val, int):
+                out[key] = val
+        return out or None
     
     def is_empty(self) -> bool:
         """

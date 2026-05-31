@@ -35,6 +35,54 @@ from pydantic import BaseModel, Field, model_validator
 # Content Block Models
 # ==================================================================================================
 
+# Content block "type" values the gateway understands. Blocks whose type is not
+# in this set are downgraded to text blocks before Pydantic validation (see
+# AnthropicMessage.sanitize_unknown_content_blocks) so unknown / forward-
+# compatible block kinds never cause a 422. Extend this set when adding a new
+# content block model rather than re-patching the validator.
+KNOWN_CONTENT_BLOCK_TYPES = {
+    "text",
+    "thinking",
+    "redacted_thinking",
+    "image",
+    "document",
+    "tool_use",
+    "tool_result",
+    "tool_reference",
+    "server_tool_use",
+    "web_search_tool_result",
+}
+
+# Content block "type" values valid inside a tool_result's content array.
+KNOWN_TOOL_RESULT_INNER_TYPES = {
+    "text",
+    "image",
+    "document",
+    "tool_reference",
+}
+
+
+def _downgrade_unknown_block(block: Any, known_types: set) -> Any:
+    """
+    Downgrade an unknown content block to a text block.
+
+    Args:
+        block: A single content block (a dict, or any other value).
+        known_types: Set of block ``type`` values to pass through untouched.
+
+    Returns:
+        The original block when its type is known (or it is not a dict),
+        otherwise a text block preserving any identifying info (text / tool name).
+    """
+    if not isinstance(block, dict) or block.get("type") in known_types:
+        return block
+    block_type = block.get("type", "unknown")
+    text = block.get("text") or block.get("tool_name") or block.get("name") or ""
+    return {
+        "type": "text",
+        "text": f"[{block_type}: {text}]" if text else f"[{block_type}]",
+    }
+
 
 class TextContentBlock(BaseModel):
     """
@@ -65,6 +113,24 @@ class ThinkingContentBlock(BaseModel):
     signature: str = ""
 
 
+class RedactedThinkingContentBlock(BaseModel):
+    """
+    Redacted thinking content block in Anthropic format.
+
+    Claude may return encrypted reasoning when extended thinking is enabled.
+    Clients can replay these blocks in later requests; the gateway accepts
+    them for schema compatibility without exposing the opaque data as prompt
+    text.
+
+    Attributes:
+        type: Always "redacted_thinking"
+        data: Opaque, encrypted reasoning payload (passed through, not decoded)
+    """
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
+
+
 class ToolUseContentBlock(BaseModel):
     """
     Tool use content block in Anthropic format.
@@ -92,6 +158,54 @@ class ToolReferenceContentBlock(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class ServerToolUseContentBlock(BaseModel):
+    """
+    Server-side tool use content block returned by Anthropic.
+
+    Claude Code can include these blocks in assistant history after native
+    tools such as web_search run. Kiro Gateway accepts them for history
+    compatibility but does not forward them as Kiro tool calls.
+    """
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchResultBlock(BaseModel):
+    """
+    Individual web search result block from Anthropic server-side tools.
+    """
+
+    type: Literal["web_search_result"] = "web_search_result"
+    title: Optional[str] = None
+    url: Optional[str] = None
+    encrypted_content: Optional[str] = None
+    page_age: Optional[str] = None
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultContentBlock(BaseModel):
+    """
+    Server-side web search result block returned by Anthropic.
+
+    These blocks appear in Claude Code conversation history paired with
+    server_tool_use blocks. They are accepted to preserve compatibility and
+    ignored by Kiro conversion because Kiro cannot replay Anthropic-native
+    server tool results.
+    """
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Union[str, List[Union[WebSearchResultBlock, Dict[str, Any]]]]
+
+    model_config = {"extra": "allow"}
+
+
 class ToolResultContentBlock(BaseModel):
     """
     Tool result content block in Anthropic format.
@@ -103,11 +217,49 @@ class ToolResultContentBlock(BaseModel):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
     content: Optional[
-        Union[str, List[Union["TextContentBlock", "ImageContentBlock", "ToolReferenceContentBlock"]]]
+        Union[
+            str,
+            List[
+                Union[
+                    "TextContentBlock",
+                    "ImageContentBlock",
+                    "DocumentContentBlock",
+                    "ToolReferenceContentBlock",
+                ]
+            ],
+        ]
     ] = None
     is_error: Optional[bool] = None
 
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_unknown_inner_blocks(cls, data: Any) -> Any:
+        """
+        Downgrade unknown content block types inside a tool_result's content
+        list to text blocks before validation.
+
+        Tool results may carry inner blocks whose type is not part of the
+        accepted set (e.g. a future block kind). Converting them to text keeps
+        the tool result usable instead of failing the whole request with a 422.
+        A string ``content`` (the common case) is passed through untouched.
+
+        Args:
+            data: Raw tool_result dict (or other value) prior to validation.
+
+        Returns:
+            The (possibly sanitized) input value.
+        """
+        if not isinstance(data, dict):
+            return data
+        content = data.get("content")
+        if not isinstance(content, list):
+            return data
+        data["content"] = [
+            _downgrade_unknown_block(block, KNOWN_TOOL_RESULT_INNER_TYPES) for block in content
+        ]
+        return data
 
 
 # ==================================================================================================
@@ -162,14 +314,77 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
+class Base64DocumentSource(BaseModel):
+    """
+    Base64-encoded document source in Anthropic format.
+
+    Claude Code sends PDFs read from disk as document blocks with base64
+    sources. Kiro has no native document input, so converters extract text
+    from supported documents and append it to the prompt.
+
+    Attributes:
+        type: Always "base64"
+        media_type: MIME type (e.g., "application/pdf", "text/plain")
+        data: Base64-encoded document data
+    """
+
+    type: Literal["base64"] = "base64"
+    media_type: str
+    data: str
+
+
+class URLDocumentSource(BaseModel):
+    """
+    URL-based document source in Anthropic format.
+
+    Note: URL document sources are not supported by Kiro Gateway and are
+    surfaced as a placeholder note rather than fetched.
+
+    Attributes:
+        type: Always "url"
+        url: HTTP(S) URL to the document
+    """
+
+    type: Literal["url"] = "url"
+    url: str
+
+
+class DocumentContentBlock(BaseModel):
+    """
+    Document content block in Anthropic format.
+
+    Represents a document such as a PDF included in a message. The source may
+    be base64-encoded, a URL, or a raw dict for forward compatibility.
+
+    Attributes:
+        type: Always "document"
+        source: Document source (base64, URL, or raw dict)
+        title: Optional document title
+        context: Optional context string supplied by the client
+        cache_control: Optional prompt-caching directive (passed through)
+    """
+
+    type: Literal["document"] = "document"
+    source: Union[Base64DocumentSource, URLDocumentSource, Dict[str, Any]]
+    title: Optional[str] = None
+    context: Optional[str] = None
+    cache_control: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "allow"}
+
+
 # Union type for all content blocks (including images and thinking)
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
+    RedactedThinkingContentBlock,
     ImageContentBlock,
+    DocumentContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
 ]
 
 
@@ -183,14 +398,47 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. The Anthropic spec only defines "user" and
+            "assistant" for the messages array (system is a top-level field),
+            but some clients (notably Claude Code on certain model ids) emit
+            other inline roles such as "system" or "developer". We accept any
+            string here and rely on ``normalize_message_roles`` in the
+            conversion pipeline to collapse unknown roles to "user" before the
+            request reaches upstream Kiro. This prevents 422s on novel roles
+            (see #190) without hardcoding a closed set.
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: str
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_unknown_content_blocks(cls, data: Any) -> Any:
+        """
+        Convert unknown content block types to text blocks before validation.
+
+        Some clients emit content blocks whose ``type`` is not part of the
+        Anthropic spec (e.g. future block kinds). Rather than rejecting the
+        whole request with a 422, we downgrade unknown blocks to a text block
+        that preserves any useful identifying info. Known types listed in
+        ``KNOWN_CONTENT_BLOCK_TYPES`` are passed through untouched.
+
+        Args:
+            data: Raw message dict (or other value) prior to validation.
+
+        Returns:
+            The (possibly sanitized) input value.
+        """
+        if not isinstance(data, dict):
+            return data
+        content = data.get("content")
+        if not isinstance(content, list):
+            return data
+        data["content"] = [_downgrade_unknown_block(block, KNOWN_CONTENT_BLOCK_TYPES) for block in content]
+        return data
 
 
 # ==================================================================================================
@@ -221,7 +469,7 @@ class AnthropicTool(BaseModel):
     type: Optional[str] = None
     
     # Common fields
-    name: str
+    name: Optional[str] = None  # Optional for server-side tools (validated below)
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None  # Now optional for server-side tools
     
@@ -235,11 +483,16 @@ class AnthropicTool(BaseModel):
     
     @model_validator(mode="after")
     def validate_tool_consistency(self):
-        """Validate that user-defined tools have input_schema."""
+        """Validate that user-defined tools have both a name and input_schema."""
         is_server_side = self.type is not None
-        
+
         if not is_server_side:
-            # User-defined tool: input_schema is required
+            # User-defined tool: name and input_schema are required.
+            if not self.name:
+                raise ValueError(
+                    "name is required for user-defined tools "
+                    "(those without a 'type' field)"
+                )
             if self.input_schema is None:
                 raise ValueError(
                     "input_schema is required for user-defined tools "

@@ -974,6 +974,113 @@ class TestStreamingAnthropicErrorHandling:
         mock_response.aclose.assert_called()
         print("✓ Response closed in finally block")
 
+    @pytest.mark.asyncio
+    async def test_mid_stream_remote_protocol_error_finalizes_gracefully(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Finalizes the Anthropic stream gracefully when Kiro drops
+            the connection mid-stream with httpx.RemoteProtocolError (#129).
+        Goal: Verify content already streamed is followed by a proper
+            message_delta (stop_reason) + message_stop, without an unhandled
+            exception or an error event.
+        """
+        import httpx
+
+        print("Setup: Mock stream that yields content then drops mid-stream...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial answer")
+            raise httpx.RemoteProtocolError("peer closed connection without sending complete message body (incomplete chunked read)")
+
+        print("Action: Streaming to Anthropic format with mid-stream drop...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        # Content delta should have been emitted
+        assert any('"Partial answer"' in e for e in events)
+        # Must terminate cleanly with message_delta (stop_reason) + message_stop
+        message_delta_events = [e for e in events if "event: message_delta" in e]
+        assert len(message_delta_events) == 1
+        assert '"stop_reason"' in message_delta_events[0]
+        assert "event: message_stop" in events[-1]
+        # No error event should be emitted for a graceful finalize
+        assert not any("event: error" in e for e in events)
+        # Response must be closed
+        mock_response.aclose.assert_called()
+        print("✓ Mid-stream RemoteProtocolError finalized gracefully")
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_read_error_finalizes_gracefully(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Finalizes the Anthropic stream gracefully when Kiro drops
+            the connection mid-stream with httpx.ReadError (#129).
+        Goal: Verify ReadError is treated like RemoteProtocolError once content
+            has already been streamed.
+        """
+        import httpx
+
+        print("Setup: Mock stream that yields content then raises ReadError...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hello")
+            yield KiroEvent(type="content", content=" there")
+            raise httpx.ReadError("connection broken")
+
+        print("Action: Streaming to Anthropic format with mid-stream ReadError...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        message_delta_events = [e for e in events if "event: message_delta" in e]
+        assert len(message_delta_events) == 1
+        assert "event: message_stop" in events[-1]
+        assert not any("event: error" in e for e in events)
+        print("✓ Mid-stream ReadError finalized gracefully")
+
+    @pytest.mark.asyncio
+    async def test_remote_protocol_error_before_content_is_propagated(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Propagates httpx.RemoteProtocolError when it occurs before
+            any content was streamed (#129).
+        Goal: Verify first-token error handling is preserved - a drop before any
+            content must NOT be silently finalized.
+        """
+        import httpx
+
+        print("Setup: Mock stream that drops before any content...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            raise httpx.RemoteProtocolError("peer closed connection")
+            yield  # Make it a generator
+
+        print("Action: Streaming to Anthropic format with pre-content drop...")
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(httpx.RemoteProtocolError):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        pass
+
+        # Response must still be closed
+        mock_response.aclose.assert_called()
+        print("✓ Pre-content RemoteProtocolError propagated correctly")
+
 
 # ==================================================================================================
 # Tests for thinking content handling

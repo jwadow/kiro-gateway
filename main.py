@@ -45,6 +45,7 @@ import json
 import logging
 import sys
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -78,7 +79,9 @@ from kiro.config import (
     ACCOUNT_SYSTEM,
     ACCOUNTS_CONFIG_FILE,
     ACCOUNTS_STATE_FILE,
+    normalize_config_path,
     _warn_timeout_configuration,
+    get_ssl_verify,
 )
 from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
@@ -86,6 +89,7 @@ from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
+from kiro.routes_admin import router as admin_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
 
@@ -224,7 +228,7 @@ def validate_configuration() -> None:
     # Priority 1: Check if credentials.json exists (Account System)
     # If it exists, legacy .env validation is skipped
     from kiro.config import ACCOUNTS_CONFIG_FILE
-    creds_json_path = Path(ACCOUNTS_CONFIG_FILE)
+    creds_json_path = Path(normalize_config_path(ACCOUNTS_CONFIG_FILE))
     
     if creds_json_path.exists():
         logger.debug(f"Found {ACCOUNTS_CONFIG_FILE}, skipping legacy .env validation")
@@ -243,14 +247,14 @@ def validate_configuration() -> None:
     
     # Check if creds file actually exists
     if KIRO_CREDS_FILE:
-        creds_path = Path(KIRO_CREDS_FILE).expanduser()
+        creds_path = Path(normalize_config_path(KIRO_CREDS_FILE))
         if not creds_path.exists():
             has_creds_file = False
             logger.warning(f"KIRO_CREDS_FILE not found: {KIRO_CREDS_FILE}")
     
     # Check if CLI database file actually exists
     if KIRO_CLI_DB_FILE:
-        cli_db_path = Path(KIRO_CLI_DB_FILE).expanduser()
+        cli_db_path = Path(normalize_config_path(KIRO_CLI_DB_FILE))
         if not cli_db_path.exists():
             has_cli_db = False
             logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
@@ -296,6 +300,7 @@ def validate_configuration() -> None:
                 "\n"
                 "   Option 3: kiro-cli SQLite database (AWS SSO)\n"
                 "      KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
+                "      Windows: KIRO_CLI_DB_FILE=\"%LOCALAPPDATA%\\Kiro-Cli\\data.sqlite3\"\n"
                 "\n"
                 "   See README.md for how to obtain credentials."
             )
@@ -351,19 +356,23 @@ async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(
         limits=limits,
         timeout=timeout,
-        follow_redirects=True
+        follow_redirects=True,
+        verify=get_ssl_verify()
     )
     logger.info("Shared HTTP client created with connection pooling")
+
+    # Record process start time for uptime reporting on /health
+    app.state.start_time = time.time()
     
     # ==============================================================================
     # Legacy Fallback: .env → credentials.json
     # ==============================================================================
-    creds_path = Path(ACCOUNTS_CONFIG_FILE)
+    creds_path = Path(normalize_config_path(ACCOUNTS_CONFIG_FILE))
     
     # Check if we have legacy .env credentials
     has_refresh_token = bool(REFRESH_TOKEN)
-    has_creds_file = bool(KIRO_CREDS_FILE) and Path(KIRO_CREDS_FILE).expanduser().exists()
-    has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
+    has_creds_file = bool(KIRO_CREDS_FILE) and Path(normalize_config_path(KIRO_CREDS_FILE)).exists()
+    has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(normalize_config_path(KIRO_CLI_DB_FILE)).exists()
     
     # Helper function to add optional per-account overrides from .env
     def _add_env_overrides(entry: dict) -> None:
@@ -499,6 +508,28 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to initialize any account. Check your credentials.")
         raise RuntimeError("Failed to initialize any account")
     
+    # Initialize remaining accounts in background (non-blocking) so the admin
+    # usage endpoint can report on every configured account without blocking startup.
+    remaining = [
+        aid for aid in all_accounts
+        if app.state.account_manager._accounts[aid].auth_manager is None
+    ]
+    if remaining:
+        async def _init_remaining():
+            for account_id in remaining:
+                try:
+                    success = await app.state.account_manager._initialize_account(account_id)
+                    if success:
+                        logger.info(f"Background-initialized account: {account_id}")
+                    else:
+                        logger.warning(f"Background init failed for account: {account_id}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(f"Background init error for account {account_id}: {exc}")
+        app.state._init_remaining_task = asyncio.create_task(_init_remaining())
+        logger.info(f"Queued background initialization for {len(remaining)} remaining account(s)")
+
     # Save initial state
     await app.state.account_manager._save_state()
     
@@ -521,6 +552,15 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     
+    # Cancel background account init task if still running
+    init_task = getattr(app.state, "_init_remaining_task", None)
+    if init_task and not init_task.done():
+        init_task.cancel()
+        try:
+            await init_task
+        except asyncio.CancelledError:
+            pass
+
     # Final state save
     await app.state.account_manager._save_state()
     logger.info("Final state saved")
@@ -570,6 +610,9 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Admin API: /admin/accounts/usage (authenticated with PROXY_API_KEY)
+app.include_router(admin_router)
 
 
 # --- Uvicorn log config ---
@@ -727,27 +770,40 @@ def print_startup_banner(host: str, port: int) -> None:
     print()
 
 
-# --- Entry Point ---
-if __name__ == "__main__":
+def main() -> None:
+    """
+    Console entry point for running the Kiro Gateway server.
+
+    Parses CLI arguments, validates configuration, resolves the final
+    host/port using the priority hierarchy (CLI > env > defaults), and
+    starts the Uvicorn server.
+
+    This function is exposed as the ``kiro-gateway`` console script via
+    ``[project.scripts]`` in ``pyproject.toml`` so the application can be
+    launched with ``uv run kiro-gateway`` or after installation.
+
+    Returns:
+        None
+    """
     import uvicorn
-    
+
     # Parse CLI arguments first (handles --version, --help without requiring config)
     args = parse_cli_args()
-    
+
     # Run configuration validation before starting server
     validate_configuration()
-    
+
     # Warn about suboptimal timeout configuration
     _warn_timeout_configuration()
-    
+
     # Resolve final configuration with priority hierarchy
     final_host, final_port = resolve_server_config(args)
-    
+
     # Print startup banner
     print_startup_banner(final_host, final_port)
-    
+
     logger.info(f"Starting Uvicorn server on {final_host}:{final_port}...")
-    
+
     # Use string reference to avoid double module import
     uvicorn.run(
         "main:app",
@@ -755,3 +811,8 @@ if __name__ == "__main__":
         port=final_port,
         log_config=UVICORN_LOG_CONFIG,
     )
+
+
+# --- Entry Point ---
+if __name__ == "__main__":
+    main()

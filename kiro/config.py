@@ -26,8 +26,12 @@ Loads environment variables and provides typed access to them.
 
 import os
 import re
+import ssl
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
+
+from loguru import logger
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -71,10 +75,38 @@ def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
             if match:
                 # Return value as-is, without processing escape sequences
                 return match.group(2)
-    except Exception:
-        pass
+    except (OSError, UnicodeDecodeError):
+        return None
     
     return None
+
+
+def normalize_config_path(raw_path: str) -> str:
+    """
+    Normalize a user-provided configuration path without requiring it to exist.
+    
+    Handles both Unix-style and Windows-style environment variable syntax so
+    paths such as ``~/.aws/...`` and ``%LOCALAPPDATA%\\Kiro-Cli\\data.sqlite3``
+    work regardless of how they are provided.
+    
+    Args:
+        raw_path: Path string from environment variables or credentials config.
+    
+    Returns:
+        Normalized path string, or an empty string when no path was provided.
+    """
+    if not raw_path:
+        return ""
+    
+    stripped_path = raw_path.strip().strip('"').strip("'")
+    windows_expanded = re.sub(
+        r"%([^%]+)%",
+        lambda match: os.environ.get(match.group(1), match.group(0)),
+        stripped_path,
+    )
+    expanded_path = os.path.expandvars(windows_expanded)
+    return str(Path(expanded_path).expanduser())
+
 
 # ==================================================================================================
 # Server Settings
@@ -151,13 +183,16 @@ REGION: str = os.getenv("KIRO_REGION", "us-east-1")
 # (e.g., \a in path D:\Projects\adolf is interpreted as bell character)
 _raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv("KIRO_CREDS_FILE", "")
 # Normalize path for cross-platform compatibility
-KIRO_CREDS_FILE: str = str(Path(_raw_creds_file)) if _raw_creds_file else ""
+KIRO_CREDS_FILE: str = normalize_config_path(_raw_creds_file)
 
 # Path to kiro-cli SQLite database (optional, for AWS SSO OIDC authentication)
-# Default location: ~/.local/share/kiro-cli/data.sqlite3 (Linux/macOS)
-# or ~/.local/share/amazon-q/data.sqlite3 (amazon-q-developer-cli)
+# Default locations:
+#   Linux/macOS (kiro-cli):          ~/.local/share/kiro-cli/data.sqlite3
+#   Linux/macOS (amazon-q-dev-cli):  ~/.local/share/amazon-q/data.sqlite3
+#   Windows (kiro-cli):              %LOCALAPPDATA%\\Kiro-Cli\\data.sqlite3
+#                                    (e.g., C:\\Users\\<user>\\AppData\\Local\\Kiro-Cli\\data.sqlite3)
 _raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
-KIRO_CLI_DB_FILE: str = str(Path(_raw_cli_db_file)) if _raw_cli_db_file else ""
+KIRO_CLI_DB_FILE: str = normalize_config_path(_raw_cli_db_file)
 
 # Disable SQLite write-back (read-only mode)
 # When enabled, gateway will only read from kiro-cli database without modifying it.
@@ -175,14 +210,40 @@ KIRO_REFRESH_URL_TEMPLATE: str = "https://prod.{region}.auth.desktop.kiro.dev/re
 # URL for token refresh (AWS SSO OIDC - used by kiro-cli)
 AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
 
+# Use legacy q.amazonaws.com endpoint instead of runtime.kiro.dev.
+# Set to true for Builder ID (free tier) accounts that have no profileArn and
+# hit runtime.kiro.dev regressions (see #168, #173).
+KIRO_USE_LEGACY_ENDPOINT: bool = os.getenv(
+    "KIRO_USE_LEGACY_ENDPOINT", "false"
+).lower() in ("true", "1", "yes")
+
+# Allow unsafe legacy TLS renegotiation (OpenSSL 3.x disables it by default).
+# Needed behind certain corporate proxies / older TLS terminators that only
+# support pre-RFC 5746 renegotiation and otherwise trigger:
+#   [SSL: UNSAFE_LEGACY_RENEGOTIATION_DISABLED] (#187)
+# SECURITY: re-exposes the CVE-2009-3555 MITM prefix weakness. Certificate
+# verification stays ON; only the legacy-renegotiation restriction is relaxed.
+# Default: false (secure).
+KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION: bool = os.getenv(
+    "KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION", "false"
+).lower() in ("true", "1", "yes")
+
 # Host for main API (generateAssistantResponse)
 # Universal endpoint for all regions (us-east-1, eu-central-1, etc.)
 # See: https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/security-data-perimeter.html
 # Fixed in issue #58 - codewhisperer.{region}.amazonaws.com doesn't exist for non-us-east-1 regions
-KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+KIRO_API_HOST_TEMPLATE: str = (
+    "https://q.{region}.amazonaws.com"
+    if KIRO_USE_LEGACY_ENDPOINT
+    else "https://runtime.{region}.kiro.dev"
+)
 
 # Host for Q API (ListAvailableModels)
-KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+KIRO_Q_HOST_TEMPLATE: str = (
+    "https://q.{region}.amazonaws.com"
+    if KIRO_USE_LEGACY_ENDPOINT
+    else "https://runtime.{region}.kiro.dev"
+)
 
 # ==================================================================================================
 # Token Settings
@@ -479,6 +540,26 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_
 
 
 # ==================================================================================================
+# Native Thinking Settings (Kiro/Claude Adaptive Thinking)
+# ==================================================================================================
+
+# Experimental native thinking pass-through for Kiro models that expose Claude adaptive thinking.
+#
+# Modes:
+# - "off": Disabled (default, preserves existing fake reasoning behavior)
+# - "auto": Enable only when the client explicitly requests a reasoning effort
+# - "force": Enable for supported models even when the client does not send an effort
+KIRO_NATIVE_THINKING_MODE: str = os.getenv("KIRO_NATIVE_THINKING_MODE", "off").lower()
+if KIRO_NATIVE_THINKING_MODE not in ("off", "auto", "force"):
+    KIRO_NATIVE_THINKING_MODE = "off"
+
+# Claude Opus 4.8/4.7 default to omitted thinking text unless display is explicitly summarized.
+KIRO_NATIVE_THINKING_DISPLAY: str = os.getenv("KIRO_NATIVE_THINKING_DISPLAY", "summarized").lower()
+if KIRO_NATIVE_THINKING_DISPLAY not in ("summarized", "omitted"):
+    KIRO_NATIVE_THINKING_DISPLAY = "summarized"
+
+
+# ==================================================================================================
 # Payload Size Guard Settings
 # ==================================================================================================
 
@@ -578,4 +659,36 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
+
+
+@lru_cache(maxsize=1)
+def get_ssl_verify() -> Union[bool, ssl.SSLContext]:
+    """
+    Build the TLS verification value for all outbound httpx clients.
+
+    By default returns ``True`` (httpx default: full certificate verification).
+    When ``KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION`` is enabled, returns a custom
+    ``ssl.SSLContext`` with ``OP_LEGACY_SERVER_CONNECT`` set so the gateway can
+    complete TLS handshakes with proxies / terminators that only support legacy
+    (pre-RFC 5746) renegotiation. Certificate verification stays ON; only the
+    legacy-renegotiation restriction is relaxed.
+
+    WARNING: Legacy renegotiation re-exposes the CVE-2009-3555 MITM prefix
+    weakness. This is OFF by default and must be explicitly opted into.
+
+    Returns:
+        ``True`` for the secure default, or a configured ``ssl.SSLContext``
+        when legacy renegotiation is explicitly allowed. The context is
+        memoized so a single instance is shared across all clients.
+    """
+    if not KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION:
+        return True
+
+    logger.warning(
+        "KIRO_ALLOW_LEGACY_SSL_RENEGOTIATION enabled: allowing unsafe legacy "
+        "TLS renegotiation (CVE-2009-3555). Use only behind trusted proxies."
+    )
+    context = ssl.create_default_context()
+    context.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+    return context
 

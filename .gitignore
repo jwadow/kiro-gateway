@@ -23,6 +23,9 @@ build/
 debug_logs*/
 debug*.json
 
+# tiktoken BPE cache (downloaded on first use, see kiro/tokenizer.py)
+.tiktoken_cache/
+
 # Project-specific
 _notes/
 requests/
