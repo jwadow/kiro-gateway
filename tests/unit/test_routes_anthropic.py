@@ -340,7 +340,7 @@ class TestMessagesValidation:
     def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
         """
         What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        Purpose: Anthropic model validates role (user, assistant, or system only).
         """
         print("Action: POST /v1/messages with invalid role...")
         response = test_client.post(
@@ -354,8 +354,30 @@ class TestMessagesValidation:
         )
         
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
         assert response.status_code == 422
+
+    def test_accepts_system_role_in_messages(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies inline system role in messages is accepted.
+        Purpose: Claude Code sends SessionStart hook context as messages[].role=system.
+        """
+        print("Action: POST /v1/messages with system role in messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "system": "You are a helpful assistant.",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "system", "content": "Session hook context"},
+                ],
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """

@@ -1499,6 +1499,71 @@ class TestAnthropicToKiro:
         print(f"Current content: {current_content}")
         assert "You are a helpful assistant." in current_content
 
+    def test_merges_inline_system_message_into_system_prompt(self):
+        """
+        What it does: Verifies inline system messages are merged into system prompt.
+        Purpose: Ensure system role messages do not appear as conversation turns.
+        """
+        print("Setup: Request with inline system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                AnthropicMessage(role="user", content="Hello!"),
+                AnthropicMessage(role="system", content="Session hook context"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        print(f"Result: {result}")
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        history = result["conversationState"].get("history", [])
+
+        assert "Session hook context" in current_content
+        assert history == []
+
+    def test_merges_top_level_and_inline_system_prompts_in_order(self):
+        """
+        What it does: Verifies top-level system precedes inline system messages.
+        Purpose: Preserve Claude Code system prompt ordering.
+        """
+        print("Setup: Request with top-level and inline system prompts...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                AnthropicMessage(role="user", content="Hello!"),
+                AnthropicMessage(role="system", content="Inline system context"),
+            ],
+            max_tokens=1024,
+            system="Top-level system prompt",
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        top_level_index = current_content.index("Top-level system prompt")
+        inline_index = current_content.index("Inline system context")
+
+        assert top_level_index < inline_index
+        assert "Hello!" in current_content
+
     def test_includes_tools(self):
         """
         What it does: Verifies that tools are included in payload.

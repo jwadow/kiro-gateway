@@ -435,7 +435,7 @@ def anthropic_to_kiro(
     This is the main entry point for Anthropic → Kiro conversion.
 
     Key differences from OpenAI:
-    - System prompt is a separate field (not in messages)
+    - System prompt is a separate field; inline system messages are merged into it
     - Content can be string or list of content blocks
     - Tool format uses input_schema instead of parameters
 
@@ -450,15 +450,34 @@ def anthropic_to_kiro(
     Raises:
         ValueError: If there are no messages to send
     """
-    # Convert messages to unified format
-    unified_messages = convert_anthropic_messages(request.messages)
+    # Separate inline system messages from conversation turns
+    inline_system_parts: List[str] = []
+    conversation_messages: List[AnthropicMessage] = []
+    for msg in request.messages:
+        if msg.role == "system":
+            inline_system_parts.append(convert_anthropic_content_to_text(msg.content))
+        else:
+            conversation_messages.append(msg)
+
+    if inline_system_parts:
+        logger.debug(
+            f"Merged {len(inline_system_parts)} inline system message(s) into system prompt"
+        )
+
+    # Convert conversation messages to unified format
+    unified_messages = convert_anthropic_messages(conversation_messages)
 
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
 
-    # System prompt is already separate in Anthropic format!
-    # It can be a string or list of content blocks (for prompt caching)
+    # System prompt from top-level field, then append inline system messages
     system_prompt = extract_system_prompt(request.system)
+    if inline_system_parts:
+        inline_system_text = "\n\n".join(inline_system_parts)
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n\n{inline_system_text}"
+        else:
+            system_prompt = inline_system_text
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
