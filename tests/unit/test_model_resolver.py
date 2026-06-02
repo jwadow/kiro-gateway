@@ -629,6 +629,43 @@ class TestGetModelIdForKiro:
         print(f"Comparing result: Expected 'claude-unknown-model' (pass-through), Got '{result}'")
         assert result == "claude-unknown-model"
 
+    def test_alias_resolves_before_normalization(self):
+        """
+        What it does: Alias is resolved before normalization.
+        Goal: Check that aliases map to target model ID for Kiro API.
+        """
+        aliases = {"claude-opus-4.6-kiro": "claude-opus-4.6"}
+
+        print("Action: get_model_id_for_kiro('claude-opus-4.6-kiro', {}, aliases)...")
+        result = get_model_id_for_kiro("claude-opus-4.6-kiro", {}, aliases)
+
+        print(f"Comparing result: Expected 'claude-opus-4.6', Got '{result}'")
+        assert result == "claude-opus-4.6"
+
+    def test_alias_resolves_then_hidden_model_applied(self):
+        """
+        What it does: Alias resolves first, then hidden model lookup applies.
+        Goal: Check alias → normalize → hidden lookup chain.
+        """
+        aliases = {"my-legacy": "claude-3.7-sonnet"}
+        hidden = {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"}
+
+        print("Action: get_model_id_for_kiro('my-legacy', hidden, aliases)...")
+        result = get_model_id_for_kiro("my-legacy", hidden, aliases)
+
+        print(f"Comparing result: Expected 'CLAUDE_3_7_SONNET_20250219_V1_0', Got '{result}'")
+        assert result == "CLAUDE_3_7_SONNET_20250219_V1_0"
+
+    def test_no_aliases_behaves_as_before(self):
+        """
+        What it does: Without aliases parameter, behavior is unchanged.
+        Goal: Backward compatibility when aliases not provided.
+        """
+        print("Action: get_model_id_for_kiro('claude-sonnet-4-5', {})...")
+        result = get_model_id_for_kiro("claude-sonnet-4-5", {})
+
+        print(f"Comparing result: Expected 'claude-sonnet-4.5', Got '{result}'")
+        assert result == "claude-sonnet-4.5"
 
 # =============================================================================
 # TestModelResolver - Tests for ModelResolver class
