@@ -187,7 +187,15 @@ class AnthropicMessage(BaseModel):
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    # @AI_GENERATED
+    # Accept 'system' here too. Some clients (e.g. Claude Code injecting
+    # CLAUDE.md / <system-reminder> blocks) place a system-role message
+    # inside the `messages` array. The Anthropic Messages API only allows
+    # user/assistant in `messages`, so the request-model validator below
+    # hoists such messages into the top-level `system` field before they
+    # reach the converters.
+    role: Literal["user", "assistant", "system"]
+    # @AI_GENERATED: end
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
@@ -294,6 +302,66 @@ class SystemContentBlock(BaseModel):
 SystemPrompt = Union[str, List[SystemContentBlock], List[Dict[str, Any]]]
 
 
+# @AI_GENERATED
+def _hoist_system_messages(values):
+    """
+    Move any in-array role="system" messages into the top-level `system` field.
+
+    The Anthropic Messages API only permits user/assistant entries in
+    `messages`. Clients that inject system-role messages mid-array would
+    otherwise trigger a 422. We extract their text, prepend it to the existing
+    top-level system prompt (preserving order), and drop them from `messages`.
+    """
+    messages = values.messages or []
+    if not any(getattr(m, "role", None) == "system" for m in messages):
+        return values
+
+    def _text_of(msg) -> str:
+        content = getattr(msg, "content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                elif getattr(block, "type", None) == "text":
+                    parts.append(getattr(block, "text", ""))
+            return "".join(parts)
+        return str(content) if content else ""
+
+    hoisted_parts = []
+    kept_messages = []
+    for m in messages:
+        if getattr(m, "role", None) == "system":
+            txt = _text_of(m)
+            if txt:
+                hoisted_parts.append(txt)
+        else:
+            kept_messages.append(m)
+
+    existing = values.system
+    existing_text = ""
+    if isinstance(existing, str):
+        existing_text = existing
+    elif isinstance(existing, list):
+        seg = []
+        for block in existing:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    seg.append(block.get("text", ""))
+            elif getattr(block, "type", None) == "text":
+                seg.append(getattr(block, "text", ""))
+        existing_text = "\n".join(seg)
+
+    combined = "\n\n".join(p for p in [*hoisted_parts, existing_text] if p)
+    values.system = combined if combined else None
+    values.messages = kept_messages
+    return values
+# @AI_GENERATED: end
+
+
 class AnthropicMessagesRequest(BaseModel):
     """
     Request to Anthropic Messages API (/v1/messages).
@@ -339,6 +407,12 @@ class AnthropicMessagesRequest(BaseModel):
 
     model_config = {"extra": "allow"}
 
+    # @AI_GENERATED
+    @model_validator(mode="after")
+    def hoist_system_messages(self):
+        return _hoist_system_messages(self)
+    # @AI_GENERATED: end
+
 
 class AnthropicCountTokensRequest(BaseModel):
     """
@@ -362,6 +436,12 @@ class AnthropicCountTokensRequest(BaseModel):
     tools: Optional[List[AnthropicTool]] = None
     
     model_config = {"extra": "allow"}
+
+    # @AI_GENERATED
+    @model_validator(mode="after")
+    def hoist_system_messages(self):
+        return _hoist_system_messages(self)
+    # @AI_GENERATED: end
 
 
 # ==================================================================================================
