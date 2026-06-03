@@ -182,11 +182,24 @@ setup_logging_intercept()
 # VPN/Proxy Configuration
 # ==================================================================================================
 # Must be set BEFORE creating any httpx clients (including in lifespan)
-# httpx automatically picks up HTTP_PROXY, HTTPS_PROXY, ALL_PROXY from environment
+# httpx automatically picks up HTTP_PROXY, HTTPS_PROXY, ALL_PROXY from environment.
+#
+# IMPORTANT: urllib.request.getproxies() (used by httpx) scans ALL environment variables
+# ending with "_proxy" case-insensitively. Docker Desktop injects LOWERCASE http_proxy/
+# https_proxy variables into containers, which iterate AFTER uppercase ones in os.environ
+# and OVERRIDE our values. We must explicitly clear lowercase variants first.
 
 if VPN_PROXY_URL:
     # Normalize URL - add http:// if no scheme specified
     proxy_url_with_scheme = VPN_PROXY_URL if "://" in VPN_PROXY_URL else f"http://{VPN_PROXY_URL}"
+    
+    # Clear lowercase proxy vars that may be injected by Docker Desktop / host system.
+    # These would otherwise override the uppercase values in getproxies() since both
+    # map to the same scheme key when compared case-insensitively.
+    for _proxy_var in ('http_proxy', 'https_proxy', 'all_proxy'):
+        if _proxy_var in os.environ:
+            _old_val = os.environ.pop(_proxy_var)
+            logger.debug(f"Cleared lowercase env var {_proxy_var}={_old_val}")
     
     # Set environment variables for httpx to pick up automatically
     os.environ['HTTP_PROXY'] = proxy_url_with_scheme
