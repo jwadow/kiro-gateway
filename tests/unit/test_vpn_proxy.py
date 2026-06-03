@@ -9,6 +9,8 @@ for different input formats and scenarios.
 
 import os
 import pytest
+import http.client
+import urllib.request
 
 
 @pytest.mark.parametrize(
@@ -96,9 +98,15 @@ def test_vpn_proxy_environment_setup(
     # Simulate VPN_PROXY_URL configuration
     print(f"VPN_PROXY_URL set to: '{vpn_url}'")
     
-    # Replicate logic from main.py (lines 175-197)
+    # Replicate logic from main.py
     if vpn_url:
         proxy_url_with_scheme = vpn_url if "://" in vpn_url else f"http://{vpn_url}"
+        
+        # Clear lowercase proxy vars that could override uppercase in getproxies()
+        for _proxy_var in ('http_proxy', 'https_proxy', 'all_proxy'):
+            if _proxy_var in os.environ:
+                del os.environ[_proxy_var]
+        
         os.environ['HTTP_PROXY'] = proxy_url_with_scheme
         os.environ['HTTPS_PROXY'] = proxy_url_with_scheme
         os.environ['ALL_PROXY'] = proxy_url_with_scheme
@@ -225,6 +233,12 @@ def test_proxy_does_not_affect_local_connections(monkeypatch):
     
     # Simulate proxy setup
     vpn_url = "http://vpn.example.com:8080"
+    
+    # Clear lowercase proxy vars that could override uppercase in getproxies()
+    for _proxy_var in ('http_proxy', 'https_proxy', 'all_proxy'):
+        if _proxy_var in os.environ:
+            del os.environ[_proxy_var]
+    
     os.environ['HTTP_PROXY'] = vpn_url
     os.environ['HTTPS_PROXY'] = vpn_url
     
@@ -304,6 +318,99 @@ def test_empty_vpn_proxy_url_does_not_set_variables(monkeypatch):
     assert os.environ.get("ALL_PROXY") is None, "ALL_PROXY should not be set!"
     
     print("✅ No proxy variables set (direct connection)")
+    print("--- Test passed ---")
+
+
+
+def test_lowercase_proxy_vars_cleared_to_prevent_getproxies_override(monkeypatch):
+    """
+    Verifies that lowercase http_proxy/https_proxy are cleared before setting uppercase versions.
+    
+    Docker Desktop injects lowercase http_proxy/https_proxy into container environment.
+    urllib.request.getproxies() scans ALL environment variables ending with "_proxy"
+    case-insensitively. When both HTTP_PROXY and http_proxy exist (mapping to scheme 'http'),
+    the last-iterated value wins. Since lowercase vars are typically set after uppercase ones
+    in os.environ insertion order, they override our intended SOCKS5 proxy value.
+    
+    This test verifies that:
+    - Lowercase proxy vars are cleared when VPN_PROXY_URL is set
+    - urllib.request.getproxies() returns our uppercase value, not the injected lowercase one
+    """
+    print("\n--- Test: Lowercase proxy vars cleared to prevent getproxies() override ---")
+    
+    # Simulate Docker Desktop injection (lowercase + uppercase both present)
+    monkeypatch.setenv("http_proxy", "http://host.docker.internal:5175")
+    monkeypatch.setenv("https_proxy", "http://host.docker.internal:5175")
+    monkeypatch.setenv("HTTP_PROXY", "http://host.docker.internal:5175")
+    monkeypatch.setenv("HTTPS_PROXY", "http://host.docker.internal:5175")
+    
+    # Verify both variants exist before the fix
+    assert os.environ.get("http_proxy") == "http://host.docker.internal:5175"
+    assert os.environ.get("HTTP_PROXY") == "http://host.docker.internal:5175"
+    
+    # Verify getproxies() initially returns the HTTP proxy (wrong one)
+    proxies_before = urllib.request.getproxies()
+    print(f"Before fix - getproxies(): {proxies_before}")
+    assert proxies_before.get("http") == "http://host.docker.internal:5175", \
+        "Before fix, getproxies() should return the lowercase HTTP proxy"
+    
+    # Now simulate the fix: clear lowercase vars and set uppercase to SOCKS5
+    for _proxy_var in ('http_proxy', 'https_proxy', 'all_proxy'):
+        if _proxy_var in os.environ:
+            del os.environ[_proxy_var]
+    
+    os.environ['HTTP_PROXY'] = 'socks5h://host.docker.internal:1080'
+    os.environ['HTTPS_PROXY'] = 'socks5h://host.docker.internal:1080'
+    os.environ['ALL_PROXY'] = 'socks5h://host.docker.internal:1080'
+    
+    # Verify lowercase are gone
+    assert os.environ.get("http_proxy") is None, "http_proxy should be cleared!"
+    assert os.environ.get("https_proxy") is None, "https_proxy should be cleared!"
+    assert os.environ.get("all_proxy") is None, "all_proxy should be cleared!"
+    
+    # Verify getproxies() now returns the SOCKS5 proxy (correct one)
+    proxies_after = urllib.request.getproxies()
+    print(f"After fix - getproxies(): {proxies_after}")
+    assert proxies_after.get("http") == "socks5h://host.docker.internal:1080", \
+        "After fix, getproxies() should return the SOCKS5 proxy!"
+    assert proxies_after.get("https") == "socks5h://host.docker.internal:1080", \
+        "After fix, getproxies() should return the SOCKS5 proxy for HTTPS!"
+    
+    print("✅ Lowercase proxy vars correctly cleared")
+    print("✅ getproxies() returns correct SOCKS5 proxy")
+    print("--- Test passed ---")
+
+
+def test_lowercase_proxy_vars_do_not_block_normal_proxy_setup(monkeypatch):
+    """
+    Verifies that the lowercase clearing logic doesn't interfere with normal proxy setup
+    when no lowercase vars are pre-set (common when running outside Docker).
+    """
+    print("\n--- Test: Lowercase clearing works even without pre-existing lowercase vars ---")
+    
+    # Ensure no lowercase proxy vars exist
+    for _proxy_var in ('http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'):
+        monkeypatch.delenv(_proxy_var, raising=False)
+    
+    # Run the proxy setup logic (should not raise)
+    vpn_url = "socks5h://192.168.1.100:1080"
+    
+    # Clear lowercase (should be no-op, no KeyError)
+    for _proxy_var in ('http_proxy', 'https_proxy', 'all_proxy'):
+        if _proxy_var in os.environ:
+            del os.environ[_proxy_var]
+    
+    os.environ['HTTP_PROXY'] = vpn_url
+    os.environ['HTTPS_PROXY'] = vpn_url
+    os.environ['ALL_PROXY'] = vpn_url
+    
+    # Verify values are set correctly
+    assert os.environ['HTTP_PROXY'] == vpn_url
+    assert os.environ['HTTPS_PROXY'] == vpn_url
+    assert os.environ['ALL_PROXY'] == vpn_url
+    assert os.environ.get('http_proxy') is None
+    
+    print("✅ Normal proxy setup works without lowercase vars present")
     print("--- Test passed ---")
 
 
