@@ -525,6 +525,72 @@ class TestAnthropicMessageWithImages:
 
 
 # ==================================================================================================
+# Tests for AnthropicMessage role acceptance (sub-agent "system" role fix)
+# ==================================================================================================
+
+class TestAnthropicMessageRole:
+    """Tests that AnthropicMessage.role accepts roles beyond user/assistant."""
+
+    def test_accepts_user_role(self):
+        """
+        What it does: Verifies AnthropicMessage still accepts 'user' role.
+        Purpose: Guard against regression in the common case.
+        """
+        message = AnthropicMessage(role="user", content="Hello")
+        assert message.role == "user"
+
+    def test_accepts_assistant_role(self):
+        """
+        What it does: Verifies AnthropicMessage still accepts 'assistant' role.
+        Purpose: Guard against regression in the common case.
+        """
+        message = AnthropicMessage(role="assistant", content="Hi")
+        assert message.role == "assistant"
+
+    def test_accepts_system_role_inlined_in_messages(self):
+        """
+        What it does: Verifies AnthropicMessage accepts a 'system' role.
+        Purpose: Claude Code inlines a 'system' message into the messages
+            array when spawning sub-agents. The schema must not reject it
+            with a 422; normalize_message_roles() folds it to 'user' later.
+        """
+        print("Setup: Creating AnthropicMessage with system role...")
+        message = AnthropicMessage(role="system", content="You are a sub-agent.")
+
+        print(f"Comparing role: Expected 'system', Got '{message.role}'")
+        assert message.role == "system"
+        assert message.content == "You are a sub-agent."
+
+    def test_accepts_developer_role(self):
+        """
+        What it does: Verifies AnthropicMessage accepts a 'developer' role.
+        Purpose: Forward compatibility with other non-standard roles that
+            downstream normalization already handles.
+        """
+        message = AnthropicMessage(role="developer", content="ctx")
+        assert message.role == "developer"
+
+    def test_request_with_inlined_system_message_validates(self):
+        """
+        What it does: Verifies a full request with a 'system' message in the
+            messages array validates (the exact shape that triggered the 422).
+        Purpose: End-to-end schema regression for the sub-agent 422 bug.
+        """
+        print("Setup: Building request with an inlined system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-haiku-4.5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="task"),
+                AnthropicMessage(role="system", content="system reminder"),
+            ],
+        )
+
+        print(f"Result: {len(request.messages)} messages")
+        assert request.messages[1].role == "system"
+
+
+# ==================================================================================================
 # Tests for AnthropicMessagesRequest with Image Content
 # ==================================================================================================
 

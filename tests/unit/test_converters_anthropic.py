@@ -1308,6 +1308,30 @@ class TestConvertAnthropicMessages:
         # We verify the images are extracted correctly, which proves the counting works
         print("Images extracted successfully - logging verification complete")
 
+    def test_converts_inlined_system_message(self):
+        """
+        What it does: Verifies a 'system' role message (inlined by Claude Code
+            when spawning sub-agents) is converted to a UnifiedMessage with its
+            role preserved and text extracted.
+        Purpose: Regression for the sub-agent 422 bug. The role is kept as-is
+            here; normalize_message_roles() folds it to 'user' downstream.
+        """
+        print("Setup: Inlined system message...")
+        messages = [
+            AnthropicMessage(role="user", content="task"),
+            AnthropicMessage(role="system", content="You are a sub-agent."),
+        ]
+
+        print("Action: Converting messages...")
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 2
+        assert result[1].role == "system"
+        assert result[1].content == "You are a sub-agent."
+        assert result[1].tool_calls is None
+        assert result[1].tool_results is None
+
 
 # ==================================================================================================
 # Tests for convert_anthropic_tools
