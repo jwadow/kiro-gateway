@@ -9,8 +9,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Create non-root user for security
-RUN groupadd -r kiro && useradd -r -g kiro kiro
+# Create non-root user for security (UID 1000 to match typical host user for volume permissions)
+RUN groupadd -g 1000 kiro && useradd -u 1000 -g 1000 kiro
 
 # Set working directory and give ownership to kiro user
 WORKDIR /app
@@ -30,6 +30,9 @@ RUN rm -f credentials.json state.json
 # Create directory for debug logs with proper permissions
 RUN mkdir -p debug_logs && chown -R kiro:kiro debug_logs
 
+# Create writable directory for the gateway's own copy of the kiro-cli database
+RUN mkdir -p /home/kiro/.local/share/kiro-cli && chown -R kiro:kiro /home/kiro
+
 # Switch to non-root user
 USER kiro
 
@@ -40,6 +43,9 @@ EXPOSE 8000
 # Using httpx (our main HTTP library) instead of requests
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"
+
+# Entrypoint copies seed database then runs CMD
+ENTRYPOINT ["./entrypoint.sh"]
 
 # Run the application
 CMD ["python", "main.py"]
