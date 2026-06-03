@@ -47,9 +47,8 @@ services:
       # Uncomment and adjust path as needed:
       # - ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro
       
-      # Mount kiro-cli database (if using KIRO_CLI_DB_FILE)
-      # Uncomment and adjust path as needed:
-      # - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
+      # Mount kiro-cli database as read-only seed (copied into container at startup by entrypoint.sh)
+      - ~/.local/share/kiro-cli:/mnt/kiro-cli-seed:ro
       
       # Mount debug logs directory (optional, for debugging)
       - ./debug_logs:/app/debug_logs
