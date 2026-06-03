@@ -337,25 +337,31 @@ class TestMessagesValidation:
         print(f"Status: {response.status_code}")
         assert response.status_code == 422
     
-    def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
+    def test_accepts_nonstandard_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies a non-standard message role is NOT rejected.
+        Purpose: Claude Code inlines a 'system' role into the messages array
+            when spawning sub-agents. The gateway must accept any role string
+            (not 422) and fold unknown roles to 'user' downstream via
+            normalize_message_roles(). Regression for the sub-agent 422 bug.
         """
-        print("Action: POST /v1/messages with invalid role...")
+        print("Action: POST /v1/messages with a non-standard role...")
         response = test_client.post(
             "/v1/messages",
             headers={"x-api-key": valid_proxy_api_key},
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 1024,
-                "messages": [{"role": "invalid_role", "content": "Hello"}]
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "system", "content": "You are a sub-agent."},
+                ]
             }
         )
-        
+
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
+        # Schema must accept the request; it must not fail validation with 422
+        assert response.status_code != 422
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """
