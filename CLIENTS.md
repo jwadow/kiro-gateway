@@ -15,12 +15,48 @@ Add a provider to your `opencode.json` (or `~/.config/opencode/config.json`):
         "baseURL": "http://localhost:8000/v1"
       },
       "models": {
-        "claude-opus-4.6": { "name": "Claude Opus 4.6 (Kiro)" },
-        "claude-sonnet-4.6": { "name": "Claude Sonnet 4.6 (Kiro)" },
-        "claude-opus-4.5": { "name": "Claude Opus 4.5 (Kiro)" },
-        "claude-sonnet-4.5": { "name": "Claude Sonnet 4.5 (Kiro)" },
-        "claude-sonnet-4": { "name": "Claude Sonnet 4 (Kiro)" },
-        "claude-haiku-4.5": { "name": "Claude Haiku 4.5 (Kiro)" }
+        "claude-opus-4.6": {
+          "name": "Claude Opus 4.6 (Kiro)",
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          }
+        },
+        "claude-sonnet-4.6": {
+          "name": "Claude Sonnet 4.6 (Kiro)",
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          }
+        },
+        "claude-opus-4.5": {
+          "name": "Claude Opus 4.5 (Kiro)",
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          }
+        },
+        "claude-sonnet-4.5": {
+          "name": "Claude Sonnet 4.5 (Kiro)",
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          }
+        },
+        "claude-sonnet-4": {
+          "name": "Claude Sonnet 4 (Kiro)",
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          }
+        },
+        "claude-haiku-4.5": {
+          "name": "Claude Haiku 4.5 (Kiro)",
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          }
+        }
       }
     }
   }
