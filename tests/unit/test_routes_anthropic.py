@@ -337,25 +337,28 @@ class TestMessagesValidation:
         print(f"Status: {response.status_code}")
         assert response.status_code == 422
     
-    def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
+    def test_normalizes_unknown_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies unknown message roles are accepted and normalized to 'user'.
+        Purpose: Claude Code and other clients send 'system' role inside messages array.
+        The gateway normalizes unknown roles (e.g., 'system', 'developer') to 'user'
+        instead of rejecting them with 422, maintaining compatibility.
         """
-        print("Action: POST /v1/messages with invalid role...")
+        print("Action: POST /v1/messages with unknown role 'system'...")
         response = test_client.post(
             "/v1/messages",
             headers={"x-api-key": valid_proxy_api_key},
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 1024,
-                "messages": [{"role": "invalid_role", "content": "Hello"}]
+                "messages": [{"role": "system", "content": "You are helpful."},
+                             {"role": "user", "content": "Hello"}]
             }
         )
-        
+
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
+        assert response.status_code != 422, "Unknown roles should pass validation, not be rejected"
+        assert response.status_code < 500, f"Unexpected server error: {response.status_code}"
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """

@@ -187,7 +187,7 @@ class AnthropicMessage(BaseModel):
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: str  # Accept any role; converter normalizes unknown roles (e.g., 'system') to 'user'
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
