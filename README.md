@@ -4,6 +4,13 @@ Local proxy gateway for Kiro API, giving you free Claude models via an OpenAI/An
 
 Based on [jwadow/kiro-gateway](https://github.com/jwadow/kiro-gateway).
 
+### Changes from upstream
+
+- Makefile for quick start (`make up`, `make python-up`, etc.)
+- Corporate VPN support: SSL verification bypass (`start_no_ssl_verify.py`)
+- Simplified Docker Compose setup that reads `.env` directly
+- Client setup guides for OpenCode and VS Code — see [CLIENTS.md](CLIENTS.md)
+
 ## Prerequisites
 
 - Signed in to `kiro-cli` (`kiro-cli login`)
@@ -154,47 +161,9 @@ make test-prompt   # should return a chat completion response
 
 ---
 
-## Connecting OpenCode
+## Connecting clients
 
-Add a provider to your `opencode.json` (or `~/.config/opencode/config.json`):
-
-```jsonc
-{
-  "provider": {
-    "kiro": {
-      "name": "Kiro Gateway",
-      "type": "anthropic",
-      "api_key_env": "KIRO_PROXY_KEY",
-      "options": {
-        "baseURL": "http://localhost:8000"
-      },
-      "models": {
-        "claude-sonnet-4-5": {
-          "name": "Claude Sonnet 4.5 (Kiro)",
-          "max_tokens": 8192,
-          "can_reason": true
-        },
-        "claude-sonnet-4": {
-          "name": "Claude Sonnet 4 (Kiro)",
-          "max_tokens": 8192
-        },
-        "claude-haiku-4-5": {
-          "name": "Claude Haiku 4.5 (Kiro)",
-          "max_tokens": 8192
-        }
-      }
-    }
-  }
-}
-```
-
-Then export the env var (or add to your shell profile):
-
-```bash
-export KIRO_PROXY_KEY="<same value as PROXY_API_KEY>"
-```
-
-Launch OpenCode and pick the Kiro model from the model selector.
+See [CLIENTS.md](CLIENTS.md) for setup instructions for OpenCode and VS Code.
 
 ---
 
