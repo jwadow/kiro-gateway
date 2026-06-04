@@ -1,6 +1,10 @@
+name: kiro-gateway
+
 services:
   kiro-gateway:
-    image: ghcr.io/jwadow/kiro-gateway:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: kiro-gateway
     ports:
       - "8000:8000"
