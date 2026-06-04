@@ -248,6 +248,7 @@ HIDDEN_MODELS: Dict[str, str] = {
 # Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
 MODEL_ALIASES: Dict[str, str] = {
     "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
+    "claude-opus-4.6-kiro": "claude-opus-4.6",  # Avoid collision with built-in Copilot model ID
 }
 
 # Models to hide from /v1/models endpoint.

@@ -35,6 +35,7 @@ from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import get_model_id_for_kiro
+from kiro.config import MODEL_ALIASES
 from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
 
 # Import from core - reuse shared logic
@@ -420,7 +421,7 @@ def build_kiro_payload(
     
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
-    model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
+    model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS, MODEL_ALIASES)
     
     # Extract thinking configuration from reasoning_effort
     thinking_config = extract_thinking_config_from_openai(request_data)

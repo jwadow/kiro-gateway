@@ -5,6 +5,7 @@ httpx
 loguru
 python-dotenv
 tiktoken
+Pillow
 
 # Testing dependencies
 pytest

@@ -31,6 +31,7 @@ to convert their formats to Kiro API format.
 """
 
 import json
+import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,6 +46,29 @@ from kiro.config import (
     AUTO_TRIM_PAYLOAD,
 )
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
+
+
+# ==================================================================================================
+# Placeholder Messages
+# ==================================================================================================
+
+_THINKING_PLACEHOLDERS = [
+    "------- Thinking out loud -------",
+    "------- Pondering the universe -------",
+    "------- Consulting the rubber duck -------",
+    "------- Brewing coffee mentally -------",
+    "------- Shuffling neurons -------",
+    "------- Connecting the dots -------",
+    "------- Loading thoughts -------",
+    "------- Crunching ideas -------",
+    "------- Summoning inspiration -------",
+    "------- Warming up the brain -------",
+]
+
+
+def _placeholder() -> str:
+    """Return a random fun placeholder for synthetic messages."""
+    return random.choice(_THINKING_PLACEHOLDERS)
 
 
 # ==================================================================================================
@@ -638,6 +662,73 @@ def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dic
 # Image Conversion to Kiro Format
 # ==================================================================================================
 
+# Maximum image dimension (width or height) before resizing
+_IMAGE_MAX_DIMENSION = 1024
+# Target max base64 size in bytes (~200KB)
+_IMAGE_MAX_BASE64_BYTES = 200_000
+# JPEG quality for compression
+_IMAGE_JPEG_QUALITY = 80
+
+
+def _compress_image(data: str, media_type: str) -> tuple:
+    """
+    Compress and resize a base64-encoded image to fit within size limits.
+    
+    Downscales to max 1024px on longest side and compresses to JPEG.
+    Falls back to original if Pillow is not available.
+    
+    Args:
+        data: Base64-encoded image data
+        media_type: Original media type (e.g. "image/png")
+    
+    Returns:
+        Tuple of (compressed_base64_data, new_media_type)
+    """
+    import base64
+    
+    # If already small enough, return as-is
+    if len(data) <= _IMAGE_MAX_BASE64_BYTES:
+        return data, media_type
+    
+    try:
+        from PIL import Image
+        import io
+        
+        # Decode base64 to bytes
+        img_bytes = base64.b64decode(data)
+        img = Image.open(io.BytesIO(img_bytes))
+        
+        # Convert RGBA/P to RGB for JPEG
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        
+        # Resize if larger than max dimension
+        w, h = img.size
+        if max(w, h) > _IMAGE_MAX_DIMENSION:
+            ratio = _IMAGE_MAX_DIMENSION / max(w, h)
+            new_size = (int(w * ratio), int(h * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+            logger.debug(f"Resized image from {w}x{h} to {new_size[0]}x{new_size[1]}")
+        
+        # Compress to JPEG
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=_IMAGE_JPEG_QUALITY, optimize=True)
+        compressed = base64.b64encode(buffer.getvalue()).decode("ascii")
+        
+        original_kb = len(data) / 1024
+        compressed_kb = len(compressed) / 1024
+        logger.debug(f"Compressed image: {original_kb:.0f}KB -> {compressed_kb:.0f}KB")
+        
+        return compressed, "image/jpeg"
+        
+    except ImportError:
+        logger.warning("Pillow not installed — cannot compress images. Install with: pip install Pillow")
+        return data, media_type
+    except Exception as e:
+        logger.warning(f"Image compression failed, using original: {e}")
+        return data, media_type
+
+
 def convert_images_to_kiro_format(images: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """
     Converts unified images to Kiro API format.
@@ -687,6 +778,9 @@ def convert_images_to_kiro_format(images: Optional[List[Dict[str, Any]]]) -> Lis
                 logger.debug(f"Stripped data URL prefix, extracted media_type: {media_type}")
             except (ValueError, IndexError) as e:
                 logger.warning(f"Failed to parse data URL prefix: {e}")
+        
+        # Compress/resize image if too large
+        data, media_type = _compress_image(data, media_type)
         
         # Extract format from media_type: "image/jpeg" -> "jpeg"
         format_str = media_type.split("/")[-1] if "/" in media_type else media_type
@@ -965,7 +1059,7 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
                     content_parts.append(result_text)
             
             # Join all parts with double newline
-            content = "\n\n".join(content_parts) if content_parts else "(empty placeholder)"
+            content = "\n\n".join(content_parts) if content_parts else _placeholder()
             
             # Create a copy of the message without tool content but with text representation
             # IMPORTANT: Preserve images from the original message (e.g., screenshots from MCP tools)
@@ -1123,6 +1217,12 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 last.tool_results = list(last.tool_results) + list(msg.tool_results)
                 total_tool_results_merged += len(msg.tool_results)
             
+            # Merge images for user messages
+            if msg.role == "user" and msg.images:
+                if last.images is None:
+                    last.images = []
+                last.images = list(last.images) + list(msg.images)
+            
             # Count merges by role
             if msg.role in merge_counts:
                 merge_counts[msg.role] += 1
@@ -1178,8 +1278,8 @@ def ensure_first_message_is_user(messages: List[UnifiedMessage]) -> List[Unified
         >>> result = ensure_first_message_is_user(messages)
         >>> result[0].role
         'user'
-        >>> result[0].content
-        '(empty placeholder)'
+        >>> result[0].role
+        'user'
     """
     if not messages:
         return messages
@@ -1190,10 +1290,9 @@ def ensure_first_message_is_user(messages: List[UnifiedMessage]) -> List[Unified
             f"(Kiro API requires conversations to start with user)"
         )
         # Create minimal synthetic user message (matches LiteLLM behavior)
-        # Using "(empty placeholder)" as minimal valid content to avoid disrupting conversation context
         synthetic_user = UnifiedMessage(
             role="user",
-            content="(empty placeholder)"
+            content=_placeholder()
         )
         
         return [synthetic_user] + messages
@@ -1262,7 +1361,7 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
     
     Kiro API requires alternating userInputMessage and assistantResponseMessage.
     When consecutive user messages are detected, synthetic assistant messages
-    with "(empty placeholder)" placeholder are inserted between them to maintain alternation.
+    with a randomized placeholder are inserted between them to maintain alternation.
     
     This fixes multiple unknown roles (converted to user)
     create consecutive userInputMessage entries that violate Kiro API requirements.
@@ -1284,8 +1383,8 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
         5  # 3 user + 2 synthetic assistant
         >>> result[1].role
         'assistant'
-        >>> result[1].content
-        '(empty placeholder)'
+        >>> result[1].role
+        'assistant'
     """
     if not messages or len(messages) < 2:
         return messages
@@ -1300,7 +1399,7 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
         if msg.role == "user" and prev_role == "user":
             synthetic_assistant = UnifiedMessage(
                 role="assistant",
-                content="(empty placeholder)"  # Consistent with build_kiro_history() placeholder
+                content=_placeholder()
             )
             result.append(synthetic_assistant)
             synthetic_count += 1
@@ -1342,7 +1441,7 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             
             # Fallback for empty content - Kiro API requires non-empty content
             if not content:
-                content = "(empty placeholder)"
+                content = _placeholder()
             
             user_input = {
                 "content": content,
@@ -1384,7 +1483,7 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             
             # Fallback for empty content - Kiro API requires non-empty content
             if not content:
-                content = "(empty placeholder)"
+                content = _placeholder()
             
             assistant_response = {"content": content}
             
@@ -1510,11 +1609,11 @@ def build_kiro_payload(
                 "content": current_content
             }
         })
-        current_content = "(empty placeholder)"
+        current_content = _placeholder()
     
     # If content is empty - use placeholder
     if not current_content:
-        current_content = "(empty placeholder)"
+        current_content = _placeholder()
     
     # Process images in current message - extract from message or content
     # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext

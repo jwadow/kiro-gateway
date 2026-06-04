@@ -189,7 +189,7 @@ def normalize_model_name(name: str) -> str:
     return name
 
 
-def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str:
+def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str], aliases: Optional[Dict[str, str]] = None) -> str:
     """
     Get the model ID to send to Kiro API.
     
@@ -202,6 +202,7 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
     Args:
         model_name: External model name from client
         hidden_models: Dict mapping display names to internal Kiro IDs
+        aliases: Optional dict mapping alias names to real model IDs
     
     Returns:
         Model ID to send to Kiro API
@@ -214,6 +215,9 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
         >>> get_model_id_for_kiro("claude-3-7-sonnet", {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"})
         'CLAUDE_3_7_SONNET_20250219_V1_0'
     """
+    # Resolve alias first (before normalization)
+    if aliases and model_name in aliases:
+        model_name = aliases[model_name]
     normalized = normalize_model_name(model_name)
     internal = hidden_models.get(normalized, normalized)
     return to_runtime_model_id(internal)
