@@ -8,15 +8,8 @@ services:
       - ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro
       - ./start_no_ssl_verify.py:/app/start_no_ssl_verify.py:ro
     command: ["python", "start_no_ssl_verify.py"]
+    env_file:
+      - ../.env
     environment:
       - KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token-cli.json
-      - PROXY_API_KEY=${PROXY_API_KEY}
-      - KIRO_API_REGION=us-east-1
-      - PROFILE_ARN=arn:aws:codewhisperer:us-east-1:562791833499:profile/UVG4KVWQCQN3
-      - FAKE_REASONING=false
-      - WEB_SEARCH_ENABLED=false
-      - TRUNCATION_RECOVERY=false
-    extra_hosts:
-      - "runtime.us-east-1.kiro.dev:18.204.113.51"
-      - "oidc.eu-west-1.amazonaws.com:18.200.150.190"
     restart: unless-stopped

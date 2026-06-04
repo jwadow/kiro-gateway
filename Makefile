@@ -4,7 +4,7 @@
 # Docker setup (in docker/) — currently broken on corporate VPN due to DNS
 # ==============================================================================
 up:
-	docker-compose -f docker/docker-compose.yml --env-file .env up -d
+	docker-compose -f docker/docker-compose.yml up -d
 
 down:
 	docker-compose -f docker/docker-compose.yml down
@@ -19,7 +19,7 @@ status:
 	docker-compose -f docker/docker-compose.yml ps
 
 pull:
-	docker-compose -f docker/docker-compose.yml pull && docker-compose -f docker/docker-compose.yml --env-file .env up -d
+	docker-compose -f docker/docker-compose.yml pull && docker-compose -f docker/docker-compose.yml up -d
 
 # ==============================================================================
 # Python setup (in python/kiro-gateway/) — recommended for corporate VPN
@@ -46,7 +46,8 @@ health:
 	curl -s http://localhost:8000/health | python3 -m json.tool
 
 test-prompt:
+	@API_KEY=$$(grep '^PROXY_API_KEY=' .env | cut -d= -f2-); \
 	curl -s http://localhost:8000/v1/chat/completions \
 		-H "Content-Type: application/json" \
-		-H "Authorization: Bearer my-super-nice-secret-key" \
+		-H "Authorization: Bearer $$API_KEY" \
 		-d '{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"Say hello in one sentence."}]}' | python3 -m json.tool
