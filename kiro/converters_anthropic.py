@@ -450,8 +450,23 @@ def anthropic_to_kiro(
     Raises:
         ValueError: If there are no messages to send
     """
+    # Extract system messages from request messages
+    system_parts = []
+    non_system_messages = []
+    for msg in request.messages:
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", None)
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+        
+        if role == "system":
+            system_parts.append(convert_anthropic_content_to_text(content))
+        else:
+            non_system_messages.append(msg)
+
     # Convert messages to unified format
-    unified_messages = convert_anthropic_messages(request.messages)
+    unified_messages = convert_anthropic_messages(non_system_messages)
 
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
@@ -459,6 +474,14 @@ def anthropic_to_kiro(
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
     system_prompt = extract_system_prompt(request.system)
+
+    # Merge system messages from messages list into the system prompt
+    if system_parts:
+        system_from_messages = "\n".join(system_parts)
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n{system_from_messages}"
+        else:
+            system_prompt = system_from_messages
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
