@@ -1499,6 +1499,44 @@ class TestAnthropicToKiro:
         print(f"Current content: {current_content}")
         assert "You are a helpful assistant." in current_content
 
+    def test_extracts_system_messages_from_messages_list(self):
+        """
+        What it does: Verifies that system messages within the messages list are extracted and merged.
+        Purpose: Ensure compatibility when client passes system messages inside the messages array.
+        """
+        print("Setup: Request with system message in messages array...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                AnthropicMessage(role="system", content="System instruction from list."),
+                AnthropicMessage(role="user", content="Hello!")
+            ],
+            max_tokens=1024,
+            system="Top level system instruction.",
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        print(f"Result: {result}")
+        
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        
+        print(f"Current content: {current_content}")
+        assert "Top level system instruction." in current_content
+        assert "System instruction from list." in current_content
+        
+        # Verify history is empty (the only remaining message is the user one, which is the currentMessage)
+        history = result["conversationState"].get("history", [])
+        assert len(history) == 0
+
     def test_includes_tools(self):
         """
         What it does: Verifies that tools are included in payload.
