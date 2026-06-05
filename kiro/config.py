@@ -192,6 +192,16 @@ KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Default 10 minutes - refresh token in advance to avoid errors
 TOKEN_REFRESH_THRESHOLD: int = 600
 
+# @AI_GENERATED
+# Interval for the background token keep-alive task (in seconds)
+# Periodically calls get_access_token() on initialized accounts so tokens are
+# refreshed proactively even when there is no incoming traffic. This prevents
+# the refresh_token chain from going stale during long idle periods.
+# MUST be smaller than TOKEN_REFRESH_THRESHOLD so the refresh window is never missed.
+# Default 5 minutes (300s) leaves a 2x safety margin against the 600s threshold.
+TOKEN_KEEPALIVE_INTERVAL_SECONDS: int = int(os.getenv("TOKEN_KEEPALIVE_INTERVAL_SECONDS", "300"))
+# @AI_GENERATED: end
+
 # ==================================================================================================
 # Retry Configuration
 # ==================================================================================================

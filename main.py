@@ -506,7 +506,16 @@ async def lifespan(app: FastAPI):
     save_task = asyncio.create_task(
         app.state.account_manager.save_state_periodically()
     )
-    
+
+    # @AI_GENERATED
+    # Start background task for proactive token keep-alive.
+    # Refreshes tokens before they expire even with no incoming traffic,
+    # preventing refresh_token staleness during long idle periods.
+    keepalive_task = asyncio.create_task(
+        app.state.account_manager.keepalive_tokens_periodically()
+    )
+    # @AI_GENERATED: end
+
     logger.info("Account system initialized successfully")
     
     yield
@@ -520,7 +529,16 @@ async def lifespan(app: FastAPI):
         await save_task
     except asyncio.CancelledError:
         pass
-    
+
+    # @AI_GENERATED
+    # Cancel token keep-alive task
+    keepalive_task.cancel()
+    try:
+        await keepalive_task
+    except asyncio.CancelledError:
+        pass
+    # @AI_GENERATED: end
+
     # Final state save
     await app.state.account_manager._save_state()
     logger.info("Final state saved")

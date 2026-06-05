@@ -57,6 +57,9 @@ from kiro.config import (
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
+    # @AI_GENERATED
+    TOKEN_KEEPALIVE_INTERVAL_SECONDS,
+    # @AI_GENERATED: end
     FALLBACK_MODELS,
 )
 from kiro.utils import get_kiro_headers
@@ -423,12 +426,49 @@ class AccountManager:
         """
         while True:
             await asyncio.sleep(STATE_SAVE_INTERVAL_SECONDS)
-            
+
             if self._dirty:
                 async with self._lock:
                     await self._save_state()
                     self._dirty = False
-    
+
+    # @AI_GENERATED
+    async def keepalive_tokens_periodically(self) -> None:
+        """
+        Background task for proactive token keep-alive.
+
+        Periodically calls get_access_token() on every initialized account so
+        that access tokens are refreshed in advance, even when there is no
+        incoming traffic. This keeps the rotating refresh_token chain moving
+        and prevents it from going stale during long idle periods (which would
+        otherwise cause refresh to fail and interrupt the next request).
+
+        Notes:
+        - get_access_token() only performs a network refresh when the token is
+          actually expiring soon (within TOKEN_REFRESH_THRESHOLD); otherwise it
+          returns the cached token immediately. So most cycles do no network I/O.
+        - Only already-initialized accounts are touched, preserving lazy-init
+          semantics (cold accounts are not forced online).
+        - Per-account errors are caught so one bad account never kills the loop.
+        """
+        while True:
+            await asyncio.sleep(TOKEN_KEEPALIVE_INTERVAL_SECONDS)
+
+            # Snapshot initialized accounts without holding the lock during
+            # network calls (get_access_token has its own internal lock).
+            accounts = [
+                acc for acc in list(self._accounts.values())
+                if acc.auth_manager is not None
+            ]
+
+            for account in accounts:
+                try:
+                    await account.auth_manager.get_access_token()
+                    logger.debug(f"Keep-alive: token verified for {account.id}")
+                except Exception as e:
+                    logger.warning(f"Keep-alive: failed to refresh token for {account.id}: {e}")
+    # @AI_GENERATED: end
+
     async def _initialize_account(self, account_id: str) -> bool:
         """
         Initialize account (lazy initialization).
