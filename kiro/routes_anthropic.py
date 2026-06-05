@@ -25,6 +25,7 @@ Contains the /v1/messages endpoint compatible with Anthropic's Messages API.
 Reference: https://docs.anthropic.com/en/api/messages
 """
 
+import asyncio
 import json
 from typing import Optional
 
@@ -583,9 +584,10 @@ async def messages(
                                 _transient_400_retries += 1
                                 logger.warning(
                                     f"400 transient error on single account, retrying "
-                                    f"({_transient_400_retries}/2): "
+                                    f"({_transient_400_retries}/2) after 3s: "
                                     f"{(last_error_message or 'unknown')[:100]}"
                                 )
+                                await asyncio.sleep(3)
                                 tried_accounts.discard(account.id)
                                 continue
                             # @AI_GENERATED: end
@@ -801,9 +803,10 @@ async def messages(
                     _legacy_400_retries += 1
                     logger.warning(
                         f"400 transient error (legacy mode), retrying "
-                        f"({_legacy_400_retries}/{_legacy_max_retries}): "
+                        f"({_legacy_400_retries}/{_legacy_max_retries}) after 3s: "
                         f"{error_message[:100]}"
                     )
+                    await asyncio.sleep(3)
                     continue
                 # @AI_GENERATED: end
 
