@@ -25,6 +25,7 @@ Contains the /v1/messages endpoint compatible with Anthropic's Messages API.
 Reference: https://docs.anthropic.com/en/api/messages
 """
 
+import asyncio
 import json
 from typing import Optional
 
@@ -326,7 +327,10 @@ async def messages(
         last_error_message = None
         last_error_status = None
         tried_accounts = set()  # Track tried accounts in current failover loop
-        
+        # @AI_GENERATED
+        _transient_400_retries = 0  # Track retries for transient 400 errors (same account)
+        # @AI_GENERATED: end
+
         for attempt in range(MAX_ATTEMPTS):
             # Get next available account (excluding already tried)
             account = await account_manager.get_next_account(
@@ -571,11 +575,24 @@ async def messages(
                             account.id, request_data.model, error_type,
                             response.status_code, error_reason
                         )
-                        
+
                         # Single account - no point in failover, break immediately
                         if len(all_accounts) == 1:
+                            # @AI_GENERATED
+                            # 400 偶发错误重试：重试后可恢复，最多重试 2 次
+                            if response.status_code == 400 and _transient_400_retries < 2:
+                                _transient_400_retries += 1
+                                logger.warning(
+                                    f"400 transient error on single account, retrying "
+                                    f"({_transient_400_retries}/2) after 3s: "
+                                    f"{(last_error_message or 'unknown')[:100]}"
+                                )
+                                await asyncio.sleep(3)
+                                tried_accounts.discard(account.id)
+                                continue
+                            # @AI_GENERATED: end
                             break
-                        
+
                         continue  # Next iteration
             
             except HTTPException as e:
@@ -739,59 +756,84 @@ async def messages(
     else:
         system_for_tokenizer = request_data.system
     
+    # @AI_GENERATED
+    _legacy_400_retries = 0
+    _legacy_max_retries = 2
+    # @AI_GENERATED: end
     try:
         # Make request to Kiro API (for both streaming and non-streaming modes)
         # Important: we wait for Kiro response BEFORE returning StreamingResponse,
         # so that we can return proper HTTP error codes if Kiro fails
-        response = await http_client.request_with_retry(
-            "POST",
-            url,
-            kiro_payload,
-            stream=True
-        )
-        
-        if response.status_code != 200:
-            try:
-                error_content = await response.aread()
-            except Exception:
-                error_content = b"Unknown error"
-            
-            await http_client.close()
-            error_text = error_content.decode('utf-8', errors='replace')
-            
-            # Try to parse JSON response from Kiro to extract error message
-            error_message = error_text
-            try:
-                error_json = json.loads(error_text)
-                # Enhance Kiro API errors with user-friendly messages
-                from kiro.kiro_errors import enhance_kiro_error
-                error_info = enhance_kiro_error(error_json)
-                error_message = error_info.user_message
-                # Log original error for debugging
-                logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
-            except (json.JSONDecodeError, KeyError):
-                pass
-            
-            # Log access log for error (before flush, so it gets into app_logs)
-            logger.warning(
-                f"HTTP {response.status_code} - POST /v1/messages - {error_message[:100]}"
+        # @AI_GENERATED
+        while True:
+        # @AI_GENERATED: end
+            response = await http_client.request_with_retry(
+                "POST",
+                url,
+                kiro_payload,
+                stream=True
             )
-            
-            # Flush debug logs on error
-            if debug_logger:
-                debug_logger.flush_on_error(response.status_code, error_message)
-            
-            # Return error in Anthropic format
-            return JSONResponse(
-                status_code=response.status_code,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": error_message
+
+            if response.status_code != 200:
+                try:
+                    error_content = await response.aread()
+                except Exception:
+                    error_content = b"Unknown error"
+
+                error_text = error_content.decode('utf-8', errors='replace')
+
+                # Try to parse JSON response from Kiro to extract error message
+                error_message = error_text
+                error_reason = None
+                try:
+                    error_json = json.loads(error_text)
+                    # Enhance Kiro API errors with user-friendly messages
+                    from kiro.kiro_errors import enhance_kiro_error
+                    error_info = enhance_kiro_error(error_json)
+                    error_message = error_info.user_message
+                    error_reason = error_info.reason
+                    # Log original error for debugging
+                    logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+                # @AI_GENERATED
+                # 400 偶发错误重试（同一账号，最多 2 次）
+                if response.status_code == 400 and error_reason == "INVALID_MODEL_ID" and _legacy_400_retries < _legacy_max_retries:
+                    _legacy_400_retries += 1
+                    logger.warning(
+                        f"400 transient error (legacy mode), retrying "
+                        f"({_legacy_400_retries}/{_legacy_max_retries}) after 3s: "
+                        f"{error_message[:100]}"
+                    )
+                    await asyncio.sleep(3)
+                    continue
+                # @AI_GENERATED: end
+
+                await http_client.close()
+
+                # Log access log for error (before flush, so it gets into app_logs)
+                logger.warning(
+                    f"HTTP {response.status_code} - POST /v1/messages - {error_message[:100]}"
+                )
+
+                # Flush debug logs on error
+                if debug_logger:
+                    debug_logger.flush_on_error(response.status_code, error_message)
+
+                # Return error in Anthropic format
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": error_message
+                        }
                     }
-                }
-            )
+                )
+
+            break  # 200 OK，退出重试循环
         
         if request_data.stream:
             # Streaming mode with first token retry
