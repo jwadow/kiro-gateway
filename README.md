@@ -590,6 +590,8 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 > **Note:** Replace `my-super-secret-password-123` with the `PROXY_API_KEY` you set in your `.env` file.
+>
+> **API Key Passthrough:** If you have a Kiro API key (`ksk_...`), you can use it directly as the bearer token — no `PROXY_API_KEY` or server-side credentials needed. The gateway detects the `ksk_` prefix and passes it through to Kiro API.
 
 </details>
 
@@ -704,6 +706,8 @@ curl http://localhost:8000/v1/messages \
 ```
 
 > **Note:** Anthropic API uses `x-api-key` header instead of `Authorization: Bearer`. Both are supported.
+>
+> **API Key Passthrough:** You can use a Kiro API key (`ksk_...`) directly in the `x-api-key` or `Authorization: Bearer` header — no server-side credentials required.
 
 </details>
 
