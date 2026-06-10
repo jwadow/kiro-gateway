@@ -1,0 +1,20 @@
+# Kiro Gateway - Docker Image
+# Optimized single-stage build
+
+FROM alpine:latest
+
+ENV PATH="/home/kiro/.local/bin:$PATH"
+
+RUN apk add bash curl
+RUN adduser -D kiro
+
+COPY mitmproxy-ca-cert.pem .
+RUN cat mitmproxy-ca-cert.pem >> /etc/ssl/certs/ca-certificates.crt
+
+USER kiro
+
+RUN curl -fsSL https://cli.kiro.dev/install | bash
+
+# Proxy only at runtime (not during build)
+ENV HTTP_PROXY=http://172.19.0.1:8080
+ENV HTTPS_PROXY=http://172.19.0.1:8080

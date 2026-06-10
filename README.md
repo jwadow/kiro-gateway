@@ -226,6 +226,57 @@ PROXY_API_KEY="my-super-secret-password-123"
 # The gateway will work without it
 ```
 
+### Option 5: Kiro API Key (Headless / CI)
+
+The simplest authentication method. Generate an API key via kiro-cli settings and use it directly — no token refresh, no SSO, no credentials files needed.
+
+```env
+KIRO_API_KEY="ksk_your_api_key_here"
+
+# Password to protect YOUR proxy server (can be the same as KIRO_API_KEY for simplicity)
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+**How to generate an API key:**
+
+1. Install kiro-cli: `curl -fsSL https://cli.kiro.dev/install | bash`
+2. Login: `kiro-cli login`
+3. Generate API key in settings (see [Kiro CLI Headless docs](https://kiro.dev/docs/cli/headless/))
+
+**Docker example:**
+
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="ksk_your_api_key_here" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+**Test:**
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer ksk_your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+<details>
+<summary>🔍 How it works</summary>
+
+The API key is passed directly to Kiro API as a Bearer token with an additional `tokentype: API_KEY` header. No token refresh or exchange is needed. The gateway auto-detects the correct region from the Kiro API `GetProfile` response.
+
+Endpoints used:
+- `POST https://management.{region}.kiro.dev/` — GetProfile, ListAvailableModels
+- `POST https://runtime.{region}.kiro.dev/` — GenerateAssistantResponse
+
+</details>
+
 <details>
 <summary>📄 Database locations</summary>
 

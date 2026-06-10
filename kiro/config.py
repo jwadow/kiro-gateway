@@ -127,6 +127,11 @@ VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
 # Refresh token for updating access token
 REFRESH_TOKEN: str = os.getenv("REFRESH_TOKEN", "")
 
+# Kiro API key for headless/CI authentication (no token refresh needed)
+# Generated via kiro-cli settings: https://kiro.dev/docs/cli/headless/
+# Format: ksk_<alphanumeric>
+KIRO_API_KEY: str = os.getenv("KIRO_API_KEY", "")
+
 # Profile ARN for AWS CodeWhisperer
 PROFILE_ARN: str = os.getenv("PROFILE_ARN", "")
 

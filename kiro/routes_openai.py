@@ -61,29 +61,93 @@ except ImportError:
     debug_logger = None
 
 
+# --- API Key Passthrough Session Cache ---
+# Caches auth_manager + model_cache + model_resolver per API key to avoid
+# re-creating them on every request.
+import hashlib
+from dataclasses import dataclass
+from typing import Dict
+
+@dataclass
+class _PassthroughSession:
+    auth_manager: KiroAuthManager
+    model_cache: ModelInfoCache
+    model_resolver: ModelResolver
+
+_passthrough_sessions: Dict[str, _PassthroughSession] = {}
+
+
+async def _get_passthrough_session(api_key: str) -> _PassthroughSession:
+    """
+    Get or create a cached passthrough session for the given API key.
+    
+    Args:
+        api_key: Kiro API key (ksk_*)
+    
+    Returns:
+        Cached session with auth_manager, model_cache, and model_resolver
+    """
+    from kiro.config import FALLBACK_MODELS, HIDDEN_MODELS, MODEL_ALIASES, HIDDEN_FROM_LIST
+    
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    
+    if key_hash not in _passthrough_sessions:
+        auth_manager = KiroAuthManager(api_key=api_key, region="eu-central-1")
+        model_cache = ModelInfoCache()
+        await model_cache.update(FALLBACK_MODELS)
+        model_resolver = ModelResolver(
+            cache=model_cache,
+            hidden_models=HIDDEN_MODELS,
+            aliases=MODEL_ALIASES,
+            hidden_from_list=HIDDEN_FROM_LIST
+        )
+        _passthrough_sessions[key_hash] = _PassthroughSession(
+            auth_manager=auth_manager,
+            model_cache=model_cache,
+            model_resolver=model_resolver
+        )
+        logger.info(f"Created passthrough session for key hash: {key_hash}")
+    
+    return _passthrough_sessions[key_hash]
+
+
 # --- Security scheme ---
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
-async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
+async def verify_api_key(auth_header: str = Security(api_key_header)) -> str:
     """
     Verify API key in Authorization header.
     
-    Expects format: "Bearer {PROXY_API_KEY}"
+    Supports two modes:
+    1. Passthrough mode: Bearer token starts with "ksk_" → Kiro API key, passed through directly
+    2. Legacy mode: Bearer token matches PROXY_API_KEY → use pre-configured credentials
     
     Args:
         auth_header: Authorization header value
     
     Returns:
-        True if key is valid
+        The bearer token (API key or PROXY_API_KEY)
     
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
-    if not auth_header or auth_header != f"Bearer {PROXY_API_KEY}":
+    if not auth_header or not auth_header.startswith("Bearer "):
         logger.warning("Access attempt with invalid API key.")
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
-    return True
+    
+    token = auth_header[len("Bearer "):]
+    
+    # Passthrough mode: Kiro API key
+    if token.startswith("ksk_"):
+        return token
+    
+    # Legacy mode: validate against PROXY_API_KEY
+    if token == PROXY_API_KEY:
+        return token
+    
+    logger.warning("Access attempt with invalid API key.")
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
 # --- Router ---
@@ -119,8 +183,8 @@ async def health():
         "version": APP_VERSION
     }
 
-@router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
-async def get_models(request: Request):
+@router.get("/v1/models", response_model=ModelList)
+async def get_models(request: Request, bearer_token: str = Depends(verify_api_key)):
     """
     Return list of available models.
     
@@ -135,8 +199,11 @@ async def get_models(request: Request):
     """
     logger.info("Request to /v1/models")
     
-    # Get available models based on mode
-    if request.app.state.account_system:
+    # Stateless mode: return fallback models
+    if getattr(request.app.state, 'stateless_mode', False):
+        from kiro.config import FALLBACK_MODELS
+        available_model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+    elif request.app.state.account_system:
         # Account system: collect models from all initialized accounts
         available_model_ids = request.app.state.account_manager.get_all_available_models()
     else:
@@ -157,8 +224,8 @@ async def get_models(request: Request):
     return ModelList(data=openai_models)
 
 
-@router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
-async def chat_completions(request: Request, request_data: ChatCompletionRequest):
+@router.post("/v1/chat/completions")
+async def chat_completions(request: Request, request_data: ChatCompletionRequest, bearer_token: str = Depends(verify_api_key)):
     """
     Chat completions endpoint - compatible with OpenAI API.
     
@@ -272,8 +339,111 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             logger.debug("Auto-injected web_search tool for MCP emulation (Path B)")
     
     # ==============================================================================
+    # API Key Passthrough Mode: Create ephemeral auth manager from bearer token
+    # ==============================================================================
+    
+    if bearer_token.startswith("ksk_"):
+        from kiro.config import FALLBACK_MODELS, HIDDEN_MODELS, MODEL_ALIASES, HIDDEN_FROM_LIST
+        
+        session = await _get_passthrough_session(bearer_token)
+        auth_manager = session.auth_manager
+        model_cache = session.model_cache
+        model_resolver = session.model_resolver
+        
+        conversation_id = generate_conversation_id()
+        profile_arn_for_payload = ""
+        
+        try:
+            kiro_payload = build_kiro_payload(
+                request_data,
+                conversation_id,
+                profile_arn_for_payload
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        
+        url = f"{auth_manager.api_host}/generateAssistantResponse"
+        logger.info(f"API key passthrough: {url} (model={request_data.model})")
+        
+        if request_data.stream:
+            http_client = KiroHttpClient(auth_manager, shared_client=None)
+        else:
+            shared_client = request.app.state.http_client
+            http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+        
+        try:
+            response = await http_client.request_with_retry(
+                "POST", url, kiro_payload, stream=True
+            )
+            
+            if response.status_code != 200:
+                error_body = await response.aread()
+                error_text = error_body.decode("utf-8", errors="replace")
+                await http_client.close()
+                raise HTTPException(status_code=response.status_code, detail=error_text)
+            
+            messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+            tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+            
+            if request_data.stream:
+                async def stream_wrapper_passthrough():
+                    try:
+                        async def make_retry_request():
+                            return await http_client.request_with_retry(
+                                "POST", url, kiro_payload, stream=True
+                            )
+                        
+                        async for chunk in stream_with_first_token_retry(
+                            make_request=make_retry_request,
+                            client=http_client.client,
+                            model=request_data.model,
+                            model_cache=model_cache,
+                            auth_manager=auth_manager,
+                            initial_response=response,
+                            request_messages=messages_for_tokenizer,
+                            request_tools=tools_for_tokenizer
+                        ):
+                            yield chunk
+                    except GeneratorExit:
+                        logger.debug("Client disconnected during streaming (passthrough)")
+                    finally:
+                        await http_client.close()
+                
+                return StreamingResponse(
+                    stream_wrapper_passthrough(),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+                )
+            else:
+                result = await collect_stream_response(
+                    client=http_client.client,
+                    response=response,
+                    model=request_data.model,
+                    model_cache=model_cache,
+                    auth_manager=auth_manager,
+                    request_messages=messages_for_tokenizer,
+                    request_tools=tools_for_tokenizer
+                )
+                await http_client.close()
+                return JSONResponse(content=result)
+        
+        except HTTPException:
+            raise
+        except Exception as e:
+            await http_client.close()
+            logger.error(f"API key passthrough error: {e}")
+            raise HTTPException(status_code=502, detail=str(e))
+    
+    # ==============================================================================
     # Account System: Account System Failover or Legacy Mode
     # ==============================================================================
+    
+    # Guard: stateless mode has no accounts — only ksk_ passthrough works
+    if getattr(request.app.state, 'stateless_mode', False):
+        raise HTTPException(
+            status_code=401,
+            detail="Gateway is running in stateless mode. Provide a Kiro API key (ksk_*) as Bearer token."
+        )
     
     if request.app.state.account_system:
         # ==============================================================================

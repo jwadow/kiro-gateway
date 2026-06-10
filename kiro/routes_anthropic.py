@@ -73,31 +73,40 @@ auth_header = APIKeyHeader(name="Authorization", auto_error=False)
 async def verify_anthropic_api_key(
     x_api_key: Optional[str] = Security(anthropic_api_key_header),
     authorization: Optional[str] = Security(auth_header)
-) -> bool:
+) -> str:
     """
     Verify API key for Anthropic API.
     
-    Supports two authentication methods:
-    1. x-api-key header (Anthropic native)
-    2. Authorization: Bearer header (for compatibility)
+    Supports three authentication methods:
+    1. x-api-key header with ksk_ prefix (Kiro API key passthrough)
+    2. x-api-key header matching PROXY_API_KEY (legacy)
+    3. Authorization: Bearer header (for compatibility)
     
     Args:
         x_api_key: Value from x-api-key header
         authorization: Value from Authorization header
     
     Returns:
-        True if key is valid
+        The validated token string
     
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
-    # Check x-api-key first (Anthropic native)
+    # Check x-api-key first — passthrough mode
+    if x_api_key and x_api_key.startswith("ksk_"):
+        return x_api_key
+    
+    # Check x-api-key — legacy mode
     if x_api_key and x_api_key == PROXY_API_KEY:
-        return True
+        return x_api_key
     
     # Fall back to Authorization: Bearer
-    if authorization and authorization == f"Bearer {PROXY_API_KEY}":
-        return True
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[len("Bearer "):]
+        if token.startswith("ksk_"):
+            return token
+        if token == PROXY_API_KEY:
+            return token
     
     logger.warning("Access attempt with invalid API key (Anthropic endpoint)")
     raise HTTPException(
@@ -116,11 +125,12 @@ async def verify_anthropic_api_key(
 router = APIRouter(tags=["Anthropic API"])
 
 
-@router.post("/v1/messages", dependencies=[Depends(verify_anthropic_api_key)])
+@router.post("/v1/messages")
 async def messages(
     request: Request,
     request_data: AnthropicMessagesRequest,
-    anthropic_version: Optional[str] = Header(None, alias="anthropic-version")
+    anthropic_version: Optional[str] = Header(None, alias="anthropic-version"),
+    bearer_token: str = Depends(verify_anthropic_api_key)
 ):
     """
     Anthropic Messages API endpoint.
@@ -310,8 +320,118 @@ async def messages(
                 return await handle_native_web_search(request, request_data, auth_manager, api_format="anthropic")
     
     # ==============================================================================
+    # API Key Passthrough Mode: Create ephemeral auth manager from bearer token
+    # ==============================================================================
+    
+    if bearer_token.startswith("ksk_"):
+        from kiro.config import FALLBACK_MODELS, HIDDEN_MODELS, MODEL_ALIASES, HIDDEN_FROM_LIST
+        from kiro.model_resolver import ModelResolver
+        from kiro.routes_openai import _get_passthrough_session
+        
+        session = await _get_passthrough_session(bearer_token)
+        auth_manager = session.auth_manager
+        model_cache = session.model_cache
+        model_resolver = session.model_resolver
+        
+        conversation_id = generate_conversation_id()
+        profile_arn_for_payload = ""
+        
+        try:
+            kiro_payload = anthropic_to_kiro(
+                request_data,
+                conversation_id,
+                profile_arn_for_payload
+            )
+        except ValueError as e:
+            return JSONResponse(
+                status_code=400,
+                content={"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}}
+            )
+        
+        url = f"{auth_manager.api_host}/generateAssistantResponse"
+        logger.info(f"API key passthrough (Anthropic): {url} (model={request_data.model})")
+        
+        if request_data.stream:
+            http_client = KiroHttpClient(auth_manager, shared_client=None)
+        else:
+            shared_client = request.app.state.http_client
+            http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+        
+        try:
+            response = await http_client.request_with_retry(
+                "POST", url, kiro_payload, stream=True
+            )
+            
+            if response.status_code != 200:
+                error_body = await response.aread()
+                error_text = error_body.decode("utf-8", errors="replace")
+                await http_client.close()
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content={"type": "error", "error": {"type": "api_error", "message": error_text}}
+                )
+            
+            messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+            
+            if request_data.stream:
+                async def stream_wrapper_anthropic_passthrough():
+                    try:
+                        async def make_retry_request():
+                            return await http_client.request_with_retry(
+                                "POST", url, kiro_payload, stream=True
+                            )
+                        
+                        async for chunk in stream_with_first_token_retry_anthropic(
+                            make_request=make_retry_request,
+                            client=http_client.client,
+                            model=request_data.model,
+                            model_cache=model_cache,
+                            auth_manager=auth_manager,
+                            initial_response=response,
+                            request_messages=messages_for_tokenizer
+                        ):
+                            yield chunk
+                    except GeneratorExit:
+                        logger.debug("Client disconnected during streaming (Anthropic passthrough)")
+                    finally:
+                        await http_client.close()
+                
+                return StreamingResponse(
+                    stream_wrapper_anthropic_passthrough(),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+                )
+            else:
+                result = await collect_anthropic_response(
+                    response=response,
+                    model=request_data.model,
+                    model_cache=model_cache,
+                    auth_manager=auth_manager,
+                    request_messages=messages_for_tokenizer
+                )
+                await http_client.close()
+                return JSONResponse(content=result)
+        
+        except HTTPException:
+            raise
+        except Exception as e:
+            await http_client.close()
+            logger.error(f"API key passthrough error (Anthropic): {e}")
+            return JSONResponse(
+                status_code=502,
+                content={"type": "error", "error": {"type": "api_error", "message": str(e)}}
+            )
+    
+    # ==============================================================================
     # Account System: Account System Failover or Legacy Mode
     # ==============================================================================
+    
+    # Guard: stateless mode has no accounts — only ksk_ passthrough works
+    if getattr(request.app.state, 'stateless_mode', False):
+        return JSONResponse(
+            status_code=401,
+            content={"type": "error", "error": {"type": "authentication_error", "message": "Gateway is running in stateless mode. Provide a Kiro API key (ksk_*) as x-api-key or Bearer token."}}
+        )
     
     if request.app.state.account_system:
         # ==============================================================================
@@ -906,10 +1026,11 @@ async def messages(
         )
 
 
-@router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_anthropic_api_key)])
+@router.post("/v1/messages/count_tokens")
 async def count_tokens_endpoint(
     request: Request,
     request_data: AnthropicCountTokensRequest,
+    bearer_token: str = Depends(verify_anthropic_api_key)
 ):
     """
     Anthropic Count Tokens API endpoint.
