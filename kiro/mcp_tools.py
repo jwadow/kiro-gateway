@@ -41,6 +41,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import get_kiro_headers
 
 # Import debug_logger
 try:
@@ -135,7 +136,7 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
-    
+
     # Log MCP request
     try:
         mcp_request_json = json.dumps(mcp_request, ensure_ascii=False, indent=2).encode('utf-8')
@@ -146,13 +147,13 @@ async def call_kiro_mcp_api(
     
     try:
         token = await auth_manager.get_access_token()
-        
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
+
+        # /mcp requires the same Kiro client-identity headers as the completion
+        # path (else 403); reuse get_kiro_headers and override what differs.
+        headers = get_kiro_headers(auth_manager, token)
+        headers["Content-Type"] = "application/json"  # /mcp is JSON-RPC
+        headers.pop("x-amz-target", None)
+        headers["x-amzn-codewhisperer-optout"] = "false"
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")

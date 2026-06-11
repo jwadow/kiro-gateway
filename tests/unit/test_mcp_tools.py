@@ -148,6 +148,51 @@ class TestCallKiroMCPAPI:
         assert results["results"][0]["url"] == "https://python.org"
     
     @pytest.mark.asyncio
+    async def test_mcp_api_sends_kiro_identity_headers(self, mock_auth_manager):
+        """
+        What it does: Verifies the MCP request sends the Kiro client-identity headers.
+        Purpose: Guard against the 403 regression - /mcp rejects a bare Authorization header.
+        """
+        print("Setup: Mocking MCP API response to capture posted headers...")
+        query = "Python tutorials"
+
+        mock_response_data = {
+            "id": "web_search_tooluse_abc123_1234567890_xyz",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"results": [], "totalResults": 0, "query": query})
+                }],
+                "isError": False
+            }
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        print("Inspecting posted request headers...")
+        assert mock_post.call_count == 1
+        headers = mock_post.call_args.kwargs["headers"]
+
+        print(f"Checking Kiro client-identity headers present...")
+        assert "KiroIDE" in headers["User-Agent"]
+        assert mock_auth_manager.fingerprint in headers["User-Agent"]
+        assert "KiroIDE" in headers["x-amz-user-agent"]
+        assert headers["x-amzn-kiro-agent-mode"] == "vibe"
+        assert "Authorization" in headers
+        assert headers["Authorization"].startswith("Bearer ")
+
+    @pytest.mark.asyncio
     async def test_mcp_api_error_response(self, mock_auth_manager):
         """
         What it does: Verifies handling of MCP API error response.
