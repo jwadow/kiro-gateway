@@ -343,6 +343,19 @@ TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in 
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # ==================================================================================================
+# Billing Attribution Strip
+# ==================================================================================================
+
+# Claude Code 2.1.x prepends a per-request system text block of the form
+# ``x-anthropic-billing-header: cc_version=...; cc_entrypoint=...; cch=<5hex>;``
+# where ``cch`` is a fresh random hex token. The Kiro gateway concatenates all
+# system text blocks before forwarding, so this random prefix would invalidate
+# any upstream prompt cache keyed on the prompt prefix. When enabled (default),
+# the gateway strips the leading attribution line / block before forwarding.
+# Disable only for A/B comparison or to debug attribution behavior.
+STRIP_BILLING_HEADER: bool = os.getenv("STRIP_BILLING_HEADER", "true").lower() in ("true", "1", "yes")
+
+# ==================================================================================================
 # First Token Timeout Settings (Streaming Retry)
 # ==================================================================================================
 
