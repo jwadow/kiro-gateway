@@ -126,10 +126,11 @@ class KiroAuthManager:
         client_secret: Optional[str] = None,
         sqlite_db: Optional[str] = None,
         api_region: Optional[str] = None,
+        refresh_client: Optional[httpx.AsyncClient] = None,
     ):
         """
         Initializes the authentication manager.
-        
+
         Args:
             refresh_token: Refresh token for obtaining access token
             profile_arn: AWS CodeWhisperer profile ARN
@@ -141,12 +142,18 @@ class KiroAuthManager:
                        Default location: ~/.local/share/kiro-cli/data.sqlite3
             api_region: Q API region override (optional, per-account)
                        If not specified, uses auto-detection or falls back to region
+            refresh_client: Optional shared httpx.AsyncClient for token refresh.
+                            Owned by the FastAPI lifespan. If None, refresh methods
+                            create a per-call client (fallback). See PR #1 of
+                            perf-async-improvements.
         """
         self._refresh_token = refresh_token
         self._profile_arn = profile_arn
         self._region = region
         self._creds_file = creds_file
         self._sqlite_db = sqlite_db
+        # Shared client used for token refresh (PR #1). Owned by app lifespan when set.
+        self._refresh_client = refresh_client
         
         # AWS SSO OIDC specific fields
         self._client_id: Optional[str] = client_id
@@ -705,10 +712,20 @@ class KiroAuthManager:
             "User-Agent": f"KiroIDE-0.7.45-{self._fingerprint}",
         }
         
-        async with httpx.AsyncClient(timeout=30) as client:
+        # PR #1 (perf-async-improvements): use the injected refresh client when available
+        # to avoid constructing a new httpx.AsyncClient per token refresh.
+        client = self._refresh_client
+        owns_client = client is None
+        if owns_client:
+            logger.warning("No shared refresh client; creating a per-call client")
+            client = httpx.AsyncClient(timeout=30)
+        try:
             response = await client.post(self._refresh_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
+        finally:
+            if owns_client:
+                await client.aclose()
         
         new_access_token = data.get("accessToken")
         new_refresh_token = data.get("refreshToken")
@@ -822,9 +839,16 @@ class KiroAuthManager:
         logger.debug(f"AWS SSO OIDC refresh request: url={url}, sso_region={sso_region}, "
                      f"api_region={self._region}, client_id={self._client_id[:8]}...")
         
-        async with httpx.AsyncClient(timeout=30) as client:
+        # PR #1 (perf-async-improvements): use the injected refresh client when available
+        # to avoid constructing a new httpx.AsyncClient per token refresh.
+        client = self._refresh_client
+        owns_client = client is None
+        if owns_client:
+            logger.warning("No shared refresh client; creating a per-call client")
+            client = httpx.AsyncClient(timeout=30)
+        try:
             response = await client.post(url, json=payload, headers=headers)
-            
+
             # Log response details for debugging (especially on errors)
             if response.status_code != 200:
                 error_body = response.text
@@ -840,8 +864,11 @@ class KiroAuthManager:
                 except Exception:
                     pass  # Body wasn't JSON, already logged as text
                 response.raise_for_status()
-            
+
             result = response.json()
+        finally:
+            if owns_client:
+                await client.aclose()
         
         # AWS SSO OIDC CreateToken API returns camelCase fields
         new_access_token = result.get("accessToken")
