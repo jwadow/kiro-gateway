@@ -885,26 +885,28 @@ class TestRouterIntegration:
 
 class TestHTTPClientSelection:
     """
-    Tests for HTTP client selection in routes (issue #54).
-    
-    Verifies that streaming requests use per-request clients to avoid CLOSE_WAIT leak
-    when network interface changes (VPN disconnect/reconnect), while non-streaming
-    requests use shared client for connection pooling.
+    Tests for HTTP client selection in routes (PR #1 of perf-async-improvements).
+
+    Verifies that BOTH streaming and non-streaming requests now use the shared
+    app.state.http_client. The streaming branch used to construct a per-request
+    client (issue #54 mitigation) but PR #1 unifies on shared-client reuse while
+    keeping the Connection: close header (http_client.py:229) to preserve the
+    CLOSE_WAIT fix.
     """
-    
+
     @patch('kiro.routes_openai.KiroHttpClient')
-    def test_streaming_uses_per_request_client(
+    def test_streaming_uses_shared_client(
         self,
         mock_kiro_http_client_class,
         test_client,
         valid_proxy_api_key
     ):
         """
-        What it does: Verifies streaming requests create per-request HTTP client.
-        Purpose: Prevent CLOSE_WAIT leak on VPN disconnect (issue #54).
+        What it does: Verifies streaming requests pass the shared app.state.http_client.
+        Purpose: PR #1 unifies shared-client reuse across streaming and non-streaming.
         """
-        print("\n--- Test: Streaming uses per-request client ---")
-        
+        print("\n--- Test: Streaming uses shared client (PR #1) ---")
+
         # Setup mock
         mock_client_instance = AsyncMock()
         mock_client_instance.request_with_retry = AsyncMock(
@@ -912,7 +914,7 @@ class TestHTTPClientSelection:
         )
         mock_client_instance.close = AsyncMock()
         mock_kiro_http_client_class.return_value = mock_client_instance
-        
+
         print("Action: POST with stream=true...")
         try:
             test_client.post(
@@ -926,14 +928,14 @@ class TestHTTPClientSelection:
             )
         except Exception:
             pass
-        
-        print("Checking: KiroHttpClient(shared_client=None)...")
+
+        print("Checking: KiroHttpClient(shared_client=app.state.http_client)...")
         assert mock_kiro_http_client_class.called
         call_args = mock_kiro_http_client_class.call_args
         print(f"Call args: {call_args}")
-        assert call_args[1]['shared_client'] is None, \
-            "Streaming should use per-request client"
-        print("✅ Streaming correctly uses per-request client")
+        assert call_args[1]['shared_client'] is not None, \
+            "Streaming should use the shared client under PR #1"
+        print("✅ Streaming correctly uses shared client")
     
     @patch('kiro.routes_openai.KiroHttpClient')
     def test_non_streaming_uses_shared_client(

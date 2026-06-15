@@ -347,11 +347,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             url = f"{auth_manager.api_host}/generateAssistantResponse"
             logger.debug(f"Kiro API URL: {url} (account: {account.id})")
             
-            if request_data.stream:
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
-            else:
-                shared_client = request.app.state.http_client
-                http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+            # PR #1 (perf-async-improvements): always reuse the shared client.
+            # Connection: close (set in http_client.py:229) preserves the issue #38 fix.
+            shared_client = getattr(request.app.state, "http_client", None)
+            if shared_client is None:
+                logger.warning("app.state.http_client missing; falling back to per-request client")
+            http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
             
             try:
                 # Make request to Kiro API
@@ -598,12 +599,17 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     logger.debug(f"Kiro API URL: {url}")
     
     if request_data.stream:
-        # Streaming mode: per-request client prevents orphaned connections
-        # when network interface changes (VPN disconnect/reconnect)
-        http_client = KiroHttpClient(auth_manager, shared_client=None)
+        # Streaming mode: PR #1 (perf-async-improvements) reuses the shared client.
+        # Connection: close (set in http_client.py:229) preserves the issue #38 fix.
+        shared_client = getattr(request.app.state, "http_client", None)
+        if shared_client is None:
+            logger.warning("app.state.http_client missing; falling back to per-request client")
+        http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
     else:
         # Non-streaming mode: shared client for efficient connection reuse
-        shared_client = request.app.state.http_client
+        shared_client = getattr(request.app.state, "http_client", None)
+        if shared_client is None:
+            logger.warning("app.state.http_client missing; falling back to per-request client")
         http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
     try:
         # Make request to Kiro API (for both streaming and non-streaming modes)
