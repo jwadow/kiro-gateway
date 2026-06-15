@@ -25,6 +25,7 @@ from kiro.converters_anthropic import (
     convert_anthropic_tools,
     anthropic_to_kiro,
     extract_thinking_config_from_anthropic,
+    extract_inline_system_messages,
 )
 from kiro.converters_core import UnifiedMessage, UnifiedTool
 from kiro.models_anthropic import (
@@ -1884,3 +1885,272 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestExtractInlineSystemMessages:
+    """
+    Tests for extract_inline_system_messages.
+
+    Verifies that inline system messages are folded out of the conversation
+    (Requirements 4.2, 4.4, 5.1, 5.2, 5.3).
+    """
+
+    def test_no_inline_system_returns_messages_unchanged(self):
+        """
+        What it does: With no system role, returns empty texts and all messages.
+        Purpose: Ensure no-op behaviour for normal conversations.
+        """
+        print("Setup: user + assistant messages only...")
+        messages = [
+            AnthropicMessage(role="user", content="Hello"),
+            AnthropicMessage(role="assistant", content="Hi"),
+        ]
+
+        print("Action: extracting inline system messages...")
+        texts, conversation = extract_inline_system_messages(messages)
+
+        print(f"Result: texts={texts}, conversation_len={len(conversation)}")
+        assert texts == []
+        assert len(conversation) == 2
+
+    def test_single_inline_system_extracted(self):
+        """
+        What it does: Extracts a single inline system message text.
+        Purpose: Requirement 4.2 - fold inline system content out.
+        """
+        print("Setup: inline system + user...")
+        messages = [
+            AnthropicMessage(role="system", content="Be concise"),
+            AnthropicMessage(role="user", content="Hello"),
+        ]
+
+        print("Action: extracting inline system messages...")
+        texts, conversation = extract_inline_system_messages(messages)
+
+        print(f"Result: texts={texts}, conversation roles={[m.role for m in conversation]}")
+        assert texts == ["Be concise"]
+        assert [m.role for m in conversation] == ["user"]
+
+    def test_multiple_inline_system_preserve_order(self):
+        """
+        What it does: Preserves order of multiple inline system messages.
+        Purpose: Requirement 5.1 - relative order preserved.
+        """
+        print("Setup: system A, user, system B...")
+        messages = [
+            AnthropicMessage(role="system", content="First"),
+            AnthropicMessage(role="user", content="Hello"),
+            AnthropicMessage(role="system", content="Second"),
+        ]
+
+        print("Action: extracting inline system messages...")
+        texts, conversation = extract_inline_system_messages(messages)
+
+        print(f"Result: texts={texts}")
+        assert texts == ["First", "Second"]
+        assert [m.role for m in conversation] == ["user"]
+
+    def test_inline_system_with_content_blocks(self):
+        """
+        What it does: Extracts text from list-of-blocks system content.
+        Purpose: Requirement 5.3 - extract text from content blocks.
+        """
+        print("Setup: inline system with content blocks...")
+        messages = [
+            AnthropicMessage(
+                role="system",
+                content=[
+                    {"type": "text", "text": "Part 1 "},
+                    {"type": "text", "text": "Part 2"},
+                ],
+            ),
+            AnthropicMessage(role="user", content="Hello"),
+        ]
+
+        print("Action: extracting inline system messages...")
+        texts, conversation = extract_inline_system_messages(messages)
+
+        print(f"Result: texts={texts}")
+        assert texts == ["Part 1 Part 2"]
+
+    def test_conversation_order_preserved(self):
+        """
+        What it does: User/assistant ordering is preserved after extraction.
+        Purpose: Requirement 5.2 - non-system order preserved.
+        """
+        print("Setup: user, system, assistant, user...")
+        messages = [
+            AnthropicMessage(role="user", content="U1"),
+            AnthropicMessage(role="system", content="S"),
+            AnthropicMessage(role="assistant", content="A1"),
+            AnthropicMessage(role="user", content="U2"),
+        ]
+
+        print("Action: extracting inline system messages...")
+        texts, conversation = extract_inline_system_messages(messages)
+
+        print(f"Result: conversation roles={[m.role for m in conversation]}")
+        assert [m.role for m in conversation] == ["user", "assistant", "user"]
+        assert [m.content for m in conversation] == ["U1", "A1", "U2"]
+
+
+class TestAnthropicToKiroInlineSystem:
+    """
+    Integration tests for inline system folding in anthropic_to_kiro.
+
+    Requirements 4.2, 4.3, 4.4, 4.5, 4.6, 5.1, 5.2.
+    """
+
+    def _build(self, request):
+        """Helper to call anthropic_to_kiro with reasoning disabled."""
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4.5"):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                with patch("kiro.config.TRUNCATION_RECOVERY", False):
+                    return anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+    def test_inline_system_folded_into_prompt(self):
+        """
+        What it does: Inline system content appears in the user message content.
+        Purpose: Requirement 4.2 - fold into system prompt.
+        """
+        print("Setup: inline system + user...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": "You are a pirate"},
+                {"role": "user", "content": "Hello"},
+            ],
+        )
+
+        print("Action: converting to Kiro payload...")
+        payload = self._build(request)
+
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        print(f"Content: {content!r}")
+        assert "You are a pirate" in content
+        assert "Hello" in content
+
+    def test_top_level_and_inline_system_combined(self):
+        """
+        What it does: Combines top-level system and inline system content.
+        Purpose: Requirement 4.3 and 5.1 - both folded, top-level first.
+        """
+        print("Setup: top-level system + inline system + user...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            system="TOP_LEVEL_SYSTEM",
+            messages=[
+                {"role": "system", "content": "INLINE_SYSTEM"},
+                {"role": "user", "content": "Hello"},
+            ],
+        )
+
+        print("Action: converting to Kiro payload...")
+        payload = self._build(request)
+
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        print(f"Content: {content!r}")
+        assert "TOP_LEVEL_SYSTEM" in content
+        assert "INLINE_SYSTEM" in content
+        # Top-level system comes before inline system
+        assert content.index("TOP_LEVEL_SYSTEM") < content.index("INLINE_SYSTEM")
+
+    def test_inline_system_excluded_from_history(self):
+        """
+        What it does: Inline system messages are not in conversation history.
+        Purpose: Requirement 4.4 - exclude inline system from history.
+        """
+        print("Setup: system, user, assistant, user...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": "SYSTEM_MARKER"},
+                {"role": "user", "content": "First user"},
+                {"role": "assistant", "content": "First assistant"},
+                {"role": "user", "content": "Second user"},
+            ],
+        )
+
+        print("Action: converting to Kiro payload...")
+        payload = self._build(request)
+
+        history = payload["conversationState"].get("history", [])
+        history_json = str(history)
+        print(f"History entries: {len(history)}")
+        # System content is folded into the first user message in history, but
+        # there must be no standalone system entry. Verify the conversation
+        # has exactly the user/assistant turns expected (2 history + current).
+        assert len(history) == 2
+
+    def test_only_inline_system_and_user_produces_valid_payload(self):
+        """
+        What it does: messages with only inline system + user yields a payload.
+        Purpose: Requirement 4.5 - user message preserved.
+        """
+        print("Setup: inline system + user only...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": "SYS"},
+                {"role": "user", "content": "The actual question"},
+            ],
+        )
+
+        print("Action: converting to Kiro payload...")
+        payload = self._build(request)
+
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        print(f"Content: {content!r}")
+        assert "The actual question" in content
+
+    def test_only_inline_system_no_user_raises(self):
+        """
+        What it does: messages with only inline system raises ValueError.
+        Purpose: Requirement 4.6 - reject when no user/assistant remains.
+        """
+        print("Setup: only inline system messages...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": "SYS only"},
+            ],
+        )
+
+        print("Action: expecting ValueError (No messages to send)...")
+        with pytest.raises(ValueError):
+            self._build(request)
+
+    def test_multiple_inline_system_order_in_prompt(self):
+        """
+        What it does: Multiple inline system messages keep order in the prompt.
+        Purpose: Requirement 5.1 - order preserved end-to-end.
+        """
+        print("Setup: system FIRST, user, system SECOND...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": "FIRST_SYS"},
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": "SECOND_SYS"},
+            ],
+        )
+
+        print("Action: converting to Kiro payload...")
+        payload = self._build(request)
+
+        # System prompt is prepended to the current user message (history empty
+        # of user turns means it lands on current). Search wherever it lands.
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        content = user_input["content"]
+        history_text = str(payload["conversationState"].get("history", []))
+        combined = content + history_text
+        print(f"Combined text: {combined!r}")
+        assert "FIRST_SYS" in combined
+        assert "SECOND_SYS" in combined
+        assert combined.index("FIRST_SYS") < combined.index("SECOND_SYS")

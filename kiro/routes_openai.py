@@ -37,7 +37,6 @@ from loguru import logger
 from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
-    PROFILE_ARN,
 )
 from kiro.models_openai import (
     OpenAIModel,
@@ -48,6 +47,8 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
+from kiro.profile_resolver import resolve_profile_arn, is_valid_profile_arn
+from kiro.exceptions import MissingProfileArnError, MalformedProfileArnError
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
@@ -323,14 +324,35 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             conversation_id = generate_conversation_id()
             
             # Build payload for Kiro
-            # profileArn is required by runtime.kiro.dev for all auth types
-            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+            # profileArn is required by runtime.kiro.dev for all auth types.
+            # Resolve via the shared Profile_Resolver and reject early with an
+            # actionable error if none is available, so we never send a request
+            # to the Kiro API without a profileArn.
+            profile_arn_for_payload = resolve_profile_arn(auth_manager)
             
             try:
+                if not profile_arn_for_payload:
+                    raise MissingProfileArnError()
+                if not is_valid_profile_arn(profile_arn_for_payload):
+                    raise MalformedProfileArnError(profile_arn_for_payload)
                 kiro_payload = build_kiro_payload(
                     request_data,
                     conversation_id,
                     profile_arn_for_payload
+                )
+            except (MissingProfileArnError, MalformedProfileArnError) as e:
+                logger.warning(f"HTTP 400 - POST /v1/chat/completions - {e}")
+                if debug_logger:
+                    debug_logger.flush_on_error(400, str(e))
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    }
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -571,14 +593,35 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is required by runtime.kiro.dev for all auth types
-    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+    # profileArn is required by runtime.kiro.dev for all auth types.
+    # Resolve via the shared Profile_Resolver and reject early with an
+    # actionable error if none is available, so we never send a request to the
+    # Kiro API without a profileArn.
+    profile_arn_for_payload = resolve_profile_arn(auth_manager)
     
     try:
+        if not profile_arn_for_payload:
+            raise MissingProfileArnError()
+        if not is_valid_profile_arn(profile_arn_for_payload):
+            raise MalformedProfileArnError(profile_arn_for_payload)
         kiro_payload = build_kiro_payload(
             request_data,
             conversation_id,
             profile_arn_for_payload
+        )
+    except (MissingProfileArnError, MalformedProfileArnError) as e:
+        logger.warning(f"HTTP 400 - POST /v1/chat/completions - {e}")
+        if debug_logger:
+            debug_logger.flush_on_error(400, str(e))
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }
+            }
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

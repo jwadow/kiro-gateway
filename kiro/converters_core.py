@@ -436,19 +436,48 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
 # JSON Schema Sanitization
 # ==================================================================================================
 
+# JSON Schema meta/annotation keywords that Kiro API rejects in tool inputSchema.
+#
+# Kiro's tool schema validation is stricter than standard JSON Schema and fails
+# the whole request with a vague "Improperly formed request"
+# (reason: REQUEST_BODY_INVALID) when any of these are present. They are pure
+# metadata/annotations that carry no structural meaning for argument validation,
+# so stripping them is safe and preserves the user's intent.
+#
+# Notably, Claude Code sends "$schema" on EVERY tool definition
+# (e.g. "https://json-schema.org/draft/2020-12/schema"), which was the root
+# cause of the REQUEST_BODY_INVALID rejections.
+#
+# NOTE: Structural "$"-keywords like "$ref"/"$defs" are intentionally NOT included
+# here — removing those would corrupt the schema. Only annotation keywords are listed.
+DISALLOWED_SCHEMA_KEYS: frozenset = frozenset({
+    "$schema",
+    "$id",
+    "$anchor",
+    "$comment",
+})
+
+
 def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Sanitizes JSON Schema from fields that Kiro API doesn't accept.
-    
-    Kiro API returns 400 "Improperly formed request" error if:
-    - required is an empty array []
-    - additionalProperties is present in schema
-    
-    This function recursively processes the schema and removes problematic fields.
-    
+
+    Kiro API returns a vague 400 "Improperly formed request"
+    (reason: REQUEST_BODY_INVALID) error if a tool's inputSchema contains
+    fields it does not support. Known offenders:
+    - ``required`` as an empty array ``[]``
+    - ``additionalProperties`` anywhere in the schema
+    - JSON Schema meta/annotation keywords (see ``DISALLOWED_SCHEMA_KEYS``),
+      most notably ``$schema`` which Claude Code sends on every tool
+      (e.g. ``"$schema": "https://json-schema.org/draft/2020-12/schema"``)
+
+    This function recursively processes the schema and removes problematic
+    fields, so the same handling applies to nested objects, ``properties``,
+    and list-valued combinators (``anyOf``/``oneOf``/``allOf``).
+
     Args:
         schema: JSON Schema to sanitize
-    
+
     Returns:
         Sanitized copy of schema
     """
@@ -464,6 +493,11 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         
         # Skip additionalProperties - Kiro API doesn't support it
         if key == "additionalProperties":
+            continue
+
+        # Skip JSON Schema meta/annotation keywords that Kiro API rejects
+        # (e.g. "$schema" sent by Claude Code on every tool definition).
+        if key in DISALLOWED_SCHEMA_KEYS:
             continue
         
         # Recursively process nested objects
@@ -483,6 +517,62 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             result[key] = value
     
+    return result
+
+
+def ensure_object_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Guarantee a tool root input schema is a valid JSON Schema object.
+
+    Bedrock (the engine behind Kiro's runtime) requires every tool's
+    ``inputSchema.json.type`` to be exactly ``"object"`` and to carry a
+    ``properties`` map. Real clients sometimes send tool schemas that violate
+    this, which surfaces as:
+
+        "toolConfig.tools.N.toolSpec.inputSchema.json.type must be one of [object]"
+
+    Common violations this normalizes:
+    - Missing ``type`` (e.g. a bare ``{}`` or only ``{"properties": {...}}``)
+    - A non-object ``type`` (e.g. ``"string"``) at the schema root, which makes
+      no sense for a tool's argument container
+    - Missing ``properties`` for an object schema (Bedrock expects the key)
+
+    This is applied ONLY to the root of a tool input schema (in
+    ``convert_tools_to_kiro_format``), never recursively, so nested property
+    schemas keep their own legitimate non-object types.
+
+    Args:
+        schema: A sanitized tool input schema (may be empty or partial).
+
+    Returns:
+        A schema dict whose root is ``type: "object"`` with a ``properties`` map.
+
+    Examples:
+        >>> ensure_object_schema({})
+        {'type': 'object', 'properties': {}}
+        >>> ensure_object_schema({"properties": {"x": {"type": "string"}}})
+        {'properties': {'x': {'type': 'string'}}, 'type': 'object'}
+        >>> ensure_object_schema({"type": "string"})
+        {'type': 'object', 'properties': {}}
+    """
+    if not schema or not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+
+    result = dict(schema)
+
+    # Force the root type to "object" if missing or not already "object".
+    if result.get("type") != "object":
+        if "type" in result:
+            logger.debug(
+                f"Tool input schema root type was {result.get('type')!r}; "
+                f"normalizing to 'object' for Bedrock compatibility"
+            )
+        result["type"] = "object"
+
+    # Bedrock expects object schemas to declare a properties map.
+    if not isinstance(result.get("properties"), dict):
+        result["properties"] = {}
+
     return result
 
 
@@ -616,7 +706,15 @@ def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dic
     for tool in tools:
         # Sanitize parameters from fields that Kiro API doesn't accept
         sanitized_params = sanitize_json_schema(tool.input_schema)
-        
+
+        # Guarantee a valid top-level schema for Bedrock/Kiro.
+        # Bedrock requires every tool's inputSchema.json.type to be "object"
+        # (error: "toolConfig.tools.N.toolSpec.inputSchema.json.type must be
+        # one of [object]"). Some clients send tools with a missing or
+        # non-object top-level type (e.g. a bare/empty schema for a no-argument
+        # tool), so we normalize the root here.
+        sanitized_params = ensure_object_schema(sanitized_params)
+
         # Kiro API requires non-empty description
         description = tool.description
         if not description or not description.strip():

@@ -33,6 +33,7 @@ from kiro.converters_core import (
     extract_tool_uses_from_message,
     sanitize_json_schema,
     convert_tools_to_kiro_format,
+    ensure_object_schema,
     convert_tool_results_to_kiro_format,
     tool_calls_to_text,
     tool_results_to_text,
@@ -2776,10 +2777,121 @@ class TestSanitizeJsonSchema:
         assert result["required"] == ["question", "options"]  # Non-empty required is preserved
         assert result["properties"]["question"]["type"] == "string"
 
+    def test_strips_dollar_schema_key(self):
+        """
+        What it does: Verifies the $schema meta key is removed.
+        Purpose: Root-cause fix for Kiro REQUEST_BODY_INVALID - Claude Code
+                 sends $schema on every tool definition.
+        """
+        print("Setup: schema with $schema meta key (Claude Code style)...")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }
 
-# ==================================================================================================
-# Tests for extract_tool_results_from_content
-# ==================================================================================================
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        assert "$schema" not in result
+        assert result["type"] == "object"
+        assert result["required"] == ["command"]
+        assert result["properties"]["command"]["type"] == "string"
+
+    def test_strips_other_meta_keys(self):
+        """
+        What it does: Verifies $id, $anchor and $comment are removed.
+        Purpose: Cover the full set of disallowed annotation keywords.
+        """
+        print("Setup: schema with $id/$anchor/$comment...")
+        schema = {
+            "$id": "https://example.com/s.json",
+            "$anchor": "root",
+            "$comment": "internal note",
+            "type": "object",
+            "properties": {"x": {"type": "number"}},
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        assert "$id" not in result
+        assert "$anchor" not in result
+        assert "$comment" not in result
+        assert result["properties"]["x"]["type"] == "number"
+
+    def test_strips_nested_dollar_schema(self):
+        """
+        What it does: Verifies $schema is stripped in nested property schemas.
+        Purpose: Ensure recursive sanitization covers nested objects.
+        """
+        print("Setup: nested schema with $schema in a property...")
+        schema = {
+            "type": "object",
+            "properties": {
+                "config": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"flag": {"type": "boolean"}},
+                }
+            },
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        assert "$schema" not in result["properties"]["config"]
+        assert result["properties"]["config"]["properties"]["flag"]["type"] == "boolean"
+
+    def test_strips_dollar_schema_inside_combinators(self):
+        """
+        What it does: Verifies $schema removed inside anyOf/oneOf lists.
+        Purpose: Ensure list-valued combinators are sanitized recursively.
+        """
+        print("Setup: schema with $schema inside anyOf entries...")
+        schema = {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"$schema": "http://json-schema.org/draft-07/schema#", "type": "string"},
+                        {"type": "integer"},
+                    ]
+                }
+            },
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        any_of = result["properties"]["value"]["anyOf"]
+        assert all("$schema" not in entry for entry in any_of)
+        assert any_of[0]["type"] == "string"
+        assert any_of[1]["type"] == "integer"
+
+    def test_preserves_structural_ref_and_defs(self):
+        """
+        What it does: Verifies $ref and $defs are NOT stripped.
+        Purpose: Structural keywords must be preserved to keep the schema valid.
+        """
+        print("Setup: schema using $ref and $defs...")
+        schema = {
+            "type": "object",
+            "properties": {"item": {"$ref": "#/$defs/Item"}},
+            "$defs": {"Item": {"type": "string"}},
+        }
+
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+
+        print(f"Result: {result}")
+        assert result["properties"]["item"]["$ref"] == "#/$defs/Item"
+        assert result["$defs"]["Item"]["type"] == "string"
 
 class TestExtractToolResults:
     """Tests for extract_tool_results_from_content function."""
@@ -6455,3 +6567,127 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+# ==================================================================================================
+# Tests for ensure_object_schema (Bedrock root-type requirement)
+# ==================================================================================================
+
+class TestEnsureObjectSchema:
+    """
+    Tests for ensure_object_schema.
+
+    Bedrock requires every tool's inputSchema.json.type to be "object"
+    (error: "toolConfig.tools.N.toolSpec.inputSchema.json.type must be one of
+    [object]"). This normalizes the root of a tool input schema.
+    """
+
+    def test_empty_schema_becomes_object(self):
+        """
+        What it does: An empty {} schema gains type=object and properties.
+        Purpose: No-argument tools often send {} which Bedrock rejects.
+        """
+        print("Action: normalizing {}...")
+        result = ensure_object_schema({})
+        print(f"Result: {result}")
+        assert result["type"] == "object"
+        assert result["properties"] == {}
+
+    def test_none_becomes_object(self):
+        """
+        What it does: None becomes a valid object schema.
+        Purpose: Defensive against missing input_schema.
+        """
+        print("Action: normalizing None...")
+        result = ensure_object_schema(None)
+        print(f"Result: {result}")
+        assert result == {"type": "object", "properties": {}}
+
+    def test_missing_type_added(self):
+        """
+        What it does: A schema with properties but no type gets type=object.
+        Purpose: Bedrock requires explicit root type.
+        """
+        print("Action: normalizing schema without type...")
+        result = ensure_object_schema({"properties": {"x": {"type": "string"}}})
+        print(f"Result: {result}")
+        assert result["type"] == "object"
+        assert result["properties"]["x"]["type"] == "string"
+
+    def test_non_object_root_type_forced_to_object(self):
+        """
+        What it does: A root type of "string" is forced to "object".
+        Purpose: Root container must be an object for tool args.
+        """
+        print("Action: normalizing schema with type=string...")
+        result = ensure_object_schema({"type": "string"})
+        print(f"Result: {result}")
+        assert result["type"] == "object"
+        assert result["properties"] == {}
+
+    def test_valid_object_schema_preserved(self):
+        """
+        What it does: A valid object schema is left intact.
+        Purpose: No-op for already-correct schemas.
+        """
+        print("Action: normalizing a valid object schema...")
+        schema = {
+            "type": "object",
+            "properties": {"cmd": {"type": "string"}},
+            "required": ["cmd"],
+        }
+        result = ensure_object_schema(schema)
+        print(f"Result: {result}")
+        assert result["type"] == "object"
+        assert result["properties"]["cmd"]["type"] == "string"
+        assert result["required"] == ["cmd"]
+
+    def test_object_without_properties_gets_properties(self):
+        """
+        What it does: An object schema lacking properties gets an empty map.
+        Purpose: Bedrock expects object schemas to declare properties.
+        """
+        print("Action: normalizing object schema without properties...")
+        result = ensure_object_schema({"type": "object"})
+        print(f"Result: {result}")
+        assert result["properties"] == {}
+
+    def test_does_not_mutate_input(self):
+        """
+        What it does: The input dict is not mutated in place.
+        Purpose: Avoid side effects on caller-owned schemas.
+        """
+        print("Action: ensuring input is not mutated...")
+        original = {"type": "string"}
+        ensure_object_schema(original)
+        print(f"Original after call: {original}")
+        assert original == {"type": "string"}
+
+
+class TestConvertToolsEnsuresObjectType:
+    """End-to-end: convert_tools_to_kiro_format guarantees object root type."""
+
+    def test_no_arg_tool_gets_object_schema(self):
+        """
+        What it does: A tool with empty input_schema yields type=object.
+        Purpose: Root-cause fix for Bedrock 'must be one of [object]' error.
+        """
+        print("Action: converting a no-arg tool...")
+        tools = [UnifiedTool(name="CronList", description="list", input_schema={})]
+        result = convert_tools_to_kiro_format(tools)
+        json_schema = result[0]["toolSpecification"]["inputSchema"]["json"]
+        print(f"Schema: {json_schema}")
+        assert json_schema["type"] == "object"
+        assert json_schema["properties"] == {}
+
+    def test_tool_with_bad_root_type_normalized(self):
+        """
+        What it does: A tool whose schema root type is not object is fixed.
+        Purpose: Ensure every emitted tool passes Bedrock validation.
+        """
+        print("Action: converting a tool with type=array root...")
+        tools = [UnifiedTool(name="Weird", description="d", input_schema={"type": "array"})]
+        result = convert_tools_to_kiro_format(tools)
+        json_schema = result[0]["toolSpecification"]["inputSchema"]["json"]
+        print(f"Schema: {json_schema}")
+        assert json_schema["type"] == "object"

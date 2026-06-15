@@ -1001,10 +1001,12 @@ class TestAnthropicHTTPClientSelection:
     requests use shared client for connection pooling.
     """
     
+    @patch('kiro.routes_anthropic.resolve_profile_arn', return_value="arn:aws:codewhisperer:us-east-1:123456789012:profile/TEST")
     @patch('kiro.routes_anthropic.KiroHttpClient')
     def test_streaming_uses_per_request_client(
         self,
         mock_kiro_http_client_class,
+        mock_resolve_arn,
         test_client,
         valid_proxy_api_key
     ):
@@ -1045,10 +1047,12 @@ class TestAnthropicHTTPClientSelection:
             "Streaming should use per-request client"
         print("✅ Anthropic streaming correctly uses per-request client")
     
+    @patch('kiro.routes_anthropic.resolve_profile_arn', return_value="arn:aws:codewhisperer:us-east-1:123456789012:profile/TEST")
     @patch('kiro.routes_anthropic.KiroHttpClient')
     def test_non_streaming_uses_shared_client(
         self,
         mock_kiro_http_client_class,
+        mock_resolve_arn,
         test_client,
         valid_proxy_api_key
     ):
@@ -2519,3 +2523,210 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+
+# =============================================================================
+# Tests for Missing Profile ARN handling (request-validation-fixes)
+# =============================================================================
+
+class TestMessagesMissingProfileArn:
+    """
+    Tests for the Missing_Profile_Error on /v1/messages.
+
+    Requirements 1.1, 1.3, 1.4, 2.1, 2.3, 2.4: when no profileArn can be
+    resolved, the gateway must return an HTTP 400 Anthropic-format error
+    (error.type == "invalid_request_error") WITHOUT contacting the Kiro API,
+    in both streaming and non-streaming modes.
+    """
+
+    @patch("kiro.routes_anthropic.KiroHttpClient")
+    @patch("kiro.routes_anthropic.resolve_profile_arn", return_value="")
+    def test_non_streaming_missing_profile_returns_400(
+        self, mock_resolve, mock_http_client, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Non-streaming request with no profileArn returns 400.
+        Purpose: Requirements 1.4, 2.1 - Anthropic-format error, no upstream call.
+        """
+        print("Action: POST /v1/messages with empty resolved profileArn...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": False,
+            },
+        )
+
+        print(f"Status: {response.status_code}, body: {response.json()}")
+        assert response.status_code == 400
+        body = response.json()
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "invalid_request_error"
+        assert "PROFILE_ARN" in body["error"]["message"]
+        assert not mock_http_client.called
+
+    @patch("kiro.routes_anthropic.KiroHttpClient")
+    @patch("kiro.routes_anthropic.resolve_profile_arn", return_value="")
+    def test_streaming_missing_profile_returns_400(
+        self, mock_resolve, mock_http_client, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Streaming request with no profileArn returns 400.
+        Purpose: Requirements 1.3, 2.1 - no streaming connection opened.
+        """
+        print("Action: POST /v1/messages stream=true, empty profileArn...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+        print(f"Status: {response.status_code}, body: {response.json()}")
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["type"] == "invalid_request_error"
+        assert "PROFILE_ARN" in body["error"]["message"]
+        assert not mock_http_client.called
+
+    @patch("kiro.routes_anthropic.KiroHttpClient")
+    @patch("kiro.routes_anthropic.resolve_profile_arn", return_value="")
+    def test_missing_profile_error_excludes_secrets(
+        self, mock_resolve, mock_http_client, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: The error message contains no credential values.
+        Purpose: Requirement 2.4 - exclude tokens/keys from the error.
+        """
+        print("Action: POST /v1/messages with empty profileArn...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        message = response.json()["error"]["message"].lower()
+        print(f"Message: {message}")
+        for forbidden in ("token", "secret", "access-key", "bearer", "password"):
+            assert forbidden not in message
+
+
+class TestMessagesInlineSystemEndpoint:
+    """
+    Endpoint-level test that an inline system role no longer yields a 422.
+
+    Requirement 4.1: the request must validate (no 422) when a message has
+    role="system" inside the messages array.
+    """
+
+    @patch("kiro.routes_anthropic.KiroHttpClient")
+    def test_inline_system_role_not_422(
+        self, mock_http_client, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Inline system role does not cause a 422 validation error.
+        Purpose: Requirement 4.1 - graceful acceptance at the endpoint.
+        """
+        # Make the HTTP client raise so we don't depend on a full upstream mock;
+        # we only care that validation (422) is passed.
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(side_effect=Exception("blocked"))
+        mock_instance.close = AsyncMock()
+        mock_http_client.return_value = mock_instance
+
+        print("Action: POST /v1/messages with inline system role...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "system", "content": "Be brief"},
+                    {"role": "user", "content": "Hello"},
+                ],
+            },
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
+
+
+class TestMessagesMalformedProfileArn:
+    """
+    Tests for the Malformed_Profile_Error on /v1/messages.
+
+    When a profileArn is present but malformed (e.g. the '...' placeholder),
+    the gateway must return HTTP 400 with an actionable Anthropic-format error
+    WITHOUT contacting the Kiro API, in both streaming and non-streaming modes.
+    """
+
+    PLACEHOLDER = "arn:aws:codewhisperer:us-east-1:..."
+
+    @patch("kiro.routes_anthropic.KiroHttpClient")
+    @patch("kiro.routes_anthropic.resolve_profile_arn")
+    def test_non_streaming_malformed_profile_returns_400(
+        self, mock_resolve, mock_http_client, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Non-streaming request with placeholder ARN returns 400.
+        Purpose: Actionable Anthropic-format error, no upstream call.
+        """
+        mock_resolve.return_value = self.PLACEHOLDER
+        print("Action: POST /v1/messages with placeholder profileArn...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": False,
+            },
+        )
+
+        print(f"Status: {response.status_code}, body: {response.json()}")
+        assert response.status_code == 400
+        body = response.json()
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "invalid_request_error"
+        assert "PROFILE_ARN" in body["error"]["message"]
+        assert not mock_http_client.called
+
+    @patch("kiro.routes_anthropic.KiroHttpClient")
+    @patch("kiro.routes_anthropic.resolve_profile_arn")
+    def test_streaming_malformed_profile_returns_400(
+        self, mock_resolve, mock_http_client, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Streaming request with placeholder ARN returns 400.
+        Purpose: No streaming connection opened on malformed ARN.
+        """
+        mock_resolve.return_value = self.PLACEHOLDER
+        print("Action: POST /v1/messages stream=true, placeholder ARN...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+        print(f"Status: {response.status_code}, body: {response.json()}")
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_request_error"
+        assert not mock_http_client.called

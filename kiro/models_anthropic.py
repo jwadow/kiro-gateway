@@ -182,12 +182,21 @@ class AnthropicMessage(BaseModel):
     """
     Message in Anthropic format.
 
+    Per the Anthropic specification the system prompt is carried in the
+    top-level ``system`` field, and ``messages`` roles are ``user`` or
+    ``assistant``. However, some clients (e.g. Claude Code) inline a
+    ``{"role": "system", ...}`` entry inside ``messages``. To avoid rejecting
+    those requests with an HTTP 422 before any conversion runs, this model
+    also accepts the ``system`` role. Inline system messages are folded into
+    the system prompt by the Anthropic converter and excluded from the
+    conversation history sent to the Kiro API.
+
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role (user, assistant, or inline system)
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

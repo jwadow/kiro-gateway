@@ -289,3 +289,130 @@ class TestValidationExceptionHandlerEdgeCases:
             
             body = json.loads(response.body.decode())
             assert "Привет мир" in body["body"]
+
+
+class TestMissingProfileArnError:
+    """Tests for the MissingProfileArnError exception."""
+
+    def test_is_subclass_of_value_error(self):
+        """
+        What it does: Verifies MissingProfileArnError subclasses ValueError.
+        Purpose: Ensure existing `except ValueError` handlers in routes catch it
+                 and translate it to HTTP 400.
+        """
+        print("Setup: importing MissingProfileArnError...")
+        from kiro.exceptions import MissingProfileArnError
+
+        print("Checking: subclass of ValueError...")
+        assert issubclass(MissingProfileArnError, ValueError)
+
+    def test_default_message_mentions_profile_arn_key(self):
+        """
+        What it does: Verifies default message includes the literal PROFILE_ARN key.
+        Purpose: Requirement 2.3 - actionable error referencing the config key.
+        """
+        print("Setup: creating error with default message...")
+        from kiro.exceptions import MissingProfileArnError
+
+        err = MissingProfileArnError()
+        message = str(err)
+
+        print(f"Message: {message}")
+        assert "PROFILE_ARN" in message
+        assert "required" in message.lower()
+
+    def test_default_message_excludes_secrets(self):
+        """
+        What it does: Verifies the default message contains no credential values.
+        Purpose: Requirement 2.4 - exclude tokens/keys from the error.
+        """
+        print("Setup: creating error with default message...")
+        from kiro.exceptions import MissingProfileArnError
+
+        message = str(MissingProfileArnError()).lower()
+
+        print("Checking: no secret-like tokens leak into the message...")
+        for forbidden in ("token", "secret", "access-key", "accesskey", "password", "bearer"):
+            assert forbidden not in message
+
+    def test_custom_message_is_used(self):
+        """
+        What it does: Verifies a custom message overrides the default.
+        Purpose: Allow callers to provide context-specific messages.
+        """
+        print("Setup: creating error with custom message...")
+        from kiro.exceptions import MissingProfileArnError
+
+        err = MissingProfileArnError("custom PROFILE_ARN message")
+
+        print(f"Message: {err}")
+        assert str(err) == "custom PROFILE_ARN message"
+
+    def test_can_be_caught_as_value_error(self):
+        """
+        What it does: Verifies the error is caught by `except ValueError`.
+        Purpose: Confirm route handler compatibility at runtime.
+        """
+        print("Setup: raising MissingProfileArnError...")
+        from kiro.exceptions import MissingProfileArnError
+
+        caught = False
+        try:
+            raise MissingProfileArnError()
+        except ValueError:
+            caught = True
+
+        print(f"Caught as ValueError: {caught}")
+        assert caught is True
+
+
+class TestMalformedProfileArnError:
+    """Tests for the MalformedProfileArnError exception."""
+
+    def test_is_subclass_of_value_error(self):
+        """
+        What it does: Verifies MalformedProfileArnError subclasses ValueError.
+        Purpose: Ensure route `except ValueError` handlers catch it.
+        """
+        from kiro.exceptions import MalformedProfileArnError
+        assert issubclass(MalformedProfileArnError, ValueError)
+
+    def test_message_mentions_profile_arn_and_placeholder(self):
+        """
+        What it does: Message references PROFILE_ARN and the placeholder guidance.
+        Purpose: Actionable error for the malformed/placeholder case.
+        """
+        from kiro.exceptions import MalformedProfileArnError
+        msg = str(MalformedProfileArnError("arn:aws:codewhisperer:us-east-1:..."))
+        print(f"Message: {msg}")
+        assert "PROFILE_ARN" in msg
+        assert "..." in msg  # guidance about the placeholder
+        assert "profile/" in msg  # shows the expected format
+
+    def test_message_echoes_offending_value(self):
+        """
+        What it does: Includes the offending ARN string to help the user.
+        Purpose: An ARN is an identifier (not a secret), so echoing aids fixing.
+        """
+        from kiro.exceptions import MalformedProfileArnError
+        msg = str(MalformedProfileArnError("arn:aws:codewhisperer:us-east-1:..."))
+        assert "arn:aws:codewhisperer:us-east-1:..." in msg
+
+    def test_message_excludes_secrets(self):
+        """
+        What it does: Message contains no credential-like tokens.
+        Purpose: Never leak secrets in errors.
+        """
+        from kiro.exceptions import MalformedProfileArnError
+        msg = str(MalformedProfileArnError("arn:aws:codewhisperer:us-east-1:...")).lower()
+        for forbidden in ("token", "secret", "access-key", "bearer", "password"):
+            assert forbidden not in msg
+
+    def test_works_without_value(self):
+        """
+        What it does: Builds a sensible message when no value is provided.
+        Purpose: Defensive default.
+        """
+        from kiro.exceptions import MalformedProfileArnError
+        msg = str(MalformedProfileArnError())
+        assert "PROFILE_ARN" in msg
