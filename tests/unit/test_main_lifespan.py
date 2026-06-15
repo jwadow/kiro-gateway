@@ -363,11 +363,12 @@ class TestLifespanAccountManagerInit:
         
         # Track AccountManager creation
         manager_created_with = {}
-        
+
         class MockAccountManager:
-            def __init__(self, credentials_file, state_file):
+            def __init__(self, credentials_file, state_file, auth_http_client=None):
                 manager_created_with["credentials_file"] = credentials_file
                 manager_created_with["state_file"] = state_file
+                manager_created_with["auth_http_client"] = auth_http_client
                 self._accounts = {"test": MagicMock()}
                 self._current_account_index = 0
             
