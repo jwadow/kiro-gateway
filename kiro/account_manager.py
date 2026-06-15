@@ -195,13 +195,23 @@ class AccountManager:
         >>> await manager.report_success(account.id, "claude-opus-4.5")
     """
     
-    def __init__(self, credentials_file: str, state_file: str):
+    def __init__(
+        self,
+        credentials_file: str,
+        state_file: str,
+        auth_http_client: Optional[httpx.AsyncClient] = None,
+    ):
         """
         Initialize AccountManager.
-        
+
         Args:
             credentials_file: Path to credentials.json
             state_file: Path to state.json
+            auth_http_client: Optional shared httpx.AsyncClient used for token
+                              refresh. Forwarded to every KiroAuthManager that
+                              this manager initializes (PR #1 of
+                              perf-async-improvements). If None, each
+                              KiroAuthManager creates a per-call client.
         """
         self._credentials_file = credentials_file
         self._state_file = state_file
@@ -211,6 +221,9 @@ class AccountManager:
         self._dirty = False
         self._credentials_config: List[Dict] = []
         self._current_account_index: int = 0  # GLOBAL sticky index for all models
+        # PR #1 (perf-async-improvements): shared refresh client threaded into
+        # KiroAuthManager during _initialize_account. Owned by the FastAPI lifespan.
+        self._auth_http_client = auth_http_client
     
     async def load_credentials(self) -> None:
         """
@@ -474,21 +487,24 @@ class AccountManager:
                     creds_file=account_id,
                     profile_arn=creds_config.get("profile_arn"),
                     region=creds_config.get("region", "us-east-1"),
-                    api_region=creds_config.get("api_region")
+                    api_region=creds_config.get("api_region"),
+                    refresh_client=self._auth_http_client,
                 )
             elif cred_type == "sqlite":
                 auth_manager = KiroAuthManager(
                     sqlite_db=account_id,
                     profile_arn=creds_config.get("profile_arn"),
                     region=creds_config.get("region", "us-east-1"),
-                    api_region=creds_config.get("api_region")
+                    api_region=creds_config.get("api_region"),
+                    refresh_client=self._auth_http_client,
                 )
             elif cred_type == "refresh_token":
                 auth_manager = KiroAuthManager(
                     refresh_token=creds_config.get("refresh_token"),
                     profile_arn=creds_config.get("profile_arn"),
                     region=creds_config.get("region", "us-east-1"),
-                    api_region=creds_config.get("api_region")
+                    api_region=creds_config.get("api_region"),
+                    refresh_client=self._auth_http_client,
                 )
             else:
                 logger.error(f"Unknown credential type: {cred_type}")

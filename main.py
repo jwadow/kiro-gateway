@@ -354,6 +354,15 @@ async def lifespan(app: FastAPI):
         follow_redirects=True
     )
     logger.info("Shared HTTP client created with connection pooling")
+
+    # PR #1 (perf-async-improvements): dedicated short-timeout client for token
+    # refresh. Auth refresh should be quick; the streaming 300s read timeout on
+    # app.state.http_client is the wrong shape for refresh.
+    app.state.auth_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0),
+        follow_redirects=True,
+    )
+    logger.info("Auth refresh client created with 30s timeout")
     
     # ==============================================================================
     # Legacy Fallback: .env → credentials.json
@@ -455,7 +464,8 @@ async def lifespan(app: FastAPI):
     # ==============================================================================
     app.state.account_manager = AccountManager(
         credentials_file=ACCOUNTS_CONFIG_FILE,
-        state_file=ACCOUNTS_STATE_FILE
+        state_file=ACCOUNTS_STATE_FILE,
+        auth_http_client=app.state.auth_http_client,
     )
     
     # Load credentials and state
@@ -531,6 +541,14 @@ async def lifespan(app: FastAPI):
         logger.info("Shared HTTP client closed")
     except Exception as e:
         logger.warning(f"Error closing shared HTTP client: {e}")
+
+    # PR #1 (perf-async-improvements): close the auth refresh client last so
+    # any in-flight refresh during shutdown can still use it.
+    try:
+        await app.state.auth_http_client.aclose()
+        logger.info("Auth refresh client closed")
+    except Exception as e:
+        logger.warning(f"Error closing auth refresh client: {e}")
 
 
 # --- FastAPI Application ---

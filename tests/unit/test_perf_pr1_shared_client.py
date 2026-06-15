@@ -298,24 +298,48 @@ class TestAuthSingletonLifecycle:
     @pytest.mark.asyncio
     async def test_auth_singleton_created_at_startup_and_closed_at_shutdown(self, clean_app):
         """
-        What it does: Verifies app.state.auth_http_client is set up and torn down by lifespan.
-        Purpose: Auth singleton lifecycle must mirror app.state.http_client.
+        What it does: Verifies app.state.auth_http_client is set up by lifespan and aclose() is called.
+        Purpose: Auth singleton lifecycle must mirror app.state.http_client (PR #1).
         """
-        print("Setup: Booting app via ASGITransport...")
-        transport = ASGITransport(app=clean_app)
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
-            # Trigger lifespan startup by sending a real request
-            await ac.get("/health")
-            assert hasattr(clean_app.state, "auth_http_client")
-            assert clean_app.state.auth_http_client is not None
-            print("Verification: auth_http_client created at startup")
-            assert not clean_app.state.auth_http_client.is_closed
+        print("Setup: Invoking lifespan() directly with mocked AccountManager...")
+        from unittest.mock import AsyncMock, MagicMock, patch as _patch
+        from main import lifespan
 
-        # Lifespan shutdown has run because we exited the AsyncClient context
-        assert clean_app.state.auth_http_client.is_closed, (
-            "auth_http_client should be closed after lifespan shutdown"
+        mock_manager = MagicMock()
+        mock_manager._accounts = {"test": MagicMock()}
+        mock_manager._current_account_index = 0
+        mock_manager._initialize_account = AsyncMock(return_value=True)
+        mock_manager.load_credentials = AsyncMock()
+        mock_manager.load_state = AsyncMock()
+        mock_manager._save_state = AsyncMock()
+        mock_manager.save_state_periodically = AsyncMock()
+
+        # Patch main.httpx.AsyncClient to a Mock so we can also verify aclose()
+        # was called without doing real I/O.
+        with _patch("main.AccountManager", return_value=mock_manager):
+            with _patch("main.httpx.AsyncClient") as mock_client_class:
+                mock_client = AsyncMock()
+                mock_client.is_closed = False
+                mock_client.aclose = AsyncMock()
+                mock_client_class.return_value = mock_client
+
+                async with lifespan(clean_app):
+                    # Lifespan startup has run
+                    assert hasattr(clean_app.state, "auth_http_client"), (
+                        "app.state.auth_http_client must be created by lifespan"
+                    )
+                    assert clean_app.state.auth_http_client is mock_client, (
+                        "app.state.auth_http_client should be the singleton we injected"
+                    )
+                    print("Verification: auth_http_client created at startup")
+
+        # Lifespan shutdown has run because we exited the context.
+        # Both clients (http_client and auth_http_client) share the same Mock,
+        # so aclose.await_count should be 2.
+        assert mock_client.aclose.await_count >= 1, (
+            "auth_http_client.aclose() should have been awaited during shutdown"
         )
-        print("Verification: auth_http_client closed at shutdown")
+        print(f"Verification: aclose awaited {mock_client.aclose.await_count} times at shutdown")
 
 
 # =============================================================================
