@@ -1,4 +1,4 @@
-.PHONY: up down restart logs status health pull test-prompt python-install python-up python-down
+.PHONY: up down rebuild restart logs status health pull test-prompt python-install python-up python-down
 
 # ==============================================================================
 # Docker setup (in docker/) — currently broken on corporate VPN due to DNS
@@ -8,6 +8,9 @@ up:
 
 down:
 	docker-compose -f docker/docker-compose.yml down
+
+rebuild:
+	docker-compose -f docker/docker-compose.yml up -d --build
 
 restart:
 	docker-compose -f docker/docker-compose.yml restart

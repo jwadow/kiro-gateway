@@ -15,6 +15,13 @@ Add a provider to your `opencode.json` (or `~/.config/opencode/config.json`):
         "baseURL": "http://localhost:8000/v1"
       },
       "models": {
+        "claude-opus-4.7": {
+          "name": "Claude Opus 4.7 (Kiro)",
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          }
+        },
         "claude-opus-4.6": {
           "name": "Claude Opus 4.6 (Kiro)",
           "modalities": {
@@ -95,7 +102,16 @@ You can use Kiro Gateway as a custom language model in VS Code Copilot Chat (req
     "apiType": "chat-completions",
     "models": [
       {
-        "id": "claude-opus-4.6",
+        "id": "claude-opus-4.7-kiro",
+        "name": "Claude Opus 4.7 (Kiro)",
+        "url": "http://localhost:8000/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 200000,
+        "maxOutputTokens": 64000
+      },
+      {
+        "id": "claude-opus-4.6-kiro",
         "name": "Claude Opus 4.6 (Kiro)",
         "url": "http://localhost:8000/v1/chat/completions",
         "toolCalling": true,
@@ -104,16 +120,16 @@ You can use Kiro Gateway as a custom language model in VS Code Copilot Chat (req
         "maxOutputTokens": 64000
       },
       {
-        "id": "claude-sonnet-4.6",
+        "id": "claude-sonnet-4.6-kiro",
         "name": "Claude Sonnet 4.6 (Kiro)",
         "url": "http://localhost:8000/v1/chat/completions",
         "toolCalling": true,
         "vision": true,
-        "maxInputTokens": 1000000,
+        "maxInputTokens": 200000,
         "maxOutputTokens": 64000
       },
       {
-        "id": "claude-opus-4.5",
+        "id": "claude-opus-4.5-kiro",
         "name": "Claude Opus 4.5 (Kiro)",
         "url": "http://localhost:8000/v1/chat/completions",
         "toolCalling": true,
@@ -122,7 +138,7 @@ You can use Kiro Gateway as a custom language model in VS Code Copilot Chat (req
         "maxOutputTokens": 64000
       },
       {
-        "id": "claude-sonnet-4.5",
+        "id": "claude-sonnet-4.5-kiro",
         "name": "Claude Sonnet 4.5 (Kiro)",
         "url": "http://localhost:8000/v1/chat/completions",
         "toolCalling": true,
@@ -131,7 +147,7 @@ You can use Kiro Gateway as a custom language model in VS Code Copilot Chat (req
         "maxOutputTokens": 64000
       },
       {
-        "id": "claude-sonnet-4",
+        "id": "claude-sonnet-4-kiro",
         "name": "Claude Sonnet 4 (Kiro)",
         "url": "http://localhost:8000/v1/chat/completions",
         "toolCalling": true,
@@ -140,7 +156,7 @@ You can use Kiro Gateway as a custom language model in VS Code Copilot Chat (req
         "maxOutputTokens": 64000
       },
       {
-        "id": "claude-haiku-4.5",
+        "id": "claude-haiku-4.5-kiro",
         "name": "Claude Haiku 4.5 (Kiro)",
         "url": "http://localhost:8000/v1/chat/completions",
         "toolCalling": true,
