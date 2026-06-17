@@ -349,49 +349,42 @@ class AwsEventStreamParser:
     
     def _process_tool_start_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes tool call start."""
-        # Finalize previous tool call if exists
         if self.current_tool_call:
             self._finalize_tool_call()
-        
-        # input can be string or object
+
         input_data = data.get('input', '')
-        if isinstance(input_data, dict):
-            if input_data:
-                # Non-empty dict: serialize it
-                input_str = json.dumps(input_data)
-            else:
-                # Empty dict {}: fragments will follow, use empty string
-                input_str = ''
-        else:
-            input_str = str(input_data) if input_data else ''
-        
+
         self.current_tool_call = {
             "id": data.get('toolUseId', generate_tool_call_id()),
             "type": "function",
             "function": {
                 "name": data.get('name', ''),
-                "arguments": input_str
-            }
+                "arguments": ''
+            },
+            "_args_dict": input_data if isinstance(input_data, dict) else None
         }
-        
+        # If input was a non-dict string, seed the string buffer
+        if not isinstance(input_data, dict):
+            self.current_tool_call['function']['arguments'] = str(input_data) if input_data else ''
+
         if data.get('stop'):
             self._finalize_tool_call()
-        
+
         return None
-    
+
     def _process_tool_input_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes input continuation for tool call."""
-        if self.current_tool_call:
-            # input can be string or object
-            input_data = data.get('input', '')
-            if isinstance(input_data, dict):
-                if input_data:
-                    input_str = json.dumps(input_data)
-                else:
-                    input_str = ''
-            else:
-                input_str = str(input_data) if input_data else ''
-            self.current_tool_call['function']['arguments'] += input_str
+        if not self.current_tool_call:
+            return None
+        input_data = data.get('input', '')
+        if isinstance(input_data, dict) and input_data:
+            if self.current_tool_call['_args_dict'] is None:
+                self.current_tool_call['_args_dict'] = {}
+            self.current_tool_call['_args_dict'].update(input_data)
+        else:
+            input_str = str(input_data) if input_data else ''
+            if input_str:
+                self.current_tool_call['function']['arguments'] += input_str
         return None
     
     def _process_tool_stop_event(self, data: dict) -> Optional[Dict[str, Any]]:
@@ -404,7 +397,12 @@ class AwsEventStreamParser:
         """Finalizes current tool call and adds to list."""
         if not self.current_tool_call:
             return
-        
+
+        # Remove internal accumulator — serialize if populated
+        args_dict = self.current_tool_call.pop('_args_dict', None)
+        if args_dict:
+            self.current_tool_call['function']['arguments'] = json.dumps(args_dict)
+
         # Try to parse and normalize arguments as JSON
         args = self.current_tool_call['function']['arguments']
         tool_name = self.current_tool_call['function'].get('name', 'unknown')
