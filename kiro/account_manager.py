@@ -40,7 +40,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from loguru import logger
@@ -52,6 +52,7 @@ from kiro.config import (
     HIDDEN_MODELS,
     MODEL_ALIASES,
     HIDDEN_FROM_LIST,
+    KIRO_CLI_LIST_MODELS_ENABLED,
     ACCOUNT_RECOVERY_TIMEOUT,
     ACCOUNT_MAX_BACKOFF_MULTIPLIER,
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
@@ -62,6 +63,7 @@ from kiro.config import (
 from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
 from kiro.http_client import KiroHttpClient
+from kiro.cli_models import KiroCliModelListError, fetch_kiro_cli_models
 
 
 def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
@@ -91,6 +93,142 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
         False
     """
     return "://runtime." in auth_manager.api_host
+
+
+def _extract_model_ids(models_data: List[Dict[str, Any]]) -> List[str]:
+    """
+    Extract model IDs from raw model metadata for diagnostics.
+
+    Args:
+        models_data: Raw model metadata list from Kiro or fallback config.
+
+    Returns:
+        Model IDs in source order, excluding malformed entries.
+    """
+    model_ids: List[str] = []
+    for model in models_data:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("modelId")
+        if isinstance(model_id, str) and model_id:
+            model_ids.append(model_id)
+    return model_ids
+
+
+def _log_model_source_snapshot(
+    account_id: str,
+    source: str,
+    models_data: List[Dict[str, Any]],
+    raw_payload: Dict[str, Any],
+    endpoint: Optional[str] = None,
+    status_code: Optional[int] = None,
+    error: Optional[str] = None,
+) -> None:
+    """
+    Write a debug-only snapshot of the source used to populate model cache.
+
+    Args:
+        account_id: Account whose cache is being initialized or refreshed.
+        source: Source label, such as runtime_fallback or list_available_models.
+        models_data: Model metadata selected for the cache.
+        raw_payload: Raw source payload used for the decision.
+        endpoint: Optional upstream endpoint URL.
+        status_code: Optional upstream response status.
+        error: Optional error text if fallback was selected after failure.
+    """
+    try:
+        from kiro.debug_logger import debug_logger
+    except ImportError as exc:
+        logger.debug(f"Debug logger unavailable for model source snapshot: {exc}")
+        return
+
+    payload: Dict[str, Any] = {
+        "event": "model_source_snapshot",
+        "account_id": account_id,
+        "source": source,
+        "model_count": len(models_data),
+        "model_ids": _extract_model_ids(models_data),
+        "raw_payload": raw_payload,
+    }
+    if endpoint is not None:
+        payload["endpoint"] = endpoint
+    if status_code is not None:
+        payload["status_code"] = status_code
+    if error is not None:
+        payload["error"] = error
+
+    debug_logger.append_jsonl_artifact("model_source_snapshots.jsonl", payload)
+
+
+async def _load_runtime_endpoint_models(
+    account_id: str,
+    credential_type: Optional[str],
+    endpoint: str,
+) -> List[Dict[str, Any]]:
+    """
+    Load models for runtime.kiro.dev accounts.
+
+    The runtime endpoint does not provide /ListAvailableModels. For sqlite
+    accounts, kiro-cli can provide the user's actual entitlement-aware model
+    list. If that is unavailable, fall back to the static compatibility list.
+
+    Args:
+        account_id: Account whose models are being loaded.
+        credential_type: Credential type from credentials.json.
+        endpoint: Runtime endpoint URL.
+
+    Returns:
+        Model metadata list in ModelInfoCache format.
+    """
+    if KIRO_CLI_LIST_MODELS_ENABLED and credential_type == "sqlite":
+        try:
+            cli_model_list = await fetch_kiro_cli_models()
+        except KiroCliModelListError as exc:
+            logger.warning(
+                f"Failed to fetch runtime model list via kiro-cli for {account_id}: {exc}. "
+                "Using static fallback models."
+            )
+            _log_model_source_snapshot(
+                account_id=account_id,
+                source="runtime_fallback_after_kiro_cli_error",
+                models_data=FALLBACK_MODELS,
+                raw_payload={"models": FALLBACK_MODELS},
+                endpoint=endpoint,
+                error=str(exc),
+            )
+            return FALLBACK_MODELS
+
+        logger.info(
+            f"Loaded {len(cli_model_list.models)} runtime model(s) via kiro-cli "
+            f"for account {account_id}"
+        )
+        _log_model_source_snapshot(
+            account_id=account_id,
+            source="kiro_cli_list_models",
+            models_data=cli_model_list.models,
+            raw_payload=cli_model_list.raw_payload,
+            endpoint=endpoint,
+        )
+        return cli_model_list.models
+
+    if not KIRO_CLI_LIST_MODELS_ENABLED:
+        logger.debug(
+            f"Account {account_id}: kiro-cli model discovery disabled, using static fallback"
+        )
+    else:
+        logger.debug(
+            f"Account {account_id}: credential type '{credential_type}' cannot use "
+            "kiro-cli model discovery, using static fallback"
+        )
+
+    _log_model_source_snapshot(
+        account_id=account_id,
+        source="runtime_fallback",
+        models_data=FALLBACK_MODELS,
+        raw_payload={"models": FALLBACK_MODELS},
+        endpoint=endpoint,
+    )
+    return FALLBACK_MODELS
 
 
 def _format_duration(seconds: float) -> str:
@@ -146,6 +284,7 @@ class Account:
     Attributes:
         id: Unique identifier (path to credentials file)
         auth_manager: Authentication manager (lazy initialized)
+        credential_type: Credential type from credentials.json
         model_cache: Model metadata cache (lazy initialized)
         model_resolver: Model resolver (lazy initialized)
         failures: Consecutive failure count (for Circuit Breaker)
@@ -155,6 +294,7 @@ class Account:
     """
     id: str
     auth_manager: Optional[KiroAuthManager] = None
+    credential_type: Optional[str] = None
     model_cache: Optional[ModelInfoCache] = None
     model_resolver: Optional[ModelResolver] = None
     failures: int = 0
@@ -469,6 +609,7 @@ class AccountManager:
             
             # Create KiroAuthManager based on type
             cred_type = creds_config.get("type")
+            account.credential_type = cred_type
             if cred_type == "json":
                 auth_manager = KiroAuthManager(
                     creds_file=account_id,
@@ -500,9 +641,16 @@ class AccountManager:
             # Determine if we should fetch models or use static list
             if _is_runtime_endpoint(auth_manager):
                 # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
-                # Use static list without attempting request
-                logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
-                models_list = FALLBACK_MODELS
+                # Use kiro-cli entitlement list for sqlite accounts when available,
+                # then fall back to the static compatibility list.
+                logger.debug(
+                    f"Account {account_id}: Loading model list for runtime.kiro.dev endpoint"
+                )
+                models_list = await _load_runtime_endpoint_models(
+                    account_id=account_id,
+                    credential_type=cred_type,
+                    endpoint=auth_manager.api_host,
+                )
             else:
                 # Old endpoint - attempt to fetch dynamic model list
                 # Fetch models list with retry + fallback
@@ -527,6 +675,14 @@ class AccountManager:
                     if response.status_code == 200:
                         data = response.json()
                         models_list = data.get("models", [])
+                        _log_model_source_snapshot(
+                            account_id=account_id,
+                            source="list_available_models",
+                            models_data=models_list,
+                            raw_payload=data,
+                            endpoint=list_models_url,
+                            status_code=response.status_code,
+                        )
                     else:
                         # Shouldn't happen (retry handles non-200), but keep for safety
                         raise Exception(f"HTTP {response.status_code}")
@@ -536,6 +692,14 @@ class AccountManager:
                     logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
                     logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
                     models_list = FALLBACK_MODELS
+                    _log_model_source_snapshot(
+                        account_id=account_id,
+                        source="fallback_after_list_available_models_error",
+                        models_data=models_list,
+                        raw_payload={"models": models_list},
+                        endpoint=list_models_url,
+                        error=str(e),
+                    )
                 
                 finally:
                     await http_client.close()
@@ -592,10 +756,27 @@ class AccountManager:
         # Check if using runtime endpoint (no dynamic model list available)
         if _is_runtime_endpoint(account.auth_manager):
             # Runtime endpoint does not provide /ListAvailableModels
-            # Use static list and update cache timestamp
-            logger.debug(f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)")
-            await account.model_cache.update(FALLBACK_MODELS)
+            # Use kiro-cli entitlement list for sqlite accounts when available,
+            # then fall back to the static compatibility list.
+            logger.debug(
+                f"Account {account_id}: Refreshing model list for runtime.kiro.dev endpoint"
+            )
+            models_list = await _load_runtime_endpoint_models(
+                account_id=account_id,
+                credential_type=account.credential_type,
+                endpoint=account.auth_manager.api_host,
+            )
+            await account.model_cache.update(models_list)
             account.models_cached_at = time.time()
+
+            # Update model_to_accounts mapping (new models may have appeared)
+            available_models = account.model_resolver.get_available_models()
+            for model in available_models:
+                if model not in self._model_to_accounts:
+                    self._model_to_accounts[model] = ModelAccountList()
+                if account_id not in self._model_to_accounts[model].accounts:
+                    self._model_to_accounts[model].accounts.append(account_id)
+
             self._dirty = True
             return
         
@@ -622,6 +803,14 @@ class AccountManager:
                 data = response.json()
                 models_list = data.get("models", [])
                 await account.model_cache.update(models_list)
+                _log_model_source_snapshot(
+                    account_id=account_id,
+                    source="list_available_models_refresh",
+                    models_data=models_list,
+                    raw_payload=data,
+                    endpoint=list_models_url,
+                    status_code=response.status_code,
+                )
                 account.models_cached_at = time.time()
                 
                 # Update model_to_accounts mapping (new models may have appeared)
@@ -638,6 +827,14 @@ class AccountManager:
         except Exception as e:
             # All retries exhausted - keep using stale cache
             logger.warning(f"Failed to refresh models for {account_id} after retries: {e}")
+            _log_model_source_snapshot(
+                account_id=account_id,
+                source="list_available_models_refresh_error_keep_stale",
+                models_data=[],
+                raw_payload={},
+                endpoint=list_models_url,
+                error=str(e),
+            )
         
         finally:
             await http_client.close()

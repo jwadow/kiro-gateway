@@ -76,6 +76,19 @@ def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
     
     return None
 
+
+def _normalize_path_value(path_value: str) -> str:
+    """
+    Normalize a configured filesystem path.
+
+    Args:
+        path_value: Raw path value from environment or .env.
+
+    Returns:
+        Normalized path string with user home expansion applied.
+    """
+    return str(Path(path_value).expanduser())
+
 # ==================================================================================================
 # Server Settings
 # ==================================================================================================
@@ -151,13 +164,13 @@ REGION: str = os.getenv("KIRO_REGION", "us-east-1")
 # (e.g., \a in path D:\Projects\adolf is interpreted as bell character)
 _raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv("KIRO_CREDS_FILE", "")
 # Normalize path for cross-platform compatibility
-KIRO_CREDS_FILE: str = str(Path(_raw_creds_file)) if _raw_creds_file else ""
+KIRO_CREDS_FILE: str = _normalize_path_value(_raw_creds_file) if _raw_creds_file else ""
 
 # Path to kiro-cli SQLite database (optional, for AWS SSO OIDC authentication)
 # Default location: ~/.local/share/kiro-cli/data.sqlite3 (Linux/macOS)
 # or ~/.local/share/amazon-q/data.sqlite3 (amazon-q-developer-cli)
 _raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
-KIRO_CLI_DB_FILE: str = str(Path(_raw_cli_db_file)) if _raw_cli_db_file else ""
+KIRO_CLI_DB_FILE: str = _normalize_path_value(_raw_cli_db_file) if _raw_cli_db_file else ""
 
 # Disable SQLite write-back (read-only mode)
 # When enabled, gateway will only read from kiro-cli database without modifying it.
@@ -261,6 +274,21 @@ MODEL_ALIASES: Dict[str, str] = {
 #
 # Default: ["auto"] to show only "auto-kiro" alias
 HIDDEN_FROM_LIST: List[str] = ["auto"]
+
+# ==================================================================================================
+# Kiro CLI Model List Configuration
+# ==================================================================================================
+
+# When enabled, sqlite/kiro-cli accounts using runtime.kiro.dev will query
+# `kiro-cli chat --list-models --format json` for the actual entitlement-aware
+# model list before falling back to the static fallback list.
+KIRO_CLI_LIST_MODELS_ENABLED: bool = os.getenv("KIRO_CLI_LIST_MODELS_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# Kiro CLI executable used for model list discovery.
+KIRO_CLI_LIST_MODELS_COMMAND: str = os.getenv("KIRO_CLI_LIST_MODELS_COMMAND", "kiro-cli")
+
+# Timeout for model list discovery via kiro-cli.
+KIRO_CLI_LIST_MODELS_TIMEOUT_SECONDS: float = float(os.getenv("KIRO_CLI_LIST_MODELS_TIMEOUT_SECONDS", "10.0"))
 
 # ==================================================================================================
 # Fallback Models Configuration (DNS Failure Recovery)

@@ -380,6 +380,40 @@ class TestModelsEndpoint:
         for model in response.json()["data"]:
             assert model["owned_by"] == "anthropic"
 
+    def test_models_writes_debug_snapshot_in_all_mode(self, test_client, valid_proxy_api_key, tmp_path):
+        """
+        What it does: Verifies /v1/models writes a debug snapshot in all mode.
+        Purpose: Preserve the exact model list returned by the endpoint for diagnosis.
+        """
+        debug_dir = tmp_path / "debug_logs"
+
+        with patch("kiro.debug_logger.DEBUG_MODE", "all"):
+            from kiro.debug_logger import debug_logger
+            debug_logger.debug_dir = debug_dir
+
+            response = test_client.get(
+                "/v1/models",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
+            )
+
+        assert response.status_code == 200
+        response_model_ids = [model["id"] for model in response.json()["data"]]
+
+        records = [
+            json.loads(line)
+            for line in (debug_dir / "models_endpoint_snapshots.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        assert records == [
+            {
+                "event": "v1_models_response",
+                "source": "legacy",
+                "model_count": len(response_model_ids),
+                "model_ids": response_model_ids,
+            }
+        ]
+
 
 # =============================================================================
 # Tests for chat completions endpoint (/v1/chat/completions)

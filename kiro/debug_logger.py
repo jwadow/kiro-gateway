@@ -36,7 +36,7 @@ import io
 import json
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from loguru import logger
 
 from kiro.config import DEBUG_MODE, DEBUG_DIR
@@ -216,6 +216,39 @@ class DebugLogger:
         else:
             # "errors" mode - buffer
             self._modified_chunks_buffer.extend(chunk)
+
+    def append_jsonl_artifact(self, file_name: str, payload: Any) -> None:
+        """
+        Append a structured diagnostic record to a debug JSONL artifact.
+
+        This is intended for source-data investigation. It writes only in
+        DEBUG_MODE=all so the existing DEBUG_MODE=errors behavior remains
+        "flush on failure" for request logs.
+
+        Args:
+            file_name: Debug artifact file name inside the debug directory.
+            payload: JSON-serializable diagnostic payload.
+        """
+        if not self._is_immediate_write():
+            return
+
+        if Path(file_name).name != file_name:
+            logger.warning(f"[DebugLogger] Refusing unsafe artifact file name: {file_name}")
+            return
+
+        try:
+            serialized = json.dumps(payload, ensure_ascii=False, default=str)
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"[DebugLogger] Failed to serialize artifact {file_name}: {exc}")
+            return
+
+        try:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
+            file_path = self.debug_dir / file_name
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(serialized + "\n")
+        except OSError as exc:
+            logger.error(f"[DebugLogger] Error writing artifact {file_name}: {exc}")
     
     def log_error_info(self, status_code: int, error_message: str = ""):
         """

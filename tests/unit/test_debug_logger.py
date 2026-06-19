@@ -161,6 +161,53 @@ class TestDebugLoggerModeAll:
             content = file_path.read_bytes()
             assert content == b'chunk1chunk2'
 
+    def test_append_jsonl_artifact_writes_record(self, tmp_path):
+        """
+        What it does: Verifies diagnostic JSONL artifacts are written in all mode.
+        Purpose: Ensure source-data collection can persist structured snapshots.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        debug_dir.mkdir()
+
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            from kiro.debug_logger import DebugLogger
+            logger = DebugLogger.__new__(DebugLogger)
+            logger._initialized = False
+            logger.__init__()
+            logger.debug_dir = debug_dir
+
+            logger.append_jsonl_artifact(
+                "model_source_snapshots.jsonl",
+                {"event": "model_source_snapshot", "model_ids": ["claude-opus-4.8"]},
+            )
+
+            file_path = debug_dir / "model_source_snapshots.jsonl"
+            assert file_path.exists()
+            records = [json.loads(line) for line in file_path.read_text(encoding="utf-8").splitlines()]
+            assert records == [
+                {"event": "model_source_snapshot", "model_ids": ["claude-opus-4.8"]}
+            ]
+
+    def test_append_jsonl_artifact_rejects_nested_file_name(self, tmp_path):
+        """
+        What it does: Verifies artifact file names cannot escape the debug directory.
+        Purpose: Keep diagnostic logging scoped to DEBUG_DIR.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        debug_dir.mkdir()
+
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            from kiro.debug_logger import DebugLogger
+            logger = DebugLogger.__new__(DebugLogger)
+            logger._initialized = False
+            logger.__init__()
+            logger.debug_dir = debug_dir
+
+            logger.append_jsonl_artifact("../outside.jsonl", {"event": "bad"})
+
+            assert not (tmp_path / "outside.jsonl").exists()
+            assert not (debug_dir / "outside.jsonl").exists()
+
 
 class TestDebugLoggerModeErrors:
     """Тесты для режима DEBUG_MODE=errors."""
@@ -189,6 +236,27 @@ class TestDebugLoggerModeErrors:
             
             print(f"Проверяем, что данные в буфере...")
             assert logger._request_body_buffer == test_data
+
+    def test_append_jsonl_artifact_does_not_write_success_artifacts(self, tmp_path):
+        """
+        What it does: Verifies JSONL artifacts are not written immediately in errors mode.
+        Purpose: Preserve existing DEBUG_MODE=errors flush-on-error semantics.
+        """
+        debug_dir = tmp_path / "debug_logs"
+
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            from kiro.debug_logger import DebugLogger
+            logger = DebugLogger.__new__(DebugLogger)
+            logger._initialized = False
+            logger.__init__()
+            logger.debug_dir = debug_dir
+
+            logger.append_jsonl_artifact(
+                "model_source_snapshots.jsonl",
+                {"event": "model_source_snapshot"},
+            )
+
+            assert not (debug_dir / "model_source_snapshots.jsonl").exists()
     
     def test_flush_on_error_writes_buffers(self, tmp_path):
         """
