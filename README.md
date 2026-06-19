@@ -230,34 +230,22 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 The simplest authentication method. Generate an API key via kiro-cli settings and use it directly — no token refresh, no SSO, no credentials files needed.
 
-```env
-KIRO_API_KEY="ksk_your_api_key_here"
+There are two modes of operation:
 
-# Password to protect YOUR proxy server (can be the same as KIRO_API_KEY for simplicity)
-PROXY_API_KEY="my-super-secret-password-123"
-```
+#### Mode A: Stateless Passthrough (Multi-Tenant)
 
-**How to generate an API key:**
-
-1. Install kiro-cli: `curl -fsSL https://cli.kiro.dev/install | bash`
-2. Login: `kiro-cli login`
-3. Generate API key in settings (see [Kiro CLI Headless docs](https://kiro.dev/docs/cli/headless/))
-
-**Docker example:**
+No server-side configuration needed. The gateway starts with zero credentials and each user passes their own Kiro API key as the Bearer token. Multiple users can share a single gateway instance.
 
 ```bash
-docker run -d -p 8000:8000 \
-  -e KIRO_API_KEY="ksk_your_api_key_here" \
-  -e PROXY_API_KEY="ksk_your_api_key_here" \
-  --name kiro-gateway \
-  kiro-gateway
+# Start gateway with no credentials at all
+docker run -d -p 8000:8000 --name kiro-gateway kiro-gateway
 ```
 
-**Test:**
+Users connect with their own key:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer ksk_your_api_key_here" \
+  -H "Authorization: Bearer ksk_USER_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet-4-5",
@@ -266,10 +254,54 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+Each `ksk_*` Bearer token is forwarded directly to Kiro API. Sessions are cached per key for performance.
+
+#### Mode B: Server-Side API Key (Single-Tenant)
+
+Configure a single API key on the server. Users authenticate with the `PROXY_API_KEY` password:
+
+```env
+KIRO_API_KEY="ksk_your_api_key_here"
+
+# Password to protect YOUR proxy server
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="my-super-secret-password-123" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+Users connect with the proxy password:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+#### How to generate an API key
+
+1. Install kiro-cli: `curl -fsSL https://cli.kiro.dev/install | bash`
+2. Login: `kiro-cli login`
+3. Generate API key in settings (see [Kiro CLI Headless docs](https://kiro.dev/docs/cli/headless/))
+
 <details>
 <summary>🔍 How it works</summary>
 
 The API key is passed directly to Kiro API as a Bearer token with an additional `tokentype: API_KEY` header. No token refresh or exchange is needed. The gateway auto-detects the correct region from the Kiro API `GetProfile` response.
+
+**Passthrough mode (Mode A):** Any Bearer token starting with `ksk_` bypasses `PROXY_API_KEY` validation and is forwarded directly to Kiro API. This enables multi-tenant usage where each user uses their own subscription.
+
+**Server-side mode (Mode B):** The `KIRO_API_KEY` is stored on the server and used for all requests authenticated via `PROXY_API_KEY`.
 
 Endpoints used:
 - `POST https://management.{region}.kiro.dev/` — GetProfile, ListAvailableModels
