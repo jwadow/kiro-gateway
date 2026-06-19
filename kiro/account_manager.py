@@ -256,7 +256,22 @@ class AccountManager:
             if cred_type == "refresh_token" and not entry.get("refresh_token"):
                 logger.warning(f"Invalid credential entry (type=refresh_token requires refresh_token field): {entry}")
                 continue
-            
+
+            # For api_key type, api_key field is required
+            if cred_type == "api_key" and not entry.get("api_key"):
+                logger.warning(f"Invalid credential entry (type=api_key requires api_key field): {entry}")
+                continue
+
+            # Handle api_key type (no path processing needed)
+            if cred_type == "api_key":
+                # Use deterministic hash for api_key (hash() is not deterministic between process restarts)
+                key = entry.get('api_key', '')
+                key_hash = hashlib.sha256(key.encode()).hexdigest()[:16]
+                account_id = f"api_key_{key_hash}"
+                self._accounts[account_id] = Account(id=account_id)
+                logger.debug(f"Added account: {account_id}")
+                continue  # Skip path processing for api_key
+
             # Handle refresh_token type (no path processing needed)
             if cred_type == "refresh_token":
                 # Use deterministic hash for refresh_token (hash() is not deterministic between process restarts)
@@ -452,7 +467,14 @@ class AccountManager:
                 path = entry.get("path", "")
                 expanded_path = Path(path).expanduser()
                 
-                if entry.get("type") == "refresh_token":
+                if entry.get("type") == "api_key":
+                    # Match by deterministic hash for api_key type
+                    key = entry.get('api_key', '')
+                    key_hash = hashlib.sha256(key.encode()).hexdigest()[:16]
+                    if account_id == f"api_key_{key_hash}":
+                        creds_config = entry
+                        break
+                elif entry.get("type") == "refresh_token":
                     # Match by deterministic hash for refresh_token type
                     token = entry.get('refresh_token', '')
                     token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
@@ -469,7 +491,13 @@ class AccountManager:
             
             # Create KiroAuthManager based on type
             cred_type = creds_config.get("type")
-            if cred_type == "json":
+            if cred_type == "api_key":
+                auth_manager = KiroAuthManager(
+                    api_key=creds_config.get("api_key"),
+                    region=creds_config.get("region", "us-east-1"),
+                    api_region=creds_config.get("api_region")
+                )
+            elif cred_type == "json":
                 auth_manager = KiroAuthManager(
                     creds_file=account_id,
                     profile_arn=creds_config.get("profile_arn"),

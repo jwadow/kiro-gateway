@@ -77,9 +77,15 @@ class AuthType(Enum):
         - Uses https://oidc.{region}.amazonaws.com/token
         - Form body: grant_type=refresh_token&client_id=...&client_secret=...&refresh_token=...
         - Requires clientId and clientSecret from credentials file
+
+    API_KEY: Kiro API key (ksk_...) for headless authentication
+        - The key is used directly as the Bearer token (no exchange, no refresh)
+        - Requires an extra "tokentype: API_KEY" header on every Kiro API request
+        - Mirrors kiro-cli headless mode (KIRO_API_KEY env var)
     """
     KIRO_DESKTOP = "kiro_desktop"
     AWS_SSO_OIDC = "aws_sso_oidc"
+    API_KEY = "api_key"
 
 
 class KiroAuthManager:
@@ -126,6 +132,7 @@ class KiroAuthManager:
         client_secret: Optional[str] = None,
         sqlite_db: Optional[str] = None,
         api_region: Optional[str] = None,
+        api_key: Optional[str] = None,
     ):
         """
         Initializes the authentication manager.
@@ -141,7 +148,11 @@ class KiroAuthManager:
                        Default location: ~/.local/share/kiro-cli/data.sqlite3
             api_region: Q API region override (optional, per-account)
                        If not specified, uses auto-detection or falls back to region
+            api_key: Kiro API key (ksk_...) for headless auth (optional)
+                     When set, it is used directly as the Bearer token with a
+                     "tokentype: API_KEY" header; no refresh/exchange is performed.
         """
+        self._api_key = api_key
         self._refresh_token = refresh_token
         self._profile_arn = profile_arn
         self._region = region
@@ -175,8 +186,11 @@ class KiroAuthManager:
         # Fingerprint for User-Agent
         self._fingerprint = get_machine_fingerprint()
         
+        # API key takes priority: it IS the access token (no loading/refresh needed)
+        if api_key:
+            self._access_token = api_key
         # Load credentials from SQLite if specified (takes priority over JSON)
-        if sqlite_db:
+        elif sqlite_db:
             self._load_credentials_from_sqlite(sqlite_db)
         # Load credentials from JSON file if specified
         elif creds_file:
@@ -237,8 +251,12 @@ class KiroAuthManager:
         
         AWS SSO OIDC credentials contain clientId and clientSecret.
         Kiro Desktop credentials do not contain these fields.
+        An API key (ksk_...) takes priority over all other types.
         """
-        if self._client_id and self._client_secret:
+        if self._api_key:
+            self._auth_type = AuthType.API_KEY
+            logger.info("Detected auth type: API key (headless)")
+        elif self._client_id and self._client_secret:
             self._auth_type = AuthType.AWS_SSO_OIDC
             logger.info("Detected auth type: AWS SSO OIDC (kiro-cli)")
         else:
@@ -639,6 +657,9 @@ class KiroAuthManager:
             True if the token expires within TOKEN_REFRESH_THRESHOLD seconds
             or if expiration time information is not available
         """
+        # API keys are long-lived and never refreshed by the gateway
+        if self._auth_type == AuthType.API_KEY:
+            return False
         if not self._expires_at:
             return True  # If no expiration info available, assume refresh is needed
         
@@ -658,6 +679,9 @@ class KiroAuthManager:
             True if the token has already expired or if expiration time
             information is not available
         """
+        # API keys do not expire from the gateway's perspective
+        if self._auth_type == AuthType.API_KEY:
+            return False
         if not self._expires_at:
             return True  # If no expiration info available, assume expired
         
@@ -938,10 +962,15 @@ class KiroAuthManager:
         Forces a token refresh.
         
         Used when receiving a 403 error from the API.
-        
+
         Returns:
             New access token
         """
+        # API keys cannot be refreshed; a 403 means the key itself is invalid
+        # or lacks the required subscription. Return it unchanged so the caller
+        # surfaces the real authentication error instead of looping.
+        if self._auth_type == AuthType.API_KEY:
+            return self._access_token
         async with self._lock:
             await self._refresh_token_request()
             return self._access_token
@@ -973,5 +1002,5 @@ class KiroAuthManager:
     
     @property
     def auth_type(self) -> AuthType:
-        """Authentication type (KIRO_DESKTOP or AWS_SSO_OIDC)."""
+        """Authentication type (KIRO_DESKTOP, AWS_SSO_OIDC, or API_KEY)."""
         return self._auth_type

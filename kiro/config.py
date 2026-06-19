@@ -124,6 +124,12 @@ VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
 # Kiro API Credentials
 # ==================================================================================================
 
+# Kiro API key (ksk_...) for headless authentication (Kiro Pro/Pro+/Power)
+# When set, the gateway sends it directly as the Bearer token (no exchange/refresh),
+# together with a "tokentype: API_KEY" header, exactly like kiro-cli does in
+# headless mode (KIRO_API_KEY env var). This is the highest-priority credential.
+KIRO_API_KEY: str = os.getenv("KIRO_API_KEY", "")
+
 # Refresh token for updating access token
 REFRESH_TOKEN: str = os.getenv("REFRESH_TOKEN", "")
 

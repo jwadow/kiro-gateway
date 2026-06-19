@@ -58,6 +58,7 @@ from kiro.config import (
     APP_TITLE,
     APP_DESCRIPTION,
     APP_VERSION,
+    KIRO_API_KEY,
     REFRESH_TOKEN,
     PROFILE_ARN,
     REGION,
@@ -237,10 +238,11 @@ def validate_configuration() -> None:
     env_file = Path(".env")
     
     # Check for credentials (from .env or environment variables)
+    has_api_key = bool(KIRO_API_KEY)
     has_refresh_token = bool(REFRESH_TOKEN)
     has_creds_file = bool(KIRO_CREDS_FILE)
     has_cli_db = bool(KIRO_CLI_DB_FILE)
-    
+
     # Check if creds file actually exists
     if KIRO_CREDS_FILE:
         creds_path = Path(KIRO_CREDS_FILE).expanduser()
@@ -256,7 +258,7 @@ def validate_configuration() -> None:
             logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
     
     # If no credentials found, show helpful error
-    if not has_refresh_token and not has_creds_file and not has_cli_db:
+    if not has_api_key and not has_refresh_token and not has_creds_file and not has_cli_db:
         if not env_file.exists():
             # No .env file and no environment variables
             errors.append(
@@ -269,9 +271,10 @@ def validate_configuration() -> None:
                 "2. Edit .env and configure your credentials:\n"
                 "   2.1. Set you super-secret password as PROXY_API_KEY\n"
                 "   2.2. Set your Kiro credentials:\n"
-                "      - Option 1: KIRO_CREDS_FILE to your Kiro credentials JSON file\n"
-                "      - Option 2: REFRESH_TOKEN from Kiro IDE traffic\n"
-                "      - Option 3: KIRO_CLI_DB_FILE to kiro-cli SQLite database\n"
+                "      - Option 1: KIRO_API_KEY (ksk_...) for headless auth (Kiro Pro/Pro+/Power)\n"
+                "      - Option 2: KIRO_CREDS_FILE to your Kiro credentials JSON file\n"
+                "      - Option 3: REFRESH_TOKEN from Kiro IDE traffic\n"
+                "      - Option 4: KIRO_CLI_DB_FILE to kiro-cli SQLite database\n"
                 "\n"
                 "Or use environment variables (for Docker):\n"
                 "   docker run -e PROXY_API_KEY=\"...\" -e REFRESH_TOKEN=\"...\" ...\n"
@@ -288,13 +291,16 @@ def validate_configuration() -> None:
                 "Set you super-secret password as PROXY_API_KEY\n"
                 "   PROXY_API_KEY=\"my-super-secret-password-123\"\n"
                 "\n"
-                "   Option 1 (Recommended): JSON credentials file\n"
+                "   Option 1: Kiro API key (headless, Kiro Pro/Pro+/Power)\n"
+                "      KIRO_API_KEY=\"ksk_...\"\n"
+                "\n"
+                "   Option 2 (Recommended): JSON credentials file\n"
                 "      KIRO_CREDS_FILE=\"path/to/your/kiro-credentials.json\"\n"
                 "\n"
-                "   Option 2: Refresh token\n"
+                "   Option 3: Refresh token\n"
                 "      REFRESH_TOKEN=\"your_refresh_token_here\"\n"
                 "\n"
-                "   Option 3: kiro-cli SQLite database (AWS SSO)\n"
+                "   Option 4: kiro-cli SQLite database (AWS SSO)\n"
                 "      KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
                 "\n"
                 "   See README.md for how to obtain credentials."
@@ -361,6 +367,7 @@ async def lifespan(app: FastAPI):
     creds_path = Path(ACCOUNTS_CONFIG_FILE)
     
     # Check if we have legacy .env credentials
+    has_api_key = bool(KIRO_API_KEY)
     has_refresh_token = bool(REFRESH_TOKEN)
     has_creds_file = bool(KIRO_CREDS_FILE) and Path(KIRO_CREDS_FILE).expanduser().exists()
     has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
@@ -383,12 +390,19 @@ async def lifespan(app: FastAPI):
     if ACCOUNT_SYSTEM:
         # Account system enabled: create credentials.json ONCE (migration)
         if not creds_path.exists():
-            if has_refresh_token or has_creds_file or has_cli_db:
+            if has_api_key or has_refresh_token or has_creds_file or has_cli_db:
                 logger.info("credentials.json not found, creating from .env (one-time migration)")
                 credentials = []
-                
-                # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
-                if has_cli_db:
+
+                # Priority: API key > SQLite DB > JSON file > environment variables (same as KiroAuthManager)
+                if has_api_key:
+                    entry = {
+                        "type": "api_key",
+                        "api_key": KIRO_API_KEY
+                    }
+                    _add_env_overrides(entry)
+                    credentials.append(entry)
+                elif has_cli_db:
                     entry = {
                         "type": "sqlite",
                         "path": KIRO_CLI_DB_FILE
@@ -417,12 +431,19 @@ async def lifespan(app: FastAPI):
                 logger.info("Created credentials.json from .env (one-time migration)")
     else:
         # Legacy mode: ALWAYS recreate credentials.json from .env
-        if has_refresh_token or has_creds_file or has_cli_db:
+        if has_api_key or has_refresh_token or has_creds_file or has_cli_db:
             logger.debug("Legacy mode: recreating credentials.json from .env")
             credentials = []
-            
-            # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
-            if has_cli_db:
+
+            # Priority: API key > SQLite DB > JSON file > environment variables (same as KiroAuthManager)
+            if has_api_key:
+                entry = {
+                    "type": "api_key",
+                    "api_key": KIRO_API_KEY
+                }
+                _add_env_overrides(entry)
+                credentials.append(entry)
+            elif has_cli_db:
                 entry = {
                     "type": "sqlite",
                     "path": KIRO_CLI_DB_FILE

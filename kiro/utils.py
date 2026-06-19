@@ -75,8 +75,8 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
         Dictionary with headers for HTTP request
     """
     fingerprint = auth_manager.fingerprint
-    
-    return {
+
+    headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/x-amz-json-1.0",
         "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
@@ -87,6 +87,13 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
         "amz-sdk-invocation-id": str(uuid.uuid4()),
         "amz-sdk-request": "attempt=1; max=3",
     }
+
+    # API key auth requires Kiro to know the bearer token is a ksk_ API key.
+    # Compare by enum value to avoid a circular import with kiro.auth.
+    if getattr(auth_manager.auth_type, "value", None) == "api_key":
+        headers["tokentype"] = "API_KEY"
+
+    return headers
 
 
 def generate_completion_id() -> str:
