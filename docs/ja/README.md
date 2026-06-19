@@ -242,6 +242,40 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 </details>
 
+### オプション 5：Kiro API キー（ヘッドレス / CI）
+
+最もシンプルな認証方法です。kiro-cli の設定から API キーを生成して直接使用します — トークンの更新不要、SSO 不要、認証情報ファイル不要。
+
+```env
+KIRO_API_KEY="ksk_your_api_key_here"
+
+# プロキシサーバーを保護するパスワード（KIRO_API_KEY と同じでも可）
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+**API キーの生成方法：**
+
+1. kiro-cli をインストール：`curl -fsSL https://cli.kiro.dev/install | bash`
+2. ログイン：`kiro-cli login`
+3. 設定で API キーを生成（[Kiro CLI Headless ドキュメント](https://kiro.dev/docs/cli/headless/)を参照）
+
+**Docker 例：**
+
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="ksk_your_api_key_here" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+<details>
+<summary>🔍 仕組み</summary>
+
+API キーは追加ヘッダー `tokentype: API_KEY` とともに Bearer トークンとして Kiro API に直接渡されます。トークンの更新は不要です。ゲートウェイは Kiro API の `GetProfile` レスポンスから正しいリージョンを自動検出します。
+
+</details>
+
 ### 認証情報の取得
 
 **Kiro IDE ユーザー向け：**

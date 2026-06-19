@@ -242,6 +242,40 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 </details>
 
+### 옵션 5: Kiro API 키 (Headless / CI)
+
+가장 간단한 인증 방법입니다. kiro-cli 설정에서 API 키를 생성하여 직접 사용합니다 — 토큰 갱신 불필요, SSO 불필요, 자격 증명 파일 불필요.
+
+```env
+KIRO_API_KEY="ksk_your_api_key_here"
+
+# 프록시 서버를 보호하는 비밀번호 (KIRO_API_KEY와 동일할 수 있음)
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+**API 키 생성 방법:**
+
+1. kiro-cli 설치: `curl -fsSL https://cli.kiro.dev/install | bash`
+2. 로그인: `kiro-cli login`
+3. 설정에서 API 키 생성 ([Kiro CLI Headless 문서](https://kiro.dev/docs/cli/headless/) 참조)
+
+**Docker 예시:**
+
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="ksk_your_api_key_here" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+<details>
+<summary>🔍 작동 원리</summary>
+
+API 키는 추가 헤더 `tokentype: API_KEY`와 함께 Bearer 토큰으로 Kiro API에 직접 전달됩니다. 토큰 갱신이 필요 없습니다. 게이트웨이는 Kiro API `GetProfile` 응답에서 올바른 리전을 자동 감지합니다.
+
+</details>
+
 ### 자격 증명 얻기
 
 **Kiro IDE 사용자:**

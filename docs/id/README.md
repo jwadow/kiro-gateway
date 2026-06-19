@@ -242,6 +242,40 @@ Kedua format kunci didukung untuk kompatibilitas dengan versi kiro-cli yang berb
 
 </details>
 
+### Opsi 5: API Key Kiro (Headless / CI)
+
+Metode autentikasi paling sederhana. Buat API key melalui pengaturan kiro-cli dan gunakan langsung — tanpa pembaruan token, tanpa SSO, tanpa file kredensial.
+
+```env
+KIRO_API_KEY="ksk_your_api_key_here"
+
+# Kata sandi untuk melindungi server proxy Anda (bisa sama dengan KIRO_API_KEY)
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+**Cara membuat API key:**
+
+1. Instal kiro-cli: `curl -fsSL https://cli.kiro.dev/install | bash`
+2. Login: `kiro-cli login`
+3. Buat API key di pengaturan (lihat [dokumentasi Kiro CLI Headless](https://kiro.dev/docs/cli/headless/))
+
+**Contoh Docker:**
+
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="ksk_your_api_key_here" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+<details>
+<summary>🔍 Cara kerjanya</summary>
+
+API key diteruskan langsung ke Kiro API sebagai token Bearer dengan header tambahan `tokentype: API_KEY`. Tidak perlu pembaruan token. Gateway secara otomatis mendeteksi region yang benar dari respons `GetProfile` Kiro API.
+
+</details>
+
 ### Mendapatkan Kredensial
 
 **Untuk pengguna Kiro IDE:**

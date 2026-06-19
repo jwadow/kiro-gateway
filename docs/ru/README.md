@@ -242,6 +242,40 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 </details>
 
+### Вариант 5: API-ключ Kiro (Headless / CI)
+
+Самый простой метод аутентификации. Сгенерируйте API-ключ через настройки kiro-cli и используйте его напрямую — без обновления токенов, без SSO, без файлов учётных данных.
+
+```env
+KIRO_API_KEY="ksk_your_api_key_here"
+
+# Пароль для защиты ВАШЕГО прокси-сервера (может совпадать с KIRO_API_KEY)
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+**Как сгенерировать API-ключ:**
+
+1. Установите kiro-cli: `curl -fsSL https://cli.kiro.dev/install | bash`
+2. Войдите: `kiro-cli login`
+3. Сгенерируйте API-ключ в настройках (см. [документацию Kiro CLI Headless](https://kiro.dev/docs/cli/headless/))
+
+**Пример Docker:**
+
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="ksk_your_api_key_here" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+<details>
+<summary>🔍 Как это работает</summary>
+
+API-ключ передаётся напрямую в Kiro API как Bearer-токен с дополнительным заголовком `tokentype: API_KEY`. Обновление токена не требуется. Шлюз автоматически определяет правильный регион из ответа Kiro API `GetProfile`.
+
+</details>
+
 ### Получение учётных данных
 
 **Для пользователей Kiro IDE:**

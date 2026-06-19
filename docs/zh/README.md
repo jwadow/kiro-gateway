@@ -242,6 +242,40 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 </details>
 
+### 选项 5：Kiro API 密钥（无头 / CI）
+
+最简单的认证方式。通过 kiro-cli 设置生成 API 密钥并直接使用 — 无需刷新令牌、无需 SSO、无需凭据文件。
+
+```env
+KIRO_API_KEY="ksk_your_api_key_here"
+
+# 保护您的代理服务器的密码（可以与 KIRO_API_KEY 相同）
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+**如何生成 API 密钥：**
+
+1. 安装 kiro-cli：`curl -fsSL https://cli.kiro.dev/install | bash`
+2. 登录：`kiro-cli login`
+3. 在设置中生成 API 密钥（参见 [Kiro CLI Headless 文档](https://kiro.dev/docs/cli/headless/)）
+
+**Docker 示例：**
+
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="ksk_your_api_key_here" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+<details>
+<summary>🔍 工作原理</summary>
+
+API 密钥作为 Bearer 令牌直接传递给 Kiro API，并附带 `tokentype: API_KEY` 头。无需刷新令牌。网关自动从 Kiro API `GetProfile` 响应中检测正确的区域。
+
+</details>
+
 ### 获取凭据
 
 **Kiro IDE 用户：**
