@@ -511,16 +511,19 @@ class TestAuthTypeEnum:
     def test_auth_type_enum_values(self):
         """
         What it does: Verifies AuthType enum values.
-        Purpose: Ensure enum contains KIRO_DESKTOP and AWS_SSO_OIDC.
+        Purpose: Ensure enum contains KIRO_DESKTOP, AWS_SSO_OIDC and API_KEY.
         """
         print("Verification: AuthType contains KIRO_DESKTOP...")
         assert AuthType.KIRO_DESKTOP.value == "kiro_desktop"
-        
+
         print("Verification: AuthType contains AWS_SSO_OIDC...")
         assert AuthType.AWS_SSO_OIDC.value == "aws_sso_oidc"
-        
-        print(f"Comparing value count: Expected 2, Got {len(AuthType)}")
-        assert len(AuthType) == 2
+
+        print("Verification: AuthType contains API_KEY...")
+        assert AuthType.API_KEY.value == "api_key"
+
+        print(f"Comparing value count: Expected 3, Got {len(AuthType)}")
+        assert len(AuthType) == 3
 
 
 # =============================================================================
