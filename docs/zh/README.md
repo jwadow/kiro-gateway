@@ -246,33 +246,65 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 最简单的认证方式。通过 kiro-cli 设置生成 API 密钥并直接使用 — 无需刷新令牌、无需 SSO、无需凭据文件。
 
+两种运行模式：
+
+#### 模式 A：无状态透传（多租户）
+
+无需任何服务器端配置。网关以零凭据启动，每个用户将自己的 Kiro API 密钥作为 Bearer 令牌传递。多个用户可共享一个网关实例。
+
+```bash
+# 无需任何凭据即可启动网关
+docker run -d -p 8000:8000 --name kiro-gateway kiro-gateway
+```
+
+用户使用自己的密钥连接：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer ksk_USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+每个 `ksk_*` Bearer 令牌直接转发到 Kiro API。会话按密钥缓存以提高性能。
+
+#### 模式 B：服务器端 API 密钥（单租户）
+
+在服务器上配置单个 API 密钥。用户使用 `PROXY_API_KEY` 密码进行认证：
+
 ```env
 KIRO_API_KEY="ksk_your_api_key_here"
 
-# 保护您的代理服务器的密码（可以与 KIRO_API_KEY 相同）
+# 保护您的代理服务器的密码
 PROXY_API_KEY="my-super-secret-password-123"
 ```
 
-**如何生成 API 密钥：**
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="my-super-secret-password-123" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+#### 如何生成 API 密钥
 
 1. 安装 kiro-cli：`curl -fsSL https://cli.kiro.dev/install | bash`
 2. 登录：`kiro-cli login`
 3. 在设置中生成 API 密钥（参见 [Kiro CLI Headless 文档](https://kiro.dev/docs/cli/headless/)）
 
-**Docker 示例：**
-
-```bash
-docker run -d -p 8000:8000 \
-  -e KIRO_API_KEY="ksk_your_api_key_here" \
-  -e PROXY_API_KEY="ksk_your_api_key_here" \
-  --name kiro-gateway \
-  kiro-gateway
-```
-
 <details>
 <summary>🔍 工作原理</summary>
 
 API 密钥作为 Bearer 令牌直接传递给 Kiro API，并附带 `tokentype: API_KEY` 头。无需刷新令牌。网关自动从 Kiro API `GetProfile` 响应中检测正确的区域。
+
+**透传模式 (A)：** 任何以 `ksk_` 开头的 Bearer 令牌会绕过 `PROXY_API_KEY` 验证，直接转发到 Kiro API。这实现了多租户使用。
+
+**服务器端模式 (B)：** `KIRO_API_KEY` 存储在服务器上，用于所有通过 `PROXY_API_KEY` 认证的请求。
 
 </details>
 

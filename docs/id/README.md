@@ -246,33 +246,65 @@ Kedua format kunci didukung untuk kompatibilitas dengan versi kiro-cli yang berb
 
 Metode autentikasi paling sederhana. Buat API key melalui pengaturan kiro-cli dan gunakan langsung — tanpa pembaruan token, tanpa SSO, tanpa file kredensial.
 
+Dua mode operasi:
+
+#### Mode A: Stateless Passthrough (Multi-Tenant)
+
+Tidak perlu konfigurasi di sisi server. Gateway dimulai tanpa kredensial dan setiap pengguna mengirimkan API key Kiro mereka sendiri sebagai Bearer token. Beberapa pengguna dapat berbagi satu instance gateway.
+
+```bash
+# Mulai gateway tanpa kredensial
+docker run -d -p 8000:8000 --name kiro-gateway kiro-gateway
+```
+
+Pengguna terhubung dengan key mereka sendiri:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer ksk_USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+Setiap Bearer token `ksk_*` diteruskan langsung ke Kiro API. Sesi di-cache per key untuk performa.
+
+#### Mode B: API Key di Server (Single-Tenant)
+
+Satu API key dikonfigurasi di server. Pengguna mengautentikasi dengan password `PROXY_API_KEY`:
+
 ```env
 KIRO_API_KEY="ksk_your_api_key_here"
 
-# Kata sandi untuk melindungi server proxy Anda (bisa sama dengan KIRO_API_KEY)
+# Kata sandi untuk melindungi server proxy Anda
 PROXY_API_KEY="my-super-secret-password-123"
 ```
 
-**Cara membuat API key:**
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="my-super-secret-password-123" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+#### Cara membuat API key
 
 1. Instal kiro-cli: `curl -fsSL https://cli.kiro.dev/install | bash`
 2. Login: `kiro-cli login`
 3. Buat API key di pengaturan (lihat [dokumentasi Kiro CLI Headless](https://kiro.dev/docs/cli/headless/))
 
-**Contoh Docker:**
-
-```bash
-docker run -d -p 8000:8000 \
-  -e KIRO_API_KEY="ksk_your_api_key_here" \
-  -e PROXY_API_KEY="ksk_your_api_key_here" \
-  --name kiro-gateway \
-  kiro-gateway
-```
-
 <details>
 <summary>🔍 Cara kerjanya</summary>
 
-API key diteruskan langsung ke Kiro API sebagai token Bearer dengan header tambahan `tokentype: API_KEY`. Tidak perlu pembaruan token. Gateway secara otomatis mendeteksi region yang benar dari respons `GetProfile` Kiro API.
+API key diteruskan langsung ke Kiro API sebagai Bearer token dengan header tambahan `tokentype: API_KEY`. Tidak perlu pembaruan token. Gateway secara otomatis mendeteksi region yang benar dari respons `GetProfile` Kiro API.
+
+**Mode Passthrough (A):** Bearer token yang dimulai dengan `ksk_` melewati validasi `PROXY_API_KEY` dan diteruskan langsung ke Kiro API. Ini memungkinkan penggunaan multi-tenant.
+
+**Mode server (B):** `KIRO_API_KEY` disimpan di server dan digunakan untuk semua permintaan yang diautentikasi melalui `PROXY_API_KEY`.
 
 </details>
 

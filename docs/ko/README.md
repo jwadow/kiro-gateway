@@ -246,33 +246,65 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 가장 간단한 인증 방법입니다. kiro-cli 설정에서 API 키를 생성하여 직접 사용합니다 — 토큰 갱신 불필요, SSO 불필요, 자격 증명 파일 불필요.
 
+두 가지 운영 모드:
+
+#### 모드 A: Stateless Passthrough (멀티테넌트)
+
+서버 측 구성이 필요 없습니다. 게이트웨이는 자격 증명 없이 시작되며 각 사용자가 자신의 Kiro API 키를 Bearer 토큰으로 전달합니다. 여러 사용자가 하나의 게이트웨이 인스턴스를 공유할 수 있습니다.
+
+```bash
+# 자격 증명 없이 게이트웨이 시작
+docker run -d -p 8000:8000 --name kiro-gateway kiro-gateway
+```
+
+사용자는 자신의 키로 연결합니다:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer ksk_USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+각 `ksk_*` Bearer 토큰은 Kiro API로 직접 전달됩니다. 성능을 위해 키별로 세션이 캐시됩니다.
+
+#### 모드 B: 서버 측 API 키 (싱글테넌트)
+
+서버에 단일 API 키를 구성합니다. 사용자는 `PROXY_API_KEY` 비밀번호로 인증합니다:
+
 ```env
 KIRO_API_KEY="ksk_your_api_key_here"
 
-# 프록시 서버를 보호하는 비밀번호 (KIRO_API_KEY와 동일할 수 있음)
+# 프록시 서버를 보호하는 비밀번호
 PROXY_API_KEY="my-super-secret-password-123"
 ```
 
-**API 키 생성 방법:**
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="my-super-secret-password-123" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+#### API 키 생성 방법
 
 1. kiro-cli 설치: `curl -fsSL https://cli.kiro.dev/install | bash`
 2. 로그인: `kiro-cli login`
 3. 설정에서 API 키 생성 ([Kiro CLI Headless 문서](https://kiro.dev/docs/cli/headless/) 참조)
 
-**Docker 예시:**
-
-```bash
-docker run -d -p 8000:8000 \
-  -e KIRO_API_KEY="ksk_your_api_key_here" \
-  -e PROXY_API_KEY="ksk_your_api_key_here" \
-  --name kiro-gateway \
-  kiro-gateway
-```
-
 <details>
 <summary>🔍 작동 원리</summary>
 
 API 키는 추가 헤더 `tokentype: API_KEY`와 함께 Bearer 토큰으로 Kiro API에 직접 전달됩니다. 토큰 갱신이 필요 없습니다. 게이트웨이는 Kiro API `GetProfile` 응답에서 올바른 리전을 자동 감지합니다.
+
+**Passthrough 모드 (A):** `ksk_`로 시작하는 Bearer 토큰은 `PROXY_API_KEY` 검증을 우회하고 Kiro API로 직접 전달됩니다. 멀티테넌트 사용이 가능합니다.
+
+**서버 모드 (B):** `KIRO_API_KEY`가 서버에 저장되고 `PROXY_API_KEY`로 인증된 모든 요청에 사용됩니다.
 
 </details>
 

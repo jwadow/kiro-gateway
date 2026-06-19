@@ -246,33 +246,65 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 Самый простой метод аутентификации. Сгенерируйте API-ключ через настройки kiro-cli и используйте его напрямую — без обновления токенов, без SSO, без файлов учётных данных.
 
+Два режима работы:
+
+#### Режим A: Stateless Passthrough (Мультитенант)
+
+Никакой конфигурации на сервере не нужно. Шлюз запускается без учётных данных, и каждый пользователь передаёт свой собственный API-ключ Kiro как Bearer-токен. Несколько пользователей могут использовать один экземпляр шлюза.
+
+```bash
+# Запуск шлюза без учётных данных
+docker run -d -p 8000:8000 --name kiro-gateway kiro-gateway
+```
+
+Пользователи подключаются со своим ключом:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer ksk_USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+Каждый `ksk_*` Bearer-токен передаётся напрямую в Kiro API. Сессии кэшируются по ключу для производительности.
+
+#### Режим B: Серверный API-ключ (Однотенант)
+
+Один API-ключ настроен на сервере. Пользователи аутентифицируются паролем `PROXY_API_KEY`:
+
 ```env
 KIRO_API_KEY="ksk_your_api_key_here"
 
-# Пароль для защиты ВАШЕГО прокси-сервера (может совпадать с KIRO_API_KEY)
+# Пароль для защиты ВАШЕГО прокси-сервера
 PROXY_API_KEY="my-super-secret-password-123"
 ```
 
-**Как сгенерировать API-ключ:**
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="my-super-secret-password-123" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+#### Как сгенерировать API-ключ
 
 1. Установите kiro-cli: `curl -fsSL https://cli.kiro.dev/install | bash`
 2. Войдите: `kiro-cli login`
 3. Сгенерируйте API-ключ в настройках (см. [документацию Kiro CLI Headless](https://kiro.dev/docs/cli/headless/))
 
-**Пример Docker:**
-
-```bash
-docker run -d -p 8000:8000 \
-  -e KIRO_API_KEY="ksk_your_api_key_here" \
-  -e PROXY_API_KEY="ksk_your_api_key_here" \
-  --name kiro-gateway \
-  kiro-gateway
-```
-
 <details>
 <summary>🔍 Как это работает</summary>
 
 API-ключ передаётся напрямую в Kiro API как Bearer-токен с дополнительным заголовком `tokentype: API_KEY`. Обновление токена не требуется. Шлюз автоматически определяет правильный регион из ответа Kiro API `GetProfile`.
+
+**Режим Passthrough (A):** Любой Bearer-токен, начинающийся с `ksk_`, обходит проверку `PROXY_API_KEY` и передаётся напрямую в Kiro API. Это позволяет мультитенантное использование.
+
+**Серверный режим (B):** `KIRO_API_KEY` хранится на сервере и используется для всех запросов, аутентифицированных через `PROXY_API_KEY`.
 
 </details>
 

@@ -246,33 +246,65 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 最もシンプルな認証方法です。kiro-cli の設定から API キーを生成して直接使用します — トークンの更新不要、SSO 不要、認証情報ファイル不要。
 
+2つの動作モード：
+
+#### モード A：ステートレス パススルー（マルチテナント）
+
+サーバー側の設定は不要です。ゲートウェイは認証情報なしで起動し、各ユーザーが自分の Kiro API キーを Bearer トークンとして渡します。複数のユーザーが1つのゲートウェイインスタンスを共有できます。
+
+```bash
+# 認証情報なしでゲートウェイを起動
+docker run -d -p 8000:8000 --name kiro-gateway kiro-gateway
+```
+
+ユーザーは自分のキーで接続します：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer ksk_USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+各 `ksk_*` Bearer トークンは Kiro API に直接転送されます。パフォーマンスのためキーごとにセッションがキャッシュされます。
+
+#### モード B：サーバー側 API キー（シングルテナント）
+
+サーバーに単一の API キーを設定します。ユーザーは `PROXY_API_KEY` パスワードで認証します：
+
 ```env
 KIRO_API_KEY="ksk_your_api_key_here"
 
-# プロキシサーバーを保護するパスワード（KIRO_API_KEY と同じでも可）
+# プロキシサーバーを保護するパスワード
 PROXY_API_KEY="my-super-secret-password-123"
 ```
 
-**API キーの生成方法：**
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="my-super-secret-password-123" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+#### API キーの生成方法
 
 1. kiro-cli をインストール：`curl -fsSL https://cli.kiro.dev/install | bash`
 2. ログイン：`kiro-cli login`
 3. 設定で API キーを生成（[Kiro CLI Headless ドキュメント](https://kiro.dev/docs/cli/headless/)を参照）
 
-**Docker 例：**
-
-```bash
-docker run -d -p 8000:8000 \
-  -e KIRO_API_KEY="ksk_your_api_key_here" \
-  -e PROXY_API_KEY="ksk_your_api_key_here" \
-  --name kiro-gateway \
-  kiro-gateway
-```
-
 <details>
 <summary>🔍 仕組み</summary>
 
 API キーは追加ヘッダー `tokentype: API_KEY` とともに Bearer トークンとして Kiro API に直接渡されます。トークンの更新は不要です。ゲートウェイは Kiro API の `GetProfile` レスポンスから正しいリージョンを自動検出します。
+
+**パススルーモード (A)：** `ksk_` で始まる Bearer トークンは `PROXY_API_KEY` の検証をバイパスし、Kiro API に直接転送されます。マルチテナント利用が可能です。
+
+**サーバーモード (B)：** `KIRO_API_KEY` がサーバーに保存され、`PROXY_API_KEY` で認証されたすべてのリクエストに使用されます。
 
 </details>
 
