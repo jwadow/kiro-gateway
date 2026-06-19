@@ -46,6 +46,7 @@ from kiro.config import (
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
+    get_kiro_management_host,
     get_aws_sso_oidc_url,
 )
 from kiro.utils import get_machine_fingerprint
@@ -235,6 +236,7 @@ class KiroAuthManager:
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
         self._api_host = get_kiro_api_host(final_api_region)
         self._q_host = get_kiro_q_host(final_api_region)
+        self._management_host = get_kiro_management_host(final_api_region)
         
         # Log initialized endpoints for diagnostics (helps with DNS issues like #58, #132, #133)
         logger.info(
@@ -994,6 +996,11 @@ class KiroAuthManager:
     def q_host(self) -> str:
         """Q API host for the current region."""
         return self._q_host
+
+    @property
+    def management_host(self) -> str:
+        """Management API host for the current region (API-key model discovery)."""
+        return self._management_host
     
     @property
     def fingerprint(self) -> str:

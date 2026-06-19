@@ -190,6 +190,11 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
+# Host for the management API (ListAvailableModels / GetProfile) used by API-key auth.
+# kiro-cli sends ListAvailableModels here (not to the runtime host) when authenticated
+# with a KIRO_API_KEY, which is how the dynamic model list is discovered.
+KIRO_MANAGEMENT_HOST_TEMPLATE: str = "https://management.{region}.kiro.dev"
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
@@ -584,4 +589,9 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_management_host(region: str) -> str:
+    """Return the management API host for the specified region (API-key model discovery)."""
+    return KIRO_MANAGEMENT_HOST_TEMPLATE.format(region=region)
 

@@ -93,6 +93,35 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
     return "://runtime." in auth_manager.api_host
 
 
+async def _fetch_models_via_management(auth_manager: KiroAuthManager) -> List[Dict]:
+    """
+    Fetch the available model list from the management endpoint (API-key auth).
+
+    When authenticated with a KIRO_API_KEY, kiro-cli discovers models via
+    ListAvailableModels on https://management.{region}.kiro.dev (the runtime host
+    does not serve it). This mirrors that call so the gateway advertises the live
+    model list (e.g. claude-opus-4.8) instead of the static fallback.
+
+    Returns:
+        List of model dicts (each with a "modelId").
+
+    Raises:
+        Exception: On HTTP/network error (caller should fall back to FALLBACK_MODELS).
+    """
+    token = await auth_manager.get_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "tokentype": "API_KEY",
+        "Content-Type": "application/x-amz-json-1.0",
+        "x-amz-target": "AmazonCodeWhispererService.ListAvailableModels",
+    }
+    url = f"{auth_manager.management_host}/"
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(url, headers=headers, json={"origin": "AI_EDITOR"})
+        response.raise_for_status()
+        return response.json().get("models", [])
+
+
 def _format_duration(seconds: float) -> str:
     """
     Format duration in human-readable format.
@@ -526,7 +555,18 @@ class AccountManager:
             token = await auth_manager.get_access_token()
             
             # Determine if we should fetch models or use static list
-            if _is_runtime_endpoint(auth_manager):
+            if auth_manager.auth_type == AuthType.API_KEY:
+                # API-key auth: discover models via the management endpoint
+                try:
+                    models_list = await _fetch_models_via_management(auth_manager)
+                    logger.info(f"Account {account_id}: Fetched {len(models_list)} models from management endpoint")
+                    if not models_list:
+                        models_list = FALLBACK_MODELS
+                except Exception as e:
+                    logger.error(f"Failed to fetch models via management endpoint for {account_id}: {e}")
+                    logger.warning("Using pre-configured fallback models.")
+                    models_list = FALLBACK_MODELS
+            elif _is_runtime_endpoint(auth_manager):
                 # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
                 # Use static list without attempting request
                 logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
@@ -617,6 +657,25 @@ class AccountManager:
         if not account or not account.auth_manager:
             return
         
+        # API-key auth: refresh the dynamic model list from the management endpoint
+        if account.auth_manager.auth_type == AuthType.API_KEY:
+            try:
+                models_list = await _fetch_models_via_management(account.auth_manager)
+                if models_list:
+                    await account.model_cache.update(models_list)
+                    account.models_cached_at = time.time()
+                    available_models = account.model_resolver.get_available_models()
+                    for model in available_models:
+                        if model not in self._model_to_accounts:
+                            self._model_to_accounts[model] = ModelAccountList()
+                        if account_id not in self._model_to_accounts[model].accounts:
+                            self._model_to_accounts[model].accounts.append(account_id)
+                    logger.debug(f"Refreshed models for {account_id} via management endpoint")
+                    self._dirty = True
+            except Exception as e:
+                logger.warning(f"Failed to refresh models via management endpoint for {account_id}: {e}")
+            return
+
         # Check if using runtime endpoint (no dynamic model list available)
         if _is_runtime_endpoint(account.auth_manager):
             # Runtime endpoint does not provide /ListAvailableModels
