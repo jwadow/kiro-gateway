@@ -294,6 +294,69 @@ class SystemContentBlock(BaseModel):
 SystemPrompt = Union[str, List[SystemContentBlock], List[Dict[str, Any]]]
 
 
+def _content_to_text(content: Any) -> str:
+    """Extract plain text from an Anthropic message content (str or block list)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def hoist_system_messages(data: Any) -> Any:
+    """
+    Lenient compatibility shim: some clients (e.g. Claude Code) place messages
+    with role "system" inside the ``messages`` array, which the Anthropic spec
+    does not allow (system must be the top-level ``system`` field).
+
+    This pulls any role=="system" entries out of ``messages`` and merges their
+    text into the top-level ``system`` field, preserving order. Well-formed
+    requests (no system messages in the array) are returned unchanged.
+    """
+    if not isinstance(data, dict):
+        return data
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return data
+
+    hoisted: List[str] = []
+    kept = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            text = _content_to_text(msg.get("content"))
+            if text:
+                hoisted.append(text)
+        else:
+            kept.append(msg)
+
+    if not hoisted:
+        return data  # nothing to do; leave request untouched
+
+    # Don't strip the array down to empty (would fail min_length validation)
+    if not kept:
+        return data
+
+    extra_system = "\n\n".join(hoisted)
+    existing = data.get("system")
+    if existing is None:
+        data["system"] = extra_system
+    elif isinstance(existing, str):
+        data["system"] = f"{existing}\n\n{extra_system}" if existing else extra_system
+    elif isinstance(existing, list):
+        data["system"] = list(existing) + [{"type": "text", "text": extra_system}]
+    else:
+        data["system"] = extra_system
+
+    data["messages"] = kept
+    return data
+
+
 class AnthropicMessagesRequest(BaseModel):
     """
     Request to Anthropic Messages API (/v1/messages).
@@ -320,6 +383,12 @@ class AnthropicMessagesRequest(BaseModel):
     # Optional parameters - system can be string or list of content blocks
     system: Optional[SystemPrompt] = None
     stream: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _hoist_system_messages(cls, data: Any) -> Any:
+        """Move any role=='system' messages into the top-level system field."""
+        return hoist_system_messages(data)
 
     # Extended thinking (official Anthropic parameter)
     thinking: Optional[Dict[str, Any]] = None
@@ -356,12 +425,18 @@ class AnthropicCountTokensRequest(BaseModel):
     
     model: str
     messages: List[AnthropicMessage] = Field(min_length=1)
-    
+
     # Optional parameters - only those that affect token count
     system: Optional[SystemPrompt] = None
     tools: Optional[List[AnthropicTool]] = None
-    
+
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _hoist_system_messages(cls, data: Any) -> Any:
+        """Move any role=='system' messages into the top-level system field."""
+        return hoist_system_messages(data)
 
 
 # ==================================================================================================
