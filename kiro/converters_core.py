@@ -30,9 +30,10 @@ The core layer provides a unified interface that API-specific adapters use
 to convert their formats to Kiro API format.
 """
 
+import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 
@@ -555,6 +556,62 @@ def process_tools_with_long_descriptions(
         )
     
     return processed_tools if processed_tools else None, tool_documentation
+
+
+#: Maximum tool name length accepted by the Kiro API (verified: <=64 OK, >=65 rejected).
+TOOL_NAME_MAX_LENGTH = 64
+
+
+def shorten_tool_name(name: str) -> str:
+    """
+    Deterministically shortens a tool name to fit Kiro's 64-character limit.
+
+    Names within the limit are returned unchanged. Longer names are aliased to
+    a 64-char string built from a truncated prefix plus a SHA-1 fingerprint, so
+    the same original name always maps to the same alias (required so that tool
+    names referenced across conversation turns alias consistently).
+
+    The alias stays within the tool-name charset ([A-Za-z0-9_-]).
+
+    Args:
+        name: Original tool name
+
+    Returns:
+        The name unchanged if <=64 chars, otherwise a 64-char deterministic alias
+
+    Example:
+        >>> len(shorten_tool_name("a" * 72))
+        64
+        >>> shorten_tool_name("short_name")
+        'short_name'
+    """
+    if len(name) <= TOOL_NAME_MAX_LENGTH:
+        return name
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
+    # 51 (prefix) + 1 ("_") + 12 (digest) == 64
+    return f"{name[:51]}_{digest}"
+
+
+def build_tool_name_reverse_map(names: Iterable[str]) -> Dict[str, str]:
+    """
+    Builds a reverse map {alias: original} for tool names that get shortened.
+
+    Used on the response side to restore the client's original tool names when
+    Kiro echoes back the (aliased) names it was given.
+
+    Args:
+        names: Iterable of original tool names
+
+    Returns:
+        Dict mapping each alias back to its original name (only for names that
+        actually changed). Empty if nothing was shortened.
+    """
+    reverse: Dict[str, str] = {}
+    for name in names:
+        alias = shorten_tool_name(name)
+        if alias != name:
+            reverse[alias] = name
+    return reverse
 
 
 def validate_tool_names(tools: Optional[List[UnifiedTool]]) -> None:
@@ -1434,8 +1491,21 @@ def build_kiro_payload(
     """
     # Process tools with long descriptions
     processed_tools, tool_documentation = process_tools_with_long_descriptions(tools)
-    
-    # Validate tool names against Kiro API 64-character limit
+
+    # Alias tool names that exceed Kiro's 64-char limit. The aliasing is
+    # deterministic, so names referenced in conversation history alias the same
+    # way as the current tool definitions. The reverse map (alias -> original)
+    # is rebuilt at the route from the request's tools and applied to responses.
+    tool_name_forward_map: Dict[str, str] = {}
+    if processed_tools:
+        for tool in processed_tools:
+            alias = shorten_tool_name(tool.name)
+            if alias != tool.name:
+                tool_name_forward_map[tool.name] = alias
+                tool.name = alias
+
+    # Validate tool names against Kiro API 64-character limit (now always passes
+    # for aliased tools; acts as a safety net for any name we did not rewrite)
     validate_tool_names(processed_tools)
     
     # Add tool documentation to system prompt if present
@@ -1493,7 +1563,19 @@ def build_kiro_payload(
             first_msg.content = f"{full_system_prompt}\n\n{original_content}"
     
     history = build_kiro_history(history_messages, model_id)
-    
+
+    # Apply tool-name aliases to any toolUses referenced in history, so prior
+    # assistant turns reference the same (aliased) names as the tool definitions.
+    if tool_name_forward_map:
+        for entry in history:
+            assistant = entry.get("assistantResponseMessage")
+            if not assistant:
+                continue
+            for tool_use in assistant.get("toolUses", []):
+                aliased = tool_name_forward_map.get(tool_use.get("name"))
+                if aliased:
+                    tool_use["name"] = aliased
+
     # Current message (the last one)
     current_message = merged_messages[-1]
     current_content = extract_text_content(current_message.content)

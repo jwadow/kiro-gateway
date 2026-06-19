@@ -45,6 +45,7 @@ from kiro.models_anthropic import (
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro
+from kiro.converters_core import build_tool_name_reverse_map
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
@@ -385,6 +386,10 @@ async def messages(
                     conversation_id,
                     profile_arn_for_payload
                 )
+                # Reverse map to restore tool names shortened to fit Kiro's 64-char limit
+                tool_name_map = build_tool_name_reverse_map(
+                    [t.name for t in request_data.tools]
+                ) if request_data.tools else None
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
                 return JSONResponse(
@@ -457,6 +462,7 @@ async def messages(
                                     request_messages=messages_for_tokenizer,
                                     request_tools=tools_for_tokenizer,
                                     request_system=system_for_tokenizer,
+                                    tool_name_map=tool_name_map,
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -505,6 +511,7 @@ async def messages(
                             request_messages=messages_for_tokenizer,
                             request_tools=tools_for_tokenizer,
                             request_system=system_for_tokenizer,
+                            tool_name_map=tool_name_map,
                         )
                         
                         await http_client.close()
@@ -693,6 +700,10 @@ async def messages(
             conversation_id,
             profile_arn_for_payload
         )
+        # Reverse map to restore tool names shortened to fit Kiro's 64-char limit
+        tool_name_map = build_tool_name_reverse_map(
+            [t.name for t in request_data.tools]
+        ) if request_data.tools else None
     except ValueError as e:
         logger.error(f"Conversion error: {e}")
         return JSONResponse(
@@ -815,6 +826,7 @@ async def messages(
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer,
                         request_system=system_for_tokenizer,
+                        tool_name_map=tool_name_map,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -864,8 +876,9 @@ async def messages(
                 request_messages=messages_for_tokenizer,
                 request_tools=tools_for_tokenizer,
                 request_system=system_for_tokenizer,
+                tool_name_map=tool_name_map,
             )
-            
+
             await http_client.close()
             
             logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")

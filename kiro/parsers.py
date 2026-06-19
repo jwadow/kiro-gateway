@@ -248,12 +248,21 @@ class AwsEventStreamParser:
         ('{"contextUsagePercentage":', 'context_usage'),
     ]
     
-    def __init__(self):
-        """Initializes the parser."""
+    def __init__(self, tool_name_map: Optional[Dict[str, str]] = None):
+        """
+        Initializes the parser.
+
+        Args:
+            tool_name_map: Optional {alias: original} map used to restore tool
+                names that were shortened to fit Kiro's 64-char limit on the way
+                in. Applied to tool_start events so clients see their original
+                names.
+        """
         self.buffer = ""
         self.last_content: Optional[str] = None  # For deduplicating repeating content
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
+        self._tool_name_map = tool_name_map or {}
     
     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
         """
@@ -365,11 +374,15 @@ class AwsEventStreamParser:
         else:
             input_str = str(input_data) if input_data else ''
         
+        # Restore original tool name if it was aliased to fit Kiro's 64-char limit
+        tool_name = data.get('name', '')
+        tool_name = self._tool_name_map.get(tool_name, tool_name)
+
         self.current_tool_call = {
             "id": data.get('toolUseId', generate_tool_call_id()),
             "type": "function",
             "function": {
-                "name": data.get('name', ''),
+                "name": tool_name,
                 "arguments": input_str
             }
         }

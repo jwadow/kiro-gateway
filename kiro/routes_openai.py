@@ -48,6 +48,7 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
+from kiro.converters_core import build_tool_name_reverse_map
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
@@ -59,6 +60,18 @@ try:
     from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
+
+
+def _openai_tool_names(tools) -> list:
+    """Extract tool names from OpenAI-format tools (supports nested function and flat name)."""
+    names = []
+    for tool in tools or []:
+        func = getattr(tool, "function", None)
+        name = getattr(func, "name", None) if func else None
+        name = name or getattr(tool, "name", None)
+        if name:
+            names.append(name)
+    return names
 
 
 # --- Security scheme ---
@@ -332,6 +345,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     conversation_id,
                     profile_arn_for_payload
                 )
+                # Reverse map to restore tool names shortened to fit Kiro's 64-char limit
+                tool_name_map = build_tool_name_reverse_map(
+                    _openai_tool_names(request_data.tools)
+                ) or None
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
             
@@ -389,7 +406,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     auth_manager=auth_manager,
                                     initial_response=response,
                                     request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer
+                                    request_tools=tools_for_tokenizer,
+                                    tool_name_map=tool_name_map
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -429,9 +447,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             model_cache,
                             auth_manager,
                             request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer
+                            request_tools=tools_for_tokenizer,
+                            tool_name_map=tool_name_map
                         )
-                        
+
                         await http_client.close()
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
                         
@@ -580,9 +599,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             conversation_id,
             profile_arn_for_payload
         )
+        # Reverse map to restore tool names shortened to fit Kiro's 64-char limit
+        tool_name_map = build_tool_name_reverse_map(
+            _openai_tool_names(request_data.tools)
+        ) or None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
+
     # Log Kiro payload
     try:
         kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
@@ -685,7 +708,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         auth_manager=auth_manager,
                         initial_response=response,
                         request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer
+                        request_tools=tools_for_tokenizer,
+                        tool_name_map=tool_name_map
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -731,9 +755,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 model_cache,
                 auth_manager,
                 request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer
+                request_tools=tools_for_tokenizer,
+                tool_name_map=tool_name_map
             )
-            
+
             await http_client.close()
             
             # Log access log for non-streaming success

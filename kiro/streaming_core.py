@@ -118,26 +118,29 @@ class FirstTokenTimeoutError(Exception):
 async def parse_kiro_stream(
     response: httpx.Response,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
-    enable_thinking_parser: bool = True
+    enable_thinking_parser: bool = True,
+    tool_name_map: Optional[Dict[str, str]] = None
 ) -> AsyncGenerator[KiroEvent, None]:
     """
     Parses Kiro SSE stream and yields unified events.
-    
+
     This is the core parsing function that converts Kiro's AWS SSE format
     into unified KiroEvent objects that can be formatted for any API.
-    
+
     Args:
         response: HTTP response with data stream
         first_token_timeout: First token wait timeout (seconds)
         enable_thinking_parser: Whether to enable thinking block parsing
-    
+        tool_name_map: Optional {alias: original} map to restore tool names that
+            were shortened to fit Kiro's 64-char limit
+
     Yields:
         KiroEvent objects representing stream events
-    
+
     Raises:
         FirstTokenTimeoutError: If first token not received within timeout
     """
-    parser = AwsEventStreamParser()
+    parser = AwsEventStreamParser(tool_name_map=tool_name_map)
     first_token_received = False
     
     # Initialize thinking parser if fake reasoning is enabled
@@ -289,26 +292,29 @@ async def _process_chunk(
 async def collect_stream_to_result(
     response: httpx.Response,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
-    enable_thinking_parser: bool = True
+    enable_thinking_parser: bool = True,
+    tool_name_map: Optional[Dict[str, str]] = None
 ) -> StreamResult:
     """
     Collects full response from Kiro stream.
-    
+
     This function consumes the entire stream and returns a StreamResult
     with all accumulated data.
-    
+
     Args:
         response: HTTP response with stream
         first_token_timeout: First token wait timeout
         enable_thinking_parser: Whether to enable thinking block parsing
-    
+        tool_name_map: Optional {alias: original} map to restore tool names that
+            were shortened to fit Kiro's 64-char limit
+
     Returns:
         StreamResult with full content, thinking, tool calls, and usage
     """
     result = StreamResult()
     full_content_for_bracket_tools = ""
-    
-    async for event in parse_kiro_stream(response, first_token_timeout, enable_thinking_parser):
+
+    async for event in parse_kiro_stream(response, first_token_timeout, enable_thinking_parser, tool_name_map=tool_name_map):
         if event.type == "content" and event.content:
             result.content += event.content
             full_content_for_bracket_tools += event.content
@@ -325,8 +331,15 @@ async def collect_stream_to_result(
     # Check for bracket-style tool calls in full content
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
+        # Restore original names for bracket-style calls too (they come from text,
+        # so the model may have emitted the aliased name)
+        if tool_name_map:
+            for tc in bracket_tool_calls:
+                func = tc.get("function")
+                if func and func.get("name") in tool_name_map:
+                    func["name"] = tool_name_map[func["name"]]
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
-    
+
     return result
 
 
