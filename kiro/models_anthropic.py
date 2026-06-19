@@ -172,6 +172,14 @@ ContentBlock = Union[
     ToolReferenceContentBlock,
 ]
 
+# Content block "type" values that map to a ContentBlock union member above.
+# Any other type (e.g. server-side blocks like server_tool_use / advisor_tool_result
+# / web_search_tool_result) is dropped before validation so the request still parses.
+KNOWN_CONTENT_BLOCK_TYPES = {
+    "text", "thinking", "image",
+    "tool_use", "tool_result", "tool_reference",
+}
+
 
 # ==================================================================================================
 # Message Models
@@ -189,6 +197,36 @@ class AnthropicMessage(BaseModel):
 
     role: Literal["user", "assistant"]
     content: Union[str, List[ContentBlock]]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_unknown_content_blocks(cls, data: Any) -> Any:
+        """
+        Drop content blocks whose type the gateway doesn't understand.
+
+        Clients (notably Claude Code) replay conversation history that can
+        contain server-side tool blocks such as ``server_tool_use`` and
+        ``advisor_tool_result`` (or future web_search/server tool blocks).
+        These are not part of the Anthropic input content union and are not
+        needed for Kiro generation, so a strict model would reject the whole
+        request with HTTP 422. We filter them out instead, leaving well-formed
+        requests untouched.
+        """
+        if not isinstance(data, dict):
+            return data
+        content = data.get("content")
+        if not isinstance(content, list):
+            return data
+
+        kept = [
+            block for block in content
+            if not (isinstance(block, dict) and block.get("type") not in KNOWN_CONTENT_BLOCK_TYPES)
+        ]
+        # Don't strip an assistant turn down to nothing; let the converter's
+        # placeholder logic handle genuinely empty content downstream.
+        if kept != content:
+            data = {**data, "content": kept}
+        return data
 
     model_config = {"extra": "allow"}
 
