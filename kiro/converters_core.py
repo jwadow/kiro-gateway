@@ -673,7 +673,18 @@ def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dic
     for tool in tools:
         # Sanitize parameters from fields that Kiro API doesn't accept
         sanitized_params = sanitize_json_schema(tool.input_schema)
-        
+
+        # Kiro/Bedrock requires the tool input schema root to be an object schema
+        # (toolSpec.inputSchema.json.type must be "object"). Some clients/MCP tools
+        # send a parameterless tool with an empty schema or omit/mistype the root
+        # "type", which triggers a 400 TOOL_SCHEMA_INVALID. Coerce the root only.
+        if not isinstance(sanitized_params, dict):
+            sanitized_params = {}
+        if sanitized_params.get("type") != "object":
+            sanitized_params["type"] = "object"
+        if "properties" not in sanitized_params:
+            sanitized_params["properties"] = {}
+
         # Kiro API requires non-empty description
         description = tool.description
         if not description or not description.strip():
