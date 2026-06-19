@@ -111,6 +111,30 @@ python main.py --port 9000
 
 > 💡 **고급 사용자:** 다중 계정 지원을 찾고 있으신가요? 아래의 [계정 시스템](#-계정-시스템고급)을 참조하세요.
 
+### 옵션 0: Kiro API 키 (헤드리스) — 권장
+
+가장 간단한 설정입니다. Kiro **Pro / Pro+ / Power** 구독이 있다면 Kiro 콘솔에서
+API 키(`ksk_...`)를 생성해 게이트웨이에 지정하기만 하면 됩니다. 브라우저 로그인도,
+토큰 갱신도 필요 없습니다 — 키가 그대로 사용됩니다.
+
+```env
+# Kiro API 키 (kiro-cli가 헤드리스 모드에서 KIRO_API_KEY로 사용하는 것과 동일한 키)
+KIRO_API_KEY="ksk_..."
+
+# 프록시 서버를 보호하는 비밀번호 (안전한 문자열 설정)
+# 게이트웨이에 연결할 때 api_key로 사용합니다
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+```bash
+# 또는 .env 수정 없이 인라인으로:
+KIRO_API_KEY="ksk_..." PROXY_API_KEY="my-super-secret-password-123" python main.py
+```
+
+> **참고:** `KIRO_API_KEY`가 설정되면 아래의 다른 옵션보다 우선합니다. 기본 리전은
+> `us-east-1`입니다(`KIRO_API_REGION`으로 변경 가능). 최신 모델을 포함한 실시간 모델
+> 목록이 자동으로 조회됩니다.
+
 ### 옵션 1: JSON 자격 증명 파일 (Kiro IDE / Enterprise)
 
 자격 증명 파일 경로 지정:

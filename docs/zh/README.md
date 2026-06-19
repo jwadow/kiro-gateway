@@ -111,6 +111,28 @@ python main.py --port 9000
 
 > 💡 **高级用户：** 寻找多账户支持？请参阅下面的 [账户系统](#-账户系统高级)。
 
+### 选项 0：Kiro API 密钥（无头模式）— 推荐
+
+最简单的设置。如果您拥有 Kiro **Pro / Pro+ / Power** 订阅，只需在 Kiro 控制台中生成
+API 密钥（`ksk_...`）并指向网关即可。无需浏览器登录，无需令牌刷新 — 密钥直接使用。
+
+```env
+# Kiro API 密钥（与 kiro-cli 在无头模式下通过 KIRO_API_KEY 使用的密钥相同）
+KIRO_API_KEY="ksk_..."
+
+# 保护您的代理服务器的密码（设置任何安全字符串）
+# 连接到您的网关时，您将使用它作为 api_key
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+```bash
+# 或者内联，无需编辑 .env：
+KIRO_API_KEY="ksk_..." PROXY_API_KEY="my-super-secret-password-123" python main.py
+```
+
+> **注意：** 如果设置了 `KIRO_API_KEY`，它将优先于下面的其他选项。默认区域为
+> `us-east-1`（可通过 `KIRO_API_REGION` 覆盖）。实时模型列表（包括最新模型）将自动获取。
+
 ### 选项 1：JSON 凭据文件 (Kiro IDE / Enterprise)
 
 指定凭据文件的路径：

@@ -111,6 +111,30 @@ O servidor estará disponível em `http://localhost:8000`
 
 > 💡 **Usuários avançados:** Procurando suporte a múltiplas contas? Veja [Sistema de Contas](#-sistema-de-contas-avançado) abaixo.
 
+### Opção 0: Chave de API Kiro (Headless) — Recomendado
+
+A configuração mais simples. Se você tem uma assinatura Kiro **Pro / Pro+ / Power**,
+gere uma chave de API (`ksk_...`) no console do Kiro e aponte o gateway para ela. Sem
+login no navegador, sem renovação de token — a chave é usada diretamente.
+
+```env
+# Chave de API Kiro (a mesma chave que o kiro-cli usa via KIRO_API_KEY no modo headless)
+KIRO_API_KEY="ksk_..."
+
+# Senha para proteger SEU servidor proxy (crie qualquer string segura)
+# Você usará isso como api_key ao conectar ao seu gateway
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+```bash
+# Ou inline, sem editar o .env:
+KIRO_API_KEY="ksk_..." PROXY_API_KEY="my-super-secret-password-123" python main.py
+```
+
+> **Nota:** `KIRO_API_KEY`, se definido, tem prioridade sobre as outras opções abaixo. A
+> região padrão é `us-east-1` (substitua com `KIRO_API_REGION`). A lista de modelos ao vivo
+> (incluindo os mais recentes) é obtida automaticamente.
+
 ### Opção 1: Arquivo JSON de Credenciais (Kiro IDE / Enterprise)
 
 Especifique o caminho para o arquivo de credenciais:

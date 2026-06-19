@@ -111,6 +111,30 @@ python main.py --port 9000
 
 > 💡 **上級者向け：** マルチアカウントサポートをお探しですか？ 下記の [アカウントシステム](#-アカウントシステム上級者向け) を参照してください。
 
+### オプション 0：Kiro API キー（ヘッドレス）— 推奨
+
+最もシンプルな設定です。Kiro **Pro / Pro+ / Power** サブスクリプションをお持ちの場合、
+Kiro コンソールで API キー（`ksk_...`）を生成し、ゲートウェイに指定するだけです。
+ブラウザログインもトークン更新も不要 — キーがそのまま使用されます。
+
+```env
+# Kiro API キー（kiro-cli がヘッドレスモードで KIRO_API_KEY として使用するものと同じキー）
+KIRO_API_KEY="ksk_..."
+
+# プロキシサーバーを保護するパスワード（任意の安全な文字列を設定）
+# ゲートウェイに接続する際に api_key として使用します
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+```bash
+# または .env を編集せずにインラインで：
+KIRO_API_KEY="ksk_..." PROXY_API_KEY="my-super-secret-password-123" python main.py
+```
+
+> **注意：** `KIRO_API_KEY` が設定されている場合、以下の他のオプションより優先されます。
+> デフォルトのリージョンは `us-east-1` です（`KIRO_API_REGION` で変更可能）。最新モデルを
+> 含むライブモデルリストが自動的に取得されます。
+
 ### オプション 1：JSON 認証情報ファイル (Kiro IDE / Enterprise)
 
 認証情報ファイルへのパスを指定：

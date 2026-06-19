@@ -111,6 +111,30 @@ Server akan tersedia di `http://localhost:8000`
 
 > 💡 **Pengguna lanjutan:** Mencari dukungan multi-akun? Lihat [Sistem Akun](#-sistem-akun-lanjutan) di bawah.
 
+### Opsi 0: Kunci API Kiro (Headless) — Direkomendasikan
+
+Pengaturan paling sederhana. Jika Anda memiliki langganan Kiro **Pro / Pro+ / Power**,
+buat kunci API (`ksk_...`) di konsol Kiro dan arahkan gateway ke sana. Tanpa login
+browser, tanpa pembaruan token — kunci digunakan secara langsung.
+
+```env
+# Kunci API Kiro (kunci yang sama yang digunakan kiro-cli via KIRO_API_KEY dalam mode headless)
+KIRO_API_KEY="ksk_..."
+
+# Password untuk melindungi server proxy ANDA (buat string aman apa pun)
+# Anda akan menggunakan ini sebagai api_key saat menghubungkan ke gateway Anda
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+```bash
+# Atau inline, tanpa mengedit .env:
+KIRO_API_KEY="ksk_..." PROXY_API_KEY="my-super-secret-password-123" python main.py
+```
+
+> **Catatan:** `KIRO_API_KEY`, jika diatur, memiliki prioritas di atas opsi lain di bawah.
+> Region default adalah `us-east-1` (timpa dengan `KIRO_API_REGION`). Daftar model langsung
+> (termasuk model terbaru) diambil secara otomatis.
+
 ### Opsi 1: File JSON Kredensial (Kiro IDE / Enterprise)
 
 Tentukan path ke file kredensial:
