@@ -120,7 +120,7 @@ python main.py --port 9000
 - **Enterprise** - для корпоративных аккаунтов с SSO
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/kiro-auth-token.json"
 
 # Пароль для защиты ВАШЕГО прокси-сервера (придумайте любую надёжную строку)
 # Вы будете использовать его как api_key при подключении к вашему шлюзу
@@ -141,7 +141,7 @@ PROXY_API_KEY="my-super-secret-password-123"
 }
 ```
 
-> **Примечание:** Если у вас есть два JSON файла в `~/.aws/sso/cache/` (например, `kiro-auth-token.json` и файл с хешированным названием), используйте `kiro-auth-token.json` в `KIRO_CREDS_FILE`. Шлюз автоматически загрузит другой файл.
+> **Примечание:** Если у вас есть два JSON файла в `~/.aws/sso/cache/` (например, `kiro-auth-token.json` и файл с хешированным названием), используйте `kiro-auth-token.json` в `KIRO_CLI_DB_FILE`. Шлюз автоматически загрузит другой файл.
 
 </details>
 
@@ -168,7 +168,7 @@ KIRO_REGION="us-east-1"
 Работает как с бесплатными аккаунтами Builder ID, так и с корпоративными аккаунтами.
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
 
 # Пароль для защиты ВАШЕГО прокси-сервера
 PROXY_API_KEY="my-super-secret-password-123"
@@ -386,7 +386,7 @@ docker run -d \
 docker run -d \
   -p 8000:8000 \
   -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
   -e PROXY_API_KEY="my-super-secret-password-123" \
   --name kiro-gateway \
   ghcr.io/jwadow/kiro-gateway:latest
@@ -397,7 +397,7 @@ docker run -d \
 docker run -d `
   -p 8000:8000 `
   -v ${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro `
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
   -e PROXY_API_KEY="my-super-secret-password-123" `
   --name kiro-gateway `
   ghcr.io/jwadow/kiro-gateway:latest

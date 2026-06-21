@@ -120,7 +120,7 @@ python main.py --port 9000
 - **Enterprise** - 用于带有 SSO 的企业账户
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/kiro-auth-token.json"
 
 # 保护您的代理服务器的密码（设置任何安全字符串）
 # 连接到您的网关时，您将使用它作为 api_key
@@ -141,7 +141,7 @@ PROXY_API_KEY="my-super-secret-password-123"
 }
 ```
 
-> **注意：** 如果您在 `~/.aws/sso/cache/` 中有两个 JSON 文件（例如 `kiro-auth-token.json` 和一个带有哈希名称的文件），请在 `KIRO_CREDS_FILE` 中使用 `kiro-auth-token.json`。网关将自动加载另一个文件。
+> **注意：** 如果您在 `~/.aws/sso/cache/` 中有两个 JSON 文件（例如 `kiro-auth-token.json` 和一个带有哈希名称的文件），请在 `KIRO_CLI_DB_FILE` 中使用 `kiro-auth-token.json`。网关将自动加载另一个文件。
 
 </details>
 
@@ -168,7 +168,7 @@ KIRO_REGION="us-east-1"
 适用于免费 Builder ID 账户和企业账户。
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
 
 # 保护您的代理服务器的密码
 PROXY_API_KEY="my-super-secret-password-123"
@@ -386,7 +386,7 @@ docker run -d \
 docker run -d \
   -p 8000:8000 \
   -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
   -e PROXY_API_KEY="my-super-secret-password-123" \
   --name kiro-gateway \
   ghcr.io/jwadow/kiro-gateway:latest
@@ -397,7 +397,7 @@ docker run -d \
 docker run -d `
   -p 8000:8000 `
   -v ${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro `
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
   -e PROXY_API_KEY="my-super-secret-password-123" `
   --name kiro-gateway `
   ghcr.io/jwadow/kiro-gateway:latest

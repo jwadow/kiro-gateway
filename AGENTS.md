@@ -223,7 +223,7 @@ docker-compose --env-file .env.production up -d
 docker run -d \
   -p 8000:8000 \
   -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
   -e PROXY_API_KEY="your-secret-key" \
   --name kiro-gateway \
   kiro-gateway
@@ -532,7 +532,7 @@ Configuration is loaded from `.env` file (see `.env.example`):
 PROXY_API_KEY="my-super-secret-password-123"
 
 # Authentication (choose one method)
-KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"  # JSON file
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/kiro-auth-token.json"  # JSON file
 REFRESH_TOKEN="your_refresh_token"                        # Direct token
 KIRO_CLI_DB_FILE="~/.local/share/kiro-cli/data.sqlite3" # SQLite DB
 
@@ -842,7 +842,7 @@ ls -la ~/.aws/sso/cache/
 
 # Check environment variables
 echo $REFRESH_TOKEN
-echo $KIRO_CREDS_FILE
+echo $KIRO_CLI_DB_FILE
 
 # Enable debug logging
 DEBUG_MODE="errors" python main.py

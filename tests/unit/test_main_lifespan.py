@@ -46,7 +46,7 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.PROFILE_ARN", "arn:aws:codewhisperer:us-east-1:123456789:profile/test")
         monkeypatch.setattr("main.REGION", "us-east-1")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -103,7 +103,7 @@ class TestLifespanLegacyFallback:
         # Arrange: Patch constants directly
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -188,7 +188,7 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", str(sqlite_db))
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", str(json_file))
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", str(json_file))
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -235,7 +235,7 @@ class TestLifespanLegacyFallback:
         # Arrange: Patch constants and also patch os.getenv for _add_env_overrides
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         # Patch os.getenv for the helper function
@@ -288,7 +288,7 @@ class TestLifespanLegacyFallback:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -352,7 +352,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -415,7 +415,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -471,7 +471,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -513,7 +513,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -568,7 +568,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -626,7 +626,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -666,7 +666,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -710,7 +710,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -761,7 +761,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -811,7 +811,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"
@@ -869,7 +869,7 @@ class TestLifespanAccountManagerInit:
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
         
         creds_file = tmp_path / "credentials.json"

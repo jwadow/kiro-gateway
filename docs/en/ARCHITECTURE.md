@@ -133,7 +133,7 @@ The `main.py` file is responsible for:
 1. **Logging configuration** — Loguru setup with colored output
 2. **Configuration validation** — `validate_configuration()` function checks:
    - Presence of `.env` file
-   - Presence of credentials (REFRESH_TOKEN or KIRO_CREDS_FILE)
+   - Presence of credentials (REFRESH_TOKEN or KIRO_CLI_DB_FILE)
 3. **Lifespan Manager** — creation and initialization of:
    - `KiroAuthManager` for token management
    - `ModelInfoCache` for model caching
@@ -150,7 +150,7 @@ Centralized storage of all settings:
 | `REFRESH_TOKEN` | Kiro refresh token | from `.env` |
 | `PROFILE_ARN` | AWS CodeWhisperer profile ARN | from `.env` |
 | `REGION` | AWS region | `us-east-1` |
-| `KIRO_CREDS_FILE` | Path to JSON credentials file | from `.env` |
+| `KIRO_CLI_DB_FILE` | Path to JSON credentials file | from `.env` |
 | `TOKEN_REFRESH_THRESHOLD` | Time before token refresh | 600 sec (10 min) |
 | `MAX_RETRIES` | Max retry attempts | 3 |
 | `BASE_RETRY_DELAY` | Base retry delay | 1.0 sec |
@@ -630,7 +630,7 @@ PROXY_API_KEY="your_proxy_secret"
 # Optional
 PROFILE_ARN="arn:aws:codewhisperer:..."
 KIRO_REGION="us-east-1"
-KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/kiro-auth-token.json"
 
 # Debug
 DEBUG_MODE="off"  # off/errors/all
