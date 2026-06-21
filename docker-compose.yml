@@ -25,7 +25,7 @@ services:
       - PROFILE_ARN=${PROFILE_ARN:-}
       
       # Option 3: Credentials file path (mounted as volume below)
-      - KIRO_CREDS_FILE=${KIRO_CREDS_FILE:-}
+      - KIRO_CLI_DB_FILE=${KIRO_CLI_DB_FILE:-}
       
       # Option 4: kiro-cli SQLite database (mounted as volume below)
       - KIRO_CLI_DB_FILE=${KIRO_CLI_DB_FILE:-}
@@ -43,7 +43,7 @@ services:
       - .env
     
     volumes:
-      # Mount credentials file (if using KIRO_CREDS_FILE)
+      # Mount credentials file (if using KIRO_CLI_DB_FILE)
       # Uncomment and adjust path as needed:
       # - ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro
       

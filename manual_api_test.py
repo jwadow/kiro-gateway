@@ -52,7 +52,7 @@ AWS_SSO_OIDC_TOKEN_URL = None  # Will be set when SSO_REGION is known
 
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN")
 PROFILE_ARN = os.getenv("PROFILE_ARN", "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK")
-KIRO_CREDS_FILE = os.getenv("KIRO_CREDS_FILE", "")
+KIRO_CLI_DB_FILE = os.getenv("KIRO_CLI_DB_FILE", "")
 KIRO_CLI_DB_FILE = os.getenv("KIRO_CLI_DB_FILE", "")
 
 # AWS SSO OIDC specific credentials
@@ -197,13 +197,13 @@ cred_source = "REFRESH_TOKEN"
 if KIRO_CLI_DB_FILE:
     if load_credentials_from_sqlite(KIRO_CLI_DB_FILE):
         cred_source = "KIRO_CLI_DB_FILE (SQLite)"
-elif KIRO_CREDS_FILE:
-    if load_credentials_from_json(KIRO_CREDS_FILE):
-        cred_source = "KIRO_CREDS_FILE (JSON)"
+elif KIRO_CLI_DB_FILE:
+    if load_credentials_from_json(KIRO_CLI_DB_FILE):
+        cred_source = "KIRO_CLI_DB_FILE (JSON)"
 
 # --- Validate required credentials ---
 if not REFRESH_TOKEN:
-    logger.error("No credentials configured. Set REFRESH_TOKEN, KIRO_CREDS_FILE, or KIRO_CLI_DB_FILE. Exiting.")
+    logger.error("No credentials configured. Set REFRESH_TOKEN, KIRO_CLI_DB_FILE, or KIRO_CLI_DB_FILE. Exiting.")
     sys.exit(1)
 
 # Additional validation for AWS SSO OIDC

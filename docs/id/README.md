@@ -120,7 +120,7 @@ Bekerja dengan:
 - **Enterprise** - untuk akun perusahaan dengan SSO
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/kiro-auth-token.json"
 
 # Password untuk melindungi server proxy ANDA (buat string aman apa pun)
 # Anda akan menggunakan ini sebagai api_key saat menghubungkan ke gateway Anda
@@ -141,7 +141,7 @@ PROXY_API_KEY="my-super-secret-password-123"
 }
 ```
 
-> **Catatan:** Jika Anda memiliki dua file JSON di `~/.aws/sso/cache/` (misalnya, `kiro-auth-token.json` dan file dengan nama hash), gunakan `kiro-auth-token.json` di `KIRO_CREDS_FILE`. Gateway akan secara otomatis memuat file lainnya.
+> **Catatan:** Jika Anda memiliki dua file JSON di `~/.aws/sso/cache/` (misalnya, `kiro-auth-token.json` dan file dengan nama hash), gunakan `kiro-auth-token.json` di `KIRO_CLI_DB_FILE`. Gateway akan secara otomatis memuat file lainnya.
 
 </details>
 
@@ -168,7 +168,7 @@ Jika Anda menggunakan `kiro-cli` atau Kiro IDE dengan AWS SSO (AWS IAM Identity 
 Bekerja dengan akun Builder ID gratis dan akun perusahaan.
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
 
 # Password untuk melindungi server proxy ANDA
 PROXY_API_KEY="my-super-secret-password-123"
@@ -386,7 +386,7 @@ docker run -d \
 docker run -d \
   -p 8000:8000 \
   -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
   -e PROXY_API_KEY="my-super-secret-password-123" \
   --name kiro-gateway \
   ghcr.io/jwadow/kiro-gateway:latest
@@ -397,7 +397,7 @@ docker run -d \
 docker run -d `
   -p 8000:8000 `
   -v ${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro `
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
   -e PROXY_API_KEY="my-super-secret-password-123" `
   --name kiro-gateway `
   ghcr.io/jwadow/kiro-gateway:latest

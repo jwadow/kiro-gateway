@@ -120,7 +120,7 @@ python main.py --port 9000
 - **Enterprise** - SSO を使用した企業アカウント用
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/kiro-auth-token.json"
 
 # プロキシサーバーを保護するパスワード（任意の安全な文字列を設定）
 # ゲートウェイに接続する際に api_key として使用します
@@ -141,7 +141,7 @@ PROXY_API_KEY="my-super-secret-password-123"
 }
 ```
 
-> **注意：** `~/.aws/sso/cache/` に 2 つの JSON ファイルがある場合（例：`kiro-auth-token.json` とハッシュ名のファイル）、`KIRO_CREDS_FILE` で `kiro-auth-token.json` を使用してください。ゲートウェイが他のファイルを自動的に読み込みます。
+> **注意：** `~/.aws/sso/cache/` に 2 つの JSON ファイルがある場合（例：`kiro-auth-token.json` とハッシュ名のファイル）、`KIRO_CLI_DB_FILE` で `kiro-auth-token.json` を使用してください。ゲートウェイが他のファイルを自動的に読み込みます。
 
 </details>
 
@@ -168,7 +168,7 @@ AWS SSO (AWS IAM Identity Center) で `kiro-cli` または Kiro IDE を使用し
 無料の Builder ID アカウントと企業アカウントの両方で動作します。
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
 
 # プロキシサーバーを保護するパスワード
 PROXY_API_KEY="my-super-secret-password-123"
@@ -386,7 +386,7 @@ docker run -d \
 docker run -d \
   -p 8000:8000 \
   -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
   -e PROXY_API_KEY="my-super-secret-password-123" \
   --name kiro-gateway \
   ghcr.io/jwadow/kiro-gateway:latest
@@ -397,7 +397,7 @@ docker run -d \
 docker run -d `
   -p 8000:8000 `
   -v ${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro `
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
   -e PROXY_API_KEY="my-super-secret-password-123" `
   --name kiro-gateway `
   ghcr.io/jwadow/kiro-gateway:latest

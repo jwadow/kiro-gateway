@@ -120,7 +120,7 @@ Works with:
 - **Enterprise** - for corporate accounts with SSO
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/kiro-auth-token.json"
 
 # Password to protect YOUR proxy server (make up any secure string)
 # You'll use this as api_key when connecting to your gateway
@@ -141,7 +141,7 @@ PROXY_API_KEY="my-super-secret-password-123"
 }
 ```
 
-> **Note:** If you have two JSON files in `~/.aws/sso/cache/` (e.g., `kiro-auth-token.json` and a file with a hash name), use `kiro-auth-token.json` in `KIRO_CREDS_FILE`. The gateway will automatically load the other file.
+> **Note:** If you have two JSON files in `~/.aws/sso/cache/` (e.g., `kiro-auth-token.json` and a file with a hash name), use `kiro-auth-token.json` in `KIRO_CLI_DB_FILE`. The gateway will automatically load the other file.
 
 </details>
 
@@ -168,7 +168,7 @@ If you use `kiro-cli` or Kiro IDE with AWS SSO (AWS IAM Identity Center), the ga
 Works with both free Builder ID accounts and corporate accounts.
 
 ```env
-KIRO_CREDS_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
 
 # Password to protect YOUR proxy server
 PROXY_API_KEY="my-super-secret-password-123"
@@ -386,7 +386,7 @@ docker run -d \
 docker run -d \
   -p 8000:8000 \
   -v ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro \
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json \
   -e PROXY_API_KEY="my-super-secret-password-123" \
   --name kiro-gateway \
   ghcr.io/jwadow/kiro-gateway:latest
@@ -397,7 +397,7 @@ docker run -d \
 docker run -d `
   -p 8000:8000 `
   -v ${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro `
-  -e KIRO_CREDS_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
+  -e KIRO_CLI_DB_FILE=/home/kiro/.aws/sso/cache/kiro-auth-token.json `
   -e PROXY_API_KEY="my-super-secret-password-123" `
   --name kiro-gateway `
   ghcr.io/jwadow/kiro-gateway:latest

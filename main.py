@@ -61,7 +61,7 @@ from kiro.config import (
     REFRESH_TOKEN,
     PROFILE_ARN,
     REGION,
-    KIRO_CREDS_FILE,
+    KIRO_CLI_DB_FILE,
     KIRO_CLI_DB_FILE,
     PROXY_API_KEY,
     LOG_LEVEL,
@@ -212,7 +212,7 @@ def validate_configuration() -> None:
     
     Priority:
     1. credentials.json (Account System) - if exists, skip legacy validation
-    2. Legacy .env variables (REFRESH_TOKEN, KIRO_CREDS_FILE, KIRO_CLI_DB_FILE)
+    2. Legacy .env variables (REFRESH_TOKEN, KIRO_CLI_DB_FILE, KIRO_CLI_DB_FILE)
     
     Checks:
     - Either credentials.json exists OR legacy variables are configured
@@ -238,15 +238,15 @@ def validate_configuration() -> None:
     
     # Check for credentials (from .env or environment variables)
     has_refresh_token = bool(REFRESH_TOKEN)
-    has_creds_file = bool(KIRO_CREDS_FILE)
+    has_creds_file = bool(KIRO_CLI_DB_FILE)
     has_cli_db = bool(KIRO_CLI_DB_FILE)
     
     # Check if creds file actually exists
-    if KIRO_CREDS_FILE:
-        creds_path = Path(KIRO_CREDS_FILE).expanduser()
+    if KIRO_CLI_DB_FILE:
+        creds_path = Path(KIRO_CLI_DB_FILE).expanduser()
         if not creds_path.exists():
             has_creds_file = False
-            logger.warning(f"KIRO_CREDS_FILE not found: {KIRO_CREDS_FILE}")
+            logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
     
     # Check if CLI database file actually exists
     if KIRO_CLI_DB_FILE:
@@ -269,7 +269,7 @@ def validate_configuration() -> None:
                 "2. Edit .env and configure your credentials:\n"
                 "   2.1. Set you super-secret password as PROXY_API_KEY\n"
                 "   2.2. Set your Kiro credentials:\n"
-                "      - Option 1: KIRO_CREDS_FILE to your Kiro credentials JSON file\n"
+                "      - Option 1: KIRO_CLI_DB_FILE to your Kiro credentials JSON file\n"
                 "      - Option 2: REFRESH_TOKEN from Kiro IDE traffic\n"
                 "      - Option 3: KIRO_CLI_DB_FILE to kiro-cli SQLite database\n"
                 "\n"
@@ -289,7 +289,7 @@ def validate_configuration() -> None:
                 "   PROXY_API_KEY=\"my-super-secret-password-123\"\n"
                 "\n"
                 "   Option 1 (Recommended): JSON credentials file\n"
-                "      KIRO_CREDS_FILE=\"path/to/your/kiro-credentials.json\"\n"
+                "      KIRO_CLI_DB_FILE=\"path/to/your/kiro-credentials.json\"\n"
                 "\n"
                 "   Option 2: Refresh token\n"
                 "      REFRESH_TOKEN=\"your_refresh_token_here\"\n"
@@ -362,7 +362,7 @@ async def lifespan(app: FastAPI):
     
     # Check if we have legacy .env credentials
     has_refresh_token = bool(REFRESH_TOKEN)
-    has_creds_file = bool(KIRO_CREDS_FILE) and Path(KIRO_CREDS_FILE).expanduser().exists()
+    has_creds_file = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
     has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
     
     # Helper function to add optional per-account overrides from .env
@@ -398,7 +398,7 @@ async def lifespan(app: FastAPI):
                 elif has_creds_file:
                     entry = {
                         "type": "json",
-                        "path": KIRO_CREDS_FILE
+                        "path": KIRO_CLI_DB_FILE
                     }
                     _add_env_overrides(entry)
                     credentials.append(entry)
@@ -432,7 +432,7 @@ async def lifespan(app: FastAPI):
             elif has_creds_file:
                 entry = {
                     "type": "json",
-                    "path": KIRO_CREDS_FILE
+                    "path": KIRO_CLI_DB_FILE
                 }
                 _add_env_overrides(entry)
                 credentials.append(entry)

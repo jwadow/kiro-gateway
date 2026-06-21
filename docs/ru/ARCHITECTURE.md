@@ -133,7 +133,7 @@ kiro-gateway/
 1. **Конфигурацию логирования** — настройка Loguru с цветным выводом
 2. **Валидацию конфигурации** — функция `validate_configuration()` проверяет:
    - Наличие файла `.env`
-   - Наличие credentials (REFRESH_TOKEN или KIRO_CREDS_FILE)
+   - Наличие credentials (REFRESH_TOKEN или KIRO_CLI_DB_FILE)
 3. **Lifespan Manager** — создание и инициализация:
    - `KiroAuthManager` для управления токенами
    - `ModelInfoCache` для кэширования моделей
@@ -150,7 +150,7 @@ kiro-gateway/
 | `REFRESH_TOKEN` | Refresh token Kiro | из `.env` |
 | `PROFILE_ARN` | ARN профиля AWS CodeWhisperer | из `.env` |
 | `REGION` | Регион AWS | `us-east-1` |
-| `KIRO_CREDS_FILE` | Путь к JSON файлу credentials | из `.env` |
+| `KIRO_CLI_DB_FILE` | Путь к JSON файлу credentials | из `.env` |
 | `TOKEN_REFRESH_THRESHOLD` | Время до обновления токена | 600 сек (10 мин) |
 | `MAX_RETRIES` | Макс. количество повторов | 3 |
 | `BASE_RETRY_DELAY` | Базовая задержка retry | 1.0 сек |
@@ -630,7 +630,7 @@ PROXY_API_KEY="your_proxy_secret"
 # Опциональные
 PROFILE_ARN="arn:aws:codewhisperer:..."
 KIRO_REGION="us-east-1"
-KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"
+KIRO_CLI_DB_FILE="~/.aws/sso/cache/kiro-auth-token.json"
 
 # Отладка
 DEBUG_MODE="off"  # off/errors/all
