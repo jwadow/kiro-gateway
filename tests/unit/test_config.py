@@ -514,6 +514,46 @@ class TestKiroCliDbFileConfig:
             assert str(path) == config_module.KIRO_CLI_DB_FILE
 
 
+class TestKiroCliModelListConfig:
+    """Tests for Kiro CLI model list discovery configuration."""
+
+    def test_kiro_cli_model_list_defaults(self, monkeypatch):
+        """
+        What it does: Verifies default Kiro CLI model discovery settings.
+        Purpose: Ensure sqlite runtime accounts use CLI discovery by default.
+        """
+        import importlib
+        import kiro.config as config_module
+
+        monkeypatch.delenv("KIRO_CLI_LIST_MODELS_ENABLED", raising=False)
+        monkeypatch.delenv("KIRO_CLI_LIST_MODELS_COMMAND", raising=False)
+        monkeypatch.delenv("KIRO_CLI_LIST_MODELS_TIMEOUT_SECONDS", raising=False)
+
+        importlib.reload(config_module)
+
+        assert config_module.KIRO_CLI_LIST_MODELS_ENABLED is True
+        assert config_module.KIRO_CLI_LIST_MODELS_COMMAND == "kiro-cli"
+        assert config_module.KIRO_CLI_LIST_MODELS_TIMEOUT_SECONDS == 10.0
+
+    def test_kiro_cli_model_list_env_overrides(self, monkeypatch):
+        """
+        What it does: Verifies environment overrides for Kiro CLI discovery.
+        Purpose: Let users disable CLI discovery or point to a custom executable.
+        """
+        import importlib
+        import kiro.config as config_module
+
+        monkeypatch.setenv("KIRO_CLI_LIST_MODELS_ENABLED", "false")
+        monkeypatch.setenv("KIRO_CLI_LIST_MODELS_COMMAND", "C:\\tools\\kiro-cli.exe")
+        monkeypatch.setenv("KIRO_CLI_LIST_MODELS_TIMEOUT_SECONDS", "3.5")
+
+        importlib.reload(config_module)
+
+        assert config_module.KIRO_CLI_LIST_MODELS_ENABLED is False
+        assert config_module.KIRO_CLI_LIST_MODELS_COMMAND == "C:\\tools\\kiro-cli.exe"
+        assert config_module.KIRO_CLI_LIST_MODELS_TIMEOUT_SECONDS == 3.5
+
+
 class TestFallbackModelsConfig:
     """Tests for FALLBACK_MODELS configuration."""
     

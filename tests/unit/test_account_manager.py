@@ -23,12 +23,81 @@ from kiro.account_manager import (
     AccountStats,
     ModelAccountList,
     AccountManager,
+    _extract_model_ids,
+    _log_model_source_snapshot,
     _format_duration
 )
 from kiro.account_errors import ErrorType
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
+from kiro.cli_models import KiroCliModelList, KiroCliModelListError
 from kiro.model_resolver import ModelResolver
+
+
+class TestModelSourceDiagnostics:
+    """
+    Tests for debug-only model source diagnostic helpers.
+    """
+
+    def test_extract_model_ids_skips_malformed_entries(self):
+        """
+        What it does: Extracts only valid model IDs from mixed source data.
+        Purpose: Keep diagnostic snapshots stable with malformed upstream data.
+        """
+        model_ids = _extract_model_ids([
+            {"modelId": "claude-sonnet-4.5"},
+            {"modelId": ""},
+            {"modelId": None},
+            {"name": "missing-id"},
+            "not-a-dict",
+            {"modelId": "claude-opus-4.8"},
+        ])
+
+        assert model_ids == ["claude-sonnet-4.5", "claude-opus-4.8"]
+
+    def test_log_model_source_snapshot_writes_selected_source_data(self, tmp_path):
+        """
+        What it does: Writes the selected model source snapshot to JSONL.
+        Purpose: Preserve the exact source used to populate the model cache.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        models_data = [
+            {"modelId": "claude-sonnet-4.5"},
+            {"modelId": "claude-opus-4.8"},
+        ]
+        raw_payload = {"models": models_data}
+
+        with patch("kiro.debug_logger.DEBUG_MODE", "all"):
+            from kiro.debug_logger import debug_logger
+            debug_logger.debug_dir = debug_dir
+
+            _log_model_source_snapshot(
+                account_id="account-1",
+                source="list_available_models",
+                models_data=models_data,
+                raw_payload=raw_payload,
+                endpoint="https://q.example.com/ListAvailableModels",
+                status_code=200,
+            )
+
+        records = [
+            json.loads(line)
+            for line in (debug_dir / "model_source_snapshots.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        assert records == [
+            {
+                "event": "model_source_snapshot",
+                "account_id": "account-1",
+                "source": "list_available_models",
+                "model_count": 2,
+                "model_ids": ["claude-sonnet-4.5", "claude-opus-4.8"],
+                "raw_payload": raw_payload,
+                "endpoint": "https://q.example.com/ListAvailableModels",
+                "status_code": 200,
+            }
+        ]
 
 
 class TestAccountDataclass:
@@ -820,6 +889,163 @@ class TestAccountManagerInitializeAccount:
         print(f"Initialization success: {success}")
         assert success is True  # Should succeed with fallback
         assert manager._accounts[account_id].model_cache is not None
+
+    @pytest.mark.asyncio
+    async def test_initialize_runtime_sqlite_account_uses_kiro_cli_models(self, tmp_path, temp_sqlite_db):
+        """
+        Test runtime sqlite account initialization with kiro-cli model discovery.
+
+        What it does: Initializes a sqlite account and uses kiro-cli model JSON.
+        Purpose: Ensure runtime accounts use entitlement-aware model lists.
+        """
+        print("\n=== Test: initialize runtime sqlite account with kiro-cli models ===")
+
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "sqlite", "path": temp_sqlite_db, "enabled": True}
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = str(Path(temp_sqlite_db).resolve())
+
+        cli_model_list = KiroCliModelList(
+            models=[
+                {
+                    "modelId": "auto",
+                    "modelName": "auto",
+                    "description": "Auto",
+                    "tokenLimits": {"maxInputTokens": 1000000},
+                    "_source": "kiro_cli",
+                },
+                {
+                    "modelId": "claude-opus-4.8",
+                    "modelName": "claude-opus-4.8",
+                    "description": "Experimental preview",
+                    "tokenLimits": {"maxInputTokens": 1000000},
+                    "_source": "kiro_cli",
+                },
+            ],
+            default_model="claude-opus-4.8",
+            raw_payload={"models": [{"model_id": "claude-opus-4.8"}]},
+        )
+
+        with patch(
+            "kiro.account_manager.fetch_kiro_cli_models",
+            AsyncMock(return_value=cli_model_list),
+        ) as mock_fetch:
+            # Act
+            success = await manager._initialize_account(account_id)
+
+        # Assert
+        assert success is True
+        mock_fetch.assert_awaited_once()
+        account = manager._accounts[account_id]
+        assert account.credential_type == "sqlite"
+        assert account.model_cache is not None
+        assert account.model_cache.get_max_input_tokens("claude-opus-4.8") == 1000000
+        assert "claude-opus-4.8" in account.model_resolver.get_available_models()
+        assert "claude-opus-4.8" in manager._model_to_accounts
+
+    @pytest.mark.asyncio
+    async def test_initialize_runtime_sqlite_account_falls_back_when_kiro_cli_fails(self, tmp_path, temp_sqlite_db):
+        """
+        Test runtime sqlite account initialization when kiro-cli model discovery fails.
+
+        What it does: Simulates a kiro-cli failure and initializes with fallback models.
+        Purpose: Keep gateway startup resilient when kiro-cli is unavailable.
+        """
+        print("\n=== Test: initialize runtime sqlite account with kiro-cli failure ===")
+
+        # Arrange
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "sqlite", "path": temp_sqlite_db, "enabled": True}
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = str(Path(temp_sqlite_db).resolve())
+
+        with patch(
+            "kiro.account_manager.fetch_kiro_cli_models",
+            AsyncMock(side_effect=KiroCliModelListError("not logged in")),
+        ) as mock_fetch:
+            # Act
+            success = await manager._initialize_account(account_id)
+
+        # Assert
+        assert success is True
+        mock_fetch.assert_awaited_once()
+        account = manager._accounts[account_id]
+        assert account.model_cache is not None
+        assert "claude-opus-4.7" in account.model_resolver.get_available_models()
+        assert "claude-opus-4.8" not in account.model_resolver.get_available_models()
+
+    @pytest.mark.asyncio
+    async def test_refresh_runtime_sqlite_account_uses_kiro_cli_models(self, tmp_path):
+        """
+        Test runtime sqlite account model refresh with kiro-cli model discovery.
+
+        What it does: Refreshes an initialized runtime account from kiro-cli output.
+        Purpose: Ensure TTL refresh can discover newly available runtime models.
+        """
+        print("\n=== Test: refresh runtime sqlite account with kiro-cli models ===")
+
+        # Arrange
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json")
+        )
+        account_id = "sqlite-account"
+
+        model_cache = ModelInfoCache()
+        await model_cache.update([{"modelId": "auto"}])
+        model_resolver = ModelResolver(
+            cache=model_cache,
+            hidden_models={},
+            aliases={},
+            hidden_from_list=[],
+        )
+        auth_manager = Mock()
+        auth_manager.api_host = "https://runtime.us-east-1.kiro.dev"
+
+        manager._accounts[account_id] = Account(
+            id=account_id,
+            auth_manager=auth_manager,
+            credential_type="sqlite",
+            model_cache=model_cache,
+            model_resolver=model_resolver,
+            models_cached_at=time.time() - 999999,
+        )
+
+        cli_model_list = KiroCliModelList(
+            models=[
+                {"modelId": "auto", "tokenLimits": {"maxInputTokens": 1000000}},
+                {"modelId": "claude-opus-4.8", "tokenLimits": {"maxInputTokens": 1000000}},
+            ],
+            default_model="auto",
+            raw_payload={"models": [{"model_id": "claude-opus-4.8"}]},
+        )
+
+        with patch(
+            "kiro.account_manager.fetch_kiro_cli_models",
+            AsyncMock(return_value=cli_model_list),
+        ) as mock_fetch:
+            # Act
+            await manager._refresh_account_models(account_id)
+
+        # Assert
+        mock_fetch.assert_awaited_once()
+        assert manager._accounts[account_id].model_cache.is_valid_model("claude-opus-4.8")
+        assert "claude-opus-4.8" in manager._model_to_accounts
 
 
 class TestAccountManagerGetNextAccount:

@@ -1402,6 +1402,35 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
 # Main Payload Building
 # ==================================================================================================
 
+def _build_additional_model_request_fields(
+    native_thinking: Optional[Dict[str, Any]],
+    native_output_config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Build Kiro Runtime native model parameters.
+
+    Kiro CLI sends adaptive-thinking fields on the command-level
+    ``additionalModelRequestFields`` object, not inside
+    ``conversationState.currentMessage.userInputMessage``.
+
+    Args:
+        native_thinking: Raw Anthropic ``thinking`` dict from the client.
+        native_output_config: Raw Anthropic ``output_config`` dict from the client.
+
+    Returns:
+        Command-level additional model fields, or None when no native fields exist.
+    """
+    additional_fields: Dict[str, Any] = {}
+
+    if native_thinking is not None:
+        additional_fields["thinking"] = dict(native_thinking)
+
+    if native_output_config is not None:
+        additional_fields["output_config"] = dict(native_output_config)
+
+    return additional_fields or None
+
+
 def build_kiro_payload(
     messages: List[UnifiedMessage],
     system_prompt: str,
@@ -1409,14 +1438,16 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    native_thinking: Optional[Dict[str, Any]] = None,
+    native_output_config: Optional[Dict[str, Any]] = None,
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
-    
+
     This is the main function that assembles the Kiro API payload from
     API-agnostic unified message and tool formats.
-    
+
     Args:
         messages: List of messages in unified format (without system messages)
         system_prompt: Already extracted system prompt
@@ -1424,14 +1455,23 @@ def build_kiro_payload(
         tools: List of tools in unified format (or None)
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
-        thinking_config: Thinking configuration from API adapter
-    
+        thinking_config: Thinking configuration from API adapter (legacy fake-reasoning path)
+        native_thinking: Raw Anthropic ``thinking`` dict to forward to the Kiro backend
+            through command-level ``additionalModelRequestFields``. When provided,
+            fake-reasoning tag injection is skipped.
+        native_output_config: Raw Anthropic ``output_config`` dict (e.g. ``{"effort": ...}``)
+            to forward through command-level ``additionalModelRequestFields``.
+
     Returns:
         KiroPayloadResult with payload and tool documentation
-    
+
     Raises:
         ValueError: If there are no messages to send
     """
+    # When native thinking/output_config are forwarded, the model handles
+    # reasoning itself — do NOT inject fake-reasoning tags or the legitimizing
+    # system prompt addition.
+    use_native_thinking = native_thinking is not None or native_output_config is not None
     # Process tools with long descriptions
     processed_tools, tool_documentation = process_tools_with_long_descriptions(tools)
     
@@ -1443,10 +1483,13 @@ def build_kiro_payload(
     if tool_documentation:
         full_system_prompt = full_system_prompt + tool_documentation if full_system_prompt else tool_documentation.strip()
     
-    # Add thinking mode legitimization to system prompt if enabled
-    thinking_system_addition = get_thinking_system_prompt_addition()
-    if thinking_system_addition:
-        full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
+    # Add thinking mode legitimization to system prompt if enabled.
+    # Skip when forwarding native thinking — the model reasons natively and
+    # the fake-reasoning legitimization is irrelevant.
+    if not use_native_thinking:
+        thinking_system_addition = get_thinking_system_prompt_addition()
+        if thinking_system_addition:
+            full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
     
     # Add truncation recovery legitimization to system prompt if enabled
     truncation_system_addition = get_truncation_recovery_system_addition()
@@ -1546,25 +1589,26 @@ def build_kiro_payload(
         if tool_results:
             user_input_context["toolResults"] = tool_results
     
-    # Inject thinking tags if enabled (only for the current/last user message)
-    if current_message.role == "user":
+    # Inject thinking tags if enabled (only for the current/last user message).
+    # Skip when forwarding native thinking — the backend model reasons natively.
+    if current_message.role == "user" and not use_native_thinking:
         current_content = inject_thinking_tags(current_content, thinking_config)
-    
+
     # Build userInputMessage
     user_input_message = {
         "content": current_content,
         "modelId": model_id,
         "origin": "AI_EDITOR",
     }
-    
+
     # Add images directly to userInputMessage (NOT to userInputMessageContext)
     if kiro_images:
         user_input_message["images"] = kiro_images
-    
+
     # Add user_input_context if present (contains tools and toolResults only)
     if user_input_context:
         user_input_message["userInputMessageContext"] = user_input_context
-    
+
     # Assemble final payload
     payload = {
         "conversationState": {
@@ -1583,6 +1627,19 @@ def build_kiro_payload(
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn
+
+    # Forward native thinking / output_config for newer models. Kiro Runtime expects
+    # these fields at the command level, matching Kiro CLI's GenerateAssistantResponseCommand.
+    additional_model_request_fields = _build_additional_model_request_fields(
+        native_thinking=native_thinking,
+        native_output_config=native_output_config,
+    )
+    if additional_model_request_fields is not None:
+        payload["additionalModelRequestFields"] = additional_model_request_fields
+        logger.debug(
+            "Forwarding native thinking/output_config to Kiro additionalModelRequestFields: "
+            f"{additional_model_request_fields}"
+        )
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:

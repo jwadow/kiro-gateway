@@ -138,11 +138,28 @@ async def get_models(request: Request):
     # Get available models based on mode
     if request.app.state.account_system:
         # Account system: collect models from all initialized accounts
+        model_source = "account_system"
         available_model_ids = request.app.state.account_manager.get_all_available_models()
     else:
         # Legacy: use resolver from first account
+        model_source = "legacy"
         account = request.app.state.account_manager.get_first_account()
         available_model_ids = account.model_resolver.get_available_models()
+
+    try:
+        from kiro.debug_logger import debug_logger
+    except ImportError as exc:
+        logger.debug(f"Debug logger unavailable for /v1/models snapshot: {exc}")
+    else:
+        debug_logger.append_jsonl_artifact(
+            "models_endpoint_snapshots.jsonl",
+            {
+                "event": "v1_models_response",
+                "source": model_source,
+                "model_count": len(available_model_ids),
+                "model_ids": available_model_ids,
+            },
+        )
     
     # Build OpenAI-compatible model list
     openai_models = [

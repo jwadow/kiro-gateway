@@ -5,7 +5,9 @@ Unit tests for AwsEventStreamParser and auxiliary parsing functions.
 Tests the parsing logic for AWS SSE stream from Kiro API.
 """
 
+import json
 import pytest
+from unittest.mock import patch
 
 from kiro.parsers import (
     AwsEventStreamParser,
@@ -429,6 +431,39 @@ class TestAwsEventStreamParserFeed:
         assert len(events) == 1
         assert events[0]["type"] == "content"
         assert events[0]["data"] == "Hello World"
+
+    def test_logs_runtime_model_id_summary_without_changing_event(self, aws_event_parser, tmp_path):
+        """
+        What it does: Verifies content events with modelId write a debug summary.
+        Goal: Preserve raw-source diagnostics without changing parser output.
+        """
+        debug_dir = tmp_path / "debug_logs"
+
+        with patch("kiro.debug_logger.DEBUG_MODE", "all"):
+            from kiro.debug_logger import debug_logger
+            debug_logger.debug_dir = debug_dir
+
+            events = aws_event_parser.feed(
+                b'{"content":"Hello World","modelId":"claude-opus-4.8"}'
+            )
+
+        assert events == [{"type": "content", "data": "Hello World"}]
+
+        file_path = debug_dir / "runtime_content_events.jsonl"
+        assert file_path.exists()
+        records = [
+            json.loads(line)
+            for line in file_path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert records == [
+            {
+                "event": "runtime_content",
+                "model_id": "claude-opus-4.8",
+                "keys": ["content", "modelId"],
+                "content_length": 11,
+                "followup_prompt": False,
+            }
+        ]
     
     def test_parses_multiple_content_events(self, aws_event_parser):
         """

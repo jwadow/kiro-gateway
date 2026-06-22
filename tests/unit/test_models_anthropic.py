@@ -38,6 +38,7 @@ from kiro.models_anthropic import (
     # Request models
     SystemContentBlock,
     AnthropicMessagesRequest,
+    AnthropicCountTokensRequest,
     # Response models
     AnthropicUsage,
     AnthropicMessagesResponse,
@@ -620,6 +621,101 @@ class TestAnthropicMessagesRequestWithImages:
         assert request.messages[2].content == "Can you describe it in more detail?"
         
         print("Multi-turn conversation with images validated successfully!")
+
+
+# ==================================================================================================
+# Tests for AnthropicMessagesRequest System Message Compatibility
+# ==================================================================================================
+
+class TestAnthropicMessagesRequestSystemMessageCompatibility:
+    """Tests for compatibility with non-standard system messages."""
+
+    def test_hoists_system_message_into_top_level_system(self):
+        """
+        What it does: Verifies role="system" messages are moved to top-level system.
+        Purpose: Ensure Claude Code compatible payloads do not fail request validation.
+        """
+        print("Setup: Creating request with top-level system and message-level system...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=1024,
+            system=[
+                {
+                    "type": "text",
+                    "text": "Top-level system.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": "Compatibility system."},
+                {"role": "assistant", "content": "Hi"},
+            ],
+        )
+
+        print(f"Result messages: {request.messages}")
+        print(f"Result system: {request.system}")
+        assert [message.role for message in request.messages] == ["user", "assistant"]
+        assert request.system is not None
+        assert len(request.system) == 2
+        assert request.system[0].text == "Top-level system."
+        assert request.system[0].cache_control == {"type": "ephemeral"}
+        assert request.system[1].text == "Compatibility system."
+
+    def test_preserves_system_message_content_blocks(self):
+        """
+        What it does: Verifies system content blocks are preserved when hoisted.
+        Purpose: Ensure prompt caching metadata survives compatibility normalization.
+        """
+        print("Setup: Creating request with system message content blocks...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=1024,
+            system="Existing system.",
+            messages=[
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Cached compatibility system.",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Hello"},
+            ],
+        )
+
+        print(f"Result messages: {request.messages}")
+        print(f"Result system: {request.system}")
+        assert [message.role for message in request.messages] == ["user"]
+        assert request.system is not None
+        assert len(request.system) == 2
+        assert request.system[0].text == "Existing system."
+        assert request.system[1].text == "Cached compatibility system."
+        assert request.system[1].cache_control == {"type": "ephemeral"}
+
+    def test_count_tokens_request_hoists_system_message(self):
+        """
+        What it does: Verifies count-tokens requests normalize system messages too.
+        Purpose: Ensure Anthropic request compatibility is consistent across endpoints.
+        """
+        print("Setup: Creating count-tokens request with message-level system...")
+        request = AnthropicCountTokensRequest(
+            model="claude-opus-4-8",
+            messages=[
+                {"role": "system", "content": "Count tokens system."},
+                {"role": "user", "content": "Hello"},
+            ],
+        )
+
+        print(f"Result messages: {request.messages}")
+        print(f"Result system: {request.system}")
+        assert [message.role for message in request.messages] == ["user"]
+        assert request.system is not None
+        assert len(request.system) == 1
+        assert request.system[0].text == "Count tokens system."
 
 
 # ==================================================================================================

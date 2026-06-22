@@ -26,9 +26,11 @@ Anthropic's Messages API specification.
 Reference: https://docs.anthropic.com/en/api/messages
 """
 
+import json
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
+from loguru import logger
 
 
 # ==================================================================================================
@@ -294,6 +296,136 @@ class SystemContentBlock(BaseModel):
 SystemPrompt = Union[str, List[SystemContentBlock], List[Dict[str, Any]]]
 
 
+def _stringify_system_content(value: Any) -> str:
+    """
+    Convert unsupported system content values to readable text.
+
+    Args:
+        value: Raw value found in a system message content block.
+
+    Returns:
+        Text representation suitable for a top-level system text block.
+    """
+    if isinstance(value, str):
+        return value
+
+    if value is None:
+        return ""
+
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _system_content_to_blocks(content: Any) -> List[Dict[str, Any]]:
+    """
+    Convert raw system message content to Anthropic system text blocks.
+
+    Args:
+        content: Content from a raw message with role="system".
+
+    Returns:
+        List of top-level system text blocks.
+    """
+    if isinstance(content, list):
+        blocks = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    blocks.append(dict(block))
+                else:
+                    blocks.append(
+                        {
+                            "type": "text",
+                            "text": _stringify_system_content(block),
+                        }
+                    )
+            elif hasattr(block, "type") and getattr(block, "type") == "text":
+                if hasattr(block, "model_dump"):
+                    blocks.append(block.model_dump())
+                else:
+                    blocks.append(
+                        {
+                            "type": "text",
+                            "text": getattr(block, "text", ""),
+                        }
+                    )
+            else:
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": _stringify_system_content(block),
+                    }
+                )
+        return blocks
+
+    return [{"type": "text", "text": _stringify_system_content(content)}]
+
+
+def _system_prompt_to_blocks(system: Any) -> List[Dict[str, Any]]:
+    """
+    Convert an existing top-level system prompt to system text blocks.
+
+    Args:
+        system: Existing system prompt in string, block list, or model form.
+
+    Returns:
+        List of top-level system text blocks.
+    """
+    if system is None:
+        return []
+
+    return _system_content_to_blocks(system)
+
+
+def _merge_system_messages_into_system(data: Any) -> Any:
+    """
+    Move non-standard Anthropic system messages into the top-level system field.
+
+    Some Claude Code compatible clients may send role="system" inside
+    messages while also sending the official top-level system field. Anthropic's
+    Messages API only allows user/assistant roles in messages, so the gateway
+    normalizes that compatibility format before strict message validation.
+
+    Args:
+        data: Raw request data passed to the Pydantic model.
+
+    Returns:
+        Request data with system messages hoisted to top-level system.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return data
+
+    normalized_messages = []
+    hoisted_system_blocks = []
+
+    for message in messages:
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        if role == "system":
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+            hoisted_system_blocks.extend(_system_content_to_blocks(content))
+            continue
+        normalized_messages.append(message)
+
+    if not hoisted_system_blocks:
+        return data
+
+    normalized_data = dict(data)
+    normalized_data["messages"] = normalized_messages
+    normalized_data["system"] = _system_prompt_to_blocks(data.get("system")) + hoisted_system_blocks
+
+    logger.info(
+        f"Normalized {len(hoisted_system_blocks)} Anthropic system message block(s) "
+        "into the top-level system field"
+    )
+    return normalized_data
+
+
 class AnthropicMessagesRequest(BaseModel):
     """
     Request to Anthropic Messages API (/v1/messages).
@@ -322,7 +454,12 @@ class AnthropicMessagesRequest(BaseModel):
     stream: bool = False
 
     # Extended thinking (official Anthropic parameter)
+    # Newer models use {"type": "adaptive"}; older ones {"type": "enabled", "budget_tokens": N}
     thinking: Optional[Dict[str, Any]] = None
+
+    # Output configuration (newer Anthropic parameter, e.g. {"effort": "high"})
+    # Replaces thinking.budget_tokens on Opus 4.6+, Sonnet 4.6, Opus 4.7/4.8, Fable 5, etc.
+    output_config: Optional[Dict[str, Any]] = None
 
     # Tools
     tools: Optional[List[AnthropicTool]] = None
@@ -338,6 +475,20 @@ class AnthropicMessagesRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_system_messages(cls, data: Any) -> Any:
+        """
+        Normalize compatibility system messages before strict validation.
+
+        Args:
+            data: Raw request payload.
+
+        Returns:
+            Payload with role="system" messages moved to top-level system.
+        """
+        return _merge_system_messages_into_system(data)
 
 
 class AnthropicCountTokensRequest(BaseModel):
@@ -362,6 +513,20 @@ class AnthropicCountTokensRequest(BaseModel):
     tools: Optional[List[AnthropicTool]] = None
     
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_system_messages(cls, data: Any) -> Any:
+        """
+        Normalize compatibility system messages before strict validation.
+
+        Args:
+            data: Raw count-tokens request payload.
+
+        Returns:
+            Payload with role="system" messages moved to top-level system.
+        """
+        return _merge_system_messages_into_system(data)
 
 
 # ==================================================================================================

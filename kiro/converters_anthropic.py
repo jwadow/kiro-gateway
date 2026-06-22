@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
-from kiro.model_resolver import get_model_id_for_kiro
+from kiro.model_resolver import get_model_id_for_kiro, model_supports_native_thinking
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessage,
@@ -372,30 +372,35 @@ def convert_anthropic_tools(
 
 def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) -> ThinkingConfig:
     """
-    Extract thinking configuration from Anthropic request.
-    
+    Extract thinking configuration from Anthropic request (legacy fake-reasoning path).
+
+    This is only used for older models that do NOT support native adaptive thinking.
+    Newer models forward `thinking`/`output_config` verbatim instead (see
+    anthropic_to_kiro and model_supports_native_thinking).
+
     Handles thinking parameter:
     - {"type": "enabled", "budget_tokens": N} → enabled with budget
+    - {"type": "adaptive"} → enabled with default budget (no explicit budget on this path)
     - {"type": "disabled"} → disabled
     - None → enabled with default budget
-    
+
     Args:
         request: Anthropic MessagesRequest
-    
+
     Returns:
         ThinkingConfig for core layer
-    
+
     Examples:
         >>> # No thinking specified → use defaults
         >>> request = AnthropicMessagesRequest(model="claude-sonnet-4.5", messages=[...], max_tokens=4096)
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=None)
-        
+
         >>> # Explicitly disabled
         >>> request.thinking = {"type": "disabled"}
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=False, budget_tokens=None)
-        
+
         >>> # Enabled with custom budget
         >>> request.thinking = {"type": "enabled", "budget_tokens": 8000}
         >>> extract_thinking_config_from_anthropic(request)
@@ -404,25 +409,25 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     if not request.thinking:
         # No thinking specified → use defaults
         return ThinkingConfig(enabled=True, budget_tokens=None)
-    
+
     if not isinstance(request.thinking, dict):
         # Invalid format → use defaults
         return ThinkingConfig(enabled=True, budget_tokens=None)
-    
+
     thinking_type = request.thinking.get("type")
-    
+
     if thinking_type == "disabled":
         # Explicitly disabled
         return ThinkingConfig(enabled=False, budget_tokens=None)
-    
+
     if thinking_type == "enabled":
         # Extract budget_tokens
         budget = request.thinking.get("budget_tokens")
         if budget:
             logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
         return ThinkingConfig(enabled=True, budget_tokens=budget)
-    
-    # Unknown type → use defaults
+
+    # Unknown type (including "adaptive" reaching the legacy path) → enabled with defaults
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
 
@@ -464,15 +469,38 @@ def anthropic_to_kiro(
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
     model_id = get_model_id_for_kiro(request.model, HIDDEN_MODELS)
 
-    # Extract thinking configuration from thinking parameter
+    # Decide path by model generation:
+    # - Newer adaptive-thinking models (Opus/Sonnet >= 4.6, Fable, Mythos):
+    #   forward the original `thinking` and `output_config` verbatim so the
+    #   backend Claude model handles reasoning natively.
+    # - Older models: fall back to the legacy fake-reasoning budget path.
+    use_native = model_supports_native_thinking(request.model)
+
+    native_thinking = None
+    native_output_config = None
     thinking_config = extract_thinking_config_from_anthropic(request)
 
-    logger.debug(
-        f"Converting Anthropic request: model={request.model} -> {model_id}, "
-        f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
-        f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
-    )
+    if use_native:
+        # Forward raw dicts (only if the client actually sent them)
+        if isinstance(request.thinking, dict):
+            native_thinking = request.thinking
+        native_output_config = getattr(request, "output_config", None)
+        if not isinstance(native_output_config, dict):
+            native_output_config = None
+
+        logger.debug(
+            f"Converting Anthropic request (native thinking): model={request.model} -> {model_id}, "
+            f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
+            f"system_prompt_length={len(system_prompt)}, "
+            f"thinking={native_thinking}, output_config={native_output_config}"
+        )
+    else:
+        logger.debug(
+            f"Converting Anthropic request (legacy budget): model={request.model} -> {model_id}, "
+            f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
+            f"system_prompt_length={len(system_prompt)}, "
+            f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        )
 
     # Use core function to build payload
     result = build_kiro_payload(
@@ -483,6 +511,8 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        native_thinking=native_thinking,
+        native_output_config=native_output_config,
     )
 
     return result.payload

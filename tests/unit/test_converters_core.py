@@ -6455,3 +6455,85 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+    def test_native_fields_use_additional_model_request_fields(self):
+        """
+        What it does: Verifies native thinking fields are sent at the Kiro command level.
+        Purpose: Match Kiro CLI's additionalModelRequestFields shape.
+        """
+        messages = [UnifiedMessage(role="user", content="Test message")]
+
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-opus-4.8",
+            tools=None,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=True, budget_tokens=7000),
+            native_thinking={"type": "adaptive"},
+            native_output_config={"effort": "high"},
+        )
+
+        payload = result.payload
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+        }
+        assert "thinking" not in user_input
+        assert "output_config" not in user_input
+        assert "<thinking_mode>" not in user_input["content"]
+        assert "<max_thinking_length>" not in user_input["content"]
+
+    def test_native_thinking_without_output_config_preserves_omitted_display(self):
+        """
+        What it does: Verifies adaptive native thinking preserves omitted display.
+        Purpose: Avoid deciding user-visible thinking display when the client omits it.
+        """
+        messages = [UnifiedMessage(role="user", content="Test message")]
+
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4.6",
+            tools=None,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=True),
+            native_thinking={"type": "adaptive"},
+        )
+
+        payload = result.payload
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive"},
+        }
+        assert "thinking" not in user_input
+        assert "output_config" not in user_input
+
+    def test_native_thinking_preserves_explicit_display(self):
+        """
+        What it does: Verifies an explicit adaptive display value is not overwritten.
+        Purpose: Allow clients to switch display between summarized and omitted.
+        """
+        messages = [UnifiedMessage(role="user", content="Test message")]
+
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4.6",
+            tools=None,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=True),
+            native_thinking={"type": "adaptive", "display": "omitted"},
+        )
+
+        payload = result.payload
+
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive", "display": "omitted"},
+        }

@@ -36,6 +36,38 @@ from loguru import logger
 from kiro.utils import generate_tool_call_id
 
 
+def _log_runtime_content_event(data: Dict[str, Any]) -> None:
+    """
+    Write a debug-only summary of runtime content events that carry modelId.
+
+    Args:
+        data: Parsed upstream content event data.
+    """
+    model_id = data.get("modelId")
+    if not isinstance(model_id, str) or not model_id:
+        return
+
+    content = data.get("content", "")
+    content_length = len(content) if isinstance(content, str) else None
+
+    try:
+        from kiro.debug_logger import debug_logger
+    except ImportError as exc:
+        logger.debug(f"Debug logger unavailable for runtime content event: {exc}")
+        return
+
+    debug_logger.append_jsonl_artifact(
+        "runtime_content_events.jsonl",
+        {
+            "event": "runtime_content",
+            "model_id": model_id,
+            "keys": sorted(data.keys()),
+            "content_length": content_length,
+            "followup_prompt": bool(data.get("followupPrompt")),
+        },
+    )
+
+
 def find_matching_brace(text: str, start_pos: int) -> int:
     """
     Finds the position of the closing brace considering nesting and strings.
@@ -333,6 +365,7 @@ class AwsEventStreamParser:
     
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""
+        _log_runtime_content_event(data)
         content = data.get('content', '')
         
         # Skip followupPrompt
