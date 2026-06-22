@@ -1941,7 +1941,7 @@ class TestAnthropicToKiroIntegration:
 
     def test_native_thinking_forwarded_for_newer_model(self):
         """
-        What it does: Verifies newer models forward raw thinking/output_config into userInputMessage
+        What it does: Verifies newer models forward thinking/output_config as additionalModelRequestFields
         Purpose: Adaptive-thinking generation should pass native params, NOT fake-reasoning tags
         """
         request = AnthropicMessagesRequest(
@@ -1958,9 +1958,13 @@ class TestAnthropicToKiroIntegration:
 
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
 
-        # Native params forwarded verbatim
-        assert user_input["thinking"] == {"type": "adaptive"}
-        assert user_input["output_config"] == {"effort": "high"}
+        # Native params use the command-level Kiro Runtime shape.
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "high"},
+        }
+        assert "thinking" not in user_input
+        assert "output_config" not in user_input
 
         # No fake-reasoning tags injected
         assert "<thinking_mode>" not in user_input["content"]
@@ -1988,6 +1992,7 @@ class TestAnthropicToKiroIntegration:
         # No native params on legacy path
         assert "thinking" not in user_input
         assert "output_config" not in user_input
+        assert "additionalModelRequestFields" not in payload
 
         # Fake-reasoning tags present
         assert "<max_thinking_length>6000</max_thinking_length>" in user_input["content"]
@@ -2010,7 +2015,10 @@ class TestAnthropicToKiroIntegration:
 
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
 
-        assert user_input["thinking"] == {"type": "adaptive"}
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive", "display": "summarized"},
+        }
+        assert "thinking" not in user_input
         assert "output_config" not in user_input
         assert "<thinking_mode>" not in user_input["content"]
 
