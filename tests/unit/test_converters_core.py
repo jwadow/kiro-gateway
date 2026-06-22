@@ -6479,7 +6479,7 @@ class TestBuildKiroPayloadWithThinkingConfig:
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
 
         assert payload["additionalModelRequestFields"] == {
-            "thinking": {"type": "adaptive", "display": "summarized"},
+            "thinking": {"type": "adaptive"},
             "output_config": {"effort": "high"},
         }
         assert "thinking" not in user_input
@@ -6487,10 +6487,10 @@ class TestBuildKiroPayloadWithThinkingConfig:
         assert "<thinking_mode>" not in user_input["content"]
         assert "<max_thinking_length>" not in user_input["content"]
 
-    def test_native_thinking_without_output_config_defaults_display(self):
+    def test_native_thinking_without_output_config_preserves_omitted_display(self):
         """
-        What it does: Verifies adaptive native thinking defaults display without output_config.
-        Purpose: Match Kiro CLI's summarized adaptive-thinking default.
+        What it does: Verifies adaptive native thinking preserves omitted display.
+        Purpose: Avoid deciding user-visible thinking display when the client omits it.
         """
         messages = [UnifiedMessage(role="user", content="Test message")]
 
@@ -6509,7 +6509,7 @@ class TestBuildKiroPayloadWithThinkingConfig:
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
 
         assert payload["additionalModelRequestFields"] == {
-            "thinking": {"type": "adaptive", "display": "summarized"},
+            "thinking": {"type": "adaptive"},
         }
         assert "thinking" not in user_input
         assert "output_config" not in user_input

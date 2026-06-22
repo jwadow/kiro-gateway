@@ -1960,7 +1960,7 @@ class TestAnthropicToKiroIntegration:
 
         # Native params use the command-level Kiro Runtime shape.
         assert payload["additionalModelRequestFields"] == {
-            "thinking": {"type": "adaptive", "display": "summarized"},
+            "thinking": {"type": "adaptive"},
             "output_config": {"effort": "high"},
         }
         assert "thinking" not in user_input
@@ -2016,7 +2016,7 @@ class TestAnthropicToKiroIntegration:
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
 
         assert payload["additionalModelRequestFields"] == {
-            "thinking": {"type": "adaptive", "display": "summarized"},
+            "thinking": {"type": "adaptive"},
         }
         assert "thinking" not in user_input
         assert "output_config" not in user_input

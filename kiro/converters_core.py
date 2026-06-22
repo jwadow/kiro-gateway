@@ -1423,14 +1423,7 @@ def _build_additional_model_request_fields(
     additional_fields: Dict[str, Any] = {}
 
     if native_thinking is not None:
-        thinking = dict(native_thinking)
-        if (
-            thinking.get("type") == "adaptive"
-            and "display" not in thinking
-        ):
-            # Kiro CLI defaults adaptive thinking to summarized display.
-            thinking["display"] = "summarized"
-        additional_fields["thinking"] = thinking
+        additional_fields["thinking"] = dict(native_thinking)
 
     if native_output_config is not None:
         additional_fields["output_config"] = dict(native_output_config)
