@@ -31,3 +31,6 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# temporary files
+tmp/*

@@ -261,6 +261,12 @@ HIDDEN_MODELS: Dict[str, str] = {
 # Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
 MODEL_ALIASES: Dict[str, str] = {
     "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
+    "claude-opus-4-8": "claude-opus-4.8",  # Explicit alias for clarity
+    "claude-opus-4-7": "claude-opus-4.7",  # Explicit alias for clarity
+    "claude-opus-4-6": "claude-opus-4.6",  # Explicit alias for clarity
+    "claude-opus-4-5": "claude-opus-4.5",  # Explicit alias for clarity
+    "claude-sonnet-4-6": "claude-sonnet-4.6",  # Explicit alias for clarity
+    "claude-sonnet-4-5": "claude-sonnet-4.5",  # Explicit alias for clarity
 }
 
 # Models to hide from /v1/models endpoint.

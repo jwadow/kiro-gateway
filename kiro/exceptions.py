@@ -85,6 +85,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     # Sanitize errors for JSON serialization
     sanitized_errors = sanitize_validation_errors(exc.errors())
     
+    logger.error(f"Error at {request.url.path} in: {exc.endpoint_file}:{exc.endpoint_line}")
     logger.error(f"Validation error (422): {sanitized_errors}")
     # Log body at DEBUG level to avoid cluttering console with potentially large payloads
     # logger.debug(f"Request body: {body_str[:500]}...")
