@@ -447,6 +447,36 @@ class TestMessagesSystemPrompt:
         # Should pass validation
         assert response.status_code != 422
 
+    def test_accepts_system_message_compatibility_format(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies message-level system prompts pass request validation.
+        Purpose: Ensure Claude Code compatible payloads do not fail with 422 errors.
+        """
+        print("Action: POST /v1/messages with message-level system prompt...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "Top-level system.",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "system", "content": "Compatibility system."},
+                ],
+            },
+        )
+
+        print(f"Status: {response.status_code}")
+        # Should pass body validation even if later request handling cannot reach Kiro in tests.
+        assert response.status_code != 422
+
 
 # =============================================================================
 # Tests for /v1/messages content blocks
@@ -2280,6 +2310,39 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print(f"✅ System blocks counted: {data['input_tokens']} tokens")
+
+    def test_count_tokens_with_system_message_compatibility_format(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Tests token counting with message-level system prompts.
+        Purpose: Ensure compatibility system messages are hoisted before validation.
+        """
+        print("Setup: Creating request with message-level system prompt...")
+        request_data = {
+            "model": "claude-opus-4-8",
+            "messages": [
+                {"role": "system", "content": "Compatibility system."},
+                {"role": "user", "content": "Hello"},
+            ],
+        }
+
+        print("Action: POST /v1/messages/count_tokens...")
+        response = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json=request_data,
+        )
+
+        print(f"Status: {response.status_code}")
+        print(f"Response: {response.json()}")
+
+        print("Checking: HTTP 200...")
+        assert response.status_code == 200
+
+        print("Checking: Response structure...")
+        data = response.json()
+        assert "input_tokens" in data
+        assert isinstance(data["input_tokens"], int)
+        assert data["input_tokens"] > 0
     
     def test_count_tokens_empty_messages(self, test_client, valid_proxy_api_key):
         """

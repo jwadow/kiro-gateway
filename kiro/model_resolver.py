@@ -219,6 +219,70 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
     return to_runtime_model_id(internal)
 
 
+def model_supports_native_thinking(model_name: str) -> bool:
+    """
+    Determine whether a model belongs to the "adaptive thinking" generation.
+
+    Newer models accept the native Anthropic ``thinking`` (``{"type": "adaptive"}``)
+    and ``output_config`` (``{"effort": ...}``) parameters instead of the legacy
+    ``thinking.budget_tokens``. For these models the gateway passes the original
+    parameters through to the Kiro backend instead of injecting fake-reasoning tags.
+
+    Generation rules (per Anthropic docs):
+    - Opus  >= 4.6  (4.6, 4.7, 4.8, ...)
+    - Sonnet >= 4.6
+    - Fable / Mythos family (e.g. fable-5, mythos-5, mythos-preview)
+
+    Everything else (Opus/Sonnet 4.5 and earlier, Haiku, 3.x, unknown) uses the
+    legacy budget_tokens path.
+
+    Args:
+        model_name: Model name from the client (any format; normalized internally)
+
+    Returns:
+        True if the model accepts native thinking/output_config parameters.
+
+    Examples:
+        >>> model_supports_native_thinking("claude-opus-4-8")
+        True
+        >>> model_supports_native_thinking("claude-opus-4.6")
+        True
+        >>> model_supports_native_thinking("claude-sonnet-4-6")
+        True
+        >>> model_supports_native_thinking("claude-fable-5")
+        True
+        >>> model_supports_native_thinking("claude-opus-4.5")
+        False
+        >>> model_supports_native_thinking("claude-sonnet-4.5")
+        False
+        >>> model_supports_native_thinking("claude-3.7-sonnet")
+        False
+    """
+    if not model_name:
+        return False
+
+    normalized = normalize_model_name(model_name).lower()
+
+    # Fable / Mythos generations are always adaptive-thinking
+    if "fable" in normalized or "mythos" in normalized:
+        return True
+
+    family = extract_model_family(normalized)
+    if family not in ("opus", "sonnet"):
+        return False
+
+    # Extract major.minor version (e.g. "4.6" -> (4, 6))
+    version_match = re.search(r'(\d+)\.(\d+)', normalized)
+    if not version_match:
+        return False
+
+    major = int(version_match.group(1))
+    minor = int(version_match.group(2))
+
+    # Opus >= 4.6 and Sonnet >= 4.6 use adaptive thinking
+    return (major, minor) >= (4, 6)
+
+
 def extract_model_family(model_name: str) -> Optional[str]:
     """
     Extract model family from model name.

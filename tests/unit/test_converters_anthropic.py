@@ -1852,7 +1852,61 @@ class TestExtractThinkingConfigFromAnthropic:
         print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
         assert config.enabled is True
         assert config.budget_tokens is None
-    
+
+    def test_thinking_adaptive_no_effort(self):
+        """
+        What it does: Verifies adaptive thinking reaching the legacy path is enabled with default budget
+        Purpose: If {"type": "adaptive"} hits this legacy helper, treat as enabled w/ default budget
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=1024,
+            thinking={"type": "adaptive"},
+        )
+
+        config = extract_thinking_config_from_anthropic(request)
+
+        assert config.enabled is True
+        assert config.budget_tokens is None
+
+    def test_effort_does_not_affect_legacy_budget(self):
+        """
+        What it does: Verifies output_config.effort is ignored by the legacy budget helper
+        Purpose: effort is only forwarded natively for newer models; legacy path ignores it
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=1024,
+            thinking={"type": "enabled", "budget_tokens": 8000},
+            output_config={"effort": "low"},
+        )
+
+        config = extract_thinking_config_from_anthropic(request)
+
+        assert config.enabled is True
+        # budget_tokens wins; effort is not consulted on the legacy path
+        assert config.budget_tokens == 8000
+
+    def test_disabled_ignores_effort(self):
+        """
+        What it does: Verifies thinking.type="disabled" stays disabled even with effort set
+        Purpose: Explicit disable must win
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=1024,
+            thinking={"type": "disabled"},
+            output_config={"effort": "high"},
+        )
+
+        config = extract_thinking_config_from_anthropic(request)
+
+        assert config.enabled is False
+        assert config.budget_tokens is None
+
 
 
 class TestAnthropicToKiroIntegration:
@@ -1884,3 +1938,100 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+    def test_native_thinking_forwarded_for_newer_model(self):
+        """
+        What it does: Verifies newer models forward raw thinking/output_config into userInputMessage
+        Purpose: Adaptive-thinking generation should pass native params, NOT fake-reasoning tags
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            messages=[AnthropicMessage(role="user", content="Test message")],
+            max_tokens=1024,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "high"},
+        )
+
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-opus-4.8"):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+                payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+
+        # Native params forwarded verbatim
+        assert user_input["thinking"] == {"type": "adaptive"}
+        assert user_input["output_config"] == {"effort": "high"}
+
+        # No fake-reasoning tags injected
+        assert "<thinking_mode>" not in user_input["content"]
+        assert "<max_thinking_length>" not in user_input["content"]
+
+    def test_legacy_model_uses_fake_reasoning_not_native(self):
+        """
+        What it does: Verifies older models still use fake-reasoning tags and do NOT forward native params
+        Purpose: Legacy generation must keep the budget_tokens path
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="Test message")],
+            max_tokens=1024,
+            thinking={"type": "enabled", "budget_tokens": 6000},
+        )
+
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4.5"):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+                with patch("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000):
+                    payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+
+        # No native params on legacy path
+        assert "thinking" not in user_input
+        assert "output_config" not in user_input
+
+        # Fake-reasoning tags present
+        assert "<max_thinking_length>6000</max_thinking_length>" in user_input["content"]
+
+    def test_native_thinking_only_no_output_config(self):
+        """
+        What it does: Verifies adaptive thinking without output_config still forwards thinking
+        Purpose: output_config is optional; thinking alone should pass through
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-6",
+            messages=[AnthropicMessage(role="user", content="Test message")],
+            max_tokens=1024,
+            thinking={"type": "adaptive"},
+        )
+
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4.6"):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+                payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+
+        assert user_input["thinking"] == {"type": "adaptive"}
+        assert "output_config" not in user_input
+        assert "<thinking_mode>" not in user_input["content"]
+
+
+class TestModelSupportsNativeThinking:
+    """Tests for the model generation detection used to branch thinking handling."""
+
+    def test_newer_models_supported(self):
+        from kiro.model_resolver import model_supports_native_thinking
+        for m in [
+            "claude-opus-4-6", "claude-opus-4.6", "claude-opus-4-7", "claude-opus-4-8",
+            "claude-sonnet-4-6", "claude-sonnet-4.6",
+            "claude-fable-5", "claude-mythos-5", "claude-mythos-preview",
+        ]:
+            assert model_supports_native_thinking(m) is True, m
+
+    def test_older_models_not_supported(self):
+        from kiro.model_resolver import model_supports_native_thinking
+        for m in [
+            "claude-opus-4-5", "claude-opus-4.5", "claude-sonnet-4-5", "claude-sonnet-4.5",
+            "claude-sonnet-4", "claude-haiku-4-5", "claude-3-7-sonnet", "claude-3.7-sonnet",
+            "", "gpt-4",
+        ]:
+            assert model_supports_native_thinking(m) is False, m
