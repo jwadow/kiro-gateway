@@ -2717,12 +2717,17 @@ class TestSanitizeJsonSchema:
         What it does: Verifies sanitization of items in lists (anyOf, oneOf).
         Purpose: Ensure list elements are also sanitized.
         """
-        print("Setup: Schema with anyOf...")
+        print("Setup: Schema with nested anyOf...")
         schema = {
-            "anyOf": [
-                {"type": "string", "additionalProperties": False},
-                {"type": "number", "required": []}
-            ]
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "string", "additionalProperties": False},
+                        {"type": "number", "required": []}
+                    ]
+                }
+            }
         }
         
         print("Action: Sanitizing schema...")
@@ -2730,8 +2735,9 @@ class TestSanitizeJsonSchema:
         
         print(f"Result: {result}")
         print("Checking anyOf elements...")
-        assert "additionalProperties" not in result["anyOf"][0]
-        assert "required" not in result["anyOf"][1]
+        nested = result["properties"]["value"]
+        assert "additionalProperties" not in nested["anyOf"][0]
+        assert "required" not in nested["anyOf"][1]
     
     def test_preserves_non_dict_list_items(self):
         """
@@ -2775,6 +2781,133 @@ class TestSanitizeJsonSchema:
         assert "additionalProperties" not in result
         assert result["required"] == ["question", "options"]  # Non-empty required is preserved
         assert result["properties"]["question"]["type"] == "string"
+
+    def test_resolves_top_level_oneof(self):
+        """
+        What it does: Verifies top-level oneOf is resolved to a flat schema.
+        Purpose: Bedrock rejects oneOf at the top level of input_schema.
+        """
+        schema = {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "object", "properties": {"name": {"type": "string"}}}
+            ]
+        }
+
+        result = sanitize_json_schema(schema)
+
+        # Should pick the object-type variant
+        assert "oneOf" not in result
+        assert result["type"] == "object"
+        assert "name" in result["properties"]
+
+    def test_resolves_top_level_anyof(self):
+        """
+        What it does: Verifies top-level anyOf is resolved to a flat schema.
+        Purpose: Bedrock rejects anyOf at the top level of input_schema.
+        """
+        schema = {
+            "anyOf": [
+                {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+                {"type": "object", "properties": {"url": {"type": "string"}}}
+            ]
+        }
+
+        result = sanitize_json_schema(schema)
+
+        assert "anyOf" not in result
+        assert result["type"] == "object"
+        assert "path" in result["properties"]
+
+    def test_resolves_top_level_allof_merges_properties(self):
+        """
+        What it does: Verifies top-level allOf merges all variants.
+        Purpose: Bedrock rejects allOf at the top level of input_schema.
+        """
+        schema = {
+            "allOf": [
+                {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+                {"properties": {"age": {"type": "integer"}}, "required": ["age"]}
+            ]
+        }
+
+        result = sanitize_json_schema(schema)
+
+        assert "allOf" not in result
+        assert result["type"] == "object"
+        assert "name" in result["properties"]
+        assert "age" in result["properties"]
+        assert "name" in result["required"]
+        assert "age" in result["required"]
+
+    def test_top_level_oneof_picks_first_if_no_object(self):
+        """
+        What it does: Verifies oneOf picks first variant when none is object type.
+        Purpose: Ensure graceful fallback when no object variant exists.
+        """
+        schema = {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "number"}
+            ]
+        }
+
+        result = sanitize_json_schema(schema)
+
+        assert "oneOf" not in result
+        assert result["type"] == "string"
+
+    def test_nested_oneof_is_preserved(self):
+        """
+        What it does: Verifies oneOf inside properties is NOT resolved.
+        Purpose: Only top-level composition keywords are problematic for Bedrock.
+        """
+        schema = {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "number"}
+                    ]
+                }
+            }
+        }
+
+        result = sanitize_json_schema(schema)
+
+        assert "oneOf" in result["properties"]["value"]
+        assert len(result["properties"]["value"]["oneOf"]) == 2
+
+    def test_top_level_anyof_preserves_extra_fields(self):
+        """
+        What it does: Verifies extra top-level fields (like description) are preserved.
+        Purpose: Ensure metadata alongside composition keywords isn't lost.
+        """
+        schema = {
+            "description": "A tool parameter",
+            "anyOf": [
+                {"type": "object", "properties": {"x": {"type": "integer"}}}
+            ]
+        }
+
+        result = sanitize_json_schema(schema)
+
+        assert "anyOf" not in result
+        assert result["description"] == "A tool parameter"
+        assert result["type"] == "object"
+
+    def test_top_level_allof_empty_variants(self):
+        """
+        What it does: Verifies handling of allOf with empty list.
+        Purpose: Ensure malformed schemas don't crash.
+        """
+        schema = {"allOf": []}
+
+        result = sanitize_json_schema(schema)
+
+        assert "allOf" not in result
+        assert result.get("type") == "object"
 
 
 # ==================================================================================================

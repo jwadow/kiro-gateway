@@ -436,24 +436,120 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
 # JSON Schema Sanitization
 # ==================================================================================================
 
-def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _resolve_top_level_composition(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Resolves top-level oneOf/allOf/anyOf that Bedrock/Kiro API rejects.
+    
+    Bedrock returns TOOL_SCHEMA_INVALID if the top-level input_schema contains
+    oneOf, allOf, or anyOf. This function resolves them:
+    - anyOf/oneOf: pick the first object-type variant (or first variant if none is object)
+    - allOf: merge all variants into a single object schema
+    
+    Only applies to the top level — nested composition keywords are left intact
+    since Bedrock only rejects them at the root of input_schema.
+    
+    Args:
+        schema: Top-level JSON Schema that may contain composition keywords
+    
+    Returns:
+        Resolved schema without top-level composition keywords
+    """
+    composition_keywords = ("oneOf", "allOf", "anyOf")
+    
+    # Check if any composition keyword is present at top level
+    found_keyword = None
+    for kw in composition_keywords:
+        if kw in schema:
+            found_keyword = kw
+            break
+    
+    if not found_keyword:
+        return schema
+    
+    variants = schema[found_keyword]
+    if not isinstance(variants, list) or not variants:
+        # Malformed — strip the keyword and return what's left
+        resolved = {k: v for k, v in schema.items() if k not in composition_keywords}
+        return resolved if resolved else {"type": "object"}
+    
+    if found_keyword == "allOf":
+        # Merge all variants into one object schema
+        merged: Dict[str, Any] = {}
+        merged_properties: Dict[str, Any] = {}
+        merged_required: List[str] = []
+        
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            for k, v in variant.items():
+                if k == "properties" and isinstance(v, dict):
+                    merged_properties.update(v)
+                elif k == "required" and isinstance(v, list):
+                    merged_required.extend(v)
+                else:
+                    merged[k] = v
+        
+        if merged_properties:
+            merged["properties"] = merged_properties
+        if merged_required:
+            merged["required"] = list(dict.fromkeys(merged_required))
+        
+        # Ensure type is object
+        if "type" not in merged:
+            merged["type"] = "object"
+        
+        # Preserve any top-level fields that aren't the composition keyword
+        for k, v in schema.items():
+            if k not in composition_keywords and k not in merged:
+                merged[k] = v
+        
+        return merged
+    else:
+        # oneOf / anyOf — pick the best variant (prefer object type)
+        best = variants[0] if isinstance(variants[0], dict) else {}
+        for variant in variants:
+            if isinstance(variant, dict) and variant.get("type") == "object":
+                best = variant
+                break
+        
+        # Preserve any top-level fields that aren't the composition keyword
+        resolved = dict(best)
+        for k, v in schema.items():
+            if k not in composition_keywords and k not in resolved:
+                resolved[k] = v
+        
+        return resolved
+
+
+def sanitize_json_schema(
+    schema: Optional[Dict[str, Any]],
+    _top_level: bool = True,
+) -> Dict[str, Any]:
     """
     Sanitizes JSON Schema from fields that Kiro API doesn't accept.
     
     Kiro API returns 400 "Improperly formed request" error if:
     - required is an empty array []
     - additionalProperties is present in schema
+    - oneOf, allOf, or anyOf appears at the top level of input_schema
     
     This function recursively processes the schema and removes problematic fields.
+    At the top level, composition keywords (oneOf/allOf/anyOf) are resolved into
+    a flat schema since Bedrock rejects them at the root of tool input_schema.
     
     Args:
         schema: JSON Schema to sanitize
+        _top_level: Internal flag — True only for the root call
     
     Returns:
         Sanitized copy of schema
     """
     if not schema:
         return {}
+    
+    # Resolve top-level composition keywords (oneOf/allOf/anyOf)
+    if _top_level:
+        schema = _resolve_top_level_composition(schema)
     
     result = {}
     
@@ -469,15 +565,16 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         # Recursively process nested objects
         if key == "properties" and isinstance(value, dict):
             result[key] = {
-                prop_name: sanitize_json_schema(prop_value) if isinstance(prop_value, dict) else prop_value
+                prop_name: sanitize_json_schema(prop_value, _top_level=False)
+                if isinstance(prop_value, dict) else prop_value
                 for prop_name, prop_value in value.items()
             }
         elif isinstance(value, dict):
-            result[key] = sanitize_json_schema(value)
+            result[key] = sanitize_json_schema(value, _top_level=False)
         elif isinstance(value, list):
             # Process lists (e.g., anyOf, oneOf)
             result[key] = [
-                sanitize_json_schema(item) if isinstance(item, dict) else item
+                sanitize_json_schema(item, _top_level=False) if isinstance(item, dict) else item
                 for item in value
             ]
         else:
