@@ -1065,12 +1065,12 @@ class TestReasoningEffort:
     
     def test_reasoning_effort_valid_values(self):
         """
-        What it does: Verifies all 6 reasoning_effort values are accepted
-        Purpose: Ensure Pydantic validates all official OpenAI reasoning_effort levels
+        What it does: Verifies all supported reasoning_effort values are accepted
+        Purpose: Ensure Pydantic validates all gateway-supported reasoning_effort levels
         """
         print("Testing all valid reasoning_effort values...")
         
-        for effort in ["none", "minimal", "low", "medium", "high", "xhigh"]:
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"]:
             print(f"  Testing reasoning_effort='{effort}'...")
             request = ChatCompletionRequest(
                 model="claude-sonnet-4.5",

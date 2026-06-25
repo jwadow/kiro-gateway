@@ -273,20 +273,24 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Some models may not be available on your Kiro plan (e.g., Opus on free tier)
 # - New models released after this version won't appear here
 # - Update gateway regularly to get the latest model list
-FALLBACK_MODELS: List[Dict[str, str]] = [
-    {"modelId": "auto"},
-    {"modelId": "claude-sonnet-4"},
-    {"modelId": "claude-sonnet-4.5"},
-    {"modelId": "claude-sonnet-4.6"},
-    {"modelId": "claude-haiku-4.5"},
-    {"modelId": "claude-opus-4.5"},
-    {"modelId": "claude-opus-4.6"},
-    {"modelId": "claude-opus-4.7"},
-    {"modelId": "deepseek-3.2"},
-    {"modelId": "glm-5"},
-    {"modelId": "minimax-m2.1"},
-    {"modelId": "minimax-m2.5"},
-    {"modelId": "qwen3-coder-next"},
+FALLBACK_MODELS: List[Dict] = [
+    # 1M context: auto router and new Claude 4.x flagship models (Kiro docs)
+    {"modelId": "auto",              "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-sonnet-4.6", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-opus-4.6",   "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-opus-4.7",   "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-opus-4.8",   "tokenLimits": {"maxInputTokens": 1000000}},
+    # 200K context: older Claude 4.x models and Haiku (Kiro docs)
+    {"modelId": "claude-sonnet-4",   "tokenLimits": {"maxInputTokens": 200000}},
+    {"modelId": "claude-sonnet-4.5", "tokenLimits": {"maxInputTokens": 200000}},
+    {"modelId": "claude-haiku-4.5",  "tokenLimits": {"maxInputTokens": 200000}},
+    {"modelId": "claude-opus-4.5",   "tokenLimits": {"maxInputTokens": 200000}},
+    # Non-Claude models
+    {"modelId": "deepseek-3.2",      "tokenLimits": {"maxInputTokens": 128000}},
+    {"modelId": "qwen3-coder-next",  "tokenLimits": {"maxInputTokens": 256000}},
+    {"modelId": "glm-5",             "tokenLimits": {"maxInputTokens": 200000}},
+    {"modelId": "minimax-m2.1",      "tokenLimits": {"maxInputTokens": 200000}},
+    {"modelId": "minimax-m2.5",      "tokenLimits": {"maxInputTokens": 200000}},
 ]
 
 # ==================================================================================================
@@ -297,7 +301,9 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
 MODEL_CACHE_TTL: int = 3600
 
 # Default maximum number of input tokens
-DEFAULT_MAX_INPUT_TOKENS: int = 200000
+# Set to 1M to match the highest-tier models (sonnet-4-6, opus-4-6/4-7/4-8) on paid plans.
+# Per-model overrides in FALLBACK_MODELS take precedence over this value.
+DEFAULT_MAX_INPUT_TOKENS: int = 1000000
 
 # ==================================================================================================
 # Tool Description Handling (Kiro API Limitations)
@@ -341,6 +347,19 @@ TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in 
 # Default: INFO (recommended for production)
 # Set to DEBUG for detailed troubleshooting
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# ==================================================================================================
+# Billing Attribution Strip
+# ==================================================================================================
+
+# Claude Code 2.1.x prepends a per-request system text block of the form
+# ``x-anthropic-billing-header: cc_version=...; cc_entrypoint=...; cch=<5hex>;``
+# where ``cch`` is a fresh random hex token. The Kiro gateway concatenates all
+# system text blocks before forwarding, so this random prefix would invalidate
+# any upstream prompt cache keyed on the prompt prefix. When enabled (default),
+# the gateway strips the leading attribution line / block before forwarding.
+# Disable only for A/B comparison or to debug attribution behavior.
+STRIP_BILLING_HEADER: bool = os.getenv("STRIP_BILLING_HEADER", "true").lower() in ("true", "1", "yes")
 
 # ==================================================================================================
 # First Token Timeout Settings (Streaming Retry)
@@ -476,6 +495,26 @@ FAKE_REASONING_OPEN_TAGS: List[str] = ["<thinking>", "<think>", "<reasoning>", "
 # Lower values = faster first token, but may miss tags with leading whitespace.
 # Default: 30 characters (enough for longest tag + some whitespace)
 FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_BUFFER_SIZE", "20"))
+
+
+# ==================================================================================================
+# Native Thinking Settings (Kiro/Claude Adaptive Thinking)
+# ==================================================================================================
+
+# Experimental native thinking pass-through for Kiro models that expose Claude adaptive thinking.
+#
+# Modes:
+# - "off": Disabled (default, preserves existing fake reasoning behavior)
+# - "auto": Enable only when the client explicitly requests a reasoning effort
+# - "force": Enable for supported models even when the client does not send an effort
+KIRO_NATIVE_THINKING_MODE: str = os.getenv("KIRO_NATIVE_THINKING_MODE", "off").lower()
+if KIRO_NATIVE_THINKING_MODE not in ("off", "auto", "force"):
+    KIRO_NATIVE_THINKING_MODE = "off"
+
+# Claude Opus 4.8/4.7 default to omitted thinking text unless display is explicitly summarized.
+KIRO_NATIVE_THINKING_DISPLAY: str = os.getenv("KIRO_NATIVE_THINKING_DISPLAY", "summarized").lower()
+if KIRO_NATIVE_THINKING_DISPLAY not in ("summarized", "omitted"):
+    KIRO_NATIVE_THINKING_DISPLAY = "summarized"
 
 
 # ==================================================================================================

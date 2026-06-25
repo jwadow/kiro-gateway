@@ -155,13 +155,20 @@ async def stream_kiro_to_openai_internal(
                 
                 yield chunk_text
             
-            elif event.type == "thinking" and event.thinking_content:
+            elif event.type == "thinking" and (event.thinking_content or event.is_last_thinking_chunk):
                 # Accumulate thinking content
-                full_thinking_content += event.thinking_content
+                full_thinking_content += event.thinking_content or ""
                 
                 # Send as reasoning_content or content based on mode
                 if FAKE_REASONING_HANDLING == "as_reasoning_content":
                     delta = {"reasoning_content": event.thinking_content}
+                elif event.is_native_thinking and FAKE_REASONING_HANDLING == "pass":
+                    thinking_text = event.thinking_content or ""
+                    if event.is_first_thinking_chunk:
+                        thinking_text = f"<thinking>{thinking_text}"
+                    if event.is_last_thinking_chunk:
+                        thinking_text = f"{thinking_text}</thinking>"
+                    delta = {"content": thinking_text}
                 else:
                     delta = {"content": event.thinking_content}
                 

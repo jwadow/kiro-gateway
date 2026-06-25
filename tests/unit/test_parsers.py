@@ -496,6 +496,81 @@ class TestAwsEventStreamParserFeed:
         assert events[0]["type"] == "context_usage"
         assert events[0]["data"] == 25.5
     
+    def test_parses_native_thinking_event(self, aws_event_parser):
+        """
+        What it does: Tests parsing of native Kiro reasoningContentEvent text payloads.
+        Goal: Ensure native thinking text is surfaced to streaming adapters.
+        """
+        print("Setup: Chunk with native thinking text...")
+        chunk = b'{"text":"Let me reason about this."}'
+
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+
+        print(f"Result: {events}")
+        assert len(events) == 1
+        assert events[0]["type"] == "thinking"
+        assert events[0]["data"] == "Let me reason about this."
+        assert events[0]["is_first"] is True
+        assert events[0]["is_native"] is True
+
+    def test_native_thinking_subsequent_chunk_is_not_first(self, aws_event_parser):
+        """
+        What it does: Tests first-chunk tracking across native thinking chunks.
+        Goal: Ensure only the first native thinking chunk opens a visible thinking block.
+        """
+        print("Setup: Two native thinking chunks without a signature between them...")
+
+        print("Action: Parsing first thinking chunk...")
+        first_events = aws_event_parser.feed(b'{"text":"First sequence"}')
+
+        print("Action: Parsing second thinking chunk...")
+        second_events = aws_event_parser.feed(b'{"text":"Second sequence"}')
+
+        print(f"First result: {first_events}")
+        print(f"Second result: {second_events}")
+        assert first_events[0]["is_first"] is True
+        assert second_events[0]["is_first"] is False
+
+    def test_parses_native_thinking_signature_event(self, aws_event_parser):
+        """
+        What it does: Tests parsing of native Kiro reasoningContentEvent signature payloads.
+        Goal: Ensure signature frames are recognized separately from visible text.
+        """
+        print("Setup: Chunk with native thinking signature...")
+        chunk = b'{"signature":"opaque-signature"}'
+
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+
+        print(f"Result: {events}")
+        assert len(events) == 1
+        assert events[0]["type"] == "thinking_signature"
+        assert events[0]["data"] == "opaque-signature"
+
+    def test_native_thinking_signature_resets_first_chunk_state(self, aws_event_parser):
+        """
+        What it does: Tests signature handling resets native thinking sequence state.
+        Goal: Ensure the next native thinking sequence opens a fresh visible thinking block.
+        """
+        print("Setup: Native thinking chunk, signature, then another thinking chunk...")
+
+        print("Action: Parsing first thinking sequence...")
+        first_events = aws_event_parser.feed(b'{"text":"First sequence"}')
+
+        print("Action: Parsing signature...")
+        signature_events = aws_event_parser.feed(b'{"signature":"sig1"}')
+
+        print("Action: Parsing second thinking sequence...")
+        second_events = aws_event_parser.feed(b'{"text":"Second sequence"}')
+
+        print(f"First result: {first_events}")
+        print(f"Signature result: {signature_events}")
+        print(f"Second result: {second_events}")
+        assert first_events[0]["is_first"] is True
+        assert signature_events[0]["type"] == "thinking_signature"
+        assert second_events[0]["is_first"] is True
+
     def test_handles_incomplete_json(self, aws_event_parser):
         """
         What it does: Tests handling of incomplete JSON.
@@ -656,6 +731,7 @@ class TestAwsEventStreamParserReset:
         print("Setup: Filling parser with data...")
         aws_event_parser.feed(b'{"content":"test"}')
         aws_event_parser.feed(b'{"name":"func","toolUseId":"call_1"}')
+        aws_event_parser.feed(b'{"text":"native thinking"}')
         
         print("Action: Resetting parser...")
         aws_event_parser.reset()
@@ -665,6 +741,7 @@ class TestAwsEventStreamParserReset:
         assert aws_event_parser.last_content is None
         assert aws_event_parser.current_tool_call is None
         assert aws_event_parser.tool_calls == []
+        assert aws_event_parser.native_thinking_started is False
 
 
 class TestAwsEventStreamParserFinalizeToolCall:

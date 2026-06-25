@@ -479,12 +479,17 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         if debug_logger:
                             debug_logger.flush_on_error(response.status_code, last_error_message)
                         
+                        _openai_error_type = (
+                            "context_length_exceeded"
+                            if error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                            else "kiro_api_error"
+                        )
                         return JSONResponse(
                             status_code=response.status_code,
                             content={
                                 "error": {
                                     "message": last_error_message,
-                                    "type": "kiro_api_error",
+                                    "type": _openai_error_type,
                                     "code": response.status_code
                                 }
                             }
@@ -648,12 +653,22 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 debug_logger.flush_on_error(response.status_code, error_message)
             
             # Return error in OpenAI API format
+            _error_reason = None
+            try:
+                _error_reason = json.loads(error_text).get("reason")
+            except Exception:
+                pass
+            _openai_err_type = (
+                "context_length_exceeded"
+                if _error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                else "kiro_api_error"
+            )
             return JSONResponse(
                 status_code=response.status_code,
                 content={
                     "error": {
                         "message": error_message,
-                        "type": "kiro_api_error",
+                        "type": _openai_err_type,
                         "code": response.status_code
                     }
                 }

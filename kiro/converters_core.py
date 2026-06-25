@@ -41,6 +41,8 @@ from kiro.config import (
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_MAX_TOKENS,
     FAKE_REASONING_BUDGET_CAP,
+    KIRO_NATIVE_THINKING_DISPLAY,
+    KIRO_NATIVE_THINKING_MODE,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
@@ -78,6 +80,174 @@ class ThinkingConfig:
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+
+
+@dataclass
+class NativeThinkingConfig:
+    """
+    Native Kiro/Claude adaptive thinking configuration.
+
+    Attributes:
+        enabled: Whether to add native adaptive thinking fields.
+        effort: Adaptive thinking effort level.
+        display: Whether upstream should return summarized or omitted thinking text.
+    """
+    enabled: bool = False
+    effort: Optional[str] = None
+    display: str = "summarized"
+
+
+REASONING_EFFORT_BUDGET_RATIOS: Dict[str, float] = {
+    "none": 0.0,      # 0% - thinking disabled by API adapters
+    "minimal": 0.10,  # 10% - minimal reasoning
+    "low": 0.20,      # 20% - quick reasoning
+    "medium": 0.50,   # 50% - balanced reasoning
+    "high": 0.80,     # 80% - deep reasoning
+    "xhigh": 0.95,    # 95% - near-maximum reasoning depth
+    "max": 1.0,       # 100% - maximum reasoning depth
+}
+
+
+NATIVE_THINKING_SUPPORTED_MODELS = (
+    "claude-opus-4.8",
+    "claude-opus-4.7",
+    "claude-opus-4.6",
+    "claude-sonnet-4.6",
+)
+
+
+def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
+    """
+    Convert a reasoning effort level to a fake thinking token budget.
+
+    Args:
+        max_tokens: Maximum output tokens for the request.
+        effort: Reasoning effort level.
+
+    Returns:
+        Thinking budget in tokens.
+
+    Raises:
+        ValueError: If the effort level is not supported.
+    """
+    try:
+        ratio = REASONING_EFFORT_BUDGET_RATIOS[effort]
+    except KeyError as exc:
+        supported_efforts = ", ".join(sorted(REASONING_EFFORT_BUDGET_RATIOS))
+        raise ValueError(
+            f"Unsupported reasoning effort '{effort}'. Supported values: {supported_efforts}"
+        ) from exc
+
+    return int(max_tokens * ratio)
+
+
+def supports_native_adaptive_thinking(model_id: str) -> bool:
+    """
+    Check whether a Kiro model is known to support native adaptive thinking.
+
+    Args:
+        model_id: Internal Kiro model ID.
+
+    Returns:
+        True when native adaptive thinking should be attempted.
+    """
+    normalized_model = model_id.lower()
+    return any(model in normalized_model for model in NATIVE_THINKING_SUPPORTED_MODELS)
+
+
+def normalize_native_thinking_effort(effort: Optional[str]) -> Optional[str]:
+    """
+    Normalize client effort values to Claude adaptive thinking effort values.
+
+    Args:
+        effort: Client-provided effort level.
+
+    Returns:
+        Native effort level, or None if the value disables or cannot map to native thinking.
+    """
+    if effort is None:
+        return None
+
+    if effort == "none":
+        return None
+
+    if effort == "minimal":
+        return "low"
+
+    if effort in ("low", "medium", "high", "xhigh", "max"):
+        return effort
+
+    logger.warning(f"Unsupported native thinking effort '{effort}'. Native thinking disabled.")
+    return None
+
+
+def build_native_thinking_config(model_id: str, effort: Optional[str]) -> NativeThinkingConfig:
+    """
+    Build native adaptive thinking configuration from model and client effort.
+
+    Args:
+        model_id: Internal Kiro model ID.
+        effort: Client effort level.
+
+    Returns:
+        NativeThinkingConfig for payload construction.
+    """
+    if KIRO_NATIVE_THINKING_MODE == "off":
+        return NativeThinkingConfig(enabled=False)
+
+    if not supports_native_adaptive_thinking(model_id):
+        return NativeThinkingConfig(enabled=False)
+
+    native_effort = normalize_native_thinking_effort(effort)
+    if native_effort is None:
+        if KIRO_NATIVE_THINKING_MODE != "force":
+            return NativeThinkingConfig(enabled=False)
+        native_effort = "high"
+
+    return NativeThinkingConfig(
+        enabled=True,
+        effort=native_effort,
+        display=KIRO_NATIVE_THINKING_DISPLAY,
+    )
+
+
+def apply_native_thinking_fields(
+    payload: Dict[str, Any],
+    native_thinking_config: Optional[NativeThinkingConfig],
+) -> None:
+    """
+    Add native Kiro/Claude adaptive thinking fields to the payload in-place.
+
+    Args:
+        payload: Kiro API payload.
+        native_thinking_config: Native thinking configuration.
+    """
+    if not native_thinking_config or not native_thinking_config.enabled:
+        return
+
+    payload["thinking"] = {
+        "type": "adaptive",
+        "display": native_thinking_config.display,
+    }
+    payload["output_config"] = {
+        "effort": native_thinking_config.effort or "high",
+    }
+    user_input_message = (
+        payload.get("conversationState", {})
+        .get("currentMessage", {})
+        .get("userInputMessage", {})
+    )
+    user_input_message["thinking"] = {
+        "type": "adaptive",
+        "display": native_thinking_config.display,
+    }
+    user_input_message["outputConfig"] = {
+        "effort": native_thinking_config.effort or "high",
+    }
+    logger.info(
+        f"Native adaptive thinking enabled: effort={payload['output_config']['effort']}, "
+        f"display={payload['thinking']['display']}"
+    )
 
 
 @dataclass
@@ -436,24 +606,120 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
 # JSON Schema Sanitization
 # ==================================================================================================
 
-def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _resolve_top_level_composition(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Resolves top-level oneOf/allOf/anyOf that Bedrock/Kiro API rejects.
+    
+    Bedrock returns TOOL_SCHEMA_INVALID if the top-level input_schema contains
+    oneOf, allOf, or anyOf. This function resolves them:
+    - anyOf/oneOf: pick the first object-type variant (or first variant if none is object)
+    - allOf: merge all variants into a single object schema
+    
+    Only applies to the top level — nested composition keywords are left intact
+    since Bedrock only rejects them at the root of input_schema.
+    
+    Args:
+        schema: Top-level JSON Schema that may contain composition keywords
+    
+    Returns:
+        Resolved schema without top-level composition keywords
+    """
+    composition_keywords = ("oneOf", "allOf", "anyOf")
+    
+    # Check if any composition keyword is present at top level
+    found_keyword = None
+    for kw in composition_keywords:
+        if kw in schema:
+            found_keyword = kw
+            break
+    
+    if not found_keyword:
+        return schema
+    
+    variants = schema[found_keyword]
+    if not isinstance(variants, list) or not variants:
+        # Malformed — strip the keyword and return what's left
+        resolved = {k: v for k, v in schema.items() if k not in composition_keywords}
+        return resolved if resolved else {"type": "object"}
+    
+    if found_keyword == "allOf":
+        # Merge all variants into one object schema
+        merged: Dict[str, Any] = {}
+        merged_properties: Dict[str, Any] = {}
+        merged_required: List[str] = []
+        
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            for k, v in variant.items():
+                if k == "properties" and isinstance(v, dict):
+                    merged_properties.update(v)
+                elif k == "required" and isinstance(v, list):
+                    merged_required.extend(v)
+                else:
+                    merged[k] = v
+        
+        if merged_properties:
+            merged["properties"] = merged_properties
+        if merged_required:
+            merged["required"] = list(dict.fromkeys(merged_required))
+        
+        # Ensure type is object
+        if "type" not in merged:
+            merged["type"] = "object"
+        
+        # Preserve any top-level fields that aren't the composition keyword
+        for k, v in schema.items():
+            if k not in composition_keywords and k not in merged:
+                merged[k] = v
+        
+        return merged
+    else:
+        # oneOf / anyOf — pick the best variant (prefer object type)
+        best = variants[0] if isinstance(variants[0], dict) else {}
+        for variant in variants:
+            if isinstance(variant, dict) and variant.get("type") == "object":
+                best = variant
+                break
+        
+        # Preserve any top-level fields that aren't the composition keyword
+        resolved = dict(best)
+        for k, v in schema.items():
+            if k not in composition_keywords and k not in resolved:
+                resolved[k] = v
+        
+        return resolved
+
+
+def sanitize_json_schema(
+    schema: Optional[Dict[str, Any]],
+    _top_level: bool = True,
+) -> Dict[str, Any]:
     """
     Sanitizes JSON Schema from fields that Kiro API doesn't accept.
     
     Kiro API returns 400 "Improperly formed request" error if:
     - required is an empty array []
     - additionalProperties is present in schema
+    - oneOf, allOf, or anyOf appears at the top level of input_schema
     
     This function recursively processes the schema and removes problematic fields.
+    At the top level, composition keywords (oneOf/allOf/anyOf) are resolved into
+    a flat schema since Bedrock rejects them at the root of tool input_schema.
     
     Args:
         schema: JSON Schema to sanitize
+        _top_level: Internal flag — True only for the root call
     
     Returns:
         Sanitized copy of schema
     """
     if not schema:
         return {}
+    
+    # Resolve top-level composition keywords (oneOf/allOf/anyOf)
+    if _top_level:
+        schema = _resolve_top_level_composition(schema)
     
     result = {}
     
@@ -469,15 +735,16 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         # Recursively process nested objects
         if key == "properties" and isinstance(value, dict):
             result[key] = {
-                prop_name: sanitize_json_schema(prop_value) if isinstance(prop_value, dict) else prop_value
+                prop_name: sanitize_json_schema(prop_value, _top_level=False)
+                if isinstance(prop_value, dict) else prop_value
                 for prop_name, prop_value in value.items()
             }
         elif isinstance(value, dict):
-            result[key] = sanitize_json_schema(value)
+            result[key] = sanitize_json_schema(value, _top_level=False)
         elif isinstance(value, list):
             # Process lists (e.g., anyOf, oneOf)
             result[key] = [
-                sanitize_json_schema(item) if isinstance(item, dict) else item
+                sanitize_json_schema(item, _top_level=False) if isinstance(item, dict) else item
                 for item in value
             ]
         else:
@@ -1409,7 +1676,8 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    native_thinking_config: Optional[NativeThinkingConfig] = None,
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1425,6 +1693,7 @@ def build_kiro_payload(
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
         thinking_config: Thinking configuration from API adapter
+        native_thinking_config: Native adaptive thinking configuration
     
     Returns:
         KiroPayloadResult with payload and tool documentation
@@ -1575,6 +1844,8 @@ def build_kiro_payload(
             }
         }
     }
+
+    apply_native_thinking_fields(payload, native_thinking_config)
     
     # Add history only if not empty
     if history:

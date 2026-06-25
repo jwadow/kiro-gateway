@@ -24,11 +24,12 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
+import re
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from kiro.config import HIDDEN_MODELS
+from kiro.config import HIDDEN_MODELS, STRIP_BILLING_HEADER
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
@@ -39,6 +40,8 @@ from kiro.converters_core import (
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
+    build_native_thinking_config,
+    reasoning_effort_to_budget,
     build_kiro_payload,
     extract_text_content,
     extract_images_from_content,
@@ -75,6 +78,32 @@ def convert_anthropic_content_to_text(content: Any) -> str:
     return str(content) if content else ""
 
 
+_BILLING_HEADER_LINE_PATTERN = re.compile(
+    r"^x-anthropic-billing-header:[^\n]*\n?", re.IGNORECASE
+)
+
+
+def _strip_billing_attribution(text: str) -> str:
+    """
+    Remove Claude Code's per-request billing attribution string.
+
+    Claude Code (2.1.x) prepends a line like
+    ``x-anthropic-billing-header: cc_version=...; cc_entrypoint=...; cch=<5hex>;``
+    to the system prompt content. The ``cch`` segment is a fresh random hex per
+    request, which defeats any prompt cache keyed on the prompt prefix on
+    upstreams that do not understand the attribution header.
+
+    The line carries no semantic content for the model and is safe to remove
+    before forwarding to Kiro.
+    """
+    if not text or not STRIP_BILLING_HEADER:
+        return text
+    stripped = _BILLING_HEADER_LINE_PATTERN.sub("", text, count=1)
+    if stripped != text:
+        return stripped.lstrip("\n")
+    return text
+
+
 def extract_system_prompt(system: Any) -> str:
     """
     Extracts system prompt text from Anthropic system field.
@@ -86,6 +115,12 @@ def extract_system_prompt(system: Any) -> str:
     The second format is used for prompt caching with cache_control.
     We extract only the text, ignoring cache_control (not supported by Kiro).
 
+    Claude Code injects a per-request billing attribution block as the first
+    system text block (``x-anthropic-billing-header: ...; cch=<5hex>;``). The
+    random ``cch`` segment changes on every request and would invalidate any
+    upstream prompt cache keyed on the prompt prefix, so we drop attribution
+    blocks (and any attribution prefix on string-form prompts) here.
+
     Args:
         system: System prompt in string or list format
 
@@ -96,18 +131,25 @@ def extract_system_prompt(system: Any) -> str:
         return ""
 
     if isinstance(system, str):
-        return system
+        return _strip_billing_attribution(system)
 
     if isinstance(system, list):
         text_parts = []
         for block in system:
+            text: Optional[str] = None
             if isinstance(block, dict):
-                # Handle {"type": "text", "text": "...", "cache_control": {...}}
                 if block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
+                    text = block.get("text", "")
             elif hasattr(block, "type") and block.type == "text":
-                # Handle Pydantic model
-                text_parts.append(getattr(block, "text", ""))
+                text = getattr(block, "text", "")
+            if text is None:
+                continue
+            # Drop pure-attribution blocks; strip leading attribution line
+            # from mixed blocks (defensive).
+            stripped = _strip_billing_attribution(text)
+            if not stripped.strip():
+                continue
+            text_parts.append(stripped)
         return "\n".join(text_parts)
 
     return str(system)
@@ -376,6 +418,7 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     
     Handles thinking parameter:
     - {"type": "enabled", "budget_tokens": N} → enabled with budget
+    - {"type": "adaptive", "effort": "max"} → enabled with effort-based budget
     - {"type": "disabled"} → disabled
     - None → enabled with default budget
     
@@ -400,6 +443,11 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         >>> request.thinking = {"type": "enabled", "budget_tokens": 8000}
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=8000)
+
+        >>> # Adaptive effort translated to gateway fake thinking budget
+        >>> request.thinking = {"type": "adaptive", "effort": "max"}
+        >>> extract_thinking_config_from_anthropic(request)
+        ThinkingConfig(enabled=True, budget_tokens=4096)
     """
     if not request.thinking:
         # No thinking specified → use defaults
@@ -422,6 +470,31 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
             logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
         return ThinkingConfig(enabled=True, budget_tokens=budget)
     
+    if thinking_type == "adaptive":
+        effort = request.thinking.get("effort")
+        if not effort:
+            logger.debug("Extracted adaptive thinking config from Anthropic without effort")
+            return ThinkingConfig(enabled=True, budget_tokens=None)
+
+        if effort == "none":
+            logger.debug("Extracted adaptive thinking config from Anthropic: effort='none'")
+            return ThinkingConfig(enabled=False, budget_tokens=None)
+
+        try:
+            budget = reasoning_effort_to_budget(request.max_tokens, effort)
+        except ValueError:
+            logger.warning(
+                f"Unsupported Anthropic adaptive thinking effort '{effort}'. "
+                "Using default fake thinking budget."
+            )
+            return ThinkingConfig(enabled=True, budget_tokens=None)
+
+        logger.debug(
+            f"Extracted adaptive thinking config from Anthropic: effort='{effort}', "
+            f"max_tokens={request.max_tokens}, budget={budget}"
+        )
+        return ThinkingConfig(enabled=True, budget_tokens=budget)
+
     # Unknown type → use defaults
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
@@ -466,12 +539,24 @@ def anthropic_to_kiro(
 
     # Extract thinking configuration from thinking parameter
     thinking_config = extract_thinking_config_from_anthropic(request)
+    native_effort: Optional[str] = None
+    native_display: Optional[str] = None
+    if isinstance(request.thinking, dict) and request.thinking.get("type") == "adaptive":
+        native_effort = request.thinking.get("effort") or "high"
+        native_display = request.thinking.get("display")
+    native_thinking_config = build_native_thinking_config(model_id, native_effort)
+    if native_display in ("summarized", "omitted"):
+        native_thinking_config.display = native_display
+    if native_thinking_config.enabled:
+        # Native adaptive thinking supersedes fake tag injection for this request.
+        thinking_config = ThinkingConfig(enabled=False, budget_tokens=None)
 
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"native_thinking_enabled={native_thinking_config.enabled}, native_effort={native_thinking_config.effort}"
     )
 
     # Use core function to build payload
@@ -483,6 +568,7 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        native_thinking_config=native_thinking_config,
     )
 
     return result.payload

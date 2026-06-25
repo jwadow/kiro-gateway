@@ -554,17 +554,22 @@ async def messages(
                         if debug_logger:
                             debug_logger.flush_on_error(response.status_code, last_error_message)
                         
+                        _anthr_error_type = (
+                            "invalid_request_error"
+                            if error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                            else "api_error"
+                        )
                         return JSONResponse(
                             status_code=response.status_code,
                             content={
                                 "type": "error",
                                 "error": {
-                                    "type": "api_error",
+                                    "type": _anthr_error_type,
                                     "message": last_error_message
                                 }
                             }
                         )
-                    
+
                     else:  # ErrorType.RECOVERABLE
                         # RECOVERABLE - try next account
                         await account_manager.report_failure(
@@ -781,13 +786,25 @@ async def messages(
             if debug_logger:
                 debug_logger.flush_on_error(response.status_code, error_message)
             
+            # Map context overflow to the Anthropic error type Claude Code recognises
+            # so /compact and auto-retry can handle it natively instead of failing silently.
+            from kiro.kiro_errors import enhance_kiro_error as _enhance
+            try:
+                _reason = _enhance(json.loads(error_text)).reason
+            except Exception:
+                _reason = None
+            _error_type = (
+                "invalid_request_error"
+                if _reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                else "api_error"
+            )
             # Return error in Anthropic format
             return JSONResponse(
                 status_code=response.status_code,
                 content={
                     "type": "error",
                     "error": {
-                        "type": "api_error",
+                        "type": _error_type,
                         "message": error_message
                     }
                 }

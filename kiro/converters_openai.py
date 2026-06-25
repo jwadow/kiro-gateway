@@ -44,6 +44,8 @@ from kiro.converters_core import (
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
+    build_native_thinking_config,
+    reasoning_effort_to_budget,
     build_kiro_payload as core_build_kiro_payload,
 )
 
@@ -297,44 +299,13 @@ def convert_openai_tools_to_unified(tools: Optional[List[Tool]]) -> Optional[Lis
 # Thinking Configuration Extraction
 # ==================================================================================================
 
-def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
-    """
-    Convert reasoning_effort to thinking budget (production-grade mapping).
-    
-    Uses percentage-based approach that adapts to different max_tokens limits.
-    This ensures that thinking budget scales proportionally with the output limit.
-    
-    Args:
-        max_tokens: Maximum output tokens for the request
-        effort: Reasoning effort level ("none", "minimal", "low", "medium", "high", "xhigh")
-    
-    Returns:
-        Thinking budget in tokens
-    
-    Examples:
-        >>> reasoning_effort_to_budget(4096, "high")
-        3276  # 80% of 4096
-        >>> reasoning_effort_to_budget(10000, "medium")
-        5000  # 50% of 10000
-    """
-    percent = {
-        "none": 0.0,      # 0% - thinking disabled (handled separately)
-        "minimal": 0.10,  # 10% - minimal reasoning
-        "low": 0.20,      # 20% - quick reasoning
-        "medium": 0.50,   # 50% - balanced reasoning
-        "high": 0.80,     # 80% - deep reasoning
-        "xhigh": 0.95,    # 95% - maximum reasoning depth
-    }
-    return int(max_tokens * percent[effort])
-
-
 def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> ThinkingConfig:
     """
     Extract thinking configuration from OpenAI request.
     
     Handles reasoning_effort parameter:
     - "none" → disabled (no thinking tags injected)
-    - "minimal", "low", "medium", "high", "xhigh" → enabled with percentage-based budget
+    - "minimal", "low", "medium", "high", "xhigh", "max" → enabled with percentage-based budget
     - None (not specified) → enabled with default budget
     
     Args:
@@ -424,12 +395,17 @@ def build_kiro_payload(
     
     # Extract thinking configuration from reasoning_effort
     thinking_config = extract_thinking_config_from_openai(request_data)
+    native_thinking_config = build_native_thinking_config(model_id, request_data.reasoning_effort)
+    if native_thinking_config.enabled:
+        # Native adaptive thinking supersedes fake tag injection for this request.
+        thinking_config = ThinkingConfig(enabled=False, budget_tokens=None)
     
     logger.debug(
         f"Converting OpenAI request: model={request_data.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"native_thinking_enabled={native_thinking_config.enabled}, native_effort={native_thinking_config.effort}"
     )
     
     # Use core function to build payload
@@ -440,7 +416,8 @@ def build_kiro_payload(
         tools=unified_tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
-        thinking_config=thinking_config
+        thinking_config=thinking_config,
+        native_thinking_config=native_thinking_config
     )
     
     return result.payload

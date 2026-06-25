@@ -339,8 +339,9 @@ class TestMessagesValidation:
     
     def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies unknown message roles are accepted and normalized.
+        Purpose: Gateway accepts any role string and normalizes unknown roles to 'user'
+        so clients like Claude Code 2.1.181+ that inject system-role messages don't get 422.
         """
         print("Action: POST /v1/messages with invalid role...")
         response = test_client.post(
@@ -352,10 +353,11 @@ class TestMessagesValidation:
                 "messages": [{"role": "invalid_role", "content": "Hello"}]
             }
         )
-        
+
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
+        # Role is now str (not Literal) — unknown roles are normalized to 'user' by
+        # normalize_message_roles() in converters_core.py instead of rejected at validation
+        assert response.status_code == 200
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """

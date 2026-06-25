@@ -4,10 +4,19 @@
 credentials.json
 state.json
 
+# Local Docker Compose overrides
+docker-compose.yaml
+docker-compose.local.yml
+docker-compose.local.yaml
+compose.local.yml
+compose.local.yaml
+
 # IDE
 .vscode/
 .idea/
 .shard/
+.agents/
+skills-lock.json
 
 # Python
 __pycache__/
