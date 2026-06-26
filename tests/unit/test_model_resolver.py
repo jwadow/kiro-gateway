@@ -125,6 +125,29 @@ class TestNormalizeModelName:
         
         print(f"Comparing result: Expected 'claude-opus-4.5', Got '{result}'")
         assert result == "claude-opus-4.5"
+
+    def test_normalizes_opus_4_8(self):
+        """
+        What it does: claude-opus-4-8 → claude-opus-4.8
+        Goal: Check Opus 4.8 (the 1M-context flagship) dash-to-dot conversion,
+              which is the exact id Claude Code sends (claude-opus-4-8).
+        """
+        print("Action: Normalizing 'claude-opus-4-8'...")
+        result = normalize_model_name("claude-opus-4-8")
+
+        print(f"Comparing result: Expected 'claude-opus-4.8', Got '{result}'")
+        assert result == "claude-opus-4.8"
+
+    def test_strips_date_suffix_opus_4_8(self):
+        """
+        What it does: claude-opus-4-8-20260528 → claude-opus-4.8
+        Goal: Check date-stamped Opus 4.8 id normalizes to the Kiro form.
+        """
+        print("Action: Normalizing 'claude-opus-4-8-20260528'...")
+        result = normalize_model_name("claude-opus-4-8-20260528")
+
+        print(f"Comparing result: Expected 'claude-opus-4.8', Got '{result}'")
+        assert result == "claude-opus-4.8"
     
     # === Removal of date suffix ===
     

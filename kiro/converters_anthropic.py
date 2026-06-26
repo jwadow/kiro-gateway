@@ -24,7 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -45,6 +45,47 @@ from kiro.converters_core import (
 )
 
 
+def _render_web_search_result_block(block: Any) -> str:
+    """
+    Render a web_search_tool_result content block as readable text.
+
+    When a client echoes a prior web_search turn back to the gateway, the raw
+    result blocks carry the grounding the assistant used. We fold them into text
+    so that context survives conversion to Kiro (which has no native
+    web_search_tool_result representation).
+
+    Args:
+        block: A web_search_tool_result block (dict or Pydantic model).
+
+    Returns:
+        A readable summary string, or "" if there is nothing to render.
+    """
+    content = block.get("content") if isinstance(block, dict) else getattr(block, "content", None)
+
+    # Failure case: the native error object.
+    if isinstance(content, dict):
+        if content.get("type") == "web_search_tool_result_error":
+            return "\n<web_search>\n(Previous web search was unavailable.)\n</web_search>\n"
+        return ""
+
+    if not isinstance(content, list):
+        return ""
+
+    lines = []
+    for item in content:
+        item_dict = item if isinstance(item, dict) else getattr(item, "__dict__", {})
+        title = item_dict.get("title", "")
+        url = item_dict.get("url", "")
+        snippet = item_dict.get("encrypted_content", "") or item_dict.get("snippet", "")
+        if title or url or snippet:
+            lines.append(f"- {title} ({url})\n  {snippet}".rstrip())
+
+    if not lines:
+        return ""
+
+    return "\n<web_search>\nPrevious search results:\n" + "\n".join(lines) + "\n</web_search>\n"
+
+
 def convert_anthropic_content_to_text(content: Any) -> str:
     """
     Extracts text content from Anthropic message content.
@@ -52,6 +93,10 @@ def convert_anthropic_content_to_text(content: Any) -> str:
     Anthropic content can be:
     - String: "Hello, world!"
     - List of content blocks: [{"type": "text", "text": "Hello"}]
+
+    Server-side web_search blocks (server_tool_use / web_search_tool_result) that
+    a client echoes back from a prior turn are folded into text so the search
+    grounding is preserved through conversion to Kiro.
 
     Args:
         content: Anthropic message content
@@ -66,10 +111,16 @@ def convert_anthropic_content_to_text(content: Any) -> str:
         text_parts = []
         for block in content:
             if isinstance(block, dict):
-                if block.get("type") == "text":
+                block_type = block.get("type")
+                if block_type == "text":
                     text_parts.append(block.get("text", ""))
-            elif hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
+                elif block_type == "web_search_tool_result":
+                    text_parts.append(_render_web_search_result_block(block))
+            elif hasattr(block, "type"):
+                if block.type == "text":
+                    text_parts.append(getattr(block, "text", ""))
+                elif block.type == "web_search_tool_result":
+                    text_parts.append(_render_web_search_result_block(block))
         return "".join(text_parts)
 
     return str(content) if content else ""
@@ -426,6 +477,55 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
 
+def separate_inline_system_messages(
+    messages: List[AnthropicMessage],
+) -> Tuple[List[str], List[AnthropicMessage]]:
+    """
+    Separates inline ``system`` role messages from conversation turns.
+
+    Some clients (notably Claude Code) inject messages with ``role == "system"``
+    directly into the ``messages`` array (e.g. SessionStart hook context), even
+    though the Anthropic spec keeps ``system`` as a separate top-level field.
+
+    To stay consistent with the OpenAI adapter (which extracts all ``system``
+    messages into the system prompt, see ``convert_openai_messages_to_unified``),
+    we peel these inline system messages out here and return their text so the
+    caller can merge it into the system prompt. This keeps system instructions
+    out of the conversation history and avoids turning them into ``user`` turns
+    (which would trigger synthetic alternation placeholders downstream).
+
+    Args:
+        messages: List of Anthropic messages (possibly containing inline system)
+
+    Returns:
+        Tuple of:
+        - List of extracted system text fragments, in original order
+        - List of remaining conversation messages (user/assistant and any other
+          non-system roles, which are normalized later by the core layer)
+
+    Example:
+        >>> msgs = [
+        ...     AnthropicMessage(role="user", content="Hi"),
+        ...     AnthropicMessage(role="system", content="Hook context"),
+        ... ]
+        >>> parts, convo = separate_inline_system_messages(msgs)
+        >>> parts
+        ['Hook context']
+        >>> [m.role for m in convo]
+        ['user']
+    """
+    inline_system_parts: List[str] = []
+    conversation_messages: List[AnthropicMessage] = []
+
+    for msg in messages:
+        if msg.role == "system":
+            inline_system_parts.append(convert_anthropic_content_to_text(msg.content))
+        else:
+            conversation_messages.append(msg)
+
+    return inline_system_parts, conversation_messages
+
+
 def anthropic_to_kiro(
     request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
 ) -> dict:
@@ -435,7 +535,9 @@ def anthropic_to_kiro(
     This is the main entry point for Anthropic → Kiro conversion.
 
     Key differences from OpenAI:
-    - System prompt is a separate field (not in messages)
+    - System prompt is a separate top-level field. Inline ``system`` messages in
+      the ``messages`` array (sent by some clients like Claude Code) are merged
+      into that system prompt, matching the OpenAI adapter's behavior.
     - Content can be string or list of content blocks
     - Tool format uses input_schema instead of parameters
 
@@ -450,15 +552,37 @@ def anthropic_to_kiro(
     Raises:
         ValueError: If there are no messages to send
     """
-    # Convert messages to unified format
-    unified_messages = convert_anthropic_messages(request.messages)
+    # Separate inline system messages (e.g. Claude Code hook context) from the
+    # actual conversation turns. This mirrors the OpenAI adapter, which extracts
+    # all system messages into the system prompt rather than the history.
+    inline_system_parts, conversation_messages = separate_inline_system_messages(
+        request.messages
+    )
+
+    if inline_system_parts:
+        logger.debug(
+            f"Merged {len(inline_system_parts)} inline system message(s) into system prompt"
+        )
+
+    # Convert conversation messages to unified format
+    unified_messages = convert_anthropic_messages(conversation_messages)
 
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
 
-    # System prompt is already separate in Anthropic format!
-    # It can be a string or list of content blocks (for prompt caching)
+    # System prompt comes from the top-level field first, then any inline system
+    # messages are appended (preserving Claude Code's intended ordering).
     system_prompt = extract_system_prompt(request.system)
+    if inline_system_parts:
+        inline_system_text = "\n\n".join(
+            part for part in inline_system_parts if part
+        )
+        if inline_system_text:
+            system_prompt = (
+                f"{system_prompt}\n\n{inline_system_text}"
+                if system_prompt
+                else inline_system_text
+            )
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid

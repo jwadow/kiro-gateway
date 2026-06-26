@@ -525,8 +525,199 @@ class TestAnthropicMessageWithImages:
 
 
 # ==================================================================================================
+# Tests for AnthropicMessage with Non-Standard Roles (inline system / developer messages)
+# ==================================================================================================
+
+class TestAnthropicMessageNonStandardRoles:
+    """
+    Tests for AnthropicMessage accepting non-standard roles in the messages array.
+
+    Some clients (notably Claude Code) inject inline messages with a 'system'
+    role mid-conversation, even though the Anthropic spec keeps 'system' as a
+    separate top-level field. Previously the strict Literal["user", "assistant"]
+    role rejected these with a 422 ValidationError before the request could reach
+    the conversion pipeline (which normalizes such roles to 'user').
+
+    These tests verify the role field is now permissive while standard roles
+    continue to work.
+    """
+
+    def test_inline_system_role_string_content_validates(self):
+        """
+        What it does: Verifies AnthropicMessage accepts role='system' with string content.
+        Purpose: PRIMARY test for the Claude Code inline system message 422 fix.
+
+        Before the fix this raised:
+            literal_error: Input should be 'user' or 'assistant', input='system'
+        """
+        print("Setup: Creating AnthropicMessage with inline system role...")
+        message = AnthropicMessage(role="system", content="You are a helpful assistant.")
+
+        print(f"Comparing role: Expected 'system', Got '{message.role}'")
+        assert message.role == "system"
+        assert message.content == "You are a helpful assistant."
+
+    def test_inline_system_role_list_content_validates(self):
+        """
+        What it does: Verifies role='system' works with list-of-blocks content.
+        Purpose: Claude Code sends system-reminder content as text content blocks.
+        """
+        print("Setup: Creating system role message with content blocks...")
+        message = AnthropicMessage(
+            role="system",
+            content=[{"type": "text", "text": "<system-reminder>context</system-reminder>"}],
+        )
+
+        print(f"Comparing role: Expected 'system', Got '{message.role}'")
+        assert message.role == "system"
+        assert len(message.content) == 1
+        assert message.content[0].type == "text"
+
+    def test_developer_role_validates(self):
+        """
+        What it does: Verifies role='developer' (OpenAI o1-style) is accepted.
+        Purpose: Ensure the whole class of non-standard roles is handled, not just 'system'.
+        """
+        print("Setup: Creating AnthropicMessage with developer role...")
+        message = AnthropicMessage(role="developer", content="Follow these guidelines.")
+
+        print(f"Comparing role: Expected 'developer', Got '{message.role}'")
+        assert message.role == "developer"
+
+    def test_standard_user_and_assistant_roles_still_valid(self):
+        """
+        What it does: Verifies the permissive role field does not break standard roles.
+        Purpose: Guard against regression of the common path.
+        """
+        print("Setup: Creating standard user and assistant messages...")
+        user_msg = AnthropicMessage(role="user", content="Hello")
+        assistant_msg = AnthropicMessage(role="assistant", content="Hi there")
+
+        print(f"Comparing user role: Expected 'user', Got '{user_msg.role}'")
+        assert user_msg.role == "user"
+        assert assistant_msg.role == "assistant"
+
+    def test_missing_role_still_raises(self):
+        """
+        What it does: Verifies role is still required.
+        Purpose: Permissiveness on value must not make the field optional.
+        """
+        print("Setup: Attempting to create AnthropicMessage without role...")
+        print("Action: Creating model (should raise ValidationError)...")
+        with pytest.raises(ValidationError) as exc_info:
+            AnthropicMessage(content="No role here")
+
+        print(f"ValidationError raised: {exc_info.value}")
+        assert "role" in str(exc_info.value)
+
+    def test_request_with_inline_system_message_validates(self):
+        """
+        What it does: Verifies a full request with an inline system message validates.
+        Purpose: Reproduces the exact Claude Code payload shape that caused the 422
+                 (system message at index 1 in the messages array).
+        """
+        print("Setup: Creating request with user + inline system + user messages...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="First user turn"),
+                AnthropicMessage(
+                    role="system",
+                    content=[{"type": "text", "text": "<system-reminder>be concise</system-reminder>"}],
+                ),
+                AnthropicMessage(role="user", content="Second user turn"),
+            ],
+        )
+
+        print(f"Comparing message count: Expected 3, Got {len(request.messages)}")
+        assert len(request.messages) == 3
+        print(f"Comparing messages[1].role: Expected 'system', Got '{request.messages[1].role}'")
+        assert request.messages[1].role == "system"
+
+
+# ==================================================================================================
 # Tests for AnthropicMessagesRequest with Image Content
 # ==================================================================================================
+
+class TestAnthropicMessageServerToolBlocks:
+    """
+    Tests that the assistant content union accepts the server-side web_search
+    blocks the gateway emits (server_tool_use, web_search_tool_result), so a
+    client echoing them back on the next turn does not trigger a 422.
+    """
+
+    def test_accepts_server_tool_use_and_result_blocks(self):
+        """
+        What it does: Verifies an assistant message with server_tool_use +
+                      web_search_tool_result (success) validates.
+        Purpose: PRIMARY regression for the post-web_search 422.
+        """
+        print("Setup: assistant message echoing web_search blocks...")
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "x"}},
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "content": [
+                        {"type": "web_search_result", "title": "T", "url": "https://e.com", "encrypted_content": "s"}
+                    ],
+                },
+                {"type": "text", "text": "answer"},
+            ],
+        )
+        types = [b.type for b in message.content]
+        print(f"Block types: {types}")
+        assert types == ["server_tool_use", "web_search_tool_result", "text"]
+
+    def test_accepts_web_search_tool_result_error_content(self):
+        """
+        What it does: Verifies a web_search_tool_result with an error object validates.
+        Purpose: The failure result the gateway emits must round-trip too.
+        """
+        print("Setup: assistant message with web_search error result...")
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"type": "server_tool_use", "id": "srvtoolu_2", "name": "web_search", "input": {}},
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_2",
+                    "content": {"type": "web_search_tool_result_error", "error_code": "unavailable"},
+                },
+            ],
+        )
+        result_block = message.content[1]
+        assert result_block.type == "web_search_tool_result"
+        assert result_block.content["error_code"] == "unavailable"
+
+    def test_full_request_with_echoed_web_search_validates(self):
+        """
+        What it does: Verifies a full request with an echoed web_search turn validates.
+        Purpose: Reproduce the exact shape that produced the 422.
+        """
+        print("Setup: full request with echoed web_search assistant turn...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="search"),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "q"}},
+                        {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []},
+                        {"type": "text", "text": "done"},
+                    ],
+                ),
+                AnthropicMessage(role="user", content="follow up"),
+            ],
+        )
+        assert len(request.messages) == 3
+        assert request.messages[1].content[0].type == "server_tool_use"
+
 
 class TestAnthropicMessagesRequestWithImages:
     """Tests for full AnthropicMessagesRequest with image content."""

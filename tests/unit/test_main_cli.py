@@ -33,6 +33,41 @@ class TestParseCliArgs:
         assert args.host is None
         assert args.port is None
     
+    def test_stop_and_force_default_false(self):
+        """
+        What it does: Verifies --stop and --force default to False.
+        Purpose: Normal startup must not be treated as a stop/force request.
+        """
+        from main import parse_cli_args
+        with patch.object(sys, 'argv', ['main.py']):
+            args = parse_cli_args()
+        print(f"stop={args.stop}, force={args.force}")
+        assert args.stop is False
+        assert args.force is False
+    
+    def test_stop_flag_parsed(self):
+        """
+        What it does: Verifies --stop sets args.stop True.
+        Purpose: Enable the 'free the port and exit' path.
+        """
+        from main import parse_cli_args
+        with patch.object(sys, 'argv', ['main.py', '--port', '9000', '--stop']):
+            args = parse_cli_args()
+        print(f"stop={args.stop}, port={args.port}")
+        assert args.stop is True
+        assert args.port == 9000
+    
+    def test_force_flag_long_and_short(self):
+        """
+        What it does: Verifies --force and -f both set args.force True.
+        Purpose: Enable the 'stop occupant then start' path.
+        """
+        from main import parse_cli_args
+        with patch.object(sys, 'argv', ['main.py', '--force']):
+            assert parse_cli_args().force is True
+        with patch.object(sys, 'argv', ['main.py', '-f']):
+            assert parse_cli_args().force is True
+    
     def test_port_argument_long_form(self):
         """
         What it does: Verifies that --port argument is parsed correctly.

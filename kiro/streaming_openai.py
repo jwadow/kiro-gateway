@@ -198,7 +198,11 @@ async def stream_kiro_to_openai_internal(
                 
                 # INTERCEPT web_search tool calls (Path B - MCP emulation)
                 if tool_name == "web_search":
-                    from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
+                    from kiro.mcp_tools import (
+                        call_kiro_mcp_api,
+                        generate_search_summary,
+                        generate_search_unavailable_summary,
+                    )
                     
                     logger.info("Intercepted web_search tool call (Path B - MCP emulation)")
                     
@@ -212,52 +216,57 @@ async def stream_kiro_to_openai_internal(
                     
                     # Extract query
                     query = tool_input.get("query", "")
+                    
                     if not query:
-                        logger.warning("web_search called without query, skipping MCP call")
-                        # Continue with normal tool_use processing
+                        logger.warning(
+                            "web_search called without query; emitting unavailable note "
+                            "(no tool_call leaked to client)"
+                        )
+                        summary = generate_search_unavailable_summary("")
                     else:
                         logger.debug(f"WebSearch query (Path B): {query}")
-                        
-                        # Call MCP API
                         mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
-                        
                         if results is None:
-                            logger.error("MCP API call failed for web_search")
-                            # Continue with normal tool_use processing (will show error to user)
+                            logger.error(
+                                "MCP API call failed for web_search; emitting unavailable "
+                                "note (no tool_call leaked to client)"
+                            )
+                            summary = generate_search_unavailable_summary(query)
                         else:
-                            # Emit summary as content chunks (OpenAI format)
                             summary = generate_search_summary(query, results)
-                            
-                            # Send content chunks
-                            chunk_size = 100
-                            for i in range(0, len(summary), chunk_size):
-                                content_chunk = summary[i:i + chunk_size]
-                                
-                                delta = {"content": content_chunk}
-                                if first_chunk:
-                                    delta["role"] = "assistant"
-                                    first_chunk = False
-                                
-                                openai_chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": model,
-                                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
-                                }
-                                
-                                chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
-                                
-                                if debug_logger:
-                                    debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
-                                
-                                yield chunk_text
-                            
-                            # Accumulate for token counting
-                            full_content += summary
-                            
-                            # Skip normal tool_use processing
-                            continue
+                    
+                    # Emit the outcome as assistant content chunks (OpenAI format).
+                    # web_search is never emitted as a tool_call the client cannot
+                    # execute - on failure we degrade to an in-band note.
+                    chunk_size = 100
+                    for i in range(0, len(summary), chunk_size):
+                        content_chunk = summary[i:i + chunk_size]
+                        
+                        delta = {"content": content_chunk}
+                        if first_chunk:
+                            delta["role"] = "assistant"
+                            first_chunk = False
+                        
+                        openai_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                        }
+                        
+                        chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+                        
+                        if debug_logger:
+                            debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+                        
+                        yield chunk_text
+                    
+                    # Accumulate for token counting
+                    full_content += summary
+                    
+                    # Skip normal tool_use processing (never leak web_search)
+                    continue
                 
                 # Collect tool calls from stream (normal tools, not web_search)
                 tool_calls_from_stream.append(event.tool_use)

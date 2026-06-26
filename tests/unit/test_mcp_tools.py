@@ -21,6 +21,10 @@ from kiro.mcp_tools import (
     generate_random_id,
     call_kiro_mcp_api,
     generate_search_summary,
+    generate_search_unavailable_summary,
+    build_web_search_result_items,
+    web_search_tool_result_content,
+    build_anthropic_web_search_blocks,
     extract_query_from_messages,
     handle_native_web_search,
     generate_anthropic_web_search_sse,
@@ -146,7 +150,133 @@ class TestCallKiroMCPAPI:
         assert results["totalResults"] == 1
         assert results["results"][0]["title"] == "Python Tutorial"
         assert results["results"][0]["url"] == "https://python.org"
-    
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_sends_kiro_identity_headers(self, mock_auth_manager):
+        """
+        What it does: Verifies the /mcp request carries the Kiro client-identity
+                      headers (User-Agent with KiroIDE+fingerprint, x-amz-user-agent,
+                      x-amzn-kiro-agent-mode) plus JSON-RPC adjustments.
+        Purpose: Guard against the 403 regression. Without these headers Kiro
+                 rejects /mcp, call_kiro_mcp_api returns (None, None), and the
+                 web_search tool_use leaks back to the client ("No such tool
+                 available: web_search"). Also verifies the JSON-RPC overrides:
+                 plain JSON content type, no x-amz-target, optout=false.
+        """
+        print("Setup: Mocking MCP API response to capture posted headers...")
+        query = "Python tutorials"
+
+        mock_response_data = {
+            "id": "web_search_tooluse_abc123_1234567890_xyz",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"results": [], "totalResults": 0, "query": query})
+                }],
+                "isError": False
+            }
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        print("Inspecting posted request headers...")
+        assert mock_post.call_count == 1
+        headers = mock_post.call_args.kwargs["headers"]
+        print(f"Headers: {headers}")
+
+        # Kiro client-identity headers must be present
+        assert "KiroIDE" in headers["User-Agent"]
+        assert mock_auth_manager.fingerprint in headers["User-Agent"]
+        assert "KiroIDE" in headers["x-amz-user-agent"]
+        assert headers["x-amzn-kiro-agent-mode"] == "vibe"
+        assert headers["Authorization"].startswith("Bearer ")
+
+        # JSON-RPC /mcp adjustments
+        assert headers["Content-Type"] == "application/json"
+        assert "x-amz-target" not in headers
+        assert headers["x-amzn-codewhisperer-optout"] == "false"
+
+    @pytest.mark.asyncio
+    async def test_mcp_request_includes_profile_arn_when_set(self, mock_auth_manager):
+        """
+        What it does: Verifies profileArn is added at the TOP level of the MCP
+                      request body when the auth manager has one.
+        Purpose: Enterprise/Builder accounts require profileArn or /mcp rejects
+                 the call, silently degrading web_search to "unavailable".
+        """
+        print("Setup: auth_manager fixture has a profile_arn...")
+        query = "Python"
+        assert mock_auth_manager.profile_arn is not None
+
+        mock_response_data = {
+            "id": "web_search_tooluse_x",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{"type": "text", "text": json.dumps({"results": [], "totalResults": 0, "query": query})}],
+                "isError": False,
+            },
+        }
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        sent_body = mock_post.await_args.kwargs["json"]
+        print(f"Sent body keys: {list(sent_body.keys())}")
+        # Top-level profileArn, never inside params
+        assert sent_body.get("profileArn") == mock_auth_manager.profile_arn
+        assert "profileArn" not in sent_body.get("params", {})
+
+    @pytest.mark.asyncio
+    async def test_mcp_request_omits_profile_arn_when_unset(self, mock_auth_manager):
+        """
+        What it does: Verifies profileArn is omitted when the account has none.
+        Purpose: Avoid sending a null/empty profileArn for non-Enterprise accounts.
+        """
+        print("Setup: clearing profile_arn on auth_manager...")
+        mock_auth_manager._profile_arn = None
+        query = "Python"
+
+        mock_response_data = {
+            "id": "web_search_tooluse_y",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{"type": "text", "text": json.dumps({"results": [], "totalResults": 0, "query": query})}],
+                "isError": False,
+            },
+        }
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        sent_body = mock_post.await_args.kwargs["json"]
+        print(f"Sent body keys: {list(sent_body.keys())}")
+        assert "profileArn" not in sent_body
+
     @pytest.mark.asyncio
     async def test_mcp_api_error_response(self, mock_auth_manager):
         """
@@ -600,3 +730,126 @@ class TestOpenAISSEEmulation:
         
         print("Checking for usage information...")
         assert any('"usage"' in chunk for chunk in chunks)
+
+
+# ==================================================================================================
+# Tests for WebSearch Outcome Helpers (anti-leak hardening)
+# ==================================================================================================
+
+class TestWebSearchOutcomeHelpers:
+    """
+    Tests for the shared helpers that build graceful web_search outcomes so the
+    gateway never leaks an unhandled web_search tool_use/tool_call to the client.
+    """
+
+    SAMPLE_RESULTS = {
+        "results": [
+            {
+                "title": "Python",
+                "url": "https://python.org",
+                "snippet": "Official site",
+                "publishedDate": 1700000000000,
+            }
+        ],
+        "totalResults": 1,
+        "query": "python",
+    }
+
+    def test_unavailable_summary_includes_query(self):
+        """
+        What it does: Verifies the failure note mentions the query and is tagged.
+        Purpose: Give the model/user a clear in-band message on failure.
+        """
+        summary = generate_search_unavailable_summary("python tutorials")
+        print(f"Summary: {summary}")
+        assert "python tutorials" in summary
+        assert "<web_search>" in summary and "</web_search>" in summary
+        assert "unavailable" in summary.lower()
+
+    def test_unavailable_summary_handles_empty_query(self):
+        """
+        What it does: Verifies the failure note works with an empty query.
+        Purpose: web_search called without a query must not crash the helper.
+        """
+        summary = generate_search_unavailable_summary("")
+        print(f"Summary: {summary}")
+        assert "<web_search>" in summary
+        # No dangling 'for ""' fragment
+        assert 'for ""' not in summary
+
+    def test_build_result_items_maps_fields(self):
+        """
+        What it does: Verifies MCP results map to web_search_result items.
+        Purpose: Ensure title/url/snippet are carried into the result blocks.
+        """
+        items = build_web_search_result_items(self.SAMPLE_RESULTS)
+        print(f"Items: {items}")
+        assert len(items) == 1
+        assert items[0]["type"] == "web_search_result"
+        assert items[0]["title"] == "Python"
+        assert items[0]["url"] == "https://python.org"
+        assert items[0]["encrypted_content"] == "Official site"
+
+    def test_build_result_items_handles_none(self):
+        """
+        What it does: Verifies None/empty results yield an empty list.
+        Purpose: Defensive boundary check.
+        """
+        assert build_web_search_result_items(None) == []
+        assert build_web_search_result_items({}) == []
+
+    def test_tool_result_content_success_is_list(self):
+        """
+        What it does: Verifies success content is a list of result items.
+        Purpose: Native Anthropic web_search_tool_result success shape.
+        """
+        content = web_search_tool_result_content(self.SAMPLE_RESULTS)
+        print(f"Content: {content}")
+        assert isinstance(content, list)
+        assert content[0]["type"] == "web_search_result"
+
+    def test_tool_result_content_failure_is_error_dict(self):
+        """
+        What it does: Verifies failure content is the native error dict.
+        Purpose: PRIMARY anti-leak behavior - failure stays a server-side tool
+                 result error, never an executable tool_use.
+        """
+        content = web_search_tool_result_content(None)
+        print(f"Content: {content}")
+        assert content["type"] == "web_search_tool_result_error"
+        assert content["error_code"] == "unavailable"
+
+    def test_build_blocks_success_sequence(self):
+        """
+        What it does: Verifies success blocks are server_tool_use + result + text.
+        Purpose: Non-streaming Anthropic shape must match the streaming sequence.
+        """
+        blocks = build_anthropic_web_search_blocks("python", "srvtoolu_x", self.SAMPLE_RESULTS)
+        print(f"Block types: {[b['type'] for b in blocks]}")
+        assert [b["type"] for b in blocks] == [
+            "server_tool_use",
+            "web_search_tool_result",
+            "text",
+        ]
+        assert blocks[0]["id"] == "srvtoolu_x"
+        assert blocks[0]["input"] == {"query": "python"}
+        assert blocks[1]["tool_use_id"] == "srvtoolu_x"
+        assert isinstance(blocks[1]["content"], list)
+        # No leaked executable tool_use
+        assert all(b["type"] != "tool_use" for b in blocks)
+
+    def test_build_blocks_failure_sequence(self):
+        """
+        What it does: Verifies failure blocks carry the error result, no tool_use.
+        Purpose: The non-streaming failure path must not leak web_search.
+        """
+        blocks = build_anthropic_web_search_blocks("python", "srvtoolu_x", None)
+        print(f"Block types: {[b['type'] for b in blocks]}")
+        assert [b["type"] for b in blocks] == [
+            "server_tool_use",
+            "web_search_tool_result",
+            "text",
+        ]
+        assert blocks[1]["content"]["type"] == "web_search_tool_result_error"
+        assert "unavailable" in blocks[2]["text"].lower()
+        assert all(b["type"] != "tool_use" for b in blocks)

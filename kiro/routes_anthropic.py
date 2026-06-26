@@ -42,7 +42,7 @@ from kiro.models_anthropic import (
     AnthropicErrorResponse,
     AnthropicErrorDetail,
 )
-from kiro.auth import KiroAuthManager, AuthType
+from kiro.auth import KiroAuthManager, AuthType, InvalidRefreshTokenError
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.streaming_anthropic import (
@@ -887,6 +887,23 @@ async def messages(
         if debug_logger:
             debug_logger.flush_on_error(e.status_code, str(e.detail))
         raise
+    except InvalidRefreshTokenError as e:
+        # Credentials problem (refresh token expired/revoked) - not an internal
+        # error. Return an actionable 401 instead of a confusing 500.
+        await http_client.close()
+        logger.error(f"HTTP 401 - POST /v1/messages - {e}")
+        if debug_logger:
+            debug_logger.flush_on_error(401, str(e))
+        return JSONResponse(
+            status_code=401,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": str(e)
+                }
+            }
+        )
     except Exception as e:
         await http_client.close()
         logger.error(f"Internal error: {e}", exc_info=True)

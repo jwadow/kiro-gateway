@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from kiro.config import MODEL_CACHE_TTL, DEFAULT_MAX_INPUT_TOKENS
+from kiro.config import MODEL_CACHE_TTL, DEFAULT_MAX_INPUT_TOKENS, MODEL_CONTEXT_WINDOWS
 
 
 class ModelInfoCache:
@@ -129,13 +129,24 @@ class ModelInfoCache:
     def get_max_input_tokens(self, model_id: str) -> int:
         """
         Returns maxInputTokens for the model.
-        
+
+        Resolution order (highest precedence first):
+        1. Explicit per-model override from MODEL_CONTEXT_WINDOWS env config
+           (lets users declare a real window, e.g. 1M, when the gateway cannot
+           discover it - notably on the runtime.kiro.dev endpoint).
+        2. Upstream value from the cached /ListAvailableModels tokenLimits.
+        3. DEFAULT_MAX_INPUT_TOKENS fallback.
+
         Args:
             model_id: Model ID
-        
+
         Returns:
-            Maximum number of input tokens or DEFAULT_MAX_INPUT_TOKENS
+            Maximum number of input tokens
         """
+        override = MODEL_CONTEXT_WINDOWS.get(model_id)
+        if override:
+            return override
+
         model = self._cache.get(model_id)
         if model and model.get("tokenLimits"):
             return model["tokenLimits"].get("maxInputTokens") or DEFAULT_MAX_INPUT_TOKENS

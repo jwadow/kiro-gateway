@@ -58,6 +58,45 @@ SQLITE_TOKEN_KEYS = [
     "codewhisperer:odic:token",  # Legacy AWS SSO OIDC
 ]
 
+
+class InvalidRefreshTokenError(Exception):
+    """
+    Raised when the auth provider rejects the stored refresh token.
+
+    This indicates the refresh token has expired or been revoked (e.g. AWS SSO
+    OIDC returns 400 ``invalid_grant``). It is a credentials/configuration
+    problem - retrying will not help. The user must re-authenticate and update
+    the gateway's credentials. Routes map this to HTTP 401 (not 500) with an
+    actionable message.
+    """
+
+
+def _is_invalid_refresh_token_response(response: "httpx.Response") -> bool:
+    """
+    Detect whether an auth-endpoint error response means the refresh token is
+    no longer valid (expired/revoked), as opposed to a transient failure.
+
+    Args:
+        response: The httpx response from a failed token refresh.
+
+    Returns:
+        True if the response indicates an invalid/expired refresh token.
+    """
+    if response.status_code not in (400, 401):
+        return False
+    error_code = ""
+    try:
+        error_code = (response.json().get("error") or "").lower()
+    except (ValueError, AttributeError):
+        error_code = ""
+    if error_code in ("invalid_grant", "invalid_client"):
+        return True
+    # Fall back to body text for providers that don't return a JSON error code.
+    try:
+        return "invalid refresh token" in response.text.lower()
+    except (ValueError, AttributeError):
+        return False
+
 # Device registration keys (for AWS SSO OIDC only)
 SQLITE_REGISTRATION_KEYS = [
     "kirocli:odic:device-registration",
@@ -922,6 +961,17 @@ class KiroAuthManager:
                             "Token expired and refresh failed. "
                             "Please run 'kiro-cli login' to refresh your credentials."
                         )
+                # If the provider rejected the refresh token itself (expired or
+                # revoked), this is a credentials problem that retrying cannot
+                # fix. Surface a clear, actionable error that routes turn into a
+                # 401 instead of a confusing 500.
+                if _is_invalid_refresh_token_response(e.response):
+                    raise InvalidRefreshTokenError(
+                        "Authentication failed: the stored refresh token was rejected by the "
+                        "auth provider (invalid_grant). It has expired or been revoked. "
+                        "Re-authenticate (e.g. sign in to Kiro / run 'kiro-cli login', or update "
+                        "REFRESH_TOKEN / your credentials file), then restart the gateway."
+                    ) from e
                 # Non-SQLite mode or non-400 error - propagate the exception
                 raise
             except Exception:

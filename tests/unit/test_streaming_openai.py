@@ -1485,3 +1485,114 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+
+# ==================================================================================================
+# Tests for web_search anti-leak hardening (OpenAI streaming, covers non-streaming via reuse)
+# ==================================================================================================
+
+def _reconstruct_openai_content(chunks: list) -> str:
+    """Reassemble assistant content from OpenAI SSE chunk strings."""
+    content = ""
+    for chunk in chunks:
+        if not chunk.startswith("data:"):
+            continue
+        data_str = chunk[len("data:"):].strip()
+        if not data_str or data_str == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        delta = data.get("choices", [{}])[0].get("delta", {})
+        if "content" in delta and delta["content"]:
+            content += delta["content"]
+    return content
+
+
+class TestOpenAIWebSearchNoLeak:
+    """
+    Verifies an intercepted web_search call never leaks to the OpenAI client as a
+    tool_call. On failure it degrades to assistant content. Because the OpenAI
+    non-streaming collector reuses this generator, fixing it covers both modes.
+    """
+
+    WS_TOOL_USE = {
+        "id": "call_ws",
+        "type": "function",
+        "function": {"name": "web_search", "arguments": '{"query": "python"}'},
+    }
+
+    SAMPLE_RESULTS = {
+        "results": [{"title": "Python", "url": "https://python.org", "snippet": "Official"}],
+        "totalResults": 1,
+        "query": "python",
+    }
+
+    @pytest.mark.asyncio
+    async def test_streaming_failure_degrades_to_content_no_tool_call(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: On MCP failure, the generator emits assistant content
+                      (an unavailable note) and NO web_search tool_call.
+        Purpose: PRIMARY regression guard - OpenAI clients must not receive an
+                 unknown web_search tool_call.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=self.WS_TOOL_USE)
+
+        chunks = []
+        with patch("kiro.streaming_openai.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_openai.parse_bracket_tool_calls", return_value=[]):
+                with patch(
+                    "kiro.mcp_tools.call_kiro_mcp_api",
+                    new=AsyncMock(return_value=(None, None)),
+                ):
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-opus-4.8",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+
+        joined = "".join(chunks)
+        # No web_search tool_call leaked to the client
+        assert '"tool_calls"' not in joined
+
+        # Reconstruct the assistant content from the SSE deltas (word may be split
+        # across chunk boundaries, so check the reassembled text, not raw SSE).
+        content = _reconstruct_openai_content(chunks)
+        print(f"Reconstructed content: {content}")
+        assert "unavailable" in content.lower()
+
+    @pytest.mark.asyncio
+    async def test_streaming_success_emits_content_no_tool_call(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: On success, the generator emits the search summary as
+                      content, not as a tool_call.
+        Purpose: Confirm the happy path stays content-only for OpenAI.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=self.WS_TOOL_USE)
+
+        chunks = []
+        with patch("kiro.streaming_openai.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_openai.parse_bracket_tool_calls", return_value=[]):
+                with patch(
+                    "kiro.mcp_tools.call_kiro_mcp_api",
+                    new=AsyncMock(return_value=("srvtoolu_ok", self.SAMPLE_RESULTS)),
+                ):
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-opus-4.8",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+
+        joined = "".join(chunks)
+        assert '"tool_calls"' not in joined
+        # Search summary content present (reconstruct - URL may span chunks)
+        content = _reconstruct_openai_content(chunks)
+        print(f"Reconstructed content: {content}")
+        assert "python.org" in content

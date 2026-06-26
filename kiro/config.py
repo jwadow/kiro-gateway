@@ -26,9 +26,11 @@ Loads environment variables and provides typed access to them.
 
 import os
 import re
+import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
+from loguru import logger
 
 # Load environment variables
 load_dotenv()
@@ -273,7 +275,12 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Some models may not be available on your Kiro plan (e.g., Opus on free tier)
 # - New models released after this version won't appear here
 # - Update gateway regularly to get the latest model list
-FALLBACK_MODELS: List[Dict[str, str]] = [
+#
+# tokenLimits.maxInputTokens is included for models with a non-default context
+# window so token accounting is accurate on the runtime.kiro.dev endpoint, which
+# does not expose /ListAvailableModels. Models without it fall back to
+# DEFAULT_MAX_INPUT_TOKENS (and can still be overridden via MODEL_CONTEXT_WINDOWS).
+FALLBACK_MODELS: List[Dict[str, Any]] = [
     {"modelId": "auto"},
     {"modelId": "claude-sonnet-4"},
     {"modelId": "claude-sonnet-4.5"},
@@ -282,6 +289,9 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "claude-opus-4.5"},
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-4.7"},
+    # Claude Opus 4.8 (released 2026-05-28): 1M token context window by default
+    # on the Claude API / Amazon Bedrock (Kiro is Bedrock-backed), 128k max output.
+    {"modelId": "claude-opus-4.8", "tokenLimits": {"maxInputTokens": 1000000}},
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
     {"modelId": "minimax-m2.1"},
@@ -296,8 +306,78 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
 # Model cache TTL in seconds (1 hour)
 MODEL_CACHE_TTL: int = 3600
 
-# Default maximum number of input tokens
-DEFAULT_MAX_INPUT_TOKENS: int = 200000
+# Default maximum number of input tokens.
+# Used for token-usage estimation (context_usage_percentage * max_input_tokens)
+# when the upstream model limit is unknown. NOT an enforced cap - requests are
+# passed through to Kiro regardless.
+#
+# Configurable via env so larger context windows (e.g. 1M on Kiro) are accounted
+# for accurately on the runtime.kiro.dev endpoint, which does not expose
+# /ListAvailableModels and therefore has no per-model tokenLimits.
+DEFAULT_MAX_INPUT_TOKENS: int = int(os.getenv("DEFAULT_MAX_INPUT_TOKENS", "200000"))
+
+
+def _parse_model_context_overrides() -> Dict[str, int]:
+    """
+    Parse per-model context window overrides from the environment.
+
+    These overrides take precedence over both the cached upstream value (from
+    /ListAvailableModels) and DEFAULT_MAX_INPUT_TOKENS. They let users declare a
+    model's real context window when the gateway cannot discover it - most
+    notably on the runtime.kiro.dev endpoint, where Kiro may grant a 1M window
+    but provides no token limits to read.
+
+    Accepted format (env var MODEL_CONTEXT_WINDOWS), JSON object mapping a Kiro
+    model id to its max input tokens:
+
+        MODEL_CONTEXT_WINDOWS='{"claude-sonnet-4": 1000000, "claude-opus-4.7": 1000000}'
+
+    Returns:
+        Mapping of model id -> max input tokens. Empty dict if unset or invalid.
+    """
+    raw = os.getenv("MODEL_CONTEXT_WINDOWS")
+    if not raw:
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning(
+            "MODEL_CONTEXT_WINDOWS is not valid JSON; ignoring. "
+            'Expected e.g. {"claude-sonnet-4": 1000000}'
+        )
+        return {}
+
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "MODEL_CONTEXT_WINDOWS must be a JSON object mapping model id -> int; ignoring."
+        )
+        return {}
+
+    overrides: Dict[str, int] = {}
+    for model_id, value in parsed.items():
+        try:
+            tokens = int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"MODEL_CONTEXT_WINDOWS: ignoring non-integer limit for '{model_id}': {value!r}"
+            )
+            continue
+        if tokens <= 0:
+            logger.warning(
+                f"MODEL_CONTEXT_WINDOWS: ignoring non-positive limit for '{model_id}': {tokens}"
+            )
+            continue
+        overrides[str(model_id)] = tokens
+
+    if overrides:
+        logger.info(f"Loaded {len(overrides)} model context window override(s) from env")
+
+    return overrides
+
+
+# Per-model context window overrides (highest precedence). See helper above.
+MODEL_CONTEXT_WINDOWS: Dict[str, int] = _parse_model_context_overrides()
 
 # ==================================================================================================
 # Tool Description Handling (Kiro API Limitations)
@@ -359,6 +439,15 @@ FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "15"))
 # while "thinking" (especially for tool calls or complex reasoning).
 # Default: 300 seconds (5 minutes) - generous timeout to avoid premature disconnects.
 STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300"))
+
+# Graceful shutdown timeout (in seconds) for Ctrl+C / SIGTERM.
+# When the server is stopped, uvicorn waits for in-flight connections to drain.
+# With long-lived streaming (STREAMING_READ_TIMEOUT=300), an open SSE connection
+# would otherwise keep the process alive (and the port bound) for minutes. This
+# caps that wait so Ctrl+C frees the port promptly. A second Ctrl+C still forces
+# an immediate exit.
+# Default: 10 seconds.
+SHUTDOWN_TIMEOUT: int = int(os.getenv("SHUTDOWN_TIMEOUT", "10"))
 
 # Maximum number of attempts on first token timeout.
 # After exhausting all attempts, an error will be returned.

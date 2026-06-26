@@ -34,13 +34,14 @@ import uuid
 import random
 import string
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import get_kiro_headers
 
 # Import debug_logger
 try:
@@ -135,6 +136,12 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+
+    # Enterprise / Builder accounts require profileArn, and it goes at the TOP
+    # level of the request body (not inside params). Without it the /mcp call is
+    # rejected and web_search silently degrades to "unavailable".
+    if getattr(auth_manager, "profile_arn", None):
+        mcp_request["profileArn"] = auth_manager.profile_arn
     
     # Log MCP request
     try:
@@ -147,12 +154,16 @@ async def call_kiro_mcp_api(
     try:
         token = await auth_manager.get_access_token()
         
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
+        # The /mcp endpoint requires the same Kiro client-identity headers as the
+        # completion path (User-Agent with KiroIDE+fingerprint, x-amz-user-agent,
+        # x-amzn-kiro-agent-mode). Without them Kiro returns 403, which would make
+        # this call fail and leak the web_search tool_use back to the client.
+        # We reuse get_kiro_headers and adjust for the JSON-RPC /mcp endpoint:
+        # it expects plain JSON (not x-amz-json-1.0) and has no x-amz-target.
+        headers = get_kiro_headers(auth_manager, token)
+        headers["Content-Type"] = "application/json"
+        headers.pop("x-amz-target", None)
+        headers["x-amzn-codewhisperer-optout"] = "false"
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
@@ -161,7 +172,7 @@ async def call_kiro_mcp_api(
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                logger.error(f"MCP API error: {response.status_code} - {response.text[:500]}")
                 return None, None
             
             mcp_response = response.json()
@@ -272,6 +283,127 @@ def generate_search_summary(query: str, results: Dict) -> str:
     summary += "</web_search>\n"
     
     return summary
+
+
+# ==================================================================================================
+# WebSearch Outcome Helpers (shared by streaming + non-streaming, both APIs)
+# ==================================================================================================
+
+# Error code reported in an Anthropic web_search_tool_result when the search
+# could not be completed (e.g. the Kiro /mcp call failed).
+WEB_SEARCH_ERROR_CODE: str = "unavailable"
+
+
+def generate_search_unavailable_summary(query: str) -> str:
+    """
+    Human-readable note shown when a web_search could not be completed.
+
+    Used as a graceful fallback so the model/user gets a clear, in-band message
+    instead of the gateway leaking an unhandled ``web_search`` tool call back to
+    a client that never defined that tool.
+
+    Args:
+        query: The search query that could not be completed (may be empty)
+
+    Returns:
+        A short note wrapped in <web_search> tags.
+    """
+    target = f' for "{query}"' if query else ""
+    return (
+        f"\n<web_search>\nSearch{target} could not be completed: the web search "
+        f"service is currently unavailable. Continue using your existing knowledge "
+        f"and note that information may be out of date.\n</web_search>\n"
+    )
+
+
+def build_web_search_result_items(results: Optional[Dict]) -> List[Dict[str, Any]]:
+    """
+    Convert MCP results into Anthropic web_search_result content items.
+
+    Args:
+        results: Parsed MCP results dict (or None)
+
+    Returns:
+        List of web_search_result blocks (empty if no results).
+    """
+    items: List[Dict[str, Any]] = []
+    for r in (results or {}).get("results", []):
+        items.append({
+            "type": "web_search_result",
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "encrypted_content": r.get("snippet", ""),
+            "page_age": None,
+        })
+    return items
+
+
+def web_search_tool_result_content(results: Optional[Dict]) -> Any:
+    """
+    Build the ``content`` for an Anthropic web_search_tool_result block.
+
+    Args:
+        results: Parsed MCP results dict, or None if the search failed.
+
+    Returns:
+        - On success: a list of web_search_result items.
+        - On failure (results is None): a web_search_tool_result_error dict, the
+          native Anthropic shape for a server-side tool failure. This keeps the
+          response valid without leaking an executable ``web_search`` tool_use.
+    """
+    if results is None:
+        return {
+            "type": "web_search_tool_result_error",
+            "error_code": WEB_SEARCH_ERROR_CODE,
+        }
+    return build_web_search_result_items(results)
+
+
+def build_anthropic_web_search_blocks(
+    query: str,
+    mcp_tool_use_id: str,
+    results: Optional[Dict],
+) -> List[Dict[str, Any]]:
+    """
+    Build the non-streaming Anthropic content blocks for a web_search outcome.
+
+    Produces the native server-side tool sequence so a client (e.g. Claude Code)
+    never receives an unhandled ``web_search`` tool_use:
+      1. server_tool_use (the search request)
+      2. web_search_tool_result (results, or an error on failure)
+      3. text (human-readable summary, or an unavailable note on failure)
+
+    Args:
+        query: The search query.
+        mcp_tool_use_id: ID linking server_tool_use and its result.
+        results: Parsed MCP results, or None on failure.
+
+    Returns:
+        List of Anthropic content-block dicts.
+    """
+    summary = (
+        generate_search_summary(query, results)
+        if results is not None
+        else generate_search_unavailable_summary(query)
+    )
+    return [
+        {
+            "type": "server_tool_use",
+            "id": mcp_tool_use_id,
+            "name": "web_search",
+            "input": {"query": query},
+        },
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": mcp_tool_use_id,
+            "content": web_search_tool_result_content(results),
+        },
+        {
+            "type": "text",
+            "text": summary,
+        },
+    ]
+
 
 
 # ==================================================================================================

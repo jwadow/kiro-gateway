@@ -1667,3 +1667,155 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+# ==================================================================================================
+# Tests for web_search anti-leak hardening (Anthropic streaming + non-streaming)
+# ==================================================================================================
+
+class TestAnthropicWebSearchNoLeak:
+    """
+    Verifies that an intercepted web_search call is never emitted to the client
+    as an executable tool_use - on success or failure, in streaming and
+    non-streaming - so Claude Code never errors with "No such tool available".
+    """
+
+    WS_TOOL_USE = {
+        "id": "toolu_ws",
+        "function": {"name": "web_search", "arguments": '{"query": "python"}'},
+    }
+
+    SAMPLE_RESULTS = {
+        "results": [{"title": "Python", "url": "https://python.org", "snippet": "Official"}],
+        "totalResults": 1,
+        "query": "python",
+    }
+
+    @pytest.mark.asyncio
+    async def test_streaming_success_emits_server_tool_result_not_tool_use(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: On a successful MCP call, streaming emits server_tool_use +
+                      web_search_tool_result, and NO `web_search` tool_use block.
+        Purpose: Confirm the happy path stays a server-side tool result.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=self.WS_TOOL_USE)
+
+        events = []
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
+                with patch(
+                    "kiro.mcp_tools.call_kiro_mcp_api",
+                    new=AsyncMock(return_value=("srvtoolu_ok", self.SAMPLE_RESULTS)),
+                ):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-opus-4.8", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+
+        joined = "".join(events)
+        print(joined)
+        assert "web_search_tool_result" in joined
+        assert "server_tool_use" in joined
+        # The model-facing executable tool_use must NOT be emitted for web_search
+        assert '"type": "tool_use"' not in joined
+
+    @pytest.mark.asyncio
+    async def test_streaming_failure_emits_error_result_not_tool_use(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: On MCP failure, streaming emits a web_search_tool_result
+                      ERROR block, never the raw web_search tool_use.
+        Purpose: PRIMARY regression guard for "No such tool available: web_search".
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=self.WS_TOOL_USE)
+
+        events = []
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
+                with patch(
+                    "kiro.mcp_tools.call_kiro_mcp_api",
+                    new=AsyncMock(return_value=(None, None)),
+                ):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-opus-4.8", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+
+        joined = "".join(events)
+        print(joined)
+        assert "web_search_tool_result_error" in joined
+        # No executable tool_use leaked to the client
+        assert '"type": "tool_use"' not in joined
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_failure_emits_error_result_not_tool_use(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Non-streaming collector intercepts web_search and, on
+                      failure, emits server-side error blocks (no tool_use).
+        Purpose: Close the non-streaming leak path (previously absent entirely).
+        """
+        mock_result = StreamResult(
+            content="",
+            thinking_content="",
+            tool_calls=[{"id": "toolu_ws", "name": "web_search", "input": {"query": "python"}}],
+            usage=None,
+            context_usage_percentage=5.0,
+        )
+
+        with patch("kiro.streaming_anthropic.collect_stream_to_result", return_value=mock_result):
+            with patch(
+                "kiro.mcp_tools.call_kiro_mcp_api",
+                new=AsyncMock(return_value=(None, None)),
+            ):
+                result = await collect_anthropic_response(
+                    mock_response, "claude-opus-4.8", mock_model_cache, mock_auth_manager
+                )
+
+        types = [b["type"] for b in result["content"]]
+        print(f"Content block types: {types}")
+        assert "web_search_tool_result" in types
+        assert "server_tool_use" in types
+        # No leaked executable tool_use
+        assert "tool_use" not in types
+        # The web_search_tool_result must carry the native error
+        ws_result = next(b for b in result["content"] if b["type"] == "web_search_tool_result")
+        assert ws_result["content"]["type"] == "web_search_tool_result_error"
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_success_emits_results_not_tool_use(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Non-streaming collector emits results on success, no tool_use.
+        Purpose: Confirm the happy path for non-streaming.
+        """
+        mock_result = StreamResult(
+            content="",
+            thinking_content="",
+            tool_calls=[{"id": "toolu_ws", "name": "web_search", "input": {"query": "python"}}],
+            usage=None,
+            context_usage_percentage=5.0,
+        )
+
+        with patch("kiro.streaming_anthropic.collect_stream_to_result", return_value=mock_result):
+            with patch(
+                "kiro.mcp_tools.call_kiro_mcp_api",
+                new=AsyncMock(return_value=("srvtoolu_ok", self.SAMPLE_RESULTS)),
+            ):
+                result = await collect_anthropic_response(
+                    mock_response, "claude-opus-4.8", mock_model_cache, mock_auth_manager
+                )
+
+        types = [b["type"] for b in result["content"]]
+        print(f"Content block types: {types}")
+        assert "tool_use" not in types
+        ws_result = next(b for b in result["content"] if b["type"] == "web_search_tool_result")
+        assert isinstance(ws_result["content"], list)
+        assert ws_result["content"][0]["type"] == "web_search_result"

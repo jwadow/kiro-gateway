@@ -162,7 +162,53 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
-# Union type for all content blocks (including images and thinking)
+class ServerToolUseContentBlock(BaseModel):
+    """
+    Server-side tool use block (e.g. web_search), in Anthropic format.
+
+    The gateway emits these for web_search (Path A and Path B). When a client
+    like Claude Code echoes the conversation back on the next turn, the assistant
+    message contains this block, so we must accept it on input as well.
+
+    Attributes:
+        type: Always "server_tool_use"
+        id: Tool use ID (links to the matching web_search_tool_result)
+        name: Server-side tool name (e.g. "web_search")
+        input: Tool input (e.g. {"query": "..."})
+    """
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any] = {}
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultContentBlock(BaseModel):
+    """
+    web_search tool result block, in Anthropic format.
+
+    Emitted by the gateway alongside server_tool_use and echoed back by clients
+    on subsequent turns. The content is either a list of web_search_result items
+    (success) or a web_search_tool_result_error object (failure), so it is kept
+    permissive here.
+
+    Attributes:
+        type: Always "web_search_tool_result"
+        tool_use_id: ID linking back to the server_tool_use block
+        content: List of result items, an error object, or a string
+    """
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Union[str, List[Dict[str, Any]], Dict[str, Any], None] = None
+
+    model_config = {"extra": "allow"}
+
+
+# Union type for all content blocks (including images, thinking, and the
+# server-side web_search blocks the gateway both emits and accepts back)
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
@@ -170,6 +216,8 @@ ContentBlock = Union[
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
 ]
 
 
@@ -182,12 +230,28 @@ class AnthropicMessage(BaseModel):
     """
     Message in Anthropic format.
 
+    Although the Anthropic spec only documents ``user`` and ``assistant`` roles
+    in the ``messages`` array (``system`` is a separate top-level field), some
+    clients (notably Claude Code) inject inline messages with non-standard roles
+    such as ``system`` mid-conversation. Rejecting these with a 422 would break
+    those clients, so the role is accepted as a free-form string here, mirroring
+    the OpenAI ``ChatMessage`` model.
+
+    Downstream handling (in ``anthropic_to_kiro``):
+    - Inline ``system`` messages are hoisted into the top-level system prompt,
+      matching the OpenAI adapter's behavior (keeps system instructions out of
+      the conversation history).
+    - Any other non-standard role (e.g. ``developer``) is normalized to ``user``
+      by ``normalize_message_roles`` in ``converters_core.py``.
+
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Standard values are ``user`` and ``assistant``;
+            inline ``system`` is hoisted to the system prompt, and other
+            non-standard roles are normalized to ``user`` downstream.
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: str
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

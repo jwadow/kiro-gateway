@@ -969,3 +969,184 @@ class TestAccountSystemConfig:
         
         print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
         assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10
+
+
+class TestModelContextWindowOverrides:
+    """
+    Tests for _parse_model_context_overrides (MODEL_CONTEXT_WINDOWS env var).
+
+    Verifies parsing of per-model context window overrides used to declare a
+    model's real window (e.g. 1M on Kiro) when the gateway cannot discover it.
+    """
+
+    def _parse_with_env(self, value):
+        """Helper: set/unset MODEL_CONTEXT_WINDOWS and call the parser."""
+        from kiro.config import _parse_model_context_overrides
+
+        original_getenv = os.getenv
+
+        def mock_getenv(key, default=None):
+            if key == "MODEL_CONTEXT_WINDOWS":
+                return value
+            return original_getenv(key, default)
+
+        with patch.object(os, "getenv", side_effect=mock_getenv):
+            return _parse_model_context_overrides()
+
+    def test_unset_returns_empty(self):
+        """
+        What it does: Verifies unset env var yields no overrides.
+        Purpose: Default behavior must be a no-op.
+        """
+        print("Action: Parsing with MODEL_CONTEXT_WINDOWS unset...")
+        result = self._parse_with_env(None)
+        print(f"Result: {result}")
+        assert result == {}
+
+    def test_valid_single_override(self):
+        """
+        What it does: Verifies a valid single-model JSON map is parsed.
+        Purpose: PRIMARY use case - declare 1M for one model.
+        """
+        print("Action: Parsing valid single override...")
+        result = self._parse_with_env('{"claude-sonnet-4": 1000000}')
+        print(f"Result: {result}")
+        assert result == {"claude-sonnet-4": 1000000}
+
+    def test_valid_multiple_overrides(self):
+        """
+        What it does: Verifies multiple models are parsed.
+        Purpose: Users may run several 1M models.
+        """
+        print("Action: Parsing multiple overrides...")
+        result = self._parse_with_env(
+            '{"claude-sonnet-4": 1000000, "claude-opus-4.7": 1000000}'
+        )
+        print(f"Result: {result}")
+        assert result == {"claude-sonnet-4": 1000000, "claude-opus-4.7": 1000000}
+
+    def test_string_integer_values_are_coerced(self):
+        """
+        What it does: Verifies numeric strings are coerced to int.
+        Purpose: Tolerate '1000000' as well as 1000000 in the JSON.
+        """
+        print("Action: Parsing override with string integer...")
+        result = self._parse_with_env('{"claude-sonnet-4": "1000000"}')
+        print(f"Result: {result}")
+        assert result == {"claude-sonnet-4": 1000000}
+
+    def test_invalid_json_returns_empty(self):
+        """
+        What it does: Verifies malformed JSON is ignored (no crash).
+        Purpose: A bad env var must not take down the gateway.
+        """
+        print("Action: Parsing malformed JSON...")
+        result = self._parse_with_env("{not valid json")
+        print(f"Result: {result}")
+        assert result == {}
+
+    def test_non_object_json_returns_empty(self):
+        """
+        What it does: Verifies a JSON array/scalar is rejected.
+        Purpose: Only an object mapping is meaningful.
+        """
+        print("Action: Parsing JSON array...")
+        result = self._parse_with_env('[1000000]')
+        print(f"Result: {result}")
+        assert result == {}
+
+    def test_non_integer_value_is_skipped(self):
+        """
+        What it does: Verifies non-numeric limits are skipped, others kept.
+        Purpose: Partial robustness - one bad entry must not drop the rest.
+        """
+        print("Action: Parsing override with one bad and one good entry...")
+        result = self._parse_with_env(
+            '{"bad": "lots", "claude-sonnet-4": 1000000}'
+        )
+        print(f"Result: {result}")
+        assert result == {"claude-sonnet-4": 1000000}
+
+    def test_non_positive_value_is_skipped(self):
+        """
+        What it does: Verifies zero/negative limits are skipped.
+        Purpose: A non-positive window is nonsensical for estimation.
+        """
+        print("Action: Parsing override with non-positive limits...")
+        result = self._parse_with_env('{"a": 0, "b": -5, "claude-sonnet-4": 1000000}')
+        print(f"Result: {result}")
+        assert result == {"claude-sonnet-4": 1000000}
+
+
+class TestFallbackModels:
+    """
+    Tests for the FALLBACK_MODELS static list (used on the runtime.kiro.dev
+    endpoint, which has no /ListAvailableModels).
+    """
+
+    def test_opus_4_8_present(self):
+        """
+        What it does: Verifies claude-opus-4.8 is in the fallback list.
+        Purpose: Ensure Opus 4.8 is recognized out-of-the-box even without
+                 dynamic model discovery.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+        print(f"Fallback model ids: {model_ids}")
+        assert "claude-opus-4.8" in model_ids
+
+    def test_opus_4_8_has_1m_context_window(self):
+        """
+        What it does: Verifies the Opus 4.8 fallback entry declares a 1M window.
+        Purpose: Opus 4.8 has a 1M context on Bedrock/Kiro; token accounting must
+                 reflect that without requiring MODEL_CONTEXT_WINDOWS env config.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        opus_48 = next(m for m in FALLBACK_MODELS if m["modelId"] == "claude-opus-4.8")
+        print(f"Opus 4.8 entry: {opus_48}")
+        assert opus_48["tokenLimits"]["maxInputTokens"] == 1000000
+
+    def test_all_fallback_entries_have_model_id(self):
+        """
+        What it does: Verifies every fallback entry has a modelId.
+        Purpose: cache.update keys on modelId; a missing key would crash refresh.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        assert all("modelId" in m and m["modelId"] for m in FALLBACK_MODELS)
+
+
+class TestShutdownTimeoutConfig:
+    """Tests for SHUTDOWN_TIMEOUT configuration."""
+
+    def test_default_shutdown_timeout_is_10(self, monkeypatch):
+        """
+        What it does: Verifies SHUTDOWN_TIMEOUT defaults to 10 seconds.
+        Purpose: Ctrl+C should free the port within a bounded time by default.
+        """
+        print("Setup: Removing SHUTDOWN_TIMEOUT from environment...")
+        monkeypatch.delenv("SHUTDOWN_TIMEOUT", raising=False)
+
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        print(f"SHUTDOWN_TIMEOUT: {config_module.SHUTDOWN_TIMEOUT}")
+        assert config_module.SHUTDOWN_TIMEOUT == 10
+
+    def test_shutdown_timeout_env_override(self, monkeypatch):
+        """
+        What it does: Verifies SHUTDOWN_TIMEOUT honors the env override.
+        Purpose: Operators can tune how long shutdown waits for streams to drain.
+        """
+        print("Setup: Setting SHUTDOWN_TIMEOUT=3...")
+        monkeypatch.setenv("SHUTDOWN_TIMEOUT", "3")
+
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        print(f"SHUTDOWN_TIMEOUT: {config_module.SHUTDOWN_TIMEOUT}")
+        assert config_module.SHUTDOWN_TIMEOUT == 3

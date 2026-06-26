@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
-from kiro.auth import KiroAuthManager, AuthType
+from kiro.auth import KiroAuthManager, AuthType, InvalidRefreshTokenError, _is_invalid_refresh_token_response
 from kiro.config import TOKEN_REFRESH_THRESHOLD, get_aws_sso_oidc_url
 
 
@@ -4251,3 +4251,140 @@ class TestAPIRegionPriorityHierarchy:
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
 
+
+
+# =============================================================================
+# Tests for invalid refresh token handling (clear 401 instead of 500)
+# =============================================================================
+
+class TestIsInvalidRefreshTokenResponse:
+    """Tests for the _is_invalid_refresh_token_response helper."""
+
+    def _resp(self, status_code, json_value=None, text=""):
+        r = Mock()
+        r.status_code = status_code
+        if json_value is None:
+            r.json = Mock(side_effect=ValueError("not json"))
+        else:
+            r.json = Mock(return_value=json_value)
+        r.text = text
+        return r
+
+    def test_detects_invalid_grant(self):
+        """
+        What it does: Detects AWS SSO OIDC invalid_grant as an invalid token.
+        Purpose: PRIMARY signal for an expired/revoked refresh token.
+        """
+        resp = self._resp(400, {"error": "invalid_grant", "error_description": "Invalid refresh token provided"})
+        assert _is_invalid_refresh_token_response(resp) is True
+
+    def test_detects_invalid_client(self):
+        """
+        What it does: Treats invalid_client as an invalid-credential failure.
+        Purpose: clientId/secret rejection is also a non-retryable auth error.
+        """
+        resp = self._resp(401, {"error": "invalid_client"})
+        assert _is_invalid_refresh_token_response(resp) is True
+
+    def test_detects_via_body_text_fallback(self):
+        """
+        What it does: Falls back to body text when no JSON error code is present.
+        Purpose: Tolerate providers that don't return a structured error code.
+        """
+        resp = self._resp(400, json_value=None, text="Invalid refresh token provided")
+        assert _is_invalid_refresh_token_response(resp) is True
+
+    def test_ignores_non_auth_status(self):
+        """
+        What it does: A 500 server error is NOT treated as an invalid token.
+        Purpose: Transient/server errors must keep their normal handling.
+        """
+        resp = self._resp(500, {"error": "internal"}, text="server error")
+        assert _is_invalid_refresh_token_response(resp) is False
+
+    def test_ignores_other_400_errors(self):
+        """
+        What it does: A 400 that is not grant/client related is not flagged.
+        Purpose: Avoid masking unrelated bad-request failures as auth errors.
+        """
+        resp = self._resp(400, {"error": "invalid_request"}, text="bad request")
+        assert _is_invalid_refresh_token_response(resp) is False
+
+
+class TestGetAccessTokenInvalidRefreshToken:
+    """Tests that get_access_token surfaces a clear InvalidRefreshTokenError."""
+
+    def _make_error_post(self, status_code=400, error_code="invalid_grant"):
+        """Build a mock httpx post that returns an auth error response."""
+        error_response = AsyncMock()
+        error_response.status_code = status_code
+        error_response.text = json.dumps({"error": error_code, "error_description": "Invalid refresh token provided"})
+        error_response.json = Mock(return_value={"error": error_code, "error_description": "Invalid refresh token provided"})
+        error_response.raise_for_status = Mock(
+            side_effect=httpx.HTTPStatusError(
+                f"{status_code} error", request=Mock(), response=error_response
+            )
+        )
+
+        async def mock_post(*args, **kwargs):
+            return error_response
+
+        return mock_post
+
+    @pytest.mark.asyncio
+    async def test_raises_invalid_refresh_token_on_invalid_grant(self):
+        """
+        What it does: get_access_token raises InvalidRefreshTokenError when the
+                      SSO OIDC provider returns 400 invalid_grant.
+        Purpose: PRIMARY fix - a rejected refresh token must not surface as a 500.
+        """
+        print("Setup: AWS SSO OIDC manager with an expired/missing token...")
+        manager = KiroAuthManager(
+            refresh_token="bad_refresh",
+            client_id="cid",
+            client_secret="csecret",
+            region="ap-south-1",
+        )
+        manager._access_token = None  # Force a refresh
+
+        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = self._make_error_post(400, "invalid_grant")
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            print("Action: get_access_token (expecting InvalidRefreshTokenError)...")
+            with pytest.raises(InvalidRefreshTokenError) as exc_info:
+                await manager.get_access_token()
+
+        print(f"Raised: {exc_info.value}")
+        message = str(exc_info.value).lower()
+        assert "re-authenticate" in message or "expired" in message
+
+    @pytest.mark.asyncio
+    async def test_propagates_server_error_unchanged(self):
+        """
+        What it does: A 500 from the auth provider is NOT converted to
+                      InvalidRefreshTokenError; it propagates as before.
+        Purpose: Only credential rejection becomes a 401; transient errors stay.
+        """
+        print("Setup: AWS SSO OIDC manager, provider returns 500...")
+        manager = KiroAuthManager(
+            refresh_token="some_refresh",
+            client_id="cid",
+            client_secret="csecret",
+            region="ap-south-1",
+        )
+        manager._access_token = None
+
+        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = self._make_error_post(500, "internal")
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            print("Action: get_access_token (expecting httpx.HTTPStatusError, not auth error)...")
+            with pytest.raises(httpx.HTTPStatusError):
+                await manager.get_access_token()

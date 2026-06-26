@@ -8,6 +8,7 @@ Unit-тесты для ModelInfoCache.
 import asyncio
 import time
 import pytest
+from unittest.mock import patch
 
 from kiro.cache import ModelInfoCache
 from kiro.config import DEFAULT_MAX_INPUT_TOKENS
@@ -266,6 +267,114 @@ class TestModelInfoCacheGetMaxInputTokens:
         print("Проверка: Возвращён дефолт...")
         print(f"Сравниваем max_tokens: Ожидалось {DEFAULT_MAX_INPUT_TOKENS}, Получено {max_tokens}")
         assert max_tokens == DEFAULT_MAX_INPUT_TOKENS
+
+
+class TestModelInfoCacheContextWindowOverrides:
+    """
+    Tests for per-model context window overrides (MODEL_CONTEXT_WINDOWS).
+
+    These verify that an explicit override takes precedence over both the cached
+    upstream tokenLimits and the default - the mechanism that lets users declare
+    a 1M window on the runtime.kiro.dev endpoint (no /ListAvailableModels).
+    """
+
+    @pytest.mark.asyncio
+    async def test_override_takes_precedence_over_cached_value(self):
+        """
+        What it does: Verifies an override beats the cached upstream tokenLimits.
+        Purpose: Explicit user config must win over discovered limits.
+        """
+        print("Setup: cache with a 200k model, override declaring 1M...")
+        cache = ModelInfoCache()
+        await cache.update([
+            {"modelId": "claude-sonnet-4", "tokenLimits": {"maxInputTokens": 200000}}
+        ])
+
+        with patch.dict(
+            "kiro.cache.MODEL_CONTEXT_WINDOWS",
+            {"claude-sonnet-4": 1000000},
+            clear=True,
+        ):
+            result = cache.get_max_input_tokens("claude-sonnet-4")
+
+        print(f"Result: {result}")
+        assert result == 1000000
+
+    @pytest.mark.asyncio
+    async def test_override_applies_when_model_not_in_cache(self):
+        """
+        What it does: Verifies override is used even if the model isn't cached.
+        Purpose: Runtime endpoint uses a static fallback list with no tokenLimits,
+                 so the override must apply without a cache entry.
+        """
+        print("Setup: empty cache, override declaring 1M for a model...")
+        cache = ModelInfoCache()
+
+        with patch.dict(
+            "kiro.cache.MODEL_CONTEXT_WINDOWS",
+            {"claude-opus-4.7": 1000000},
+            clear=True,
+        ):
+            result = cache.get_max_input_tokens("claude-opus-4.7")
+
+        print(f"Result: {result}")
+        assert result == 1000000
+
+    @pytest.mark.asyncio
+    async def test_no_override_falls_back_to_cached_value(self):
+        """
+        What it does: Verifies models without an override still use cached limits.
+        Purpose: Overrides must not affect unrelated models.
+        """
+        print("Setup: cached model, override only for a different model...")
+        cache = ModelInfoCache()
+        await cache.update([
+            {"modelId": "claude-haiku-4.5", "tokenLimits": {"maxInputTokens": 200000}}
+        ])
+
+        with patch.dict(
+            "kiro.cache.MODEL_CONTEXT_WINDOWS",
+            {"some-other-model": 1000000},
+            clear=True,
+        ):
+            result = cache.get_max_input_tokens("claude-haiku-4.5")
+
+        print(f"Result: {result}")
+        assert result == 200000
+
+    @pytest.mark.asyncio
+    async def test_no_override_falls_back_to_default(self):
+        """
+        What it does: Verifies default is used when neither override nor cache match.
+        Purpose: Guard the bottom of the resolution chain.
+        """
+        print("Setup: empty cache, empty overrides...")
+        cache = ModelInfoCache()
+
+        with patch.dict("kiro.cache.MODEL_CONTEXT_WINDOWS", {}, clear=True):
+            result = cache.get_max_input_tokens("unknown-model")
+
+        print(f"Result: {result}")
+        assert result == DEFAULT_MAX_INPUT_TOKENS
+
+    @pytest.mark.asyncio
+    async def test_opus_4_8_fallback_reports_1m(self):
+        """
+        What it does: Verifies Opus 4.8 from FALLBACK_MODELS reports a 1M window.
+        Purpose: End-to-end check that the static fallback list (runtime endpoint)
+                 surfaces the correct 1M context for Opus 4.8 with no env override.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        print("Setup: cache populated from FALLBACK_MODELS, no overrides...")
+        cache = ModelInfoCache()
+        await cache.update(FALLBACK_MODELS)
+
+        with patch.dict("kiro.cache.MODEL_CONTEXT_WINDOWS", {}, clear=True):
+            result = cache.get_max_input_tokens("claude-opus-4.8")
+
+        print(f"Result: {result}")
+        assert result == 1000000
 
 
 class TestModelInfoCacheIsEmpty:

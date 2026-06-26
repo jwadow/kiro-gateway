@@ -44,7 +44,7 @@ from kiro.models_openai import (
     ModelList,
     ChatCompletionRequest,
 )
-from kiro.auth import KiroAuthManager, AuthType
+from kiro.auth import KiroAuthManager, AuthType, InvalidRefreshTokenError
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
@@ -759,6 +759,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         if debug_logger:
             debug_logger.flush_on_error(e.status_code, str(e.detail))
         raise
+    except InvalidRefreshTokenError as e:
+        # Credentials problem (refresh token expired/revoked) - not an internal
+        # error. Return an actionable 401 instead of a confusing 500.
+        await http_client.close()
+        logger.error(f"HTTP 401 - POST /v1/chat/completions - {e}")
+        if debug_logger:
+            debug_logger.flush_on_error(401, str(e))
+        raise HTTPException(status_code=401, detail=str(e))
     except Exception as e:
         await http_client.close()
         logger.error(f"Internal error: {e}", exc_info=True)

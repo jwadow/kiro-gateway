@@ -36,6 +36,13 @@ Usage:
     # Using uvicorn directly (uvicorn handles its own CLI args)
     uvicorn main:app --host 0.0.0.0 --port 8000
 
+Stopping / freeing the port:
+    # Stop whatever is listening on the resolved port, then exit
+    python main.py --port 9000 --stop
+
+    # If the port is busy at startup, stop the occupant and start anyway
+    python main.py --port 9000 --force
+
 Priority: CLI args > Environment variables > Default values
 """
 
@@ -70,6 +77,7 @@ from kiro.config import (
     DEFAULT_SERVER_HOST,
     DEFAULT_SERVER_PORT,
     STREAMING_READ_TIMEOUT,
+    SHUTDOWN_TIMEOUT,
     HIDDEN_MODELS,
     MODEL_ALIASES,
     HIDDEN_FROM_LIST,
@@ -88,6 +96,7 @@ from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
+from kiro.port_utils import is_port_in_use, free_port
 
 
 # --- Loguru Configuration ---
@@ -638,6 +647,20 @@ Examples:
     )
     
     parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop any process listening on the resolved port, then exit "
+             "(frees the port without starting the server)."
+    )
+    
+    parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="If the port is already in use at startup, stop the occupying "
+             "process(es) and start anyway."
+    )
+    
+    parser.add_argument(
         "-v", "--version",
         action="version",
         version=f"%(prog)s {APP_VERSION}"
@@ -734,6 +757,17 @@ if __name__ == "__main__":
     # Parse CLI arguments first (handles --version, --help without requiring config)
     args = parse_cli_args()
     
+    # --stop: free the resolved port and exit (no credentials needed).
+    if args.stop:
+        final_host, final_port = resolve_server_config(args)
+        logger.info(f"Stopping any process listening on port {final_port}...")
+        stopped = free_port(final_port)
+        if stopped:
+            logger.info(f"Stopped process(es) {stopped}; port {final_port} is now free.")
+        else:
+            logger.info(f"Nothing was listening on port {final_port}; already free.")
+        sys.exit(0)
+    
     # Run configuration validation before starting server
     validate_configuration()
     
@@ -743,10 +777,26 @@ if __name__ == "__main__":
     # Resolve final configuration with priority hierarchy
     final_host, final_port = resolve_server_config(args)
     
+    # Preflight: make sure the port is available, with an actionable message.
+    if is_port_in_use(final_host, final_port):
+        if args.force:
+            logger.warning(f"Port {final_port} is in use; --force given, stopping the occupant(s)...")
+            stopped = free_port(final_port)
+            logger.info(f"Stopped process(es) {stopped}; continuing startup.")
+        else:
+            logger.error(
+                f"Port {final_port} is already in use. Stop the existing process with:\n"
+                f"    python main.py --port {final_port} --stop\n"
+                f"or start anyway (stopping the occupant) with:\n"
+                f"    python main.py --port {final_port} --force"
+            )
+            sys.exit(1)
+    
     # Print startup banner
     print_startup_banner(final_host, final_port)
     
     logger.info(f"Starting Uvicorn server on {final_host}:{final_port}...")
+    logger.debug(f"Graceful shutdown timeout: {SHUTDOWN_TIMEOUT}s (Ctrl+C; press again to force quit)")
     
     # Use string reference to avoid double module import
     uvicorn.run(
@@ -754,4 +804,7 @@ if __name__ == "__main__":
         host=final_host,
         port=final_port,
         log_config=UVICORN_LOG_CONFIG,
+        # Cap how long shutdown waits for in-flight (streaming) connections so
+        # Ctrl+C frees the port promptly instead of hanging on open SSE streams.
+        timeout_graceful_shutdown=SHUTDOWN_TIMEOUT,
     )

@@ -24,6 +24,7 @@ from kiro.converters_anthropic import (
     convert_anthropic_messages,
     convert_anthropic_tools,
     anthropic_to_kiro,
+    separate_inline_system_messages,
     extract_thinking_config_from_anthropic,
 )
 from kiro.converters_core import UnifiedMessage, UnifiedTool
@@ -980,6 +981,33 @@ class TestConvertAnthropicMessages:
         assert result[0].role == "assistant"
         assert result[0].content == "Hi there!"
 
+    def test_preserves_inline_system_role(self):
+        """
+        What it does: Verifies an inline system message keeps its role through conversion.
+        Purpose: convert_anthropic_messages should pass the role through unchanged;
+                 normalization to 'user' happens later in build_kiro_payload. This
+                 guards the boundary between the adapter and the core normalization.
+        """
+        print("Setup: Inline system message (Claude Code style)...")
+        messages = [
+            AnthropicMessage(role="user", content="Hello"),
+            AnthropicMessage(
+                role="system",
+                content=[{"type": "text", "text": "<system-reminder>be concise</system-reminder>"}],
+            ),
+        ]
+
+        print("Action: Converting messages...")
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result roles: {[m.role for m in result]}")
+        assert len(result) == 2
+        assert result[1].role == "system"
+        assert result[1].content == "<system-reminder>be concise</system-reminder>"
+        # System messages carry no tool data
+        assert result[1].tool_calls is None
+        assert result[1].tool_results is None
+
     def test_converts_user_message_with_content_blocks(self):
         """
         What it does: Verifies conversion of user message with content blocks.
@@ -1441,6 +1469,123 @@ class TestConvertAnthropicTools:
 # ==================================================================================================
 
 
+class TestSeparateInlineSystemMessages:
+    """Tests for separate_inline_system_messages function."""
+
+    def test_no_system_messages_returns_all_as_conversation(self):
+        """
+        What it does: Verifies messages without system role are untouched.
+        Purpose: Ensure the common path adds no system parts and keeps all turns.
+        """
+        print("Setup: user + assistant messages, no system...")
+        messages = [
+            AnthropicMessage(role="user", content="Hi"),
+            AnthropicMessage(role="assistant", content="Hello"),
+        ]
+
+        print("Action: Separating inline system messages...")
+        parts, convo = separate_inline_system_messages(messages)
+
+        print(f"Result parts={parts}, convo_roles={[m.role for m in convo]}")
+        assert parts == []
+        assert len(convo) == 2
+        assert [m.role for m in convo] == ["user", "assistant"]
+
+    def test_extracts_single_inline_system_message(self):
+        """
+        What it does: Verifies a single inline system message is extracted.
+        Purpose: PRIMARY behavior - Claude Code SessionStart hook context.
+        """
+        print("Setup: user + inline system message...")
+        messages = [
+            AnthropicMessage(role="user", content="Hi"),
+            AnthropicMessage(role="system", content="Hook context"),
+        ]
+
+        print("Action: Separating inline system messages...")
+        parts, convo = separate_inline_system_messages(messages)
+
+        print(f"Result parts={parts}, convo_roles={[m.role for m in convo]}")
+        assert parts == ["Hook context"]
+        assert len(convo) == 1
+        assert convo[0].role == "user"
+
+    def test_extracts_multiple_inline_system_messages_in_order(self):
+        """
+        What it does: Verifies multiple system messages are extracted in order.
+        Purpose: Ensure ordering is preserved for downstream merging.
+        """
+        print("Setup: multiple inline system messages interleaved...")
+        messages = [
+            AnthropicMessage(role="system", content="First"),
+            AnthropicMessage(role="user", content="Hi"),
+            AnthropicMessage(role="system", content="Second"),
+        ]
+
+        print("Action: Separating inline system messages...")
+        parts, convo = separate_inline_system_messages(messages)
+
+        print(f"Result parts={parts}, convo_roles={[m.role for m in convo]}")
+        assert parts == ["First", "Second"]
+        assert len(convo) == 1
+        assert convo[0].role == "user"
+
+    def test_extracts_system_message_with_content_blocks(self):
+        """
+        What it does: Verifies system content as list-of-blocks is flattened to text.
+        Purpose: Claude Code sends system-reminder as text content blocks.
+        """
+        print("Setup: system message with content blocks...")
+        messages = [
+            AnthropicMessage(role="user", content="Hi"),
+            AnthropicMessage(
+                role="system",
+                content=[
+                    {"type": "text", "text": "Block A "},
+                    {"type": "text", "text": "Block B"},
+                ],
+            ),
+        ]
+
+        print("Action: Separating inline system messages...")
+        parts, convo = separate_inline_system_messages(messages)
+
+        print(f"Result parts={parts}")
+        assert parts == ["Block A Block B"]
+        assert len(convo) == 1
+
+    def test_non_system_unknown_roles_remain_in_conversation(self):
+        """
+        What it does: Verifies non-system unknown roles are NOT extracted here.
+        Purpose: Only 'system' is hoisted; other roles (e.g. 'developer') stay in
+                 the conversation and are normalized to 'user' by the core layer.
+        """
+        print("Setup: developer role message (not system)...")
+        messages = [
+            AnthropicMessage(role="developer", content="Guidelines"),
+            AnthropicMessage(role="user", content="Hi"),
+        ]
+
+        print("Action: Separating inline system messages...")
+        parts, convo = separate_inline_system_messages(messages)
+
+        print(f"Result parts={parts}, convo_roles={[m.role for m in convo]}")
+        assert parts == []
+        assert len(convo) == 2
+        assert convo[0].role == "developer"
+
+    def test_empty_messages_returns_empty(self):
+        """
+        What it does: Verifies empty input is handled gracefully.
+        Purpose: Defensive boundary check.
+        """
+        print("Action: Separating inline system messages on empty list...")
+        parts, convo = separate_inline_system_messages([])
+
+        assert parts == []
+        assert convo == []
+
+
 class TestAnthropicToKiro:
     """Tests for anthropic_to_kiro function - main entry point."""
 
@@ -1537,6 +1682,252 @@ class TestAnthropicToKiro:
         print(f"Tools in payload: {tools}")
         assert len(tools) == 1
         assert tools[0]["toolSpecification"]["name"] == "get_weather"
+
+    def test_handles_inline_system_message_from_claude_code(self):
+        """
+        What it does: Verifies a request with an inline 'system' role message
+                      (as sent by Claude Code) merges that content into the
+                      system prompt rather than a conversation turn.
+        Purpose: End-to-end regression test for the 422 literal_error
+                 ("Input should be 'user' or 'assistant'", input='system').
+                 The inline system message must be hoisted into the system
+                 prompt (consistent with the OpenAI adapter), not turned into a
+                 user turn.
+        """
+        print("Setup: Request mimicking Claude Code inline system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            messages=[
+                AnthropicMessage(role="user", content="First user turn"),
+                AnthropicMessage(
+                    role="system",
+                    content=[
+                        {"type": "text", "text": "<system-reminder>be concise</system-reminder>"}
+                    ],
+                ),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-4.8",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-sys", "arn:aws:test")
+
+        print(f"Result: {result}")
+        # Only the user turn remains as conversation, so no history is produced
+        history = result["conversationState"].get("history", [])
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        print(f"History: {history}")
+        print(f"Current content: {current_content}")
+
+        # System content is merged into the (only) user message, history stays empty
+        assert history == []
+        assert "<system-reminder>be concise</system-reminder>" in current_content
+        assert "First user turn" in current_content
+
+    def test_inline_system_message_does_not_create_user_turn(self):
+        """
+        What it does: Verifies an inline system message between two user turns is
+                      hoisted to the system prompt and does NOT add an extra turn.
+        Purpose: Guards against the normalize-to-user behavior that would turn
+                 hook context into a conversation turn and force synthetic
+                 assistant placeholders for alternation.
+        """
+        print("Setup: Request with user / inline-system / user...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            messages=[
+                AnthropicMessage(role="user", content="First user turn"),
+                AnthropicMessage(role="system", content="Inline hook context"),
+                AnthropicMessage(role="user", content="Second user turn"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-4.8",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-sys2", "arn:aws:test")
+
+        print(f"Result: {result}")
+        history = result["conversationState"].get("history", [])
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        print(f"History length: {len(history)}")
+
+        # The inline system message was removed (hoisted to the system prompt),
+        # NOT converted to a user turn. The two surrounding user turns are then
+        # adjacent and merge into a single user message - so there is no history
+        # and no synthetic assistant placeholder.
+        assert history == []
+        assert "Inline hook context" in current_content
+        assert "First user turn" in current_content
+        assert "Second user turn" in current_content
+        # No synthetic placeholder was needed for alternation
+        assert "(empty placeholder)" not in current_content
+
+    def test_merges_top_level_and_inline_system_in_order(self):
+        """
+        What it does: Verifies top-level system precedes inline system content.
+        Purpose: Preserve Claude Code's intended system prompt ordering when both
+                 a top-level system field and inline system messages are present.
+        """
+        print("Setup: Request with both top-level and inline system prompts...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            messages=[
+                AnthropicMessage(role="user", content="Hello"),
+                AnthropicMessage(role="system", content="Inline system context"),
+            ],
+            max_tokens=1024,
+            system="Top-level system prompt",
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-4.8",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-order", "arn:aws:test")
+
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        print(f"Current content: {current_content}")
+
+        top_level_index = current_content.index("Top-level system prompt")
+        inline_index = current_content.index("Inline system context")
+        assert top_level_index < inline_index
+        assert "Hello" in current_content
+
+    def test_handles_echoed_web_search_blocks(self):
+        """
+        What it does: Verifies a follow-up request whose assistant turn echoes
+                      server_tool_use + web_search_tool_result blocks validates
+                      and converts cleanly.
+        Purpose: Regression for the 422 that occurred after a successful
+                 web_search - Claude Code sends the search blocks back in
+                 history, and the gateway (which emitted them) must accept them.
+                 Also verifies the search grounding survives as text.
+        """
+        print("Setup: Follow-up request with echoed web_search blocks...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Do a websearch for coderhisham"),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        {
+                            "id": "srvtoolu_abc",
+                            "type": "server_tool_use",
+                            "name": "web_search",
+                            "input": {"query": "coderhisham"},
+                        },
+                        {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": "srvtoolu_abc",
+                            "content": [
+                                {
+                                    "type": "web_search_result",
+                                    "title": "coderhisham GitHub",
+                                    "url": "https://github.com/coderhisham",
+                                    "encrypted_content": "Developer & Tech Enthusiast",
+                                    "page_age": None,
+                                }
+                            ],
+                        },
+                        {"type": "text", "text": "coderhisham is Muhammed Hisham."},
+                    ],
+                ),
+                AnthropicMessage(role="user", content="who is coderhisham"),
+            ],
+        )
+
+        # The assistant turn must validate with the server-side block types
+        block_types = [getattr(b, "type", None) for b in request.messages[1].content]
+        print(f"Assistant block types: {block_types}")
+        assert block_types == ["server_tool_use", "web_search_tool_result", "text"]
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-4.8",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-ws", "arn:aws:test")
+
+        print(f"Result: {result}")
+        assert "conversationState" in result
+        # Search grounding (the result url) is preserved in the converted history
+        history = result["conversationState"].get("history", [])
+        assistant_text = "".join(
+            entry.get("assistantResponseMessage", {}).get("content", "") for entry in history
+        )
+        print(f"Assistant history text: {assistant_text}")
+        assert "github.com/coderhisham" in assistant_text
+        assert "coderhisham is Muhammed Hisham." in assistant_text
+
+    def test_handles_echoed_web_search_error_block(self):
+        """
+        What it does: Verifies an echoed web_search_tool_result ERROR block also
+                      validates and converts (failure case round-trip).
+        Purpose: The gateway emits an error result on MCP failure; the client may
+                 echo it back, so it must be accepted too.
+        """
+        print("Setup: Follow-up request with echoed web_search error block...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="search please"),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        {
+                            "id": "srvtoolu_err",
+                            "type": "server_tool_use",
+                            "name": "web_search",
+                            "input": {"query": "x"},
+                        },
+                        {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": "srvtoolu_err",
+                            "content": {
+                                "type": "web_search_tool_result_error",
+                                "error_code": "unavailable",
+                            },
+                        },
+                    ],
+                ),
+                AnthropicMessage(role="user", content="continue"),
+            ],
+        )
+
+        block_types = [getattr(b, "type", None) for b in request.messages[1].content]
+        assert block_types == ["server_tool_use", "web_search_tool_result"]
+
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-4.8",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-ws-err", "arn:aws:test")
+
+        print(f"Result: {result}")
+        assert "conversationState" in result
 
     def test_builds_history_for_multi_turn(self):
         """
