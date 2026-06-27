@@ -27,6 +27,7 @@ Contains all API endpoints:
 """
 
 import json
+import httpx
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
@@ -152,6 +153,63 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> str:
 
 # --- Router ---
 router = APIRouter()
+
+
+@router.get("/v1/credits")
+async def get_credits(request: Request, bearer_token: str = Depends(verify_api_key)):
+    """
+    Get credit usage and subscription info from Kiro API.
+    
+    Requires a Kiro API key (ksk_*) as Bearer token.
+    
+    Returns:
+        Credit usage, subscription plan, overage info
+    """
+    if not bearer_token.startswith("ksk_"):
+        raise HTTPException(status_code=400, detail="Credits endpoint requires a Kiro API key (ksk_*)")
+    
+    session = await _get_passthrough_session(bearer_token)
+    auth_manager = session.auth_manager
+    
+    url = f"{auth_manager.api_host.replace('runtime.', 'management.')}/"
+    headers = {
+        "Content-Type": "application/x-amz-json-1.0",
+        "x-amz-target": "AmazonCodeWhispererService.GetUsageLimits",
+        "tokentype": "API_KEY",
+        "Authorization": f"Bearer {bearer_token}",
+    }
+    
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post(
+            url,
+            headers=headers,
+            params={"isEmailRequired": "true"},
+            content=json.dumps({"isEmailRequired": True})
+        )
+    
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+    
+    data = response.json()
+    
+    usage = data.get("usageBreakdownList", [{}])[0] if data.get("usageBreakdownList") else {}
+    sub = data.get("subscriptionInfo", {})
+    user = data.get("userInfo", {})
+    
+    return {
+        "plan": sub.get("subscriptionTitle", "unknown"),
+        "email": user.get("email", ""),
+        "credits": {
+            "limit": usage.get("usageLimitWithPrecision", 0),
+            "used": usage.get("currentUsageWithPrecision", 0),
+            "overage": usage.get("currentOveragesWithPrecision", 0),
+            "overage_charges_usd": usage.get("overageCharges", 0),
+            "overage_rate_usd": usage.get("overageRate", 0),
+            "overage_cap": usage.get("overageCapWithPrecision", 0),
+        },
+        "next_reset": data.get("nextDateReset"),
+        "raw": data
+    }
 
 
 @router.get("/")
