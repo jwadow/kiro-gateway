@@ -308,6 +308,35 @@ API key diteruskan langsung ke Kiro API sebagai Bearer token dengan header tamba
 
 </details>
 
+### Penggunaan Kredit
+
+Periksa penggunaan kredit langganan, kelebihan, dan informasi penagihan:
+
+```bash
+curl http://localhost:8000/v1/credits \
+  -H "Authorization: Bearer ksk_YOUR_API_KEY"
+```
+
+Respons:
+
+```json
+{
+  "plan": "KIRO PRO+",
+  "email": "user@example.com",
+  "credits": {
+    "limit": 2000,
+    "used": 2920.83,
+    "overage": 920.83,
+    "overage_charges_usd": 36.83,
+    "overage_rate_usd": 0.04,
+    "overage_cap": 10000
+  },
+  "next_reset": 1782864000
+}
+```
+
+> **Catatan:** Endpoint ini memerlukan API key `ksk_*` (mode passthrough). Ini bukan bagian dari spesifikasi API OpenAI — ini adalah ekstensi kiro-gateway.
+
 ### Mendapatkan Kredensial
 
 **Untuk pengguna Kiro IDE:**

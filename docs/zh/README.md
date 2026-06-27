@@ -308,6 +308,35 @@ API 密钥作为 Bearer 令牌直接传递给 Kiro API，并附带 `tokentype: A
 
 </details>
 
+### 额度使用查询
+
+查看订阅额度使用、超额和计费信息：
+
+```bash
+curl http://localhost:8000/v1/credits \
+  -H "Authorization: Bearer ksk_YOUR_API_KEY"
+```
+
+响应：
+
+```json
+{
+  "plan": "KIRO PRO+",
+  "email": "user@example.com",
+  "credits": {
+    "limit": 2000,
+    "used": 2920.83,
+    "overage": 920.83,
+    "overage_charges_usd": 36.83,
+    "overage_rate_usd": 0.04,
+    "overage_cap": 10000
+  },
+  "next_reset": 1782864000
+}
+```
+
+> **注意：** 此端点需要 `ksk_*` API 密钥（透传模式）。它不属于 OpenAI API 规范 — 这是 kiro-gateway 的扩展。
+
 ### 获取凭据
 
 **Kiro IDE 用户：**

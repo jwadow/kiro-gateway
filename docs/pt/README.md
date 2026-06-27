@@ -308,6 +308,35 @@ A API key é passada diretamente para a Kiro API como Bearer token com um cabeç
 
 </details>
 
+### Uso de Créditos
+
+Consulte o uso de créditos, excedentes e informações de faturamento:
+
+```bash
+curl http://localhost:8000/v1/credits \
+  -H "Authorization: Bearer ksk_YOUR_API_KEY"
+```
+
+Resposta:
+
+```json
+{
+  "plan": "KIRO PRO+",
+  "email": "user@example.com",
+  "credits": {
+    "limit": 2000,
+    "used": 2920.83,
+    "overage": 920.83,
+    "overage_charges_usd": 36.83,
+    "overage_rate_usd": 0.04,
+    "overage_cap": 10000
+  },
+  "next_reset": 1782864000
+}
+```
+
+> **Nota:** Este endpoint requer uma API key `ksk_*` (modo passthrough). Não faz parte da especificação da API do OpenAI — é uma extensão do kiro-gateway.
+
 ### Obtendo Credenciais
 
 **Para usuários do Kiro IDE:**

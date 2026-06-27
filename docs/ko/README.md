@@ -308,6 +308,35 @@ API 키는 추가 헤더 `tokentype: API_KEY`와 함께 Bearer 토큰으로 Kiro
 
 </details>
 
+### 크레딧 사용량
+
+구독 크레딧 사용량, 초과 및 청구 정보를 확인합니다:
+
+```bash
+curl http://localhost:8000/v1/credits \
+  -H "Authorization: Bearer ksk_YOUR_API_KEY"
+```
+
+응답:
+
+```json
+{
+  "plan": "KIRO PRO+",
+  "email": "user@example.com",
+  "credits": {
+    "limit": 2000,
+    "used": 2920.83,
+    "overage": 920.83,
+    "overage_charges_usd": 36.83,
+    "overage_rate_usd": 0.04,
+    "overage_cap": 10000
+  },
+  "next_reset": 1782864000
+}
+```
+
+> **참고:** 이 엔드포인트는 `ksk_*` API 키(패스스루 모드)가 필요합니다. OpenAI API 사양의 일부가 아니라 kiro-gateway 확장입니다.
+
 ### 자격 증명 얻기
 
 **Kiro IDE 사용자:**
