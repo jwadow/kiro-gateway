@@ -737,7 +737,7 @@ class TestBuildKiroPayload:
     def test_handles_assistant_as_last_message(self):
         """
         What it does: Verifies handling of assistant as last message.
-        Purpose: Ensure "(empty placeholder)" message is created.
+        Purpose: Ensure "." message is created.
         """
         print("Setup: Request with assistant at the end...")
         request = ChatCompletionRequest(
@@ -753,7 +753,7 @@ class TestBuildKiroPayload:
         
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert current_content == "(empty placeholder)"
+        assert current_content == "."
     
     def test_raises_for_empty_messages(self):
         """
@@ -775,8 +775,8 @@ class TestBuildKiroPayload:
     
     def test_uses_continue_for_empty_content(self):
         """
-        What it does: Verifies using "(empty placeholder)" for empty content.
-        Purpose: Ensure empty message is replaced with "(empty placeholder)".
+        What it does: Verifies using "." for empty content.
+        Purpose: Ensure empty message is replaced with ".".
         """
         print("Setup: Request with empty content...")
         request = ChatCompletionRequest(
@@ -791,7 +791,7 @@ class TestBuildKiroPayload:
 
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert current_content == "(empty placeholder)"
+        assert current_content == "."
     
     def test_normalizes_model_id_correctly(self):
         """
@@ -845,10 +845,13 @@ class TestBuildKiroPayload:
         assert len(context["tools"]) == 1
         assert context["tools"][0]["toolSpecification"]["name"] == "get_weather"
     
-    def test_injects_thinking_tags_even_when_tool_results_present(self):
+    def test_skips_thinking_tags_when_current_message_is_tool_result_only(self):
         """
-        What it does: Verifies thinking tags ARE injected even when toolResults are present.
-        Purpose: Extended thinking should work in all scenarios including tool use flows.
+        What it does: Verifies thinking tags are NOT injected when the current message is a
+                      tool-result-only turn (no user text, only toolResults).
+        Purpose: A tool-result delivery carries no user intent. Injecting thinking tags there
+                 makes the model treat it as an empty user message, so the gateway deliberately
+                 skips injection and the content stays the minimal "." filler.
         """
         print("Setup: Request where last message is a tool result...")
         request = ChatCompletionRequest(
@@ -892,8 +895,8 @@ class TestBuildKiroPayload:
         print(f"Has toolResults: {'toolResults' in context}")
         
         assert "toolResults" in context, "toolResults should be present"
-        assert "<thinking_mode>enabled</thinking_mode>" in content, "thinking tags SHOULD be injected even with toolResults"
-        assert "<max_thinking_length>4000</max_thinking_length>" in content, "max_thinking_length should be present"
+        assert "<thinking_mode>" not in content, "thinking tags should NOT be injected for tool-result-only turns"
+        assert content == ".", "tool-result-only current message uses the minimal '.' filler"
     
     def test_injects_thinking_tags_when_no_tool_results(self):
         """

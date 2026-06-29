@@ -48,6 +48,21 @@ from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 
 
 # ==================================================================================================
+# Constants
+# ==================================================================================================
+
+# Filler used when a message has no text but the Kiro API still requires a non-empty `content`
+# string (the real payload lives in toolUses / toolResults). A bare "." is deliberately minimal:
+# unlike descriptive fillers such as "(empty placeholder)" or "[System: ...]", it cannot be
+# misread by the model as user/assistant intent, and it does not get echoed back across turns.
+#
+# This mirrors LiteLLM's `_DEFAULT_EMPTY_CONTENT_MESSAGE = "."` (BerriAI/litellm PR #28987), which
+# replaced the older "[System: ...]" placeholders precisely because those leaked into `content`
+# and the model started repeating them on subsequent turns.
+EMPTY_CONTENT_PLACEHOLDER = "."
+
+
+# ==================================================================================================
 # Data Classes for Unified Message Format
 # ==================================================================================================
 
@@ -965,7 +980,7 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
                     content_parts.append(result_text)
             
             # Join all parts with double newline
-            content = "\n\n".join(content_parts) if content_parts else "(empty placeholder)"
+            content = "\n\n".join(content_parts) if content_parts else EMPTY_CONTENT_PLACEHOLDER
             
             # Create a copy of the message without tool content but with text representation
             # IMPORTANT: Preserve images from the original message (e.g., screenshots from MCP tools)
@@ -1179,7 +1194,7 @@ def ensure_first_message_is_user(messages: List[UnifiedMessage]) -> List[Unified
         >>> result[0].role
         'user'
         >>> result[0].content
-        '(empty placeholder)'
+        '.'
     """
     if not messages:
         return messages
@@ -1189,11 +1204,12 @@ def ensure_first_message_is_user(messages: List[UnifiedMessage]) -> List[Unified
             f"First message is '{messages[0].role}', prepending synthetic user message "
             f"(Kiro API requires conversations to start with user)"
         )
-        # Create minimal synthetic user message (matches LiteLLM behavior)
-        # Using "(empty placeholder)" as minimal valid content to avoid disrupting conversation context
+        # Create minimal synthetic user message (matches LiteLLM behavior).
+        # Use the minimal "." filler (see EMPTY_CONTENT_PLACEHOLDER): it satisfies Kiro's
+        # non-empty-content requirement without injecting text the model could misread.
         synthetic_user = UnifiedMessage(
             role="user",
-            content="(empty placeholder)"
+            content=EMPTY_CONTENT_PLACEHOLDER
         )
         
         return [synthetic_user] + messages
@@ -1258,20 +1274,20 @@ def normalize_message_roles(messages: List[UnifiedMessage]) -> List[UnifiedMessa
 
 def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMessage]:
     """
-    Ensures alternating user/assistant roles by inserting synthetic assistant messages.
+    Ensures alternating user/assistant roles by merging consecutive same-role messages.
     
     Kiro API requires alternating userInputMessage and assistantResponseMessage.
-    When consecutive user messages are detected, synthetic assistant messages
-    with "(empty placeholder)" placeholder are inserted between them to maintain alternation.
+    Instead of inserting synthetic placeholder messages (which confuse the model),
+    consecutive messages with the same role are merged into one — combining their
+    content, tool_calls, tool_results, and images.
     
-    This fixes multiple unknown roles (converted to user)
-    create consecutive userInputMessage entries that violate Kiro API requirements.
+    This follows the LiteLLM/CrewAI pattern: merge rather than fabricate.
     
     Args:
         messages: List of messages in unified format
     
     Returns:
-        List of messages with synthetic assistant messages inserted where needed
+        List of messages with strict role alternation (via merging)
     
     Example:
         >>> messages = [
@@ -1281,36 +1297,64 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
         ... ]
         >>> result = ensure_alternating_roles(messages)
         >>> len(result)
-        5  # 3 user + 2 synthetic assistant
-        >>> result[1].role
-        'assistant'
-        >>> result[1].content
-        '(empty placeholder)'
+        1  # All merged into one user message
+        >>> "First" in result[0].content
+        True
     """
     if not messages or len(messages) < 2:
         return messages
     
     result = [messages[0]]
-    synthetic_count = 0
+    merged_count = 0
     
     for msg in messages[1:]:
-        prev_role = result[-1].role
+        prev = result[-1]
         
-        # If both current and previous are user → insert synthetic assistant
-        if msg.role == "user" and prev_role == "user":
-            synthetic_assistant = UnifiedMessage(
-                role="assistant",
-                content="(empty placeholder)"  # Consistent with build_kiro_history() placeholder
-            )
-            result.append(synthetic_assistant)
-            synthetic_count += 1
-        
-        result.append(msg)
+        if msg.role == prev.role:
+            # Merge into the previous message instead of inserting a synthetic
+            _merge_message_into(prev, msg)
+            merged_count += 1
+        else:
+            result.append(msg)
     
-    if synthetic_count > 0:
-        logger.debug(f"Inserted {synthetic_count} synthetic assistant message(s) to ensure alternation")
+    if merged_count > 0:
+        logger.debug(f"Merged {merged_count} consecutive same-role message(s) to ensure alternation")
     
     return result
+
+
+def _merge_message_into(target: UnifiedMessage, source: UnifiedMessage) -> None:
+    """
+    Merges source message fields into target (in place).
+    
+    Combines content (with newline separator), tool_calls, tool_results, and images.
+    """
+    # Merge text content
+    target_text = extract_text_content(target.content)
+    source_text = extract_text_content(source.content)
+    if target_text and source_text:
+        target.content = f"{target_text}\n{source_text}"
+    elif source_text:
+        target.content = source_text
+    # else: keep target.content as-is
+    
+    # Merge tool_calls (assistant messages)
+    if source.tool_calls:
+        if target.tool_calls is None:
+            target.tool_calls = []
+        target.tool_calls = list(target.tool_calls) + list(source.tool_calls)
+    
+    # Merge tool_results (user messages)
+    if source.tool_results:
+        if target.tool_results is None:
+            target.tool_results = []
+        target.tool_results = list(target.tool_results) + list(source.tool_results)
+    
+    # Merge images
+    if source.images:
+        if target.images is None:
+            target.images = []
+        target.images = list(target.images) + list(source.images)
 
 
 # ==================================================================================================
@@ -1340,9 +1384,12 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         if msg.role == "user":
             content = extract_text_content(msg.content)
             
-            # Fallback for empty content - Kiro API requires non-empty content
+            # Fallback for empty content - Kiro API requires a non-empty content string,
+            # even when the real payload is tool_results carried in userInputMessageContext.
+            # Use the minimal "." filler (see EMPTY_CONTENT_PLACEHOLDER) rather than a
+            # descriptive marker, which the model can misread as user intent or echo back.
             if not content:
-                content = "(empty placeholder)"
+                content = EMPTY_CONTENT_PLACEHOLDER
             
             user_input = {
                 "content": content,
@@ -1382,10 +1429,13 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         elif msg.role == "assistant":
             content = extract_text_content(msg.content)
             
-            # Fallback for empty content - Kiro API requires non-empty content
+            # Fallback for empty content - Kiro API requires a non-empty content string,
+            # even when the assistant turn is purely a tool call (toolUses carries the action,
+            # and is preserved separately below). Use the minimal "." filler so the model is
+            # not fed descriptive text it could misread or echo back.
             if not content:
-                content = "(empty placeholder)"
-            
+                content = EMPTY_CONTENT_PLACEHOLDER
+
             assistant_response = {"content": content}
             
             # Process tool_calls
@@ -1510,11 +1560,13 @@ def build_kiro_payload(
                 "content": current_content
             }
         })
-        current_content = "(empty placeholder)"
+        current_content = EMPTY_CONTENT_PLACEHOLDER
     
-    # If content is empty - use placeholder
+    # If content is empty - use the minimal "." filler (see EMPTY_CONTENT_PLACEHOLDER).
+    # Tool results (if any) are carried in userInputMessageContext below, so no descriptive
+    # marker is needed in content — and a bare "." cannot be misread or echoed by the model.
     if not current_content:
-        current_content = "(empty placeholder)"
+        current_content = EMPTY_CONTENT_PLACEHOLDER
     
     # Process images in current message - extract from message or content
     # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext
@@ -1547,7 +1599,10 @@ def build_kiro_payload(
             user_input_context["toolResults"] = tool_results
     
     # Inject thinking tags if enabled (only for the current/last user message)
-    if current_message.role == "user":
+    # Skip injection for tool-result-only messages — they carry no user intent,
+    # and injecting tags makes the model think the user sent an empty message.
+    is_tool_result_only = current_message.tool_results and not extract_text_content(current_message.content).strip()
+    if current_message.role == "user" and not is_tool_result_only:
         current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage

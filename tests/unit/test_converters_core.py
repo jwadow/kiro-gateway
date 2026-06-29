@@ -1342,7 +1342,7 @@ class TestEnsureFirstMessageIsUser:
         
         print("Checking first message is synthetic user...")
         assert result[0].role == "user"
-        assert result[0].content == "(empty placeholder)"
+        assert result[0].content == "."
         
         print("Checking original messages are preserved...")
         assert result[1].role == "assistant"
@@ -1379,7 +1379,7 @@ class TestEnsureFirstMessageIsUser:
         print(f"Comparing length: Expected 2 (synthetic + original), Got {len(result)}")
         assert len(result) == 2
         assert result[0].role == "user"
-        assert result[0].content == "(empty placeholder)"
+        assert result[0].content == "."
         assert result[1].role == "assistant"
     
     def test_handles_assistant_user_assistant_sequence(self):
@@ -1400,7 +1400,7 @@ class TestEnsureFirstMessageIsUser:
         print(f"Comparing length: Expected 4 (synthetic + 3 original), Got {len(result)}")
         assert len(result) == 4
         assert result[0].role == "user"
-        assert result[0].content == "(empty placeholder)"
+        assert result[0].content == "."
         assert result[1].role == "assistant"
         assert result[2].role == "user"
         assert result[3].role == "assistant"
@@ -1429,7 +1429,7 @@ class TestEnsureFirstMessageIsUser:
         print("Checking synthetic user was prepended...")
         assert len(result) == 2
         assert result[0].role == "user"
-        assert result[0].content == "(empty placeholder)"
+        assert result[0].content == "."
         
         print("Checking tool_calls are preserved...")
         assert result[1].role == "assistant"
@@ -1463,7 +1463,7 @@ class TestEnsureFirstMessageIsUser:
     
     def test_uses_minimal_content_for_synthetic_message(self):
         """
-        What it does: Verifies synthetic message uses minimal content ("(empty placeholder)").
+        What it does: Verifies synthetic message uses minimal content (".").
         Purpose: Ensure minimal token usage and avoid disrupting conversation context.
         """
         print("Setup: Assistant-first conversation...")
@@ -1475,7 +1475,7 @@ class TestEnsureFirstMessageIsUser:
         result = ensure_first_message_is_user(messages)
         
         print("Checking synthetic message content...")
-        assert result[0].content == "(empty placeholder)"
+        assert result[0].content == "."
         print("✓ Synthetic message uses minimal content (matches LiteLLM behavior)")
 
 
@@ -1684,40 +1684,39 @@ class TestEnsureAlternatingRoles:
     """
     Tests for ensure_alternating_roles function.
     
-    This function ensures alternating user/assistant roles by inserting synthetic
-    assistant messages with "(empty placeholder)" content between consecutive user messages.
-    This is part of the fix for Issue #64 where multiple 'developer' roles
-    (converted to 'user') create consecutive userInputMessage entries.
+    This function ensures alternating user/assistant roles by MERGING consecutive
+    same-role messages (content, tool_calls, tool_results, images) into one — rather
+    than inserting synthetic placeholder turns the model could misread. This is part
+    of the fix for Issue #64 where multiple 'developer' roles (converted to 'user')
+    create consecutive userInputMessage entries.
     """
-    
-    def test_inserts_synthetic_assistant_between_two_consecutive_users(self):
+
+    def test_merges_two_consecutive_users(self):
         """
-        What it does: Verifies insertion of synthetic assistant between two user messages.
-        Purpose: Ensure Kiro API requirement of alternating roles is maintained.
+        What it does: Verifies two consecutive user messages are merged into one.
+        Purpose: Ensure Kiro's alternation requirement is met by merging, not by
+                 fabricating a synthetic assistant turn the model could misread.
         """
         print("Setup: Two consecutive user messages...")
         messages = [
             UnifiedMessage(role="user", content="First"),
             UnifiedMessage(role="user", content="Second")
         ]
-        
+
         print("Action: Ensuring alternating roles...")
         result = ensure_alternating_roles(messages)
-        
-        print(f"Comparing length: Expected 3 (2 user + 1 synthetic), Got {len(result)}")
-        assert len(result) == 3
-        print("Checking alternation pattern...")
+
+        print(f"Comparing length: Expected 1 (merged), Got {len(result)}")
+        assert len(result) == 1
+        print("Checking merged content...")
         assert result[0].role == "user"
-        assert result[0].content == "First"
-        assert result[1].role == "assistant"
-        assert result[1].content == "(empty placeholder)"
-        assert result[2].role == "user"
-        assert result[2].content == "Second"
-    
-    def test_inserts_multiple_synthetic_assistants_for_four_consecutive_users(self):
+        assert result[0].content == "First\nSecond"
+
+    def test_merges_four_consecutive_users(self):
         """
-        What it does: Verifies insertion of multiple synthetic assistants.
-        Purpose: Fix for Issue #64 - handle multiple consecutive developer messages.
+        What it does: Verifies four consecutive user messages are merged into one.
+        Purpose: Fix for Issue #64 - handle multiple consecutive developer messages
+                 by merging them rather than inserting synthetic assistant turns.
         """
         print("Setup: Four consecutive user messages...")
         messages = [
@@ -1726,20 +1725,15 @@ class TestEnsureAlternatingRoles:
             UnifiedMessage(role="user", content="Third"),
             UnifiedMessage(role="user", content="Fourth")
         ]
-        
+
         print("Action: Ensuring alternating roles...")
         result = ensure_alternating_roles(messages)
-        
-        print(f"Comparing length: Expected 7 (4 user + 3 synthetic), Got {len(result)}")
-        assert len(result) == 7
-        print("Checking alternation pattern...")
-        assert result[0].role == "user" and result[0].content == "First"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
-        assert result[2].role == "user" and result[2].content == "Second"
-        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
-        assert result[4].role == "user" and result[4].content == "Third"
-        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
-        assert result[6].role == "user" and result[6].content == "Fourth"
+
+        print(f"Comparing length: Expected 1 (merged), Got {len(result)}")
+        assert len(result) == 1
+        print("Checking merged content...")
+        assert result[0].role == "user"
+        assert result[0].content == "First\nSecond\nThird\nFourth"
     
     def test_preserves_already_alternating_messages(self):
         """
@@ -1765,10 +1759,10 @@ class TestEnsureAlternatingRoles:
         assert result[2].role == "user" and result[2].content == "How are you?"
         assert result[3].role == "assistant" and result[3].content == "Fine"
     
-    def test_handles_multiple_groups_of_consecutive_users(self):
+    def test_merges_multiple_groups_of_consecutive_users(self):
         """
-        What it does: Verifies handling of multiple groups of consecutive users.
-        Purpose: Ensure function handles complex conversation patterns.
+        What it does: Verifies multiple groups of consecutive users are each merged.
+        Purpose: Ensure function handles complex conversation patterns via merging.
         """
         print("Setup: Multiple groups of consecutive users...")
         messages = [
@@ -1779,24 +1773,18 @@ class TestEnsureAlternatingRoles:
             UnifiedMessage(role="user", content="E"),
             UnifiedMessage(role="user", content="F")
         ]
-        
+
         print("Action: Ensuring alternating roles...")
         result = ensure_alternating_roles(messages)
-        
-        print(f"Comparing length: Expected 9 (6 original + 3 synthetic), Got {len(result)}")
-        assert len(result) == 9
-        print("Checking first group (A, synthetic, B)...")
-        assert result[0].role == "user" and result[0].content == "A"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
-        assert result[2].role == "user" and result[2].content == "B"
+
+        print(f"Comparing length: Expected 3 (A+B, C, D+E+F), Got {len(result)}")
+        assert len(result) == 3
+        print("Checking first merged group (A+B)...")
+        assert result[0].role == "user" and result[0].content == "A\nB"
         print("Checking real assistant...")
-        assert result[3].role == "assistant" and result[3].content == "C"
-        print("Checking second group (D, synthetic, E, synthetic, F)...")
-        assert result[4].role == "user" and result[4].content == "D"
-        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
-        assert result[6].role == "user" and result[6].content == "E"
-        assert result[7].role == "assistant" and result[7].content == "(empty placeholder)"
-        assert result[8].role == "user" and result[8].content == "F"
+        assert result[1].role == "assistant" and result[1].content == "C"
+        print("Checking second merged group (D+E+F)...")
+        assert result[2].role == "user" and result[2].content == "D\nE\nF"
     
     def test_handles_empty_list(self):
         """
@@ -1827,10 +1815,10 @@ class TestEnsureAlternatingRoles:
         assert result[0].role == "user"
         assert result[0].content == "Solo"
     
-    def test_preserves_tool_results_in_original_messages(self):
+    def test_merges_tool_results_from_consecutive_users(self):
         """
-        What it does: Verifies tool_results are preserved in original messages.
-        Purpose: Ensure synthetic assistants don't have tool content, but originals do.
+        What it does: Verifies tool_results from consecutive user messages are merged.
+        Purpose: Ensure merging preserves all tool_results instead of dropping any.
         """
         print("Setup: Two consecutive user messages with tool_results...")
         messages = [
@@ -1845,25 +1833,23 @@ class TestEnsureAlternatingRoles:
                 tool_results=[{"type": "tool_result", "tool_use_id": "call_2", "content": "Result 2"}]
             )
         ]
-        
+
         print("Action: Ensuring alternating roles...")
         result = ensure_alternating_roles(messages)
-        
-        print(f"Comparing length: Expected 3, Got {len(result)}")
-        assert len(result) == 3
-        print("Checking that synthetic assistant has no tool_results...")
-        assert result[1].role == "assistant"
-        assert result[1].tool_results is None
-        print("Checking that original messages preserved tool_results...")
+
+        print(f"Comparing length: Expected 1 (merged), Got {len(result)}")
+        assert len(result) == 1
+        print("Checking that tool_results from both messages are preserved...")
+        assert result[0].role == "user"
         assert result[0].tool_results is not None
-        assert len(result[0].tool_results) == 1
-        assert result[2].tool_results is not None
-        assert len(result[2].tool_results) == 1
-    
-    def test_preserves_images_in_original_messages(self):
+        assert len(result[0].tool_results) == 2
+        assert result[0].tool_results[0]["tool_use_id"] == "call_1"
+        assert result[0].tool_results[1]["tool_use_id"] == "call_2"
+
+    def test_merges_images_from_consecutive_users(self):
         """
-        What it does: Verifies images are preserved in original messages.
-        Purpose: Ensure synthetic assistants don't have images, but originals do.
+        What it does: Verifies images from consecutive user messages are merged.
+        Purpose: Ensure merging preserves all images instead of dropping any.
         """
         print("Setup: Two consecutive user messages with images...")
         messages = [
@@ -1878,20 +1864,16 @@ class TestEnsureAlternatingRoles:
                 images=[{"media_type": "image/jpeg", "data": "data2"}]
             )
         ]
-        
+
         print("Action: Ensuring alternating roles...")
         result = ensure_alternating_roles(messages)
-        
-        print(f"Comparing length: Expected 3, Got {len(result)}")
-        assert len(result) == 3
-        print("Checking that synthetic assistant has no images...")
-        assert result[1].role == "assistant"
-        assert result[1].images is None
-        print("Checking that original messages preserved images...")
+
+        print(f"Comparing length: Expected 1 (merged), Got {len(result)}")
+        assert len(result) == 1
+        print("Checking that images from both messages are preserved...")
+        assert result[0].role == "user"
         assert result[0].images is not None
-        assert len(result[0].images) == 1
-        assert result[2].images is not None
-        assert len(result[2].images) == 1
+        assert len(result[0].images) == 2
 
 
 # ==================================================================================================
@@ -1904,13 +1886,14 @@ class TestNormalizeAndAlternatingIntegration:
     
     These tests verify the complete pipeline for Issue #64 fix:
     1. Unknown roles (developer, system) are normalized to 'user'
-    2. Consecutive user messages get synthetic assistant messages inserted
+    2. Consecutive same-role messages are merged into a single message
     """
-    
-    def test_developer_messages_are_normalized_and_alternated(self):
+
+    def test_developer_messages_are_normalized_and_merged(self):
         """
         What it does: Verifies complete pipeline for Issue #64.
-        Purpose: Ensure multiple developer messages are normalized and alternated correctly.
+        Purpose: Ensure multiple developer messages are normalized to user and then
+                 merged into a single user message (no synthetic assistant turns).
         """
         print("Setup: Multiple developer messages + user question...")
         messages = [
@@ -1919,29 +1902,24 @@ class TestNormalizeAndAlternatingIntegration:
             UnifiedMessage(role="developer", content="Context 3"),
             UnifiedMessage(role="user", content="Question")
         ]
-        
+
         print("Action: Normalizing roles...")
         normalized = normalize_message_roles(messages)
         print(f"After normalization: {[msg.role for msg in normalized]}")
-        
+
         print("Action: Ensuring alternating roles...")
         result = ensure_alternating_roles(normalized)
-        
-        print(f"Comparing length: Expected 7 (4 user + 3 synthetic), Got {len(result)}")
-        assert len(result) == 7
-        print("Checking alternation pattern...")
-        assert result[0].role == "user" and result[0].content == "Context 1"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
-        assert result[2].role == "user" and result[2].content == "Context 2"
-        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
-        assert result[4].role == "user" and result[4].content == "Context 3"
-        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
-        assert result[6].role == "user" and result[6].content == "Question"
-    
-    def test_mixed_roles_are_normalized_and_alternated(self):
+
+        print(f"Comparing length: Expected 1 (all merged), Got {len(result)}")
+        assert len(result) == 1
+        print("Checking merged content...")
+        assert result[0].role == "user"
+        assert result[0].content == "Context 1\nContext 2\nContext 3\nQuestion"
+
+    def test_mixed_roles_are_normalized_and_merged(self):
         """
         What it does: Verifies pipeline with mixed roles (developer, system, user, assistant).
-        Purpose: Ensure complex conversation patterns are handled correctly.
+        Purpose: Ensure complex conversation patterns are handled correctly via merging.
         """
         print("Setup: Mixed roles conversation...")
         messages = [
@@ -1952,32 +1930,26 @@ class TestNormalizeAndAlternatingIntegration:
             UnifiedMessage(role="developer", content="Dev2"),
             UnifiedMessage(role="user", content="User2")
         ]
-        
+
         print("Action: Normalizing roles...")
         normalized = normalize_message_roles(messages)
         print(f"After normalization: {[msg.role for msg in normalized]}")
-        
+
         print("Action: Ensuring alternating roles...")
         result = ensure_alternating_roles(normalized)
-        
+
         print(f"Result length: {len(result)}")
         print(f"Result roles: {[msg.role for msg in result]}")
-        
+
         # After normalization: all system/developer → user
         # [user, user, user, assistant, user, user]
-        # After alternation: insert synthetic between consecutive users
-        # [user, synthetic, user, synthetic, user, assistant, user, synthetic, user]
-        assert len(result) == 9
-        print("Checking that all system/developer were converted to user...")
-        assert result[0].role == "user" and result[0].content == "System"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
-        assert result[2].role == "user" and result[2].content == "Dev"
-        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
-        assert result[4].role == "user" and result[4].content == "User1"
-        assert result[5].role == "assistant" and result[5].content == "Assistant1"
-        assert result[6].role == "user" and result[6].content == "Dev2"
-        assert result[7].role == "assistant" and result[7].content == "(empty placeholder)"
-        assert result[8].role == "user" and result[8].content == "User2"
+        # After alternation (merge consecutive same-role):
+        # [user(System+Dev+User1), assistant(Assistant1), user(Dev2+User2)]
+        assert len(result) == 3
+        print("Checking merged groups...")
+        assert result[0].role == "user" and result[0].content == "System\nDev\nUser1"
+        assert result[1].role == "assistant" and result[1].content == "Assistant1"
+        assert result[2].role == "user" and result[2].content == "Dev2\nUser2"
 
 
 # ==================================================================================================
@@ -3899,7 +3871,7 @@ class TestBuildKiroHistory:
     
     def test_adds_empty_placeholder_for_empty_user_content(self):
         """
-        What it does: Verifies that "(empty placeholder)" placeholder is added for user messages with empty content.
+        What it does: Verifies that "." placeholder is added for user messages with empty content.
         Purpose: Ensure Kiro API receives non-empty content in history.
         
         This is a fallback test for issue #20 - ensures any edge case with empty content
@@ -3913,12 +3885,12 @@ class TestBuildKiroHistory:
         
         print(f"Result: {result}")
         print(f"Content: '{result[0]['userInputMessage']['content']}'")
-        print("Checking that '(empty placeholder)' placeholder is added...")
-        assert result[0]["userInputMessage"]["content"] == "(empty placeholder)"
+        print("Checking that '.' placeholder is added...")
+        assert result[0]["userInputMessage"]["content"] == "."
     
     def test_adds_empty_placeholder_for_empty_assistant_content(self):
         """
-        What it does: Verifies that "(empty placeholder)" placeholder is added for assistant messages with empty content.
+        What it does: Verifies that "." placeholder is added for assistant messages with empty content.
         Purpose: Ensure Kiro API receives non-empty content in history.
         
         This is a fallback test for issue #20 - ensures any edge case with empty content
@@ -3932,12 +3904,12 @@ class TestBuildKiroHistory:
         
         print(f"Result: {result}")
         print(f"Content: '{result[0]['assistantResponseMessage']['content']}'")
-        print("Checking that '(empty placeholder)' placeholder is added...")
-        assert result[0]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+        print("Checking that '.' placeholder is added...")
+        assert result[0]["assistantResponseMessage"]["content"] == "."
     
     def test_adds_empty_placeholder_for_none_user_content(self):
         """
-        What it does: Verifies that "(empty placeholder)" placeholder is added for user messages with None content.
+        What it does: Verifies that "." placeholder is added for user messages with None content.
         Purpose: Ensure Kiro API receives non-empty content when content is None.
         """
         print("Setup: User message with None content...")
@@ -3948,12 +3920,12 @@ class TestBuildKiroHistory:
         
         print(f"Result: {result}")
         print(f"Content: '{result[0]['userInputMessage']['content']}'")
-        print("Checking that '(empty placeholder)' placeholder is added...")
-        assert result[0]["userInputMessage"]["content"] == "(empty placeholder)"
+        print("Checking that '.' placeholder is added...")
+        assert result[0]["userInputMessage"]["content"] == "."
     
     def test_adds_empty_placeholder_for_none_assistant_content(self):
         """
-        What it does: Verifies that "(empty placeholder)" placeholder is added for assistant messages with None content.
+        What it does: Verifies that "." placeholder is added for assistant messages with None content.
         Purpose: Ensure Kiro API receives non-empty content when content is None.
         """
         print("Setup: Assistant message with None content...")
@@ -3964,8 +3936,8 @@ class TestBuildKiroHistory:
         
         print(f"Result: {result}")
         print(f"Content: '{result[0]['assistantResponseMessage']['content']}'")
-        print("Checking that '(empty placeholder)' placeholder is added...")
-        assert result[0]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+        print("Checking that '.' placeholder is added...")
+        assert result[0]["assistantResponseMessage"]["content"] == "."
     
     def test_preserves_non_empty_content_in_history(self):
         """
@@ -4011,10 +3983,10 @@ class TestBuildKiroHistory:
         assert result[0]["userInputMessage"]["content"] == "Start"
         
         print(f"Message 1 content: '{result[1]['assistantResponseMessage']['content']}'")
-        assert result[1]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+        assert result[1]["assistantResponseMessage"]["content"] == "."
         
         print(f"Message 2 content: '{result[2]['userInputMessage']['content']}'")
-        assert result[2]["userInputMessage"]["content"] == "(empty placeholder)"
+        assert result[2]["userInputMessage"]["content"] == "."
         
         print(f"Message 3 content: '{result[3]['assistantResponseMessage']['content']}'")
         assert result[3]["assistantResponseMessage"]["content"] == "Response"
@@ -4488,7 +4460,7 @@ class TestStripAllToolContent:
                 content="",
                 tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "tool", "arguments": "{}"}}]
             ),  # Has tool content
-            UnifiedMessage(role="user", content="(empty placeholder)"),  # No tool content
+            UnifiedMessage(role="user", content="."),  # No tool content
         ]
         
         print("Action: Stripping tool content...")
@@ -4499,7 +4471,7 @@ class TestStripAllToolContent:
         assert result[0].content == "Hello"
         assert result[0].tool_calls is None
         assert result[1].tool_calls is None  # Stripped
-        assert result[2].content == "(empty placeholder)"
+        assert result[2].content == "."
         assert result[2].tool_calls is None
         assert had_content is True
     
@@ -5507,7 +5479,7 @@ class TestBuildKiroPayloadIssue20:
                     "content": "Tool executed"
                 }]
             ),
-            UnifiedMessage(role="user", content="(empty placeholder)")
+            UnifiedMessage(role="user", content=".")
         ]
         
         tools = [UnifiedTool(
@@ -5558,7 +5530,7 @@ class TestBuildKiroPayloadIssue20:
                     "function": {"name": "some_tool", "arguments": "{}"}
                 }]
             ),
-            UnifiedMessage(role="user", content="(empty placeholder)")
+            UnifiedMessage(role="user", content=".")
         ]
         
         print("Action: Building Kiro payload with empty tools list...")
