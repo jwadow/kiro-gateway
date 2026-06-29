@@ -146,22 +146,44 @@ async def call_kiro_mcp_api(
     
     try:
         token = await auth_manager.get_access_token()
-        
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
-        
-        mcp_url = f"{auth_manager.q_host}/mcp"
+
+        # Endpoint selection for web_search MCP:
+        # - kiro-cli / AWS SSO OIDC accounts must call the Amazon Q endpoint
+        #   (https://q.{region}.amazonaws.com/mcp) and pass the profile ARN via the
+        #   x-amzn-kiro-profile-arn header. The runtime.kiro.dev host rejects MCP
+        #   web_search with 403 "User is not authorized" / 400 "profileArn is required".
+        # - Other auth types keep the original q_host behavior.
+        from kiro.auth import AuthType
+
+        profile_arn = getattr(auth_manager, "profile_arn", None)
+        is_sso = getattr(auth_manager, "auth_type", None) == AuthType.AWS_SSO_OIDC
+
+        if is_sso and profile_arn:
+            # Derive region from the profile ARN (arn:aws:codewhisperer:{region}:...).
+            arn_parts = profile_arn.split(":")
+            region = arn_parts[3] if len(arn_parts) > 3 and arn_parts[3] else auth_manager.region
+            mcp_url = f"https://q.{region}.amazonaws.com/mcp"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "x-amzn-kiro-profile-arn": profile_arn,
+                "x-amzn-codewhisperer-optout": "false",
+                "Content-Type": "application/x-amz-json-1.0",
+            }
+        else:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "x-amzn-codewhisperer-optout": "false",
+                "Content-Type": "application/json",
+            }
+            mcp_url = f"{auth_manager.q_host}/mcp"
+
         logger.debug(f"Calling MCP API: {mcp_url}")
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                logger.error(f"MCP API error: {response.status_code} - {response.text[:300]}")
                 return None, None
             
             mcp_response = response.json()

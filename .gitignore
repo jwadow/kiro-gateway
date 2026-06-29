@@ -31,3 +31,9 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local gateway runtime artifacts (may contain tokens/ARNs - never commit)
+gateway.pid
+gateway.log
+gateway.out.log
+gateway.err.log
