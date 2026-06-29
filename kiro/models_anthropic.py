@@ -324,6 +324,10 @@ class AnthropicMessagesRequest(BaseModel):
     # Extended thinking (official Anthropic parameter)
     thinking: Optional[Dict[str, Any]] = None
 
+    # Output configuration (e.g. {"effort": "xhigh"}) — used to derive
+    # thinking budget when thinking.type == "adaptive" or when thinking is omitted
+    output_config: Optional[Dict[str, Any]] = None
+
     # Tools
     tools: Optional[List[AnthropicTool]] = None
     tool_choice: Optional[Union[ToolChoice, Dict[str, Any]]] = None

@@ -370,58 +370,148 @@ def convert_anthropic_tools(
     return unified_tools if unified_tools else None
 
 
+# Maps reasoning effort levels to a fraction of max_tokens used as the
+# thinking budget. Used for adaptive thinking and output_config.effort
+# (e.g. Claude Code requesting Opus 4.8 with "xhigh" effort).
+EFFORT_BUDGET_FRACTION = {
+    "none": 0.0,
+    "low": 0.20,
+    "medium": 0.50,
+    "high": 0.80,
+    "xhigh": 0.95,
+    "max": 0.99,
+}
+
+
+def _budget_from_effort(effort: Optional[str], max_tokens: int) -> Optional[int]:
+    """
+    Derive a thinking budget (in tokens) from an effort level.
+
+    Args:
+        effort: Effort level (none, low, medium, high, xhigh, max).
+            Matched case-insensitively; non-string values are ignored.
+        max_tokens: Request max_tokens used as the basis for the budget
+
+    Returns:
+        Budget token count, or None if the effort level is unknown/absent
+    """
+    if not isinstance(effort, str):
+        return None
+    fraction = EFFORT_BUDGET_FRACTION.get(effort.lower())
+    if fraction is None:
+        return None
+    return int(max_tokens * fraction)
+
+
+def _thinking_config_from_effort(
+    effort: Optional[str], max_tokens: int
+) -> Optional[ThinkingConfig]:
+    """
+    Build a ThinkingConfig from an effort level.
+
+    Args:
+        effort: Effort level (none, low, medium, high, xhigh, max)
+        max_tokens: Request max_tokens used as the basis for the budget
+
+    Returns:
+        - ThinkingConfig(enabled=False) when the effort resolves to a zero
+          budget (e.g. "none", or a budget that rounds down to 0)
+        - ThinkingConfig(enabled=True, budget_tokens=N) for a positive budget
+        - None when the effort level is unknown/absent (caller should fall
+          back to its own defaults)
+    """
+    budget = _budget_from_effort(effort, max_tokens)
+    if budget is None:
+        return None
+    if budget <= 0:
+        # Effort resolves to no thinking (e.g. "none")
+        return ThinkingConfig(enabled=False, budget_tokens=None)
+    logger.debug(
+        f"Extracted thinking config from Anthropic: effort='{effort}', budget={budget}"
+    )
+    return ThinkingConfig(enabled=True, budget_tokens=budget)
+
+
 def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) -> ThinkingConfig:
     """
     Extract thinking configuration from Anthropic request.
-    
+
     Handles thinking parameter:
     - {"type": "enabled", "budget_tokens": N} → enabled with budget
+    - {"type": "adaptive"} → budget derived from output_config.effort
     - {"type": "disabled"} → disabled
-    - None → enabled with default budget
-    
+    - None → enabled with default budget (or derived from output_config.effort)
+
+    The output_config.effort level (none, low, medium, high, xhigh, max) maps
+    to a fraction of max_tokens (0%, 20%, 50%, 80%, 95%, 99% respectively).
+    An effort that resolves to a zero budget disables thinking.
+
     Args:
         request: Anthropic MessagesRequest
-    
+
     Returns:
         ThinkingConfig for core layer
-    
+
     Examples:
         >>> # No thinking specified → use defaults
         >>> request = AnthropicMessagesRequest(model="claude-sonnet-4.5", messages=[...], max_tokens=4096)
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=None)
-        
+
         >>> # Explicitly disabled
         >>> request.thinking = {"type": "disabled"}
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=False, budget_tokens=None)
-        
+
         >>> # Enabled with custom budget
         >>> request.thinking = {"type": "enabled", "budget_tokens": 8000}
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=8000)
+
+        >>> # Adaptive thinking with xhigh effort (Claude Code + Opus 4.8)
+        >>> request = AnthropicMessagesRequest(model="claude-opus-4.8", messages=[...], max_tokens=32000)
+        >>> request.thinking = {"type": "adaptive"}
+        >>> request.output_config = {"effort": "xhigh"}
+        >>> extract_thinking_config_from_anthropic(request)
+        ThinkingConfig(enabled=True, budget_tokens=30400)
+
+        >>> # Effort without an explicit thinking parameter
+        >>> request.thinking = None
+        >>> request.output_config = {"effort": "xhigh"}
+        >>> extract_thinking_config_from_anthropic(request)
+        ThinkingConfig(enabled=True, budget_tokens=30400)
     """
+    output_config = request.output_config if isinstance(request.output_config, dict) else None
+    effort = output_config.get("effort") if output_config else None
+
     if not request.thinking:
-        # No thinking specified → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
-    
+        # No thinking specified → derive from effort if present, else defaults
+        config = _thinking_config_from_effort(effort, request.max_tokens)
+        return config if config is not None else ThinkingConfig(enabled=True, budget_tokens=None)
+
     if not isinstance(request.thinking, dict):
         # Invalid format → use defaults
         return ThinkingConfig(enabled=True, budget_tokens=None)
-    
+
     thinking_type = request.thinking.get("type")
-    
+
     if thinking_type == "disabled":
         # Explicitly disabled
         return ThinkingConfig(enabled=False, budget_tokens=None)
-    
+
+    if thinking_type == "adaptive":
+        # Adaptive thinking → budget derived from output_config.effort
+        config = _thinking_config_from_effort(effort, request.max_tokens)
+        # Adaptive with no/unknown effort → use defaults
+        return config if config is not None else ThinkingConfig(enabled=True, budget_tokens=None)
+
     if thinking_type == "enabled":
         # Extract budget_tokens
         budget = request.thinking.get("budget_tokens")
         if budget:
             logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
         return ThinkingConfig(enabled=True, budget_tokens=budget)
-    
+
     # Unknown type → use defaults
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
