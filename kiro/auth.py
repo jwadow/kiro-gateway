@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sqlite3
+import ssl
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
@@ -43,6 +44,7 @@ from loguru import logger
 from kiro.config import (
     TOKEN_REFRESH_THRESHOLD,
     SQLITE_READONLY,
+    SSL_UNSAFE_LEGACY_RENEGOTIATION,
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
@@ -230,7 +232,15 @@ class KiroAuthManager:
             f"api_host={self._api_host}, "
             f"q_host={self._q_host}"
         )
-    
+
+    @staticmethod
+    def _get_ssl_context() -> ssl.SSLContext:
+        """Returns SSL context with optional legacy renegotiation support."""
+        ctx = ssl.create_default_context()
+        if SSL_UNSAFE_LEGACY_RENEGOTIATION:
+            ctx.options |= 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
+        return ctx
+
     def _detect_auth_type(self) -> None:
         """
         Detects authentication type based on available credentials.
@@ -705,7 +715,7 @@ class KiroAuthManager:
             "User-Agent": f"KiroIDE-0.7.45-{self._fingerprint}",
         }
         
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, verify=self._get_ssl_context()) as client:
             response = await client.post(self._refresh_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -733,13 +743,13 @@ class KiroAuthManager:
         )
         
         logger.info(f"Token refreshed via Kiro Desktop Auth, expires: {self._expires_at.isoformat()}")
-        
+
         # Save to file or SQLite depending on configuration
         if self._sqlite_db:
             self._save_credentials_to_sqlite()
         else:
             self._save_credentials_to_file()
-    
+
     async def _refresh_token_aws_sso_oidc(self) -> None:
         """
         Refreshes token using AWS SSO OIDC endpoint.
@@ -822,7 +832,7 @@ class KiroAuthManager:
         logger.debug(f"AWS SSO OIDC refresh request: url={url}, sso_region={sso_region}, "
                      f"api_region={self._region}, client_id={self._client_id[:8]}...")
         
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, verify=self._get_ssl_context()) as client:
             response = await client.post(url, json=payload, headers=headers)
             
             # Log response details for debugging (especially on errors)
@@ -860,13 +870,13 @@ class KiroAuthManager:
         self._expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
         
         logger.info(f"Token refreshed via AWS SSO OIDC, expires: {self._expires_at.isoformat()}")
-        
+
         # Save to file or SQLite depending on configuration
         if self._sqlite_db:
             self._save_credentials_to_sqlite()
         else:
             self._save_credentials_to_file()
-    
+
     async def get_access_token(self) -> str:
         """
         Returns a valid access_token, refreshing it if necessary.

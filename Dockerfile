@@ -30,6 +30,13 @@ RUN rm -f credentials.json state.json
 # Create directory for debug logs with proper permissions
 RUN mkdir -p debug_logs && chown -R kiro:kiro debug_logs
 
+# Create directory for local kiro-cli data (token isolation, Issue #203)
+RUN mkdir -p /home/kiro/.local/share/kiro-cli && chown -R kiro:kiro /home/kiro
+
+# Copy entrypoint script
+COPY --chown=kiro:kiro docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
 # Switch to non-root user
 USER kiro
 
@@ -41,5 +48,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"
 
-# Run the application
-CMD ["python", "main.py"]
+# Run the application via entrypoint (handles DB seed copy for token isolation)
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

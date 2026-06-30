@@ -19,6 +19,7 @@ from kiro.converters_core import (
     extract_text_content,
     extract_images_from_content,
     convert_images_to_kiro_format,
+    convert_documents_to_kiro_format,
     merge_adjacent_messages,
     ensure_first_message_is_user,
     normalize_message_roles,
@@ -6455,3 +6456,37 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestConvertDocumentsToKiroFormat:
+    """PDF/document blocks must include a non-empty `name` or Kiro rejects the
+    whole request as REQUEST_BODY_INVALID."""
+
+    def test_document_has_required_name_and_format(self):
+        docs = convert_documents_to_kiro_format(
+            [{"media_type": "application/pdf", "data": "JVBERi0xLjQ="}]
+        )
+        assert len(docs) == 1
+        d = docs[0]
+        assert d["format"] == "pdf"
+        assert d["source"]["bytes"] == "JVBERi0xLjQ="
+        # the bug: name was missing -> Kiro 400. Lock it in.
+        assert d.get("name"), "Kiro document block must include a non-empty name"
+        # name must be extension-free / safe
+        assert "." not in d["name"]
+
+    def test_multiple_documents_get_unique_names(self):
+        docs = convert_documents_to_kiro_format(
+            [
+                {"media_type": "application/pdf", "data": "AAAA"},
+                {"media_type": "application/pdf", "data": "BBBB"},
+            ]
+        )
+        names = [d["name"] for d in docs]
+        assert len(names) == len(set(names)) == 2
+
+    def test_empty_and_none_safe(self):
+        assert convert_documents_to_kiro_format(None) == []
+        assert convert_documents_to_kiro_format([]) == []
+        # doc with empty data is skipped
+        assert convert_documents_to_kiro_format([{"media_type": "application/pdf", "data": ""}]) == []

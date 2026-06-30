@@ -32,16 +32,34 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
+import ssl
 from typing import Optional
 
 import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT, SSL_UNSAFE_LEGACY_RENEGOTIATION
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+
+
+def create_ssl_context() -> ssl.SSLContext:
+    """
+    Creates an SSL context for outbound connections.
+
+    When SSL_UNSAFE_LEGACY_RENEGOTIATION is enabled, allows connections to
+    servers/proxies that require legacy TLS renegotiation (Issue #187).
+
+    Returns:
+        Configured SSL context
+    """
+    ctx = ssl.create_default_context()
+    if SSL_UNSAFE_LEGACY_RENEGOTIATION:
+        ctx.options |= 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
+        logger.warning("SSL unsafe legacy renegotiation enabled (SSL_UNSAFE_LEGACY_RENEGOTIATION=true)")
+    return ctx
 
 
 class KiroHttpClient:
@@ -142,7 +160,7 @@ class KiroHttpClient:
                 timeout_config = httpx.Timeout(timeout=300.0)
                 logger.debug("Creating non-streaming HTTP client (timeout=300s)")
             
-            self.client = httpx.AsyncClient(timeout=timeout_config, follow_redirects=True)
+            self.client = httpx.AsyncClient(timeout=timeout_config, follow_redirects=True, verify=create_ssl_context())
         return self.client
     
     async def close(self) -> None:

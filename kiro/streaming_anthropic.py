@@ -37,6 +37,7 @@ import uuid
 from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
 
 import httpx
+import httpcore
 from loguru import logger
 
 from kiro.streaming_core import (
@@ -697,11 +698,22 @@ async def stream_kiro_to_anthropic(
     except GeneratorExit:
         logger.debug("Client disconnected (GeneratorExit)")
         raise
+    except (httpcore.RemoteProtocolError, httpx.RemoteProtocolError, httpx.ReadError) as e:
+        # Mid-stream connection drop from upstream (Issue #129)
+        logger.warning(f"Upstream connection dropped mid-stream: [{type(e).__name__}] {e}")
+        yield format_sse_event("error", {
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": "The upstream server closed the connection before completing the response. Please retry."
+            }
+        })
+        raise
     except Exception as e:
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "(empty message)"
         logger.error(f"Error during Anthropic streaming: [{error_type}] {error_msg}", exc_info=True)
-        
+
         # Send error event
         yield format_sse_event("error", {
             "type": "error",

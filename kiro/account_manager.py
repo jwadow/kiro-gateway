@@ -496,6 +496,16 @@ class AccountManager:
             
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
+
+            # If profileArn is missing, force a token refresh to discover it
+            # The Kiro API requires profileArn (Issue #168)
+            # Token refresh response includes profileArn which gets stored
+            if not auth_manager.profile_arn:
+                logger.info(f"No profileArn found for {account_id}, forcing token refresh to discover it")
+                try:
+                    await auth_manager.force_refresh()
+                except Exception as e:
+                    logger.warning(f"Failed to discover profileArn via refresh for {account_id}: {e}")
             
             # Determine if we should fetch models or use static list
             if _is_runtime_endpoint(auth_manager):

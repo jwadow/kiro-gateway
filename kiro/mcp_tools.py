@@ -41,6 +41,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.http_client import create_ssl_context
+from kiro.utils import get_kiro_headers
 
 # Import debug_logger
 try:
@@ -135,7 +137,11 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
-    
+
+    # profileArn is required by runtime.kiro.dev/mcp endpoint (Issue #173)
+    if auth_manager.profile_arn:
+        mcp_request["profileArn"] = auth_manager.profile_arn
+
     # Log MCP request
     try:
         mcp_request_json = json.dumps(mcp_request, ensure_ascii=False, indent=2).encode('utf-8')
@@ -143,21 +149,17 @@ async def call_kiro_mcp_api(
             debug_logger.log_raw_chunk(b"[MCP REQUEST]\n" + mcp_request_json)
     except Exception as e:
         logger.warning(f"Failed to log MCP request: {e}")
-    
+
     try:
         token = await auth_manager.get_access_token()
-        
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
-        
+
+        # Use full Kiro headers (same as main API requests)
+        headers = get_kiro_headers(auth_manager, token)
+
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0, verify=create_ssl_context()) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:

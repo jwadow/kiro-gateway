@@ -88,6 +88,7 @@ from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
+from kiro.http_client import create_ssl_context
 
 
 # --- Loguru Configuration ---
@@ -351,7 +352,8 @@ async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(
         limits=limits,
         timeout=timeout,
-        follow_redirects=True
+        follow_redirects=True,
+        verify=create_ssl_context()
     )
     logger.info("Shared HTTP client created with connection pooling")
     

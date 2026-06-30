@@ -33,6 +33,7 @@ import time
 from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional
 
 import httpx
+import httpcore
 from fastapi import HTTPException
 from loguru import logger
 
@@ -423,6 +424,41 @@ async def stream_kiro_to_openai_internal(
         # Client disconnected - this is normal, don't log as error
         logger.debug("Client disconnected (GeneratorExit)")
         streaming_error_occurred = True
+    except httpcore.RemoteProtocolError as e:
+        # Mid-stream connection drop from upstream (Issue #129)
+        streaming_error_occurred = True
+        logger.warning(
+            f"Upstream connection dropped mid-stream: {e} "
+            f"(peer closed connection without sending complete message body)"
+        )
+        try:
+            error_event = {
+                "error": {
+                    "type": "upstream_connection_dropped",
+                    "message": "The upstream server closed the connection before completing the response. Please retry.",
+                    "code": "stream_interrupted"
+                }
+            }
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+        except Exception:
+            pass
+        raise
+    except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+        # httpx-level mid-stream errors (Issue #129)
+        streaming_error_occurred = True
+        logger.warning(f"Upstream connection error mid-stream: [{type(e).__name__}] {e}")
+        try:
+            error_event = {
+                "error": {
+                    "type": "upstream_connection_dropped",
+                    "message": "The upstream server closed the connection before completing the response. Please retry.",
+                    "code": "stream_interrupted"
+                }
+            }
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+        except Exception:
+            pass
+        raise
     except Exception as e:
         streaming_error_occurred = True
         # Log exception type and message for better diagnostics

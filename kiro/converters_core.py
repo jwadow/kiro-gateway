@@ -101,6 +101,7 @@ class UnifiedMessage:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
     images: Optional[List[Dict[str, Any]]] = None
+    documents: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -293,8 +294,65 @@ def extract_images_from_content(content: Any) -> List[Dict[str, Any]]:
     
     if images:
         logger.debug(f"Extracted {len(images)} image(s) from content")
-    
+
     return images
+
+
+def extract_documents_from_content(content: Any) -> List[Dict[str, Any]]:
+    """
+    Extracts documents (PDFs) from message content.
+
+    Anthropic format:
+        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "..."}}
+
+    Args:
+        content: Content in any supported format (usually a list of content blocks)
+
+    Returns:
+        List of documents in unified format: [{"media_type": "application/pdf", "data": "base64..."}]
+    """
+    documents: List[Dict[str, Any]] = []
+
+    if not isinstance(content, list):
+        return documents
+
+    for item in content:
+        if isinstance(item, dict):
+            item_type = item.get("type")
+        elif hasattr(item, "type"):
+            item_type = item.type
+        else:
+            continue
+
+        if item_type == "document":
+            source = item.get("source", {}) if isinstance(item, dict) else getattr(item, "source", None)
+
+            if source is None:
+                continue
+
+            if isinstance(source, dict):
+                if source.get("type") == "base64":
+                    media_type = source.get("media_type", "application/pdf")
+                    data = source.get("data", "")
+                    if data:
+                        documents.append({
+                            "media_type": media_type,
+                            "data": data
+                        })
+            elif hasattr(source, "type"):
+                if source.type == "base64":
+                    media_type = getattr(source, "media_type", "application/pdf")
+                    data = getattr(source, "data", "")
+                    if data:
+                        documents.append({
+                            "media_type": media_type,
+                            "data": data
+                        })
+
+    if documents:
+        logger.debug(f"Extracted {len(documents)} document(s) from content")
+
+    return documents
 
 
 # ==================================================================================================
@@ -700,8 +758,55 @@ def convert_images_to_kiro_format(images: Optional[List[Dict[str, Any]]]) -> Lis
     
     if kiro_images:
         logger.debug(f"Converted {len(kiro_images)} image(s) to Kiro format")
-    
+
     return kiro_images
+
+
+def convert_documents_to_kiro_format(documents: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Converts unified documents (PDFs) to Kiro API format.
+
+    Documents use the same structure as images in the Kiro API:
+    Unified format: [{"media_type": "application/pdf", "data": "base64..."}]
+    Kiro format: [{"format": "pdf", "source": {"bytes": "base64..."}}]
+
+    Args:
+        documents: List of documents in unified format
+
+    Returns:
+        List of documents in Kiro format, ready for userInputMessage.documents
+    """
+    if not documents:
+        return []
+
+    kiro_docs = []
+    for idx, doc in enumerate(documents, start=1):
+        media_type = doc.get("media_type", "application/pdf")
+        data = doc.get("data", "")
+
+        if not data:
+            logger.warning("Skipping document with empty data")
+            continue
+
+        # Extract format from media_type: "application/pdf" -> "pdf"
+        format_str = media_type.split("/")[-1] if "/" in media_type else media_type
+
+        # Kiro requires a non-empty `name` on each document block; omitting it
+        # makes the API reject the whole request as REQUEST_BODY_INVALID.
+        # The name must be safe (letters/digits/space/hyphen, no extension), so
+        # we generate a stable placeholder since callers don't supply a filename.
+        kiro_docs.append({
+            "format": format_str,
+            "name": f"document-{idx}",
+            "source": {
+                "bytes": data
+            }
+        })
+
+    if kiro_docs:
+        logger.debug(f"Converted {len(kiro_docs)} document(s) to Kiro format")
+
+    return kiro_docs
 
 
 # ==================================================================================================
@@ -1358,6 +1463,13 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
                 kiro_images = convert_images_to_kiro_format(images)
                 if kiro_images:
                     user_input["images"] = kiro_images
+
+            # Process documents (PDFs)
+            documents = msg.documents or extract_documents_from_content(msg.content)
+            if documents:
+                kiro_docs = convert_documents_to_kiro_format(documents)
+                if kiro_docs:
+                    user_input["documents"] = kiro_docs
             
             # Build userInputMessageContext for tools and toolResults only
             user_input_context: Dict[str, Any] = {}
@@ -1525,6 +1637,14 @@ def build_kiro_payload(
         kiro_images = convert_images_to_kiro_format(images)
         if kiro_images:
             logger.debug(f"Added {len(kiro_images)} image(s) to current message")
+
+    # Process documents (PDFs) in current message
+    documents = current_message.documents or extract_documents_from_content(current_message.content)
+    kiro_documents = None
+    if documents:
+        kiro_documents = convert_documents_to_kiro_format(documents)
+        if kiro_documents:
+            logger.debug(f"Added {len(kiro_documents)} document(s) to current message")
     
     # Build user_input_context for tools and toolResults only (NOT images)
     user_input_context: Dict[str, Any] = {}
@@ -1560,6 +1680,10 @@ def build_kiro_payload(
     # Add images directly to userInputMessage (NOT to userInputMessageContext)
     if kiro_images:
         user_input_message["images"] = kiro_images
+
+    # Add documents directly to userInputMessage
+    if kiro_documents:
+        user_input_message["documents"] = kiro_documents
     
     # Add user_input_context if present (contains tools and toolResults only)
     if user_input_context:

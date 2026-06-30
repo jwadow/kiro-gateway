@@ -162,11 +162,41 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
-# Union type for all content blocks (including images and thinking)
+class DocumentSource(BaseModel):
+    """
+    Base64-encoded document source in Anthropic format.
+
+    Attributes:
+        type: Always "base64"
+        media_type: MIME type (e.g., "application/pdf")
+        data: Base64-encoded document data
+    """
+
+    type: Literal["base64"] = "base64"
+    media_type: str
+    data: str
+
+
+class DocumentContentBlock(BaseModel):
+    """
+    Document content block in Anthropic format.
+
+    Represents a document (e.g., PDF) in a message.
+    Used when Claude Code reads PDF files and includes them in the conversation.
+    """
+
+    type: Literal["document"] = "document"
+    source: DocumentSource
+
+    model_config = {"extra": "allow"}
+
+
+# Union type for all content blocks (including images, documents, and thinking)
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
     ImageContentBlock,
+    DocumentContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
@@ -338,29 +368,74 @@ class AnthropicMessagesRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
     model_config = {"extra": "allow"}
+    @model_validator(mode="before")
+    @classmethod
+    def fold_system_role_messages(cls, data):
+        """
+        Claude Code >=2.1.156 injects hook/session context as a role:"system"
+        message inside `messages` instead of using the top-level `system`
+        field. Strip those messages and merge their text into `system`.
+        """
+        if not isinstance(data, dict):
+            return data
+        messages = data.get("messages")
+        if not messages:
+            return data
+
+        kept = []
+        extracted_text = []
+        for msg in messages:
+            role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+            if role != "system":
+                kept.append(msg)
+                continue
+            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            if isinstance(content, str):
+                extracted_text.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+                    if text:
+                        extracted_text.append(text)
+
+        if extracted_text:
+            existing_system = data.get("system")
+            if isinstance(existing_system, str):
+                existing_text = existing_system
+            elif isinstance(existing_system, list):
+                existing_text = "\n\n".join(
+                    (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", ""))
+                    for b in existing_system
+                )
+            else:
+                existing_text = ""
+            data["system"] = "\n\n".join(t for t in [existing_text, *extracted_text] if t)
+
+        data["messages"] = kept
+        return data
 
 
 class AnthropicCountTokensRequest(BaseModel):
     """
     Request to Anthropic Count Tokens API (/v1/messages/count_tokens).
-    
+
     Similar to AnthropicMessagesRequest but without generation parameters.
     Used to estimate token count before making actual request.
-    
+
     Attributes:
         model: Model ID (e.g., "claude-sonnet-4-5")
         messages: List of conversation messages
         system: System prompt (optional, string or list of content blocks)
         tools: List of available tools
     """
-    
+
     model: str
     messages: List[AnthropicMessage] = Field(min_length=1)
-    
+
     # Optional parameters - only those that affect token count
     system: Optional[SystemPrompt] = None
     tools: Optional[List[AnthropicTool]] = None
-    
+
     model_config = {"extra": "allow"}
 
 

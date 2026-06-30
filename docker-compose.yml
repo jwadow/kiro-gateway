@@ -27,7 +27,10 @@ services:
       # Option 3: Credentials file path (mounted as volume below)
       - KIRO_CREDS_FILE=${KIRO_CREDS_FILE:-}
       
-      # Option 4: kiro-cli SQLite database (mounted as volume below)
+      # Option 4: kiro-cli SQLite database
+      # Use KIRO_CLI_DB_SEED to copy at startup (avoids race condition with host kiro-cli)
+      # The container gets its own token lifecycle independent of the host.
+      - KIRO_CLI_DB_SEED=${KIRO_CLI_DB_SEED:-}
       - KIRO_CLI_DB_FILE=${KIRO_CLI_DB_FILE:-}
       
       # Optional settings
@@ -46,11 +49,13 @@ services:
       # Mount credentials file (if using KIRO_CREDS_FILE)
       # Uncomment and adjust path as needed:
       # - ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro
-      
-      # Mount kiro-cli database (if using KIRO_CLI_DB_FILE)
+
+      # Mount kiro-cli database as READ-ONLY SEED (if using KIRO_CLI_DB_SEED)
+      # The entrypoint copies it at startup for independent token lifecycle (Issue #203)
       # Uncomment and adjust path as needed:
-      # - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
-      
+      # - ~/.local/share/kiro-cli/data.sqlite3:/mnt/kiro-cli-seed/data.sqlite3:ro
+      # Then set: KIRO_CLI_DB_SEED=/mnt/kiro-cli-seed/data.sqlite3
+
       # Mount debug logs directory (optional, for debugging)
       - ./debug_logs:/app/debug_logs
     
