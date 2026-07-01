@@ -338,6 +338,54 @@ Response:
 
 > **Note:** This endpoint requires a `ksk_*` API key (passthrough mode). It is not part of the OpenAI API specification — it is a kiro-gateway extension.
 
+### Models Endpoint (Enriched)
+
+When using a `ksk_*` API key, the `GET /v1/models` endpoint returns full metadata from Kiro API:
+
+```bash
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer ksk_YOUR_API_KEY"
+```
+
+Response:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "claude-opus-4.8",
+      "object": "model",
+      "created": 1782933838,
+      "owned_by": "kiro",
+      "description": "Claude Opus 4.8 model with 1M context window",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "rate_multiplier": 2.2,
+      "rate_unit": "Credit",
+      "supported_inputs": ["TEXT", "IMAGE"],
+      "prompt_caching": {
+        "supported": true,
+        "max_checkpoints": 4,
+        "min_tokens_per_checkpoint": 1024
+      },
+      "additional_request_fields_schema": { ... }
+    }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `context_window` | Maximum input tokens |
+| `max_output_tokens` | Maximum output tokens |
+| `rate_multiplier` | Credit cost multiplier (e.g. 2.2x for Opus, 0.05x for Qwen) |
+| `supported_inputs` | `TEXT`, `IMAGE` |
+| `prompt_caching` | Whether prompt caching is available and its constraints |
+| `additional_request_fields_schema` | JSON Schema for extra fields like `thinking` and `effort` |
+
+> **Note:** With a `ksk_*` key, models are fetched live from Kiro API. With `PROXY_API_KEY`, the cached/static model list is returned without metadata.
+
 <details>
 <summary>📄 Database locations</summary>
 
