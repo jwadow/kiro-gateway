@@ -245,6 +245,7 @@ class AwsEventStreamParser:
         ('{"stop":', 'tool_stop'),
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
+        ('{"unit":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
     ]
     
@@ -325,6 +326,8 @@ class AwsEventStreamParser:
         elif event_type == 'tool_stop':
             return self._process_tool_stop_event(data)
         elif event_type == 'usage':
+            if 'unit' in data:
+                return {"type": "usage", "data": data}
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}

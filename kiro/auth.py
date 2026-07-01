@@ -77,9 +77,16 @@ class AuthType(Enum):
         - Uses https://oidc.{region}.amazonaws.com/token
         - Form body: grant_type=refresh_token&client_id=...&client_secret=...&refresh_token=...
         - Requires clientId and clientSecret from credentials file
+    
+    API_KEY: Kiro API key (headless/CI mode)
+        - Uses the API key directly as Bearer token
+        - Requires extra header: tokentype: API_KEY
+        - No token refresh needed
+        - Generated via: https://kiro.dev/docs/cli/headless/
     """
     KIRO_DESKTOP = "kiro_desktop"
     AWS_SSO_OIDC = "aws_sso_oidc"
+    API_KEY = "api_key"
 
 
 class KiroAuthManager:
@@ -126,6 +133,7 @@ class KiroAuthManager:
         client_secret: Optional[str] = None,
         sqlite_db: Optional[str] = None,
         api_region: Optional[str] = None,
+        api_key: Optional[str] = None,
     ):
         """
         Initializes the authentication manager.
@@ -141,12 +149,17 @@ class KiroAuthManager:
                        Default location: ~/.local/share/kiro-cli/data.sqlite3
             api_region: Q API region override (optional, per-account)
                        If not specified, uses auto-detection or falls back to region
+            api_key: Kiro API key for headless/CI authentication (optional)
+                    Generated via kiro-cli settings. No token refresh needed.
         """
         self._refresh_token = refresh_token
         self._profile_arn = profile_arn
         self._region = region
         self._creds_file = creds_file
         self._sqlite_db = sqlite_db
+        
+        # API key auth (headless/CI mode) - no refresh needed
+        self._api_key: Optional[str] = api_key
         
         # AWS SSO OIDC specific fields
         self._client_id: Optional[str] = client_id
@@ -235,10 +248,14 @@ class KiroAuthManager:
         """
         Detects authentication type based on available credentials.
         
+        API key auth is detected by presence of api_key parameter.
         AWS SSO OIDC credentials contain clientId and clientSecret.
         Kiro Desktop credentials do not contain these fields.
         """
-        if self._client_id and self._client_secret:
+        if self._api_key:
+            self._auth_type = AuthType.API_KEY
+            logger.info("Detected auth type: API Key (headless/CI)")
+        elif self._client_id and self._client_secret:
             self._auth_type = AuthType.AWS_SSO_OIDC
             logger.info("Detected auth type: AWS SSO OIDC (kiro-cli)")
         else:
@@ -874,6 +891,8 @@ class KiroAuthManager:
         Thread-safe method using asyncio.Lock.
         Automatically refreshes the token if it has expired or is about to expire.
         
+        For API key auth: returns the API key directly (no refresh needed).
+        
         For SQLite mode (kiro-cli): implements graceful degradation when refresh fails.
         If kiro-cli has been running and refreshing tokens in memory (without persisting
         to SQLite), the refresh_token in SQLite becomes stale. In this case, we fall back
@@ -885,6 +904,12 @@ class KiroAuthManager:
         Raises:
             ValueError: If unable to obtain access token
         """
+        # API key auth: return the key directly, no refresh needed
+        if self._auth_type == AuthType.API_KEY:
+            if not self._api_key:
+                raise ValueError("API key is not set")
+            return self._api_key
+        
         async with self._lock:
             # Token is valid and not expiring soon - just return it
             if self._access_token and not self.is_token_expiring_soon():
@@ -938,10 +963,16 @@ class KiroAuthManager:
         Forces a token refresh.
         
         Used when receiving a 403 error from the API.
+        For API key auth, simply returns the key (no refresh possible).
         
         Returns:
             New access token
         """
+        if self._auth_type == AuthType.API_KEY:
+            if not self._api_key:
+                raise ValueError("API key is not set")
+            return self._api_key
+        
         async with self._lock:
             await self._refresh_token_request()
             return self._access_token

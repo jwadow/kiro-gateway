@@ -63,6 +63,7 @@ from kiro.config import (
     REGION,
     KIRO_CREDS_FILE,
     KIRO_CLI_DB_FILE,
+    KIRO_API_KEY,
     PROXY_API_KEY,
     LOG_LEVEL,
     SERVER_HOST,
@@ -240,6 +241,7 @@ def validate_configuration() -> None:
     has_refresh_token = bool(REFRESH_TOKEN)
     has_creds_file = bool(KIRO_CREDS_FILE)
     has_cli_db = bool(KIRO_CLI_DB_FILE)
+    has_api_key = bool(KIRO_API_KEY)
     
     # Check if creds file actually exists
     if KIRO_CREDS_FILE:
@@ -255,50 +257,10 @@ def validate_configuration() -> None:
             has_cli_db = False
             logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
     
-    # If no credentials found, show helpful error
-    if not has_refresh_token and not has_creds_file and not has_cli_db:
-        if not env_file.exists():
-            # No .env file and no environment variables
-            errors.append(
-                "No Kiro credentials configured!\n"
-                "\n"
-                "To get started:\n"
-                "1. Create .env file:\n"
-                "   cp .env.example .env\n"
-                "\n"
-                "2. Edit .env and configure your credentials:\n"
-                "   2.1. Set you super-secret password as PROXY_API_KEY\n"
-                "   2.2. Set your Kiro credentials:\n"
-                "      - Option 1: KIRO_CREDS_FILE to your Kiro credentials JSON file\n"
-                "      - Option 2: REFRESH_TOKEN from Kiro IDE traffic\n"
-                "      - Option 3: KIRO_CLI_DB_FILE to kiro-cli SQLite database\n"
-                "\n"
-                "Or use environment variables (for Docker):\n"
-                "   docker run -e PROXY_API_KEY=\"...\" -e REFRESH_TOKEN=\"...\" ...\n"
-                "\n"
-                "See README.md for detailed instructions."
-            )
-        else:
-            # .env exists but no credentials configured
-            errors.append(
-                "No Kiro credentials configured!\n"
-                "\n"
-                "   Configure one of the following in your .env file:\n"
-                "\n"
-                "Set you super-secret password as PROXY_API_KEY\n"
-                "   PROXY_API_KEY=\"my-super-secret-password-123\"\n"
-                "\n"
-                "   Option 1 (Recommended): JSON credentials file\n"
-                "      KIRO_CREDS_FILE=\"path/to/your/kiro-credentials.json\"\n"
-                "\n"
-                "   Option 2: Refresh token\n"
-                "      REFRESH_TOKEN=\"your_refresh_token_here\"\n"
-                "\n"
-                "   Option 3: kiro-cli SQLite database (AWS SSO)\n"
-                "      KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
-                "\n"
-                "   See README.md for how to obtain credentials."
-            )
+    # If no credentials found, switch to stateless mode
+    if not has_refresh_token and not has_creds_file and not has_cli_db and not has_api_key:
+        logger.info("No Kiro credentials configured — running gateway in stateless passthrough mode")
+        logger.info("Users must provide their own Kiro API key (ksk_*) as Bearer token")
     
     # Print errors and exit if any
     if errors:
@@ -364,6 +326,7 @@ async def lifespan(app: FastAPI):
     has_refresh_token = bool(REFRESH_TOKEN)
     has_creds_file = bool(KIRO_CREDS_FILE) and Path(KIRO_CREDS_FILE).expanduser().exists()
     has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
+    has_api_key = bool(KIRO_API_KEY)
     
     # Helper function to add optional per-account overrides from .env
     def _add_env_overrides(entry: dict) -> None:
@@ -383,12 +346,19 @@ async def lifespan(app: FastAPI):
     if ACCOUNT_SYSTEM:
         # Account system enabled: create credentials.json ONCE (migration)
         if not creds_path.exists():
-            if has_refresh_token or has_creds_file or has_cli_db:
+            if has_refresh_token or has_creds_file or has_cli_db or has_api_key:
                 logger.info("credentials.json not found, creating from .env (one-time migration)")
                 credentials = []
                 
-                # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
-                if has_cli_db:
+                # Priority: API Key > SQLite DB > JSON file > environment variables
+                if has_api_key:
+                    entry = {
+                        "type": "api_key",
+                        "api_key": KIRO_API_KEY
+                    }
+                    _add_env_overrides(entry)
+                    credentials.append(entry)
+                elif has_cli_db:
                     entry = {
                         "type": "sqlite",
                         "path": KIRO_CLI_DB_FILE
@@ -417,12 +387,19 @@ async def lifespan(app: FastAPI):
                 logger.info("Created credentials.json from .env (one-time migration)")
     else:
         # Legacy mode: ALWAYS recreate credentials.json from .env
-        if has_refresh_token or has_creds_file or has_cli_db:
+        if has_refresh_token or has_creds_file or has_cli_db or has_api_key:
             logger.debug("Legacy mode: recreating credentials.json from .env")
             credentials = []
             
-            # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
-            if has_cli_db:
+            # Priority: API Key > SQLite DB > JSON file > environment variables
+            if has_api_key:
+                entry = {
+                    "type": "api_key",
+                    "api_key": KIRO_API_KEY
+                }
+                _add_env_overrides(entry)
+                credentials.append(entry)
+            elif has_cli_db:
                 entry = {
                     "type": "sqlite",
                     "path": KIRO_CLI_DB_FILE
@@ -466,48 +443,54 @@ async def lifespan(app: FastAPI):
     app.state.account_system = ACCOUNT_SYSTEM
     
     # ==============================================================================
-    # Initialize first working account (blocking)
+    # Initialize first working account (blocking) — or stateless mode
     # ==============================================================================
     all_accounts = list(app.state.account_manager._accounts.keys())
     
+    save_task = None
+    
     if not all_accounts:
-        logger.error("No accounts configured in credentials.json")
-        raise RuntimeError("No accounts configured in credentials.json")
-    
-    # Determine start index from state.json
-    start_index = app.state.account_manager._current_account_index
-    
-    # Try to initialize accounts (full circle)
-    initialized = False
-    
-    for i in range(len(all_accounts)):
-        current_index = (start_index + i) % len(all_accounts)
-        account_id = all_accounts[current_index]
+        # No accounts configured — stateless passthrough mode
+        logger.info("Running in stateless passthrough mode — no server-side credentials")
+        logger.info("Users must provide their Kiro API key (ksk_*) as Bearer token")
+        app.state.stateless_mode = True
+    else:
+        app.state.stateless_mode = False
         
-        logger.info(f"Attempting to initialize account: {account_id}")
+        # Determine start index from state.json
+        start_index = app.state.account_manager._current_account_index
         
-        success = await app.state.account_manager._initialize_account(account_id)
+        # Try to initialize accounts (full circle)
+        initialized = False
         
-        if success:
-            logger.info(f"Successfully initialized account: {account_id}")
-            initialized = True
-            break
-        else:
-            logger.warning(f"Failed to initialize account: {account_id}")
-    
-    if not initialized:
-        logger.error("Failed to initialize any account. Check your credentials.")
-        raise RuntimeError("Failed to initialize any account")
-    
-    # Save initial state
-    await app.state.account_manager._save_state()
-    
-    # Start background task for periodic state saving
-    save_task = asyncio.create_task(
-        app.state.account_manager.save_state_periodically()
-    )
-    
-    logger.info("Account system initialized successfully")
+        for i in range(len(all_accounts)):
+            current_index = (start_index + i) % len(all_accounts)
+            account_id = all_accounts[current_index]
+            
+            logger.info(f"Attempting to initialize account: {account_id}")
+            
+            success = await app.state.account_manager._initialize_account(account_id)
+            
+            if success:
+                logger.info(f"Successfully initialized account: {account_id}")
+                initialized = True
+                break
+            else:
+                logger.warning(f"Failed to initialize account: {account_id}")
+        
+        if not initialized:
+            logger.error("Failed to initialize any account. Check your credentials.")
+            raise RuntimeError("Failed to initialize any account")
+        
+        # Save initial state
+        await app.state.account_manager._save_state()
+        
+        # Start background task for periodic state saving
+        save_task = asyncio.create_task(
+            app.state.account_manager.save_state_periodically()
+        )
+        
+        logger.info("Account system initialized successfully")
     
     yield
     
@@ -515,15 +498,17 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application...")
     
     # Cancel background task
-    save_task.cancel()
-    try:
-        await save_task
-    except asyncio.CancelledError:
-        pass
+    if save_task:
+        save_task.cancel()
+        try:
+            await save_task
+        except asyncio.CancelledError:
+            pass
     
     # Final state save
-    await app.state.account_manager._save_state()
-    logger.info("Final state saved")
+    if not getattr(app.state, 'stateless_mode', False):
+        await app.state.account_manager._save_state()
+        logger.info("Final state saved")
     
     # Close HTTP client
     try:

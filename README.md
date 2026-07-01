@@ -226,6 +226,166 @@ PROXY_API_KEY="my-super-secret-password-123"
 # The gateway will work without it
 ```
 
+### Option 5: Kiro API Key (Headless / CI)
+
+The simplest authentication method. Generate an API key via kiro-cli settings and use it directly — no token refresh, no SSO, no credentials files needed.
+
+There are two modes of operation:
+
+#### Mode A: Stateless Passthrough (Multi-Tenant)
+
+No server-side configuration needed. The gateway starts with zero credentials and each user passes their own Kiro API key as the Bearer token. Multiple users can share a single gateway instance.
+
+```bash
+# Start gateway with no credentials at all
+docker run -d -p 8000:8000 --name kiro-gateway kiro-gateway
+```
+
+Users connect with their own key:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer ksk_USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+Each `ksk_*` Bearer token is forwarded directly to Kiro API. Sessions are cached per key for performance.
+
+#### Mode B: Server-Side API Key (Single-Tenant)
+
+Configure a single API key on the server. Users authenticate with the `PROXY_API_KEY` password:
+
+```env
+KIRO_API_KEY="ksk_your_api_key_here"
+
+# Password to protect YOUR proxy server
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="my-super-secret-password-123" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+Users connect with the proxy password:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+#### How to generate an API key
+
+1. Install kiro-cli: `curl -fsSL https://cli.kiro.dev/install | bash`
+2. Login: `kiro-cli login`
+3. Generate API key in settings (see [Kiro CLI Headless docs](https://kiro.dev/docs/cli/headless/))
+
+<details>
+<summary>🔍 How it works</summary>
+
+The API key is passed directly to Kiro API as a Bearer token with an additional `tokentype: API_KEY` header. No token refresh or exchange is needed. The gateway auto-detects the correct region from the Kiro API `GetProfile` response.
+
+**Passthrough mode (Mode A):** Any Bearer token starting with `ksk_` bypasses `PROXY_API_KEY` validation and is forwarded directly to Kiro API. This enables multi-tenant usage where each user uses their own subscription.
+
+**Server-side mode (Mode B):** The `KIRO_API_KEY` is stored on the server and used for all requests authenticated via `PROXY_API_KEY`.
+
+Endpoints used:
+- `POST https://management.{region}.kiro.dev/` — GetProfile, ListAvailableModels
+- `POST https://runtime.{region}.kiro.dev/` — GenerateAssistantResponse
+
+</details>
+
+### Credit Usage Endpoint
+
+Check your subscription credits, overage, and billing info:
+
+```bash
+curl http://localhost:8000/v1/credits \
+  -H "Authorization: Bearer ksk_YOUR_API_KEY"
+```
+
+Response:
+
+```json
+{
+  "plan": "KIRO PRO+",
+  "email": "user@example.com",
+  "credits": {
+    "limit": 2000,
+    "used": 2920.83,
+    "overage": 920.83,
+    "overage_charges_usd": 36.83,
+    "overage_rate_usd": 0.04,
+    "overage_cap": 10000
+  },
+  "next_reset": 1782864000
+}
+```
+
+> **Note:** This endpoint requires a `ksk_*` API key (passthrough mode). It is not part of the OpenAI API specification — it is a kiro-gateway extension.
+
+### Models Endpoint (Enriched)
+
+When using a `ksk_*` API key, the `GET /v1/models` endpoint returns full metadata from Kiro API:
+
+```bash
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer ksk_YOUR_API_KEY"
+```
+
+Response:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "claude-opus-4.8",
+      "object": "model",
+      "created": 1782933838,
+      "owned_by": "kiro",
+      "description": "Claude Opus 4.8 model with 1M context window",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "rate_multiplier": 2.2,
+      "rate_unit": "Credit",
+      "supported_inputs": ["TEXT", "IMAGE"],
+      "prompt_caching": {
+        "supported": true,
+        "max_checkpoints": 4,
+        "min_tokens_per_checkpoint": 1024
+      },
+      "additional_request_fields_schema": { ... }
+    }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `context_window` | Maximum input tokens |
+| `max_output_tokens` | Maximum output tokens |
+| `rate_multiplier` | Credit cost multiplier (e.g. 2.2x for Opus, 0.05x for Qwen) |
+| `supported_inputs` | `TEXT`, `IMAGE` |
+| `prompt_caching` | Whether prompt caching is available and its constraints |
+| `additional_request_fields_schema` | JSON Schema for extra fields like `thinking` and `effort` |
+
+> **Note:** With a `ksk_*` key, models are fetched live from Kiro API. With `PROXY_API_KEY`, the cached/static model list is returned without metadata.
+
 <details>
 <summary>📄 Database locations</summary>
 
@@ -539,6 +699,8 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 > **Note:** Replace `my-super-secret-password-123` with the `PROXY_API_KEY` you set in your `.env` file.
+>
+> **API Key Passthrough:** If you have a Kiro API key (`ksk_...`), you can use it directly as the bearer token — no `PROXY_API_KEY` or server-side credentials needed. The gateway detects the `ksk_` prefix and passes it through to Kiro API.
 
 </details>
 
@@ -653,6 +815,8 @@ curl http://localhost:8000/v1/messages \
 ```
 
 > **Note:** Anthropic API uses `x-api-key` header instead of `Authorization: Bearer`. Both are supported.
+>
+> **API Key Passthrough:** You can use a Kiro API key (`ksk_...`) directly in the `x-api-key` or `Authorization: Bearer` header — no server-side credentials required.
 
 </details>
 
