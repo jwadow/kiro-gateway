@@ -308,7 +308,13 @@ async def get_models(request: Request, bearer_token: str = Depends(verify_api_ke
                     }
                     schema = m.get("additionalModelRequestFieldsSchema")
                     if schema:
-                        model_entry["additional_request_fields_schema"] = schema
+                        effort_enum = (schema.get("properties", {})
+                                       .get("output_config", {})
+                                       .get("properties", {})
+                                       .get("effort", {})
+                                       .get("enum"))
+                        if effort_enum:
+                            model_entry["reasoning_efforts"] = effort_enum
                     openai_models.append(model_entry)
                 
                 return {"object": "list", "data": openai_models}
