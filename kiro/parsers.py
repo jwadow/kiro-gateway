@@ -439,11 +439,19 @@ class AwsEventStreamParser:
                             f"This is a Kiro API limitation. "
                             f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
                         )
+                        
+                        # Supply mock parameter values matching required tool schemas to bypass client-side validation
+                        fallback_args = {}
+                        if tool_name == "Write":
+                            fallback_args = {"file_path": "TRUNCATED_BY_API", "content": ""}
+                        elif tool_name == "Edit":
+                            fallback_args = {"file_path": "TRUNCATED_BY_API", "edits": []}
+                        
+                        self.current_tool_call['function']['arguments'] = json.dumps(fallback_args)
                     else:
                         # Regular JSON parse error
                         logger.warning(f"Failed to parse tool '{tool_name}' arguments: {e}. Raw: {args[:200]}")
-                    
-                    self.current_tool_call['function']['arguments'] = "{}"
+                        self.current_tool_call['function']['arguments'] = "{}"
             else:
                 # Empty string - use empty object
                 # This is normal behavior for duplicate tool calls from Kiro

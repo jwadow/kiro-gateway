@@ -5,6 +5,7 @@ Unit tests for AwsEventStreamParser and auxiliary parsing functions.
 Tests the parsing logic for AWS SSE stream from Kiro API.
 """
 
+import json
 import pytest
 
 from kiro.parsers import (
@@ -819,6 +820,54 @@ class TestAwsEventStreamParserFinalizeToolCall:
         
         print(f"current_tool_call after finalization: {aws_event_parser.current_tool_call}")
         assert aws_event_parser.current_tool_call is None
+
+    def test_finalize_with_truncated_write_tool(self, aws_event_parser):
+        """
+        What it does: Tests finalization of truncated Write tool call.
+        Goal: Ensure it returns schema-valid arguments with file_path and content.
+        """
+        print("Setup: Truncated Write tool call...")
+        aws_event_parser.current_tool_call = {
+            "id": "call_write_truncated",
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "arguments": '{"file_path": "test.txt", "content": "hello world'  # Missing closing quote & brace
+            }
+        }
+        
+        print("Action: Finalizing tool call...")
+        aws_event_parser._finalize_tool_call()
+        
+        print(f"Result: {aws_event_parser.tool_calls}")
+        assert len(aws_event_parser.tool_calls) == 1
+        args = json.loads(aws_event_parser.tool_calls[0]["function"]["arguments"])
+        assert args["file_path"] == "TRUNCATED_BY_API"
+        assert args["content"] == ""
+
+    def test_finalize_with_truncated_edit_tool(self, aws_event_parser):
+        """
+        What it does: Tests finalization of truncated Edit tool call.
+        Goal: Ensure it returns schema-valid arguments with file_path and edits list.
+        """
+        print("Setup: Truncated Edit tool call...")
+        aws_event_parser.current_tool_call = {
+            "id": "call_edit_truncated",
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "arguments": '{"file_path": "test.txt", "edits": ['  # Missing braces
+            }
+        }
+        
+        print("Action: Finalizing tool call...")
+        aws_event_parser._finalize_tool_call()
+        
+        print(f"Result: {aws_event_parser.tool_calls}")
+        assert len(aws_event_parser.tool_calls) == 1
+        args = json.loads(aws_event_parser.tool_calls[0]["function"]["arguments"])
+        assert args["file_path"] == "TRUNCATED_BY_API"
+        assert args["edits"] == []
 
 
 class TestAwsEventStreamParserEdgeCases:
