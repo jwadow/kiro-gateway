@@ -27,6 +27,7 @@ Contains all API endpoints:
 """
 
 import json
+import time
 import httpx
 from datetime import datetime, timezone
 
@@ -241,40 +242,94 @@ async def health():
         "version": APP_VERSION
     }
 
-@router.get("/v1/models", response_model=ModelList)
+@router.get("/v1/models")
 async def get_models(request: Request, bearer_token: str = Depends(verify_api_key)):
     """
     Return list of available models.
     
-    Models are loaded at startup (blocking) and cached.
-    This endpoint returns the cached list.
+    For ksk_* API keys: fetches live model data from Kiro API with full metadata
+    (context window, output tokens, rate, caching, supported inputs).
+    
+    For legacy mode: returns cached model IDs.
     
     Args:
         request: FastAPI Request for accessing app.state
     
     Returns:
-        ModelList with available models in consistent format (with dots)
+        ModelList with available models including metadata
     """
     logger.info("Request to /v1/models")
     
-    # Stateless mode: return fallback models
+    # Passthrough mode: fetch live model data from Kiro API
+    if bearer_token.startswith("ksk_"):
+        session = await _get_passthrough_session(bearer_token)
+        auth_manager = session.auth_manager
+        
+        url = f"{auth_manager.api_host.replace('runtime.', 'management.')}/"
+        headers = {
+            "Content-Type": "application/x-amz-json-1.0",
+            "x-amz-target": "AmazonCodeWhispererService.ListAvailableModels",
+            "tokentype": "API_KEY",
+            "Authorization": f"Bearer {bearer_token}",
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    params={"origin": "KIRO_CLI"},
+                    content=json.dumps({"origin": "KIRO_CLI"})
+                )
+            
+            if response.status_code == 200:
+                data = response.json()
+                models = data.get("models", [])
+                openai_models = []
+                for m in models:
+                    token_limits = m.get("tokenLimits", {})
+                    caching = m.get("promptCaching", {})
+                    model_entry = {
+                        "id": m.get("modelId", ""),
+                        "object": "model",
+                        "created": int(time.time()),
+                        "owned_by": "kiro",
+                        "description": m.get("description", ""),
+                        "context_window": token_limits.get("maxInputTokens", 0),
+                        "max_output_tokens": token_limits.get("maxOutputTokens", 0),
+                        "rate_multiplier": m.get("rateMultiplier", 1.0),
+                        "rate_unit": m.get("rateUnit", "Credit"),
+                        "supported_inputs": m.get("supportedInputTypes", []),
+                        "prompt_caching": {
+                            "supported": caching.get("supportsPromptCaching", False),
+                            "max_checkpoints": caching.get("maximumCacheCheckpointsPerRequest", 0),
+                            "min_tokens_per_checkpoint": caching.get("minimumTokensPerCacheCheckpoint", 0),
+                        },
+                    }
+                    schema = m.get("additionalModelRequestFieldsSchema")
+                    if schema:
+                        model_entry["additional_request_fields_schema"] = schema
+                    openai_models.append(model_entry)
+                
+                return {"object": "list", "data": openai_models}
+        except Exception as e:
+            logger.warning(f"Failed to fetch models from Kiro API: {e}, falling back to static list")
+    
+    # Stateless mode fallback: return static models
     if getattr(request.app.state, 'stateless_mode', False):
         from kiro.config import FALLBACK_MODELS
         available_model_ids = [m["modelId"] for m in FALLBACK_MODELS]
     elif request.app.state.account_system:
-        # Account system: collect models from all initialized accounts
         available_model_ids = request.app.state.account_manager.get_all_available_models()
     else:
-        # Legacy: use resolver from first account
         account = request.app.state.account_manager.get_first_account()
         available_model_ids = account.model_resolver.get_available_models()
     
-    # Build OpenAI-compatible model list
     openai_models = [
         OpenAIModel(
             id=model_id,
-            owned_by="anthropic",
-            description="Claude model via Kiro API"
+            owned_by="kiro",
+            description="Model via Kiro API"
         )
         for model_id in available_model_ids
     ]
