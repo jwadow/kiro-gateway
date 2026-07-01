@@ -500,6 +500,45 @@ class TestKiroAuthManagerProperties:
         print(f"fingerprint: {manager.fingerprint}")
         assert len(manager.fingerprint) == 64
 
+    def test_profile_arn_fallback_auto_detection(self):
+        """
+        What it does: Verifies profile_arn fallback to detect_kiro_agent_profile_arn.
+        Purpose: Ensure Kiro Agent IDE profile.json is read if no profile_arn is set.
+        """
+        print("Setup: Creating KiroAuthManager without profile_arn...")
+        manager = KiroAuthManager(refresh_token="test")
+        
+        print("Action: Accessing profile_arn with mocked detect_kiro_agent_profile_arn...")
+        mock_arn = "arn:aws:codewhisperer:us-east-1:1111:profile/auto-detected"
+        with patch("kiro.auth.detect_kiro_agent_profile_arn", return_value=mock_arn) as mock_detect:
+            arn = manager.profile_arn
+            mock_detect.assert_called_once()
+            
+        print(f"Comparing profile_arn: Expected '{mock_arn}', Got '{arn}'")
+        assert arn == mock_arn
+        
+        # Verify it caches the value in memory
+        print("Verification: Subsequent accesses do not call detect again...")
+        with patch("kiro.auth.detect_kiro_agent_profile_arn") as mock_detect2:
+            arn2 = manager.profile_arn
+            mock_detect2.assert_not_called()
+        assert arn2 == mock_arn
+
+    def test_profile_arn_returns_none_if_no_detection(self):
+        """
+        What it does: Verifies profile_arn returns None when no profile_arn is set
+                      and auto-detection fails (returns None).
+        Purpose: Prevent crash and return None as standard default.
+        """
+        print("Setup: Creating KiroAuthManager without profile_arn...")
+        manager = KiroAuthManager(refresh_token="test")
+        
+        print("Action: Accessing profile_arn when auto-detection returns None...")
+        with patch("kiro.auth.detect_kiro_agent_profile_arn", return_value=None):
+            arn = manager.profile_arn
+            
+        assert arn is None
+
 
 # =============================================================================
 # Tests for AuthType enum

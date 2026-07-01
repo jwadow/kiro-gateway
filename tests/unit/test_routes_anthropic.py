@@ -337,25 +337,34 @@ class TestMessagesValidation:
         print(f"Status: {response.status_code}")
         assert response.status_code == 422
     
-    def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
+    def test_accepts_non_standard_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies a non-standard message role (e.g. inline 'system')
+                      is NOT rejected at the validation layer.
+        Purpose: Some clients (notably Claude Code) inject inline 'system' role
+                 messages into the messages array. These previously triggered a
+                 422 literal_error. The role field is now permissive and such
+                 roles are normalized to 'user' downstream, so validation must
+                 pass (any non-422 status).
         """
-        print("Action: POST /v1/messages with invalid role...")
+        print("Action: POST /v1/messages with inline system role...")
         response = test_client.post(
             "/v1/messages",
             headers={"x-api-key": valid_proxy_api_key},
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 1024,
-                "messages": [{"role": "invalid_role", "content": "Hello"}]
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "system", "content": "Inline system reminder"},
+                    {"role": "user", "content": "Continue"},
+                ]
             }
         )
         
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
+        # Role is now permissive - must pass validation (normalized to 'user' downstream)
+        assert response.status_code != 422
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """

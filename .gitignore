@@ -3,6 +3,7 @@
 .env.local
 credentials.json
 state.json
+venv/
 
 # IDE
 .vscode/

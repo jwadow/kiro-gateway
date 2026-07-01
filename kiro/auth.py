@@ -48,7 +48,7 @@ from kiro.config import (
     get_kiro_q_host,
     get_aws_sso_oidc_url,
 )
-from kiro.utils import get_machine_fingerprint
+from kiro.utils import get_machine_fingerprint, detect_kiro_agent_profile_arn
 
 
 # Supported SQLite token keys (searched in priority order)
@@ -949,7 +949,16 @@ class KiroAuthManager:
     @property
     def profile_arn(self) -> Optional[str]:
         """AWS CodeWhisperer profile ARN."""
-        return self._profile_arn
+        if self._profile_arn:
+            return self._profile_arn
+        
+        # Fallback to auto-detect from Kiro Agent IDE's profile.json
+        detected = detect_kiro_agent_profile_arn()
+        if detected:
+            self._profile_arn = detected
+            return detected
+            
+        return None
     
     @property
     def region(self) -> str:

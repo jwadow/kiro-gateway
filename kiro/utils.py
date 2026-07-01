@@ -26,8 +26,11 @@ and other common utilities.
 
 import hashlib
 import json
+import os
+import sys
 import uuid
-from typing import TYPE_CHECKING, List, Dict, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, List, Dict, Any, Optional
 
 from loguru import logger
 
@@ -171,3 +174,55 @@ def generate_tool_call_id() -> str:
         ID in format "call_{uuid_hex[:8]}"
     """
     return f"call_{uuid.uuid4().hex[:8]}"
+
+
+def detect_kiro_agent_profile_arn() -> Optional[str]:
+    """
+    Attempts to auto-detect the profile ARN from Kiro Agent IDE's global storage.
+    
+    Checks %APPDATA%/Kiro/User/globalStorage/kiro.kiroagent/profile.json (on Windows)
+    or the platform-specific equivalents.
+    
+    Returns:
+        Auto-detected profile ARN string, or None if not found/invalid
+    """
+    try:
+        home = Path.home()
+        if os.name == 'nt':  # Windows
+            appdata = os.getenv('APPDATA')
+            if not appdata:
+                return None
+            kiro_dir = Path(appdata) / "Kiro"
+        elif sys.platform == 'darwin':  # macOS
+            kiro_dir = home / "Library" / "Application Support" / "Kiro"
+        else:  # Linux/Unix
+            kiro_dir = home / ".config" / "Kiro"
+            
+        # 1. Check the direct path first
+        profile_path = kiro_dir / "User" / "globalStorage" / "kiro.kiroagent" / "profile.json"
+        if profile_path.exists():
+            with open(profile_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                arn = data.get("profileArn") or data.get("profile_arn") or data.get("arn")
+                if arn:
+                    logger.info(f"Auto-detected Kiro Agent profile ARN: {arn}")
+                    return arn
+                    
+        # 2. Fall back to recursive search in kiro.kiroagent folder if it exists
+        kiro_agent_dir = kiro_dir / "User" / "globalStorage" / "kiro.kiroagent"
+        if kiro_agent_dir.exists():
+            for root, _, files in os.walk(kiro_agent_dir):
+                if "profile.json" in files:
+                    file_path = Path(root) / "profile.json"
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            arn = data.get("profileArn") or data.get("profile_arn") or data.get("arn")
+                            if arn:
+                                logger.info(f"Auto-detected Kiro Agent profile ARN from subdirectory: {arn}")
+                                return arn
+                    except Exception as inner_e:
+                        logger.debug(f"Failed to read Kiro Agent profile.json at {file_path}: {inner_e}")
+    except Exception as e:
+        logger.warning(f"Failed to auto-detect Kiro Agent profile ARN: {e}")
+    return None

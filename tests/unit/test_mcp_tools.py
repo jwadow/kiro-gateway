@@ -253,6 +253,111 @@ class TestCallKiroMCPAPI:
 
 
 # ==================================================================================================
+# Tests for MCP Endpoint Selection (host + profile ARN header)
+# ==================================================================================================
+
+class TestMCPEndpointSelection:
+    """
+    Tests for endpoint/header selection in call_kiro_mcp_api.
+
+    The Kiro MCP web_search endpoint behaves differently depending on auth type:
+    - AWS SSO OIDC (kiro-cli) accounts must call the Amazon Q endpoint
+      (https://q.{region}.amazonaws.com/mcp) and pass the profile ARN in the
+      x-amzn-kiro-profile-arn header. The runtime.kiro.dev host rejects these
+      requests with 400 "profileArn is required" / 403 "not authorized".
+    - Other auth types (Kiro Desktop) keep the q_host endpoint without that header.
+    """
+
+    @staticmethod
+    def _make_mock_client():
+        """Build a mocked httpx.AsyncClient returning a minimal successful response."""
+        mock_response_data = {
+            "id": "web_search_tooluse_abc_1_xyz",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"results": [], "totalResults": 0, "query": "q"})
+                }],
+                "isError": False
+            }
+        }
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+        return mock_client, mock_post
+
+    @pytest.mark.asyncio
+    async def test_sso_account_uses_amazon_q_host_and_profile_arn_header(self):
+        """
+        What it does: Verifies AWS SSO OIDC accounts call the Amazon Q endpoint
+        with the profile ARN header and the x-amz-json content type.
+        Purpose: Prevent regression of the 403/400 web_search failure for kiro-cli.
+        """
+        from kiro.auth import KiroAuthManager
+        from datetime import datetime, timezone
+
+        # AWS SSO OIDC is detected when client_id + client_secret are present.
+        manager = KiroAuthManager(
+            refresh_token="test_refresh_token",
+            profile_arn="arn:aws:codewhisperer:eu-central-1:123456789012:profile/EXAMPLE",
+            region="us-east-1",
+            client_id="test_client_id",
+            client_secret="test_client_secret",
+        )
+        manager._access_token = "test_access_token"
+        manager._expires_at = datetime.now(timezone.utc).replace(year=2099)
+
+        mock_client, mock_post = self._make_mock_client()
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test query", manager)
+
+        called_url = mock_post.call_args.args[0]
+        called_headers = mock_post.call_args.kwargs["headers"]
+
+        # Region is derived from the profile ARN (eu-central-1), not the SSO region.
+        assert called_url == "https://q.eu-central-1.amazonaws.com/mcp"
+        assert called_headers["x-amzn-kiro-profile-arn"] == \
+            "arn:aws:codewhisperer:eu-central-1:123456789012:profile/EXAMPLE"
+        assert called_headers["Content-Type"] == "application/x-amz-json-1.0"
+        assert called_headers["Authorization"] == "Bearer test_access_token"
+
+    @pytest.mark.asyncio
+    async def test_desktop_account_uses_q_host_without_profile_arn_header(self):
+        """
+        What it does: Verifies non-SSO (Kiro Desktop) accounts keep the q_host
+        endpoint and do NOT send the profile ARN header.
+        Purpose: Ensure the SSO-specific routing does not affect Desktop auth.
+        """
+        from kiro.auth import KiroAuthManager
+        from datetime import datetime, timezone
+
+        # No client_id/secret -> Kiro Desktop auth type.
+        manager = KiroAuthManager(
+            refresh_token="test_refresh_token",
+            profile_arn="arn:aws:codewhisperer:us-east-1:123456789012:profile/EXAMPLE",
+            region="us-east-1",
+        )
+        manager._access_token = "test_access_token"
+        manager._expires_at = datetime.now(timezone.utc).replace(year=2099)
+
+        mock_client, mock_post = self._make_mock_client()
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test query", manager)
+
+        called_url = mock_post.call_args.args[0]
+        called_headers = mock_post.call_args.kwargs["headers"]
+
+        assert called_url == f"{manager.q_host}/mcp"
+        assert "x-amzn-kiro-profile-arn" not in called_headers
+        assert called_headers["Content-Type"] == "application/json"
+
+
+# ==================================================================================================
 # Tests for Search Summary Generation
 # ==================================================================================================
 
