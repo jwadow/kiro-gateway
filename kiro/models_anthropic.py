@@ -632,3 +632,10 @@ class AnthropicErrorResponse(BaseModel):
 
     type: Literal["error"] = "error"
     error: AnthropicErrorDetail
+
+
+# Rebuild models that use forward references in Union types.
+# ToolResultContentBlock.content references "ToolReferenceContentBlock" as a string —
+# Pydantic v2 needs an explicit rebuild to resolve it after all classes are defined.
+ToolResultContentBlock.model_rebuild()
+AnthropicMessage.model_rebuild()
