@@ -8,6 +8,11 @@ state.json
 .vscode/
 .idea/
 .shard/
+.DS_Store
+
+# Python venv
+.venv/
+venv/
 
 # Python
 __pycache__/
