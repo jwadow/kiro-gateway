@@ -38,6 +38,7 @@ from kiro.models_anthropic import (
     # Request models
     SystemContentBlock,
     AnthropicMessagesRequest,
+    AnthropicCountTokensRequest,
     # Response models
     AnthropicUsage,
     AnthropicMessagesResponse,
@@ -1353,6 +1354,123 @@ class TestSystemContentBlock:
         
         print(f"ValidationError raised: {exc_info.value}")
         assert "text" in str(exc_info.value)
+
+
+# ==================================================================================================
+# Tests for system-role message folding (AnthropicMessagesRequest / AnthropicCountTokensRequest)
+# ==================================================================================================
+
+class TestSystemRoleMessageFolding:
+    """
+    Tests for folding role="system" messages into the top-level `system` field.
+
+    Anthropic's API only allows "user"/"assistant" in `messages` — some clients
+    (e.g. OpenAI-style translators) still send role="system" entries inline instead
+    of using the top-level `system` field. Rather than 422-ing, the gateway merges
+    them into `system` and drops them from `messages`.
+    """
+
+    def test_folds_system_message_into_string_system(self):
+        """
+        What it does: Verifies a role="system" message is merged into a string `system`.
+        Purpose: Ensure the client's original system field is preserved and prefixed.
+        """
+        print("Setup: Request with inline system-role message + existing string system...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-5",
+            max_tokens=10,
+            system="Existing system prompt.",
+            messages=[
+                {"role": "system", "content": "Inline system instruction."},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+
+        print(f"Result messages roles: {[m.role for m in request.messages]}")
+        assert [m.role for m in request.messages] == ["user"]
+
+        print(f"Result system: {request.system}")
+        assert request.system == "Inline system instruction.\n\nExisting system prompt."
+
+    def test_folds_system_message_with_no_existing_system(self):
+        """
+        What it does: Verifies folding works when no top-level `system` was provided.
+        Purpose: Ensure `system` is populated purely from the inline message.
+        """
+        print("Setup: Request with inline system-role message, no top-level system...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-5",
+            max_tokens=10,
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Be nice."},
+                {"role": "assistant", "content": "Ok"},
+            ],
+        )
+
+        print(f"Result messages roles: {[m.role for m in request.messages]}")
+        assert [m.role for m in request.messages] == ["user", "assistant"]
+
+        print(f"Result system: {request.system}")
+        assert request.system == "Be nice."
+
+    def test_no_system_messages_leaves_request_unchanged(self):
+        """
+        What it does: Verifies requests without any role="system" message are untouched.
+        Purpose: Ensure the fold is a no-op for normal user/assistant conversations.
+        """
+        print("Setup: Normal user/assistant conversation...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-5",
+            max_tokens=10,
+            system="Existing system prompt.",
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+
+        print(f"Result messages roles: {[m.role for m in request.messages]}")
+        assert [m.role for m in request.messages] == ["user"]
+
+        print(f"Result system: {request.system}")
+        assert request.system == "Existing system prompt."
+
+    def test_folds_system_message_content_blocks(self):
+        """
+        What it does: Verifies a system-role message with list content (text blocks)
+        is folded correctly, extracting text from each block.
+        Purpose: Ensure list-form content (not just plain strings) is handled.
+        """
+        print("Setup: System-role message with list content blocks...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-5",
+            max_tokens=10,
+            messages=[
+                {"role": "system", "content": [{"type": "text", "text": "Part 1."}]},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+
+        print(f"Result system: {request.system}")
+        assert request.system == "Part 1."
+
+    def test_count_tokens_request_also_folds_system_messages(self):
+        """
+        What it does: Verifies AnthropicCountTokensRequest applies the same folding.
+        Purpose: Ensure /v1/messages/count_tokens doesn't 422 on inline system messages either.
+        """
+        print("Setup: Count-tokens request with inline system-role message...")
+        request = AnthropicCountTokensRequest(
+            model="claude-sonnet-5",
+            messages=[
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+
+        print(f"Result messages roles: {[m.role for m in request.messages]}")
+        assert [m.role for m in request.messages] == ["user"]
+
+        print(f"Result system: {request.system}")
+        assert request.system == "Be concise."
 
 
 # ==================================================================================================

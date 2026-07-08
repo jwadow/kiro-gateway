@@ -187,7 +187,7 @@ class AnthropicMessage(BaseModel):
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
@@ -294,6 +294,48 @@ class SystemContentBlock(BaseModel):
 SystemPrompt = Union[str, List[SystemContentBlock], List[Dict[str, Any]]]
 
 
+def _extract_system_messages(messages, system):
+    """
+    Fold any role="system" messages out of the messages list into the system prompt.
+
+    The Anthropic API only allows "user"/"assistant" roles inside `messages` —
+    system instructions belong in the top-level `system` field. Some clients
+    (e.g. OpenAI-style translators) still send role="system" entries inline;
+    rather than 422-ing, merge their text into `system` and drop them so the
+    rest of the pipeline only ever sees user/assistant messages.
+    """
+    system_texts: List[str] = []
+    kept_messages = []
+
+    for msg in messages:
+        if msg.role != "system":
+            kept_messages.append(msg)
+            continue
+
+        content = msg.content
+        if isinstance(content, str):
+            system_texts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                text = getattr(block, "text", None) if not isinstance(block, dict) else block.get("text")
+                if text:
+                    system_texts.append(text)
+
+    if not system_texts:
+        return kept_messages, system
+
+    if isinstance(system, str):
+        merged = "\n\n".join(system_texts + [system]) if system else "\n\n".join(system_texts)
+    elif isinstance(system, list):
+        merged = [{"type": "text", "text": t} for t in system_texts] + [
+            b.model_dump() if hasattr(b, "model_dump") else b for b in system
+        ]
+    else:
+        merged = "\n\n".join(system_texts)
+
+    return kept_messages, merged
+
+
 class AnthropicMessagesRequest(BaseModel):
     """
     Request to Anthropic Messages API (/v1/messages).
@@ -339,6 +381,11 @@ class AnthropicMessagesRequest(BaseModel):
 
     model_config = {"extra": "allow"}
 
+    @model_validator(mode="after")
+    def _fold_system_role_messages(self):
+        self.messages, self.system = _extract_system_messages(self.messages, self.system)
+        return self
+
 
 class AnthropicCountTokensRequest(BaseModel):
     """
@@ -360,8 +407,13 @@ class AnthropicCountTokensRequest(BaseModel):
     # Optional parameters - only those that affect token count
     system: Optional[SystemPrompt] = None
     tools: Optional[List[AnthropicTool]] = None
-    
+
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="after")
+    def _fold_system_role_messages(self):
+        self.messages, self.system = _extract_system_messages(self.messages, self.system)
+        return self
 
 
 # ==================================================================================================

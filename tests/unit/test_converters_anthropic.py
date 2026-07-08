@@ -1435,6 +1435,60 @@ class TestConvertAnthropicTools:
         assert result is not None
         assert result[0].description is None
 
+    def test_skips_server_side_tool_without_input_schema(self):
+        """
+        What it does: Verifies server-side Anthropic tools (type set, no input_schema)
+        are dropped instead of forwarded with an empty/broken schema.
+        Purpose: Kiro has no function-calling equivalent for these (e.g. "advisor",
+        "web_search_20250305"); forwarding them causes a Kiro-side
+        TOOL_SCHEMA_INVALID / REQUEST_BODY_INVALID error.
+        """
+        print("Setup: Server-side tool without input_schema...")
+        tools = [
+            AnthropicTool(type="advisor_20260301", name="advisor"),
+            AnthropicTool(name="get_weather", input_schema={"type": "object", "properties": {}}),
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {result}")
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].name == "get_weather"
+
+    def test_skips_server_side_tool_dict_without_input_schema(self):
+        """
+        What it does: Verifies the same server-side tool skip applies to dict-form tools.
+        Purpose: Ensure the dict branch of convert_anthropic_tools also checks type/input_schema.
+        """
+        print("Setup: Dict server-side tool without input_schema...")
+        tools = [{"type": "web_search_20250305", "name": "web_search"}]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Comparing result: Expected None, Got {result}")
+        assert result is None
+
+    def test_keeps_custom_tool_with_empty_input_schema(self):
+        """
+        What it does: Verifies a user-defined tool with an empty (but present) input_schema
+        is still converted normally.
+        Purpose: Ensure the server-side-tool skip only triggers when input_schema is None,
+        not when it's merely an empty dict.
+        """
+        print("Setup: Custom tool with empty input_schema...")
+        tools = [AnthropicTool(name="no_args_tool", input_schema={})]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {result}")
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].name == "no_args_tool"
+
 
 # ==================================================================================================
 # Tests for anthropic_to_kiro

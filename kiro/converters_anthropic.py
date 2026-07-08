@@ -357,14 +357,26 @@ def convert_anthropic_tools(
         if isinstance(tool, dict):
             name = tool.get("name", "")
             description = tool.get("description")
-            input_schema = tool.get("input_schema", {})
+            input_schema = tool.get("input_schema")
+            tool_type = tool.get("type")
         else:
             name = tool.name
             description = tool.description
             input_schema = tool.input_schema
+            tool_type = tool.type
+
+        # Server-side Anthropic tools (e.g. "web_search_20250305", "advisor_20260301")
+        # have no input_schema — their schema is executed on Anthropic's side, not ours.
+        # Kiro has no function-calling equivalent for these; forwarding an empty/missing
+        # schema produces a Kiro-side TOOL_SCHEMA_INVALID / REQUEST_BODY_INVALID error.
+        # Drop them here — known server tools we can emulate (e.g. web_search) are
+        # re-injected separately with a real input_schema (see WEB_SEARCH_ENABLED).
+        if tool_type is not None and input_schema is None:
+            logger.debug(f"Skipping server-side tool '{name}' (type={tool_type}) — no input_schema for Kiro")
+            continue
 
         unified_tools.append(
-            UnifiedTool(name=name, description=description, input_schema=input_schema)
+            UnifiedTool(name=name, description=description, input_schema=input_schema or {})
         )
 
     return unified_tools if unified_tools else None
