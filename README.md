@@ -11,11 +11,10 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
-[![Sponsor](https://img.shields.io/badge/💖_Sponsor-Support_Development-ff69b4)](#-support-the-project)
 
 *Use Claude models from Kiro with Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue and other OpenAI or Anthropic compatible tools*
 
-[Models](#-supported-models) • [Features](#-features) • [Quick Start](#-quick-start) • [Configuration](#%EF%B8%8F-configuration) • [💖 Sponsor](#-support-the-project)
+[Models](#-supported-models) • [Features](#-features) • [Quick Start](#-quick-start) • [Configuration](#%EF%B8%8F-configuration)
 
 </div>
 
@@ -642,6 +641,47 @@ print(response.content)
 ### Anthropic API
 
 <details>
+<summary>🖥️ Claude Code CLI</summary>
+
+Point Claude Code at your local gateway via environment variables (e.g. in `.claude/settings.json` under `env`, or exported in your shell):
+
+```json
+{
+  "ANTHROPIC_BASE_URL": "http://127.0.0.1:9000",
+  "ANTHROPIC_API_KEY": "my-super-secret-password-123",
+  "ANTHROPIC_MODEL": "claude-sonnet-5"
+}
+```
+
+Or via shell export:
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:9000"
+export ANTHROPIC_API_KEY="my-super-secret-password-123"
+export ANTHROPIC_MODEL="claude-sonnet-5"
+```
+
+`ANTHROPIC_API_KEY` must match your gateway's `PROXY_API_KEY` (from `.env`). `ANTHROPIC_MODEL` is any model ID from the [Available Models](#-available-models-free-list) list.
+
+</details>
+
+<details>
+<summary>🧪 Quick Smoke Test</summary>
+
+Verify the gateway is up and answering before pointing a client at it:
+
+```bash
+curl -s -X POST http://127.0.0.1:9000/v1/messages \
+  -H "x-api-key: my-super-secret-password-123" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-5","max_tokens":50,"messages":[{"role":"user","content":"say hi in 3 words"}]}'
+```
+
+Expected: a `200` JSON response with `content[0].text`. A `400`/`422` here means something is misconfigured (wrong `x-api-key`, invalid model, or malformed body) — check [Debugging](#-debugging).
+
+</details>
+
+<details>
 <summary>🔹 Simple cURL Request</summary>
 
 ```bash
@@ -827,38 +867,6 @@ By submitting a contribution to this project, you agree to the terms of our [Con
 - You have the right to submit the contribution
 - You grant the maintainer rights to use and relicense your contribution
 - The project remains legally protected
-
----
-
-## 💖 Support the Project
-
-<div align="center">
-
-<img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Smilies/Smiling%20Face%20with%20Hearts.png" alt="Love" width="80" />
-
-**If this project saved you time or money, consider supporting it!**
-
-Every contribution helps keep this project alive and growing
-
-<br>
-
-### 🤑 Donate
-
-[**☕ One-time Support**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
-
-<br>
-
-### 🪙 Or send crypto
-
-| Currency | Network | Address |
-|:--------:|:-------:|:--------|
-| **USDT** | TRC20 | `TSVtgRc9pkC1UgcbVeijBHjFmpkYHDRu26` |
-| **BTC** | Bitcoin | `12GZqxqpcBsqJ4Vf1YreLqwoMGvzBPgJq6` |
-| **ETH** | Ethereum | `0xc86eab3bba3bbaf4eb5b5fff8586f1460f1fd395` |
-| **SOL** | Solana | `9amykF7KibZmdaw66a1oqYJyi75fRqgdsqnG66AK3jvh` |
-| **TON** | TON | `UQBVh8T1H3GI7gd7b-_PPNnxHYYxptrcCVf3qQk5v41h3QTM` |
-
-</div>
 
 ---
 
