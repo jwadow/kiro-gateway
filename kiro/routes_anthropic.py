@@ -407,13 +407,9 @@ async def messages(
                     }
                 )
             
-            # Log Kiro payload
-            try:
-                kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-                if debug_logger:
-                    debug_logger.log_kiro_request_body(kiro_request_body)
-            except Exception as e:
-                logger.warning(f"Failed to log Kiro request: {e}")
+            # Log Kiro payload (serialization is skipped entirely when DEBUG_MODE=off)
+            if debug_logger:
+                debug_logger.log_kiro_request_payload(kiro_payload)
             
             # Create HTTP client
             url = f"{auth_manager.api_host}/generateAssistantResponse"
@@ -722,13 +718,9 @@ async def messages(
             }
         )
     
-    # Log Kiro payload
-    try:
-        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-        if debug_logger:
-            debug_logger.log_kiro_request_body(kiro_request_body)
-    except Exception as e:
-        logger.warning(f"Failed to log Kiro request: {e}")
+    # Log Kiro payload (serialization is skipped entirely when DEBUG_MODE=off)
+    if debug_logger:
+        debug_logger.log_kiro_request_payload(kiro_payload)
     
     # Create HTTP client with retry logic
     # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)

@@ -688,3 +688,137 @@ class TestDebugLoggerAppLogsCapture:
             print(f"Проверяем, что app_logs.txt НЕ создан...")
             app_logs_file = debug_dir / "app_logs.txt"
             assert not app_logs_file.exists()
+
+
+class TestLogKiroRequestPayload:
+    """
+    Tests for log_kiro_request_payload().
+
+    This method is a performance optimization: it must skip json.dumps
+    serialization entirely when debug logging is disabled (the default),
+    while preserving identical output when a debug mode is active.
+    """
+
+    @staticmethod
+    def _make_logger(debug_dir):
+        """Build a fresh-initialized DebugLogger bound to the given debug_dir."""
+        from kiro.debug_logger import DebugLogger
+        instance = DebugLogger.__new__(DebugLogger)
+        instance._initialized = False
+        instance.__init__()
+        instance.debug_dir = debug_dir
+        return instance
+
+    def test_off_mode_skips_serialization_entirely(self, tmp_path):
+        """
+        What it does: Verifies that in 'off' mode json.dumps is NEVER called.
+        Goal: This is the core optimization - no CPU wasted serializing a
+              payload that will only be discarded when logging is disabled.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'off'):
+            instance = self._make_logger(debug_dir)
+            with patch('kiro.debug_logger.json.dumps') as mock_dumps:
+                instance.log_kiro_request_payload({"conversationState": {"big": "x" * 1000}})
+                mock_dumps.assert_not_called()
+            # Nothing buffered and no file created
+            assert instance._kiro_request_body_buffer is None
+            assert not debug_dir.exists()
+
+    def test_errors_mode_serializes_and_buffers(self, tmp_path):
+        """
+        What it does: Verifies that in 'errors' mode the payload is serialized
+                      and buffered in memory (but not yet written to disk).
+        Goal: Ensure the buffered-until-error contract still holds.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            instance = self._make_logger(debug_dir)
+            instance.log_kiro_request_payload({"model": "claude-sonnet-4.5", "value": 42})
+
+            assert instance._kiro_request_body_buffer is not None
+            parsed = json.loads(instance._kiro_request_body_buffer)
+            assert parsed["model"] == "claude-sonnet-4.5"
+            assert parsed["value"] == 42
+            # Buffered only - no file until flush_on_error
+            assert not (debug_dir / "kiro_request_body.json").exists()
+
+    def test_errors_mode_flush_writes_payload_to_file(self, tmp_path):
+        """
+        What it does: Verifies the buffered payload is written on flush_on_error.
+        Goal: Confirm end-to-end behavior in the intended troubleshooting mode.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            instance = self._make_logger(debug_dir)
+            instance.log_kiro_request_payload({"conversationState": {"id": "abc"}})
+            instance.flush_on_error(400, "Improperly formed request")
+
+            written = debug_dir / "kiro_request_body.json"
+            assert written.exists()
+            assert json.loads(written.read_text())["conversationState"]["id"] == "abc"
+
+    def test_all_mode_writes_payload_immediately(self, tmp_path):
+        """
+        What it does: Verifies that in 'all' mode the payload is written to disk
+                      immediately, pretty-printed.
+        Goal: Ensure the developer 'all' mode still captures every request.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        debug_dir.mkdir()
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = self._make_logger(debug_dir)
+            instance.log_kiro_request_payload({"foo": "bar", "nested": {"a": 1}})
+
+            written = debug_dir / "kiro_request_body.json"
+            assert written.exists()
+            content = written.read_text()
+            assert json.loads(content)["foo"] == "bar"
+            # Pretty-printed (indent=2) -> contains newlines and indentation
+            assert "\n" in content
+            assert "  " in content
+
+    def test_non_serializable_payload_does_not_raise(self, tmp_path):
+        """
+        What it does: Verifies a non-JSON-serializable payload is handled
+                      gracefully (warning logged, nothing buffered/written).
+        Goal: A logging failure must never break the actual API request.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            instance = self._make_logger(debug_dir)
+            # object() cannot be serialized by json.dumps
+            instance.log_kiro_request_payload({"bad": object()})
+
+            assert instance._kiro_request_body_buffer is None
+            assert not (debug_dir / "kiro_request_body.json").exists()
+
+    def test_off_mode_ignores_non_serializable_payload_without_touching_json(self, tmp_path):
+        """
+        What it does: Verifies that in 'off' mode a non-serializable payload is
+                      not even inspected (json.dumps is never reached).
+        Goal: Guarantee the fast path returns before any serialization attempt,
+              so even a problematic payload costs nothing when logging is off.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'off'):
+            instance = self._make_logger(debug_dir)
+            with patch('kiro.debug_logger.json.dumps') as mock_dumps:
+                # Should not raise and should not call json.dumps
+                instance.log_kiro_request_payload({"bad": object()})
+                mock_dumps.assert_not_called()
+
+    def test_output_matches_legacy_inline_serialization(self, tmp_path):
+        """
+        What it does: Verifies the buffered bytes are byte-for-byte identical to
+                      the previous inline json.dumps(...).encode('utf-8') call.
+        Goal: Prove this optimization changed performance, not output.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        payload = {"conversationState": {"history": [1, 2, 3]}, "profileArn": "arn:test"}
+        expected = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            instance = self._make_logger(debug_dir)
+            instance.log_kiro_request_payload(payload)
+            assert instance._kiro_request_body_buffer == expected
