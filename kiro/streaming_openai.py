@@ -53,6 +53,7 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
+from kiro.network_errors import classify_network_error, build_http_error_detail
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -607,45 +608,63 @@ async def collect_stream_response(
     finish_reason = "stop"  # Default fallback
     completion_id = generate_completion_id()
     
-    async for chunk_str in stream_kiro_to_openai(
-        client,
-        response,
-        model,
-        model_cache,
-        auth_manager,
-        request_messages=request_messages,
-        request_tools=request_tools
-    ):
-        if not chunk_str.startswith("data:"):
-            continue
-        
-        data_str = chunk_str[len("data:"):].strip()
-        if not data_str or data_str == "[DONE]":
-            continue
-        
-        try:
-            chunk_data = json.loads(data_str)
+    try:
+        async for chunk_str in stream_kiro_to_openai(
+            client,
+            response,
+            model,
+            model_cache,
+            auth_manager,
+            request_messages=request_messages,
+            request_tools=request_tools
+        ):
+            if not chunk_str.startswith("data:"):
+                continue
             
-            # Extract data from chunk
-            delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-            if "content" in delta:
-                full_content += delta["content"]
-            if "reasoning_content" in delta:
-                full_reasoning_content += delta["reasoning_content"]
-            if "tool_calls" in delta:
-                tool_calls.extend(delta["tool_calls"])
+            data_str = chunk_str[len("data:"):].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
             
-            # Extract finish_reason from chunk (streaming already calculated it correctly)
-            finish_reason_from_chunk = chunk_data.get("choices", [{}])[0].get("finish_reason")
-            if finish_reason_from_chunk:
-                finish_reason = finish_reason_from_chunk
-            
-            # Save usage from last chunk
-            if "usage" in chunk_data:
-                final_usage = chunk_data["usage"]
+            try:
+                chunk_data = json.loads(data_str)
                 
-        except (json.JSONDecodeError, IndexError):
-            continue
+                # Extract data from chunk
+                delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                if "content" in delta:
+                    full_content += delta["content"]
+                if "reasoning_content" in delta:
+                    full_reasoning_content += delta["reasoning_content"]
+                if "tool_calls" in delta:
+                    tool_calls.extend(delta["tool_calls"])
+                
+                # Extract finish_reason from chunk (streaming already calculated it correctly)
+                finish_reason_from_chunk = chunk_data.get("choices", [{}])[0].get("finish_reason")
+                if finish_reason_from_chunk:
+                    finish_reason = finish_reason_from_chunk
+                
+                # Save usage from last chunk
+                if "usage" in chunk_data:
+                    final_usage = chunk_data["usage"]
+                    
+            except (json.JSONDecodeError, IndexError):
+                continue
+    except httpx.RequestError as e:
+        # Upstream closed the connection mid-response (e.g. RemoteProtocolError:
+        # "incomplete chunked read"). This is raised while reading the response
+        # body, AFTER request_with_retry already returned HTTP 200, so the HTTP
+        # client's retry/classification never sees it. Classify it here and raise
+        # a proper 502/504 instead of letting it surface as a generic 500. The
+        # route's HTTPException handlers treat 502/504 as a recoverable network
+        # error (account-system mode fails over to the next account).
+        error_info = classify_network_error(e)
+        logger.error(
+            f"Upstream connection error during non-streaming collection (OpenAI): "
+            f"{error_info.technical_details}"
+        )
+        raise HTTPException(
+            status_code=error_info.suggested_http_code,
+            detail=build_http_error_detail(error_info),
+        )
     
     # Form final response
     message = {"role": "assistant", "content": full_content}

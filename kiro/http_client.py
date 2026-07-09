@@ -41,7 +41,12 @@ from loguru import logger
 from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
-from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+from kiro.network_errors import (
+    classify_network_error,
+    get_short_error_message,
+    build_http_error_detail,
+    NetworkErrorInfo,
+)
 
 
 class KiroHttpClient:
@@ -312,21 +317,12 @@ class KiroHttpClient:
         
         # All attempts exhausted - provide detailed, user-friendly error message
         if last_error_info:
-            # Use classified error information
-            error_message = last_error_info.user_message
-            
-            # Add troubleshooting steps
-            if last_error_info.troubleshooting_steps:
-                error_message += "\n\nTroubleshooting:\n"
-                for i, step in enumerate(last_error_info.troubleshooting_steps, 1):
-                    error_message += f"{i}. {step}\n"
-            
-            # Add technical details for debugging
-            error_message += f"\nTechnical details: {last_error_info.technical_details}"
-            
+            # Use classified error information. The detail is built via the shared
+            # formatter so connection-level failures here and mid-stream body drops
+            # (classified in the streaming collectors) produce identical messages.
             raise HTTPException(
                 status_code=last_error_info.suggested_http_code,
-                detail=error_message.strip()
+                detail=build_http_error_detail(last_error_info)
             )
         else:
             # Fallback if no error was captured (shouldn't happen)
