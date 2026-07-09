@@ -38,6 +38,7 @@ from kiro.models_anthropic import (
     # Request models
     SystemContentBlock,
     AnthropicMessagesRequest,
+    AnthropicCountTokensRequest,
     # Response models
     AnthropicUsage,
     AnthropicMessagesResponse,
@@ -1753,7 +1754,238 @@ class TestThinkingParameter:
             max_tokens=1024,
             thinking={"type": "disabled"}
         )
-        
+
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+# ==================================================================================================
+# Tests for Inline System Message Hoisting (422 fix)
+# ==================================================================================================
+
+class TestInlineSystemMessageHoisting:
+    """
+    Tests for hoisting inline ``role: "system"`` messages into the top-level
+    ``system`` field.
+
+    Some clients (Claude Code, LangChain, OpenAI-style callers) put the system
+    prompt inside the ``messages`` array. Anthropic's schema only accepts
+    ``user``/``assistant`` roles there, so those requests failed with a 422
+    ``literal_error``. The ``mode="before"`` validator moves them out before
+    per-message validation runs.
+    """
+
+    def test_inline_system_message_hoisted_to_system_field(self):
+        """
+        What it does: Verifies a single inline system message becomes the top-level system field.
+        Purpose: PRIMARY test for the 422 "Input should be 'user' or 'assistant'" fix.
+        """
+        print("Setup: Creating request with inline system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "You are helpful."},
+                {"role": "assistant", "content": "ok"},
+            ],
+        )
+
+        print(f"Comparing system: Expected 'You are helpful.', Got '{request.system}'")
+        assert request.system == "You are helpful."
+
+        print(f"Comparing messages count: Expected 2, Got {len(request.messages)}")
+        assert len(request.messages) == 2
+        assert [m.role for m in request.messages] == ["user", "assistant"]
+
+    def test_multiple_inline_system_messages_joined(self):
+        """
+        What it does: Verifies multiple inline system messages are joined with blank lines.
+        Purpose: Ensure order is preserved and all system text is retained.
+        """
+        print("Setup: Creating request with multiple inline system messages...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": "First rule."},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Second rule."},
+            ],
+        )
+
+        print(f"Comparing system: Got '{request.system}'")
+        assert request.system == "First rule.\n\nSecond rule."
+
+        print(f"Comparing messages count: Expected 1, Got {len(request.messages)}")
+        assert len(request.messages) == 1
+        assert request.messages[0].role == "user"
+
+    def test_inline_system_merged_with_existing_string_system(self):
+        """
+        What it does: Verifies inline system text is appended to an existing string system field.
+        Purpose: Ensure we never clobber a top-level system prompt the client already sent.
+        """
+        print("Setup: Creating request with both top-level and inline system...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            system="Top-level prompt.",
+            messages=[
+                {"role": "system", "content": "Inline prompt."},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+
+        print(f"Comparing system: Got '{request.system}'")
+        assert request.system == "Top-level prompt.\n\nInline prompt."
+
+    def test_inline_system_merged_with_existing_list_system(self):
+        """
+        What it does: Verifies inline system text is appended as blocks to a list-form system field.
+        Purpose: Ensure prompt-caching (list) system format is preserved and extended.
+        """
+        print("Setup: Creating request with list-form system + inline system...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            system=[{"type": "text", "text": "Cached prompt."}],
+            messages=[
+                {"role": "system", "content": "Inline prompt."},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+
+        print(f"Comparing system: Got '{request.system}'")
+        assert isinstance(request.system, list)
+        assert len(request.system) == 2
+        assert request.system[0].text == "Cached prompt."
+        assert request.system[1].text == "Inline prompt."
+
+    def test_inline_system_with_block_content(self):
+        """
+        What it does: Verifies system messages whose content is a list of text blocks are hoisted.
+        Purpose: Clients may send system content as [{"type":"text","text":...}], not a plain string.
+        """
+        print("Setup: Creating request with block-form inline system content...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Part A."},
+                        {"type": "text", "text": "Part B."},
+                    ],
+                },
+                {"role": "user", "content": "hi"},
+            ],
+        )
+
+        print(f"Comparing system: Got '{request.system}'")
+        assert request.system == "Part A.\n\nPart B."
+
+    def test_no_system_message_is_passthrough(self):
+        """
+        What it does: Verifies requests without inline system messages are unchanged.
+        Purpose: Ensure the validator is a no-op when there is nothing to hoist.
+        """
+        print("Setup: Creating request with no inline system messages...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+        )
+
+        print(f"Comparing system: Expected None, Got {request.system}")
+        assert request.system is None
+
+        print(f"Comparing messages count: Expected 2, Got {len(request.messages)}")
+        assert len(request.messages) == 2
+
+    def test_empty_inline_system_content_ignored(self):
+        """
+        What it does: Verifies an inline system message with empty content adds no system text.
+        Purpose: Ensure empty strings don't produce a spurious top-level system field.
+        """
+        print("Setup: Creating request with empty inline system content...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+
+        print(f"Comparing system: Expected None, Got {request.system}")
+        assert request.system is None
+
+        print(f"Comparing messages count: Expected 1, Got {len(request.messages)}")
+        assert len(request.messages) == 1
+        assert request.messages[0].role == "user"
+
+    def test_all_system_messages_leaves_valid_messages(self):
+        """
+        What it does: Verifies that after hoisting, a request keeping at least one real message validates.
+        Purpose: Ensure min_length constraint on messages is satisfied by remaining messages.
+        """
+        print("Setup: Creating request where system precedes a single user message...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+
+        print(f"Comparing system: Got '{request.system}'")
+        assert request.system == "Be concise."
+        assert len(request.messages) == 1
+
+    def test_count_tokens_request_hoists_system(self):
+        """
+        What it does: Verifies AnthropicCountTokensRequest applies the same hoisting.
+        Purpose: Consistency — the count_tokens endpoint shares the schema and must not 422 either.
+        """
+        print("Setup: Creating AnthropicCountTokensRequest with inline system...")
+        request = AnthropicCountTokensRequest(
+            model="claude-opus-4.8",
+            messages=[
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+
+        print(f"Comparing system: Expected 'You are helpful.', Got '{request.system}'")
+        assert request.system == "You are helpful."
+
+        print(f"Comparing messages count: Expected 1, Got {len(request.messages)}")
+        assert len(request.messages) == 1
+        assert request.messages[0].role == "user"
+
+    def test_pydantic_object_messages_still_validate(self):
+        """
+        What it does: Verifies passing AnthropicMessage objects (not dicts) still works.
+        Purpose: The validator only hoists dict system messages; typed user/assistant
+                 objects must pass through untouched.
+        """
+        print("Setup: Creating request from AnthropicMessage objects...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="hi"),
+                AnthropicMessage(role="assistant", content="hello"),
+            ],
+        )
+
+        print(f"Comparing messages count: Expected 2, Got {len(request.messages)}")
+        assert len(request.messages) == 2
+        assert request.system is None

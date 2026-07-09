@@ -681,13 +681,45 @@ class TestFallbackModelsIntegration:
         print(f"Available models: {available}")
         print(f"Comparing length: Expected {len(FALLBACK_MODELS)}, Got {len(available)}")
         assert len(available) == len(FALLBACK_MODELS)
-        
+
         # Verify all fallback models are present
         fallback_ids = {m["modelId"] for m in FALLBACK_MODELS}
         available_set = set(available)
-        
+
         print(f"Comparing sets: Expected {fallback_ids}, Got {available_set}")
         assert fallback_ids == available_set
+
+    @pytest.mark.asyncio
+    async def test_opus_4_8_present_and_resolves(self):
+        """
+        What it does: Verifies claude-opus-4.8 is in FALLBACK_MODELS and resolves from cache.
+        Purpose: Regression guard — opus 4.8 was missing from the fallback list, so requests
+                 for it were treated as unknown pass-through models and rejected by Kiro.
+        """
+        print("Setup: Importing FALLBACK_MODELS and creating cache...")
+        from kiro.config import FALLBACK_MODELS
+        from kiro.cache import ModelInfoCache
+        from kiro.model_resolver import ModelResolver
+
+        model_ids = {m["modelId"] for m in FALLBACK_MODELS}
+        print(f"Verification: 'claude-opus-4.8' in fallback list...")
+        assert "claude-opus-4.8" in model_ids
+
+        cache = ModelInfoCache()
+        await cache.update(FALLBACK_MODELS)
+        resolver = ModelResolver(cache=cache, hidden_models={})
+
+        # Both dot and dash client formats must resolve to the cached model
+        for input_name in ("claude-opus-4.8", "claude-opus-4-8"):
+            print(f"\n  Testing: {input_name}")
+            resolution = resolver.resolve(input_name)
+
+            print(f"    Normalized: {resolution.normalized}, source: {resolution.source}")
+            assert resolution.normalized == "claude-opus-4.8"
+            assert resolution.source == "cache", (
+                f"Model {input_name} should resolve from cache, not pass-through"
+            )
+            assert resolution.is_verified is True
 
 
 # ==================================================================================================
