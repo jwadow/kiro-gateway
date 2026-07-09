@@ -339,6 +339,72 @@ class AnthropicMessagesRequest(BaseModel):
 
     model_config = {"extra": "allow"}
 
+    @model_validator(mode="before")
+    @classmethod
+    def _hoist_system(cls, data: Any) -> Any:
+        return _hoist_system_messages(data)
+
+
+def _hoist_system_messages(data: Any) -> Any:
+    """
+    Move any inline ``role: "system"`` messages out of ``messages`` and into
+    the top-level ``system`` field. Some clients (Claude Code, LangChain,
+    older OpenAI-style callers) send system prompts inside the messages
+    array, but Anthropic's schema only accepts ``user``/``assistant`` there.
+    """
+    if not isinstance(data, dict):
+        return data
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return data
+
+    system_texts: List[str] = []
+    remaining: List[Any] = []
+    found_system = False
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            found_system = True
+            content = msg.get("content")
+            if isinstance(content, str):
+                if content:
+                    system_texts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text:
+                            system_texts.append(text)
+                    elif isinstance(block, str) and block:
+                        system_texts.append(block)
+            continue
+        remaining.append(msg)
+
+    # No inline system messages at all: leave the request untouched.
+    if not found_system:
+        return data
+
+    # Always strip inline system messages from `messages` — even empty ones,
+    # which would otherwise fail per-message validation with a 422.
+    data["messages"] = remaining
+
+    # Nothing to merge into `system` if every inline system message was empty.
+    if not system_texts:
+        return data
+
+    existing_system = data.get("system")
+    if existing_system is None:
+        data["system"] = "\n\n".join(system_texts)
+    elif isinstance(existing_system, str):
+        data["system"] = "\n\n".join([existing_system, *system_texts])
+    elif isinstance(existing_system, list):
+        data["system"] = list(existing_system) + [
+            {"type": "text", "text": t} for t in system_texts
+        ]
+    else:
+        data["system"] = "\n\n".join(system_texts)
+
+    return data
+
 
 class AnthropicCountTokensRequest(BaseModel):
     """
@@ -360,8 +426,13 @@ class AnthropicCountTokensRequest(BaseModel):
     # Optional parameters - only those that affect token count
     system: Optional[SystemPrompt] = None
     tools: Optional[List[AnthropicTool]] = None
-    
+
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _hoist_system(cls, data: Any) -> Any:
+        return _hoist_system_messages(data)
 
 
 # ==================================================================================================
