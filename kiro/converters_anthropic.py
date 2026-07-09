@@ -24,7 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -255,6 +255,51 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
     return tool_calls
 
 
+def extract_inline_system_messages(
+    messages: List[AnthropicMessage],
+) -> Tuple[List[str], List[AnthropicMessage]]:
+    """
+    Separates inline system messages from the conversation messages.
+
+    Some clients (e.g. Claude Code) place ``{"role": "system", ...}`` entries
+    inside the ``messages`` array instead of using the top-level ``system``
+    field. This function extracts the text of those inline system messages
+    (preserving their relative order) and returns the remaining user/assistant
+    messages with their order preserved.
+
+    The extracted inline system messages are excluded from the returned
+    conversation messages so they are never sent to the Kiro API as
+    conversation history.
+
+    Args:
+        messages: List of Anthropic messages (may contain inline system roles)
+
+    Returns:
+        Tuple of:
+        - List of inline system prompt texts, in original order
+        - List of non-system messages (user/assistant), in original order
+    """
+    inline_system_texts: List[str] = []
+    conversation_messages: List[AnthropicMessage] = []
+
+    for msg in messages:
+        if msg.role == "system":
+            # Extract text from string or list-of-content-blocks content
+            system_text = convert_anthropic_content_to_text(msg.content)
+            if system_text:
+                inline_system_texts.append(system_text)
+        else:
+            conversation_messages.append(msg)
+
+    if inline_system_texts:
+        logger.debug(
+            f"Folded {len(inline_system_texts)} inline system message(s) "
+            f"from messages array into system prompt"
+        )
+
+    return inline_system_texts, conversation_messages
+
+
 def convert_anthropic_messages(
     messages: List[AnthropicMessage],
 ) -> List[UnifiedMessage]:
@@ -449,16 +494,34 @@ def anthropic_to_kiro(
 
     Raises:
         ValueError: If there are no messages to send
+        MissingProfileArnError: If no profileArn could be resolved (raised by
+            the core payload builder before contacting the Kiro API).
     """
-    # Convert messages to unified format
-    unified_messages = convert_anthropic_messages(request.messages)
+    # Separate inline system messages (role="system" inside the messages array)
+    # from the actual conversation. Some clients (e.g. Claude Code) inline the
+    # system prompt this way instead of using the top-level system field.
+    inline_system_texts, conversation_messages = extract_inline_system_messages(
+        request.messages
+    )
+
+    # Convert messages to unified format (inline system messages excluded)
+    unified_messages = convert_anthropic_messages(conversation_messages)
 
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
 
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
-    system_prompt = extract_system_prompt(request.system)
+    top_level_system = extract_system_prompt(request.system)
+
+    # Combine top-level system content with any inline system messages,
+    # preserving order: top-level system first, then inline system messages
+    # in their original order.
+    system_parts: List[str] = []
+    if top_level_system:
+        system_parts.append(top_level_system)
+    system_parts.extend(inline_system_texts)
+    system_prompt = "\n".join(system_parts)
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid

@@ -15,7 +15,8 @@ from kiro.network_errors import (
     NetworkErrorInfo,
     classify_network_error,
     format_error_for_user,
-    get_short_error_message
+    get_short_error_message,
+    build_http_error_detail,
 )
 
 
@@ -669,3 +670,70 @@ class TestNetworkErrorInfoDataclass:
         assert error_info.technical_details == "Technical details"
         assert error_info.is_retryable is True
         assert error_info.suggested_http_code == 502
+
+
+class TestBuildHttpErrorDetail:
+    """Tests for build_http_error_detail() - the shared HTTPException detail formatter."""
+
+    def _make_info(self, steps):
+        return NetworkErrorInfo(
+            category=ErrorCategory.CONNECTION_RESET,
+            user_message="Connection reset - the server closed the connection unexpectedly.",
+            troubleshooting_steps=steps,
+            technical_details="RemoteProtocolError: peer closed connection (incomplete chunked read)",
+            is_retryable=True,
+            suggested_http_code=502,
+        )
+
+    def test_includes_user_message_steps_and_technical_details(self):
+        """
+        What it does: Verifies the detail string contains the user message,
+                      numbered troubleshooting steps, and technical details.
+        Goal: Ensure the classified error is fully actionable for the client.
+        """
+        info = self._make_info(["Try again in a few moments", "Check network stability"])
+        detail = build_http_error_detail(info)
+
+        assert "Connection reset" in detail
+        assert "Troubleshooting:" in detail
+        assert "1. Try again in a few moments" in detail
+        assert "2. Check network stability" in detail
+        assert "Technical details:" in detail
+        assert "incomplete chunked read" in detail
+
+    def test_omits_troubleshooting_section_when_no_steps(self):
+        """
+        What it does: Verifies the 'Troubleshooting:' header is not present when
+                      there are no steps.
+        Goal: Avoid an empty, confusing section.
+        """
+        info = self._make_info([])
+        detail = build_http_error_detail(info)
+
+        assert "Troubleshooting:" not in detail
+        assert "Technical details:" in detail
+
+    def test_result_is_stripped(self):
+        """
+        What it does: Verifies the returned string has no leading/trailing whitespace.
+        Goal: Keep client-facing error messages clean.
+        """
+        info = self._make_info(["Step one"])
+        detail = build_http_error_detail(info)
+
+        assert detail == detail.strip()
+
+    def test_matches_classified_remote_protocol_error(self):
+        """
+        What it does: End-to-end - classify a RemoteProtocolError and build the detail.
+        Goal: Confirm the mid-stream drop maps to a 502 connectivity detail.
+        """
+        err = httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body (incomplete chunked read)"
+        )
+        info = classify_network_error(err)
+        detail = build_http_error_detail(info)
+
+        assert info.suggested_http_code == 502
+        assert info.is_retryable is True
+        assert "Network request failed" in detail or "connection" in detail.lower()

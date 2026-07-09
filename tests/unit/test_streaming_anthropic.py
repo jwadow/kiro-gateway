@@ -16,6 +16,9 @@ import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+from fastapi import HTTPException
+
 from kiro.streaming_anthropic import (
     generate_message_id,
     generate_thinking_signature,
@@ -1667,3 +1670,73 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+class TestCollectAnthropicResponseConnectionDrop:
+    """
+    Tests that Anthropic non-streaming collection classifies upstream connection drops.
+
+    A RemoteProtocolError raised while reading the response body must become an
+    HTTPException(502), not a generic 500, so the route treats it as a recoverable
+    network error (account-system mode fails over to the next account).
+    """
+
+    @pytest.mark.asyncio
+    async def test_remote_protocol_error_becomes_http_502(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Upstream closes the connection mid-body during collection.
+        Goal: Verify collect_anthropic_response raises HTTPException(502) with a
+              classified, actionable detail instead of leaking a raw 500.
+        """
+        with patch(
+            'kiro.streaming_anthropic.collect_stream_to_result',
+            side_effect=httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body (incomplete chunked read)"
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                )
+
+        assert exc_info.value.status_code == 502
+        assert "connection" in str(exc_info.value.detail).lower()
+
+    @pytest.mark.asyncio
+    async def test_read_error_becomes_http_502(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Upstream connection breaks (httpx.ReadError) during collection.
+        Goal: Verify any httpx.RequestError subclass is classified to 502.
+        """
+        with patch(
+            'kiro.streaming_anthropic.collect_stream_to_result',
+            side_effect=httpx.ReadError("connection broken"),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                )
+
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_non_network_error_is_not_swallowed(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: A generic (non-httpx) error must NOT be converted to 502.
+        Goal: Ensure the new except clause only targets transport errors and lets
+              genuine internal errors propagate (route returns 500 for those).
+        """
+        with patch(
+            'kiro.streaming_anthropic.collect_stream_to_result',
+            side_effect=ValueError("some internal bug"),
+        ):
+            with pytest.raises(ValueError):
+                await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                )

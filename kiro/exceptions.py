@@ -32,6 +32,88 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 
+class MissingProfileArnError(ValueError):
+    """
+    Raised when no profileArn can be resolved for a Kiro API request.
+
+    The Kiro runtime (`runtime.kiro.dev`) rejects `generateAssistantResponse`
+    requests without a `profileArn` with an opaque HTTP 400
+    ("profileArn is required for this request."). The Gateway detects this
+    condition before contacting the Kiro API and surfaces this actionable
+    error instead.
+
+    This subclasses ``ValueError`` so that the existing ``except ValueError``
+    handlers in both the OpenAI and Anthropic routes (streaming and
+    non-streaming paths) translate it into an HTTP 400 response in the
+    correct per-API error format.
+
+    The error message intentionally references the ``PROFILE_ARN``
+    configuration key and never includes any credential, token, or
+    access-key value.
+    """
+
+    #: Default user-facing message. Contains the literal ``PROFILE_ARN`` key
+    #: and a statement that the value is required. Contains no secrets.
+    DEFAULT_MESSAGE: str = (
+        "profileArn is required but could not be resolved. Set the PROFILE_ARN "
+        "configuration value (for example, in your .env file) to your AWS "
+        "CodeWhisperer profile ARN, or use credentials that provide one."
+    )
+
+    def __init__(self, message: str = "") -> None:
+        """
+        Initialize the error.
+
+        Args:
+            message: Optional override for the user-facing message. When empty,
+                ``DEFAULT_MESSAGE`` is used.
+        """
+        super().__init__(message or self.DEFAULT_MESSAGE)
+
+
+class MalformedProfileArnError(ValueError):
+    """
+    Raised when a profileArn is present but is not a valid CodeWhisperer ARN.
+
+    The most common cause is leaving the documentation placeholder
+    ``arn:aws:codewhisperer:us-east-1:...`` in the configuration (the ``...``
+    is never replaced with a real AWS account ID and profile). The Kiro runtime
+    accepts that *some* profileArn is present but then rejects the malformed
+    value during body validation with an opaque
+    ``HTTP 400 "Improperly formed request." (reason: REQUEST_BODY_INVALID)``.
+
+    Detecting this in the Gateway lets us return an actionable error instead of
+    the cryptic upstream one (AGENTS.md §9 "User Experience First").
+
+    Subclasses ``ValueError`` so existing route handlers translate it to HTTP
+    400 in the correct per-API error format. The message references the
+    ``PROFILE_ARN`` key and never includes credential values.
+    """
+
+    def __init__(self, profile_arn: str = "") -> None:
+        """
+        Initialize the error.
+
+        Args:
+            profile_arn: The offending profileArn value. Only the
+                non-sensitive ARN string is echoed (an ARN is an identifier,
+                not a secret); it helps the user spot the placeholder.
+        """
+        detail = (
+            f"PROFILE_ARN is set to an invalid value ('{profile_arn}'). "
+            if profile_arn
+            else "PROFILE_ARN is set to an invalid value. "
+        )
+        message = (
+            f"{detail}It must be a real AWS CodeWhisperer profile ARN of the form "
+            "'arn:aws:codewhisperer:<region>:<aws-account-id>:profile/<profile-id>'. "
+            "The default '...' placeholder must be replaced with your actual AWS "
+            "account ID and profile ID. You can find this ARN in your Kiro IDE "
+            "request traffic, in the Amazon Q Developer console, or via kiro-cli."
+        )
+        super().__init__(message)
+
+
 def sanitize_validation_errors(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Converts validation errors to JSON-serializable format.

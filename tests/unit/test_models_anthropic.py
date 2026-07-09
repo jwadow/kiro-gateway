@@ -1757,3 +1757,81 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+class TestAnthropicMessageInlineSystemRole:
+    """
+    Tests for inline "system" role acceptance in AnthropicMessage.
+
+    Some clients (e.g. Claude Code) place {"role": "system", ...} inside the
+    messages array. The model must accept this without a validation error
+    (Requirement 4.1).
+    """
+
+    def test_accepts_system_role_with_string_content(self):
+        """
+        What it does: Accepts a message with role="system" and string content.
+        Purpose: Requirement 4.1 - no 422 for inline system role.
+        """
+        print("Setup: building a system-role message with string content...")
+        msg = AnthropicMessage(role="system", content="You are helpful")
+
+        print(f"Result: role={msg.role}, content={msg.content!r}")
+        assert msg.role == "system"
+        assert msg.content == "You are helpful"
+
+    def test_accepts_system_role_with_content_blocks(self):
+        """
+        What it does: Accepts role="system" with a list of content blocks.
+        Purpose: Requirement 5.3 - list content must be allowed.
+        """
+        print("Setup: building system-role message with content blocks...")
+        msg = AnthropicMessage(
+            role="system",
+            content=[{"type": "text", "text": "Block A"}],
+        )
+
+        print(f"Result: role={msg.role}, content={msg.content!r}")
+        assert msg.role == "system"
+        assert isinstance(msg.content, list)
+
+    def test_still_accepts_user_and_assistant_roles(self):
+        """
+        What it does: Verifies user/assistant roles still validate.
+        Purpose: Ensure we did not break existing role handling.
+        """
+        print("Setup: building user and assistant messages...")
+        user = AnthropicMessage(role="user", content="hi")
+        assistant = AnthropicMessage(role="assistant", content="hello")
+
+        print(f"Result: {user.role}, {assistant.role}")
+        assert user.role == "user"
+        assert assistant.role == "assistant"
+
+    def test_rejects_unknown_role(self):
+        """
+        What it does: Verifies an unrelated role still fails validation.
+        Purpose: Ensure the Literal was widened only to include "system".
+        """
+        print("Setup: attempting an unknown role 'developer'...")
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role="developer", content="hi")
+
+    def test_request_accepts_inline_system_message(self):
+        """
+        What it does: A full request with an inline system message validates.
+        Purpose: Requirement 4.1 at the request level (no 422).
+        """
+        print("Setup: building a request with an inline system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": "Be concise"},
+                {"role": "user", "content": "Hello"},
+            ],
+        )
+
+        print(f"Result: {len(request.messages)} messages")
+        assert request.messages[0].role == "system"
+        assert request.messages[1].role == "user"

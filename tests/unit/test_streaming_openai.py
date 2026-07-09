@@ -16,6 +16,9 @@ import json
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+from fastapi import HTTPException
+
 from kiro.streaming_openai import (
     stream_kiro_to_openai,
     stream_kiro_to_openai_internal,
@@ -1485,3 +1488,84 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+
+class TestCollectStreamResponseConnectionDrop:
+    """
+    Tests that non-streaming collection classifies upstream connection drops.
+
+    A RemoteProtocolError raised while reading the response body (after the
+    initial HTTP 200) must become an HTTPException(502), not a generic 500,
+    so the route's failover/error handling treats it as a network error.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_remote_protocol_error_becomes_http_502(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Upstream yields partial content then drops the connection.
+        Goal: Verify collect_stream_response raises HTTPException(502) with a
+              classified, actionable detail instead of leaking the raw error.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="partial ")
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body (incomplete chunked read)"
+            )
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(HTTPException) as exc_info:
+                    await collect_stream_response(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    )
+
+        assert exc_info.value.status_code == 502
+        assert "connection" in str(exc_info.value.detail).lower()
+
+    @pytest.mark.asyncio
+    async def test_read_error_before_any_content_becomes_http_502(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Upstream drops before sending any content (httpx.ReadError).
+        Goal: Verify any httpx.RequestError subclass is classified to 502, not 500.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            if False:
+                yield  # make this an async generator
+            raise httpx.ReadError("connection broken")
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(HTTPException) as exc_info:
+                    await collect_stream_response(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    )
+
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_first_token_timeout_still_propagates_unchanged(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Ensures the new httpx.RequestError handling does NOT swallow
+                      FirstTokenTimeoutError (which must keep propagating for retry).
+        Goal: Guard against the new except clause changing timeout-retry behavior.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            if False:
+                yield
+            raise FirstTokenTimeoutError("no response within 15 seconds")
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(FirstTokenTimeoutError):
+                    await collect_stream_response(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    )

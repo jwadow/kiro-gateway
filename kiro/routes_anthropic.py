@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY, PROFILE_ARN
+from kiro.config import PROXY_API_KEY
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicCountTokensRequest,
@@ -45,6 +45,8 @@ from kiro.models_anthropic import (
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro
+from kiro.profile_resolver import resolve_profile_arn, is_valid_profile_arn
+from kiro.exceptions import MissingProfileArnError, MalformedProfileArnError
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
@@ -376,10 +378,17 @@ async def messages(
             conversation_id = generate_conversation_id()
             
             # Build payload for Kiro
-            # profileArn is required by runtime.kiro.dev for all auth types
-            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+            # profileArn is required by runtime.kiro.dev for all auth types.
+            # Resolve via the shared Profile_Resolver and reject early with an
+            # actionable error if none is available, so we never send a request
+            # to the Kiro API without a profileArn.
+            profile_arn_for_payload = resolve_profile_arn(auth_manager)
             
             try:
+                if not profile_arn_for_payload:
+                    raise MissingProfileArnError()
+                if not is_valid_profile_arn(profile_arn_for_payload):
+                    raise MalformedProfileArnError(profile_arn_for_payload)
                 kiro_payload = anthropic_to_kiro(
                     request_data,
                     conversation_id,
@@ -398,13 +407,9 @@ async def messages(
                     }
                 )
             
-            # Log Kiro payload
-            try:
-                kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-                if debug_logger:
-                    debug_logger.log_kiro_request_body(kiro_request_body)
-            except Exception as e:
-                logger.warning(f"Failed to log Kiro request: {e}")
+            # Log Kiro payload (serialization is skipped entirely when DEBUG_MODE=off)
+            if debug_logger:
+                debug_logger.log_kiro_request_payload(kiro_payload)
             
             # Create HTTP client
             url = f"{auth_manager.api_host}/generateAssistantResponse"
@@ -684,10 +689,17 @@ async def messages(
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is required by runtime.kiro.dev for all auth types
-    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+    # profileArn is required by runtime.kiro.dev for all auth types.
+    # Resolve via the shared Profile_Resolver and reject early with an
+    # actionable error if none is available, so we never send a request to the
+    # Kiro API without a profileArn.
+    profile_arn_for_payload = resolve_profile_arn(auth_manager)
     
     try:
+        if not profile_arn_for_payload:
+            raise MissingProfileArnError()
+        if not is_valid_profile_arn(profile_arn_for_payload):
+            raise MalformedProfileArnError(profile_arn_for_payload)
         kiro_payload = anthropic_to_kiro(
             request_data,
             conversation_id,
@@ -706,13 +718,9 @@ async def messages(
             }
         )
     
-    # Log Kiro payload
-    try:
-        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-        if debug_logger:
-            debug_logger.log_kiro_request_body(kiro_request_body)
-    except Exception as e:
-        logger.warning(f"Failed to log Kiro request: {e}")
+    # Log Kiro payload (serialization is skipped entirely when DEBUG_MODE=off)
+    if debug_logger:
+        debug_logger.log_kiro_request_payload(kiro_payload)
     
     # Create HTTP client with retry logic
     # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)

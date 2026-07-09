@@ -19,6 +19,20 @@ __pycache__/
 dist/
 build/
 
+# Python virtual environment (local only - never push to GitHub)
+# This project keeps its venv in the repo root (bin/, lib/, include/, pyvenv.cfg)
+.venv/
+venv/
+env/
+ENV/
+pyvenv.cfg
+/bin/
+/lib/
+/lib64
+/include/
+/share/
+/pyvenv.cfg
+
 # Debug logs (generated when DEBUG_MODE is enabled)
 debug_logs*/
 debug*.json
@@ -31,3 +45,6 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Kiro spec/workflow files (local only)
+.kiro/

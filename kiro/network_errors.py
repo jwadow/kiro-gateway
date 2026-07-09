@@ -434,3 +434,39 @@ def get_short_error_message(error_info: NetworkErrorInfo) -> str:
         >>> logger.warning(get_short_error_message(error_info))
     """
     return error_info.user_message
+
+
+def build_http_error_detail(error_info: NetworkErrorInfo) -> str:
+    """
+    Builds a detailed, user-friendly error string for an HTTPException detail.
+
+    Combines the user-facing message, numbered troubleshooting steps, and the
+    technical details into a single multi-line string. This is the standard
+    representation used when raising an HTTPException for a classified network
+    error, so that connectivity failures surface the same actionable guidance
+    everywhere in the gateway (HTTP client retries and mid-stream body drops).
+
+    Args:
+        error_info: The classified network error information.
+
+    Returns:
+        A formatted, stripped multi-line error message suitable for use as an
+        HTTPException `detail`.
+
+    Example:
+        >>> error_info = classify_network_error(exception)
+        >>> raise HTTPException(
+        ...     status_code=error_info.suggested_http_code,
+        ...     detail=build_http_error_detail(error_info),
+        ... )
+    """
+    detail = error_info.user_message
+
+    if error_info.troubleshooting_steps:
+        detail += "\n\nTroubleshooting:\n"
+        for i, step in enumerate(error_info.troubleshooting_steps, 1):
+            detail += f"{i}. {step}\n"
+
+    detail += f"\nTechnical details: {error_info.technical_details}"
+
+    return detail.strip()

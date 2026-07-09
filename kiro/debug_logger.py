@@ -36,7 +36,7 @@ import io
 import json
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from loguru import logger
 
 from kiro.config import DEBUG_MODE, DEBUG_DIR
@@ -184,6 +184,39 @@ class DebugLogger:
         else:
             # "errors" mode - buffer
             self._kiro_request_body_buffer = body
+
+    def log_kiro_request_payload(self, payload: Any) -> None:
+        """
+        Serialize and log the outgoing Kiro request payload for debugging.
+
+        Serialization (json.dumps + encode) is performed ONLY when debug logging
+        is enabled (DEBUG_MODE is "errors" or "all"). When logging is disabled
+        (the default "off" mode), this returns immediately WITHOUT serializing,
+        avoiding wasted CPU and memory on the request hot path for potentially
+        large payloads (Kiro payloads can reach hundreds of KB).
+
+        This is the preferred entry point for route handlers: it lets callers
+        pass the raw payload object and pay the serialization cost only when a
+        debug mode is active, instead of always serializing and discarding.
+
+        Args:
+            payload: JSON-serializable Kiro request payload (typically a dict).
+
+        Returns:
+            None
+        """
+        # Fast path: skip all serialization work when logging is disabled.
+        if not self._is_enabled():
+            return
+
+        try:
+            body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        except (TypeError, ValueError) as e:
+            # Non-serializable payload: log and skip rather than breaking the request.
+            logger.warning(f"[DebugLogger] Failed to serialize Kiro request payload: {e}")
+            return
+
+        self.log_kiro_request_body(body)
 
     def log_raw_chunk(self, chunk: bytes):
         """

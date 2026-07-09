@@ -37,6 +37,7 @@ import uuid
 from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
 
 import httpx
+from fastapi import HTTPException
 from loguru import logger
 
 from kiro.streaming_core import (
@@ -47,6 +48,7 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
 )
+from kiro.network_errors import classify_network_error, build_http_error_detail
 from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
@@ -758,7 +760,25 @@ async def collect_anthropic_response(
         input_tokens = request_token_stats["total_tokens"]
     
     # Collect stream result
-    result = await collect_stream_to_result(response)
+    try:
+        result = await collect_stream_to_result(response)
+    except httpx.RequestError as e:
+        # Upstream closed the connection mid-response (e.g. RemoteProtocolError:
+        # "incomplete chunked read"). This is raised while reading the response
+        # body, AFTER request_with_retry already returned HTTP 200, so the HTTP
+        # client's retry/classification never sees it. Classify it here and raise
+        # a proper 502/504 instead of letting it surface as a generic 500. The
+        # route's HTTPException handlers treat 502/504 as a recoverable network
+        # error (account-system mode fails over to the next account).
+        error_info = classify_network_error(e)
+        logger.error(
+            f"Upstream connection error during non-streaming collection (Anthropic): "
+            f"{error_info.technical_details}"
+        )
+        raise HTTPException(
+            status_code=error_info.suggested_http_code,
+            detail=build_http_error_detail(error_info),
+        )
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
     
     # Build content blocks
