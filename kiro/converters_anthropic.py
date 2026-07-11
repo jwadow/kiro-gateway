@@ -257,11 +257,12 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
 
 def convert_anthropic_messages(
     messages: List[AnthropicMessage],
-) -> List[UnifiedMessage]:
+) -> tuple:
     """
     Converts Anthropic messages to unified format.
 
     Handles:
+    - System messages (extracted as inline system prompt, non-standard but sent by Claude Code)
     - Text content (string or list of text blocks)
     - Tool use blocks (assistant messages)
     - Tool result blocks (user messages)
@@ -270,10 +271,13 @@ def convert_anthropic_messages(
         messages: List of Anthropic messages
 
     Returns:
-        List of messages in unified format
+        Tuple of (inline_system_prompt, unified_messages):
+        - inline_system_prompt: Text from any system-role messages found inline
+        - unified_messages: List of messages in unified format (excluding system messages)
     """
 
     unified_messages = []
+    inline_system_parts = []
     total_tool_calls = 0
     total_tool_results = 0
     total_images = 0
@@ -281,6 +285,13 @@ def convert_anthropic_messages(
     for msg in messages:
         role = msg.role
         content = msg.content
+
+        # Handle system messages inline (non-standard, sent by Claude Code)
+        if role == "system":
+            text_content = convert_anthropic_content_to_text(content)
+            if text_content:
+                inline_system_parts.append(text_content)
+            continue
 
         # Extract text content
         text_content = convert_anthropic_content_to_text(content)
@@ -333,7 +344,14 @@ def convert_anthropic_messages(
             f"{total_tool_calls} tool_calls, {total_tool_results} tool_results, {total_images} images"
         )
 
-    return unified_messages
+    inline_system_prompt = "\n".join(inline_system_parts).strip()
+    if inline_system_prompt:
+        logger.debug(
+            f"Extracted {len(inline_system_parts)} inline system message(s) "
+            f"({len(inline_system_prompt)} chars) from Anthropic messages array"
+        )
+
+    return inline_system_prompt, unified_messages
 
 
 def convert_anthropic_tools(
@@ -451,7 +469,8 @@ def anthropic_to_kiro(
         ValueError: If there are no messages to send
     """
     # Convert messages to unified format
-    unified_messages = convert_anthropic_messages(request.messages)
+    # Also extracts any inline system messages (non-standard, sent by Claude Code)
+    inline_system_prompt, unified_messages = convert_anthropic_messages(request.messages)
 
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
@@ -459,6 +478,13 @@ def anthropic_to_kiro(
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
     system_prompt = extract_system_prompt(request.system)
+
+    # Merge inline system messages (from messages array) with the explicit system field
+    if inline_system_prompt:
+        if system_prompt:
+            system_prompt = system_prompt + "\n\n" + inline_system_prompt
+        else:
+            system_prompt = inline_system_prompt
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid

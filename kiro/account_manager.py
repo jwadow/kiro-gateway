@@ -58,6 +58,7 @@ from kiro.config import (
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
+    CANDIDATE_MODELS,
 )
 from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
@@ -91,6 +92,173 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
         False
     """
     return "://runtime." in auth_manager.api_host
+
+
+async def _probe_model(
+    auth_manager: KiroAuthManager,
+    model_id: str,
+    profile_arn: str,
+    timeout: float = 10.0
+) -> bool:
+    """
+    Probe a single model to check if it's available on Kiro API.
+    
+    Sends a minimal generateAssistantResponse request and checks the response.
+    A 200 status means the model exists and is available.
+    A non-200 status with model-related error means it doesn't exist.
+    
+    Args:
+        auth_manager: Authenticated KiroAuthManager instance
+        model_id: Model ID to probe (e.g., "claude-sonnet-5")
+        profile_arn: Profile ARN for the request
+        timeout: Request timeout in seconds
+    
+    Returns:
+        True if model is available, False otherwise
+    """
+    import uuid
+    
+    # Minimal payload — single short message, no tools, no history
+    payload = {
+        "conversationState": {
+            "chatTriggerType": "MANUAL",
+            "conversationId": str(uuid.uuid4()),
+            "currentMessage": {
+                "userInputMessage": {
+                    "content": "hi",
+                    "modelId": model_id,
+                    "origin": "AI_EDITOR",
+                }
+            }
+        }
+    }
+    
+    if profile_arn:
+        payload["profileArn"] = profile_arn
+    
+    url = f"{auth_manager.api_host}/generateAssistantResponse"
+    
+    # Use a short-lived client with tight timeout
+    probe_timeout = httpx.Timeout(connect=5.0, read=timeout, write=5.0, pool=5.0)
+    
+    try:
+        token = await auth_manager.get_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        
+        async with httpx.AsyncClient(timeout=probe_timeout) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            
+            if response.status_code == 200:
+                # Model exists and responded — close immediately, we don't need the content
+                return True
+            else:
+                # Check if error is model-specific (not found) vs other (rate limit, auth, etc.)
+                try:
+                    error_text = response.text
+                    # Model not found errors typically contain these indicators
+                    model_not_found_indicators = [
+                        "not found",
+                        "not available",
+                        "invalid model",
+                        "unknown model",
+                        "does not exist",
+                        "not supported",
+                        "InvalidModelId",
+                    ]
+                    error_lower = error_text.lower()
+                    for indicator in model_not_found_indicators:
+                        if indicator.lower() in error_lower:
+                            return False
+                    
+                    # Rate limit (429) or server error (5xx) — model might exist but we can't confirm
+                    # Be optimistic: don't exclude it
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        logger.debug(f"Probe {model_id}: HTTP {response.status_code} (inconclusive, assuming available)")
+                        return True
+                    
+                    # 403 could mean model exists but not on our plan
+                    if response.status_code == 403:
+                        logger.debug(f"Probe {model_id}: HTTP 403 (access denied, model exists but may not be on plan)")
+                        return True
+                    
+                    # Other 4xx — likely model doesn't exist
+                    return False
+                    
+                except Exception:
+                    return False
+    
+    except httpx.TimeoutException:
+        # Timeout — model might exist but is slow to respond
+        # Be optimistic for the probe
+        logger.debug(f"Probe {model_id}: timeout (assuming available)")
+        return True
+    except Exception as e:
+        logger.debug(f"Probe {model_id}: error ({e})")
+        return False
+
+
+async def _probe_candidate_models(
+    auth_manager: KiroAuthManager,
+    candidates: List[str],
+    profile_arn: str,
+    max_concurrent: int = 10
+) -> List[Dict[str, str]]:
+    """
+    Probe multiple candidate models concurrently to discover which are available.
+    
+    Sends minimal requests to each candidate model and returns only those that respond
+    successfully. Uses asyncio.Semaphore to limit concurrent probes.
+    
+    Args:
+        auth_manager: Authenticated KiroAuthManager instance
+        candidates: List of model IDs to probe
+        profile_arn: Profile ARN for the requests
+        max_concurrent: Maximum number of concurrent probe requests
+    
+    Returns:
+        List of model dicts ({"modelId": "..."}) for available models.
+        Always includes "auto" regardless of probing.
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def probe_with_semaphore(model_id: str) -> tuple:
+        async with semaphore:
+            is_available = await _probe_model(auth_manager, model_id, profile_arn)
+            return model_id, is_available
+    
+    # Probe all candidates concurrently (with semaphore limiting)
+    logger.info(f"Probing {len(candidates)} candidate models for availability...")
+    tasks = [probe_with_semaphore(model_id) for model_id in candidates]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Collect available models
+    available = [{"modelId": "auto"}]  # "auto" is always available
+    available_names = []
+    unavailable_names = []
+    
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        model_id, is_available = result
+        if is_available:
+            available.append({"modelId": model_id})
+            available_names.append(model_id)
+        else:
+            unavailable_names.append(model_id)
+    
+    logger.info(
+        f"Model probing complete: {len(available_names)} available, "
+        f"{len(unavailable_names)} unavailable"
+    )
+    if available_names:
+        logger.info(f"Available models: {', '.join(sorted(available_names))}")
+    if unavailable_names:
+        logger.debug(f"Unavailable models: {', '.join(sorted(unavailable_names))}")
+    
+    return available
 
 
 def _format_duration(seconds: float) -> str:
@@ -497,48 +665,60 @@ class AccountManager:
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
             
-            # Determine if we should fetch models or use static list
-            if _is_runtime_endpoint(auth_manager):
-                # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
-                # Use static list without attempting request
-                logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
-                models_list = FALLBACK_MODELS
-            else:
-                # Old endpoint - attempt to fetch dynamic model list
-                # Fetch models list with retry + fallback
-                params = {"origin": "AI_EDITOR"}
-                if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
-                    params["profileArn"] = auth_manager.profile_arn
+            # === Model Discovery (3-tier fallback) ===
+            # 1. Try /ListAvailableModels API (works on old endpoints)
+            # 2. Probe candidate models (works on runtime.kiro.dev)
+            # 3. Use static FALLBACK_MODELS (last resort, network issues)
+            
+            models_list = None
+            profile_arn_value = auth_manager.profile_arn or creds_config.get("profile_arn") or ""
+            
+            # Tier 1: Try /ListAvailableModels API
+            params = {"origin": "AI_EDITOR"}
+            if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+                params["profileArn"] = auth_manager.profile_arn
+            
+            list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
+            http_client = KiroHttpClient(auth_manager, shared_client=None)
+            
+            try:
+                response = await http_client.request_with_retry(
+                    method="GET",
+                    url=list_models_url,
+                    json_data=None,
+                    params=params,
+                    stream=False
+                )
                 
-                list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
-                
-                # Use KiroHttpClient for retry logic (3 attempts with exponential backoff)
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
-                
+                if response.status_code == 200:
+                    data = response.json()
+                    fetched = data.get("models", [])
+                    if fetched:
+                        models_list = fetched
+                        logger.info(f"Account {account_id}: Fetched {len(models_list)} models from /ListAvailableModels API")
+            except Exception as e:
+                logger.debug(f"Account {account_id}: /ListAvailableModels unavailable ({e})")
+            finally:
+                await http_client.close()
+            
+            # Tier 2: Probe candidate models
+            if not models_list:
                 try:
-                    response = await http_client.request_with_retry(
-                        method="GET",
-                        url=list_models_url,
-                        json_data=None,
-                        params=params,
-                        stream=False
+                    probed = await _probe_candidate_models(
+                        auth_manager, CANDIDATE_MODELS, profile_arn_value
                     )
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        models_list = data.get("models", [])
+                    if len(probed) > 1:  # More than just "auto"
+                        models_list = probed
+                        logger.info(f"Account {account_id}: Discovered {len(models_list)} models via probing")
                     else:
-                        # Shouldn't happen (retry handles non-200), but keep for safety
-                        raise Exception(f"HTTP {response.status_code}")
-                
+                        logger.warning(f"Account {account_id}: Probing found no models, using fallback")
                 except Exception as e:
-                    # All retries exhausted - use fallback
-                    logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
-                    logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
-                    models_list = FALLBACK_MODELS
-                
-                finally:
-                    await http_client.close()
+                    logger.warning(f"Account {account_id}: Model probing failed ({e})")
+            
+            # Tier 3: Static fallback
+            if not models_list:
+                models_list = FALLBACK_MODELS
+                logger.warning(f"Account {account_id}: Using static fallback model list ({len(models_list)} models)")
             
             # Create model cache and update
             model_cache = ModelInfoCache()
@@ -582,6 +762,11 @@ class AccountManager:
         """
         Refresh model cache for account (TTL refresh).
         
+        Uses the same 3-tier discovery as initialization:
+        1. /ListAvailableModels API
+        2. Probe candidate models
+        3. Keep current cache (no fallback override on refresh)
+        
         Args:
             account_id: Account ID to refresh
         """
@@ -589,18 +774,10 @@ class AccountManager:
         if not account or not account.auth_manager:
             return
         
-        # Check if using runtime endpoint (no dynamic model list available)
-        if _is_runtime_endpoint(account.auth_manager):
-            # Runtime endpoint does not provide /ListAvailableModels
-            # Use static list and update cache timestamp
-            logger.debug(f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)")
-            await account.model_cache.update(FALLBACK_MODELS)
-            account.models_cached_at = time.time()
-            self._dirty = True
-            return
+        models_list = None
+        profile_arn_value = account.auth_manager.profile_arn or ""
         
-        # Old endpoint - attempt to fetch dynamic model list
-        # Use KiroHttpClient for retry logic
+        # Tier 1: Try /ListAvailableModels API
         http_client = KiroHttpClient(account.auth_manager, shared_client=None)
         
         try:
@@ -620,27 +797,44 @@ class AccountManager:
             
             if response.status_code == 200:
                 data = response.json()
-                models_list = data.get("models", [])
-                await account.model_cache.update(models_list)
-                account.models_cached_at = time.time()
-                
-                # Update model_to_accounts mapping (new models may have appeared)
-                available_models = account.model_resolver.get_available_models()
-                for model in available_models:
-                    if model not in self._model_to_accounts:
-                        self._model_to_accounts[model] = ModelAccountList()
-                    if account_id not in self._model_to_accounts[model].accounts:
-                        self._model_to_accounts[model].accounts.append(account_id)
-                
-                logger.debug(f"Refreshed models for {account_id}")
-                self._dirty = True
-        
+                fetched = data.get("models", [])
+                if fetched:
+                    models_list = fetched
+                    logger.debug(f"Refreshed models for {account_id}: {len(models_list)} from API")
         except Exception as e:
-            # All retries exhausted - keep using stale cache
-            logger.warning(f"Failed to refresh models for {account_id} after retries: {e}")
-        
+            logger.debug(f"Account {account_id}: /ListAvailableModels unavailable on refresh ({e})")
         finally:
             await http_client.close()
+        
+        # Tier 2: Probe candidate models
+        if not models_list:
+            try:
+                probed = await _probe_candidate_models(
+                    account.auth_manager, CANDIDATE_MODELS, profile_arn_value
+                )
+                if len(probed) > 1:  # More than just "auto"
+                    models_list = probed
+                    logger.debug(f"Refreshed models for {account_id}: {len(models_list)} via probing")
+            except Exception as e:
+                logger.warning(f"Account {account_id}: Model probing failed on refresh ({e})")
+        
+        # Update cache if we got new data
+        if models_list:
+            await account.model_cache.update(models_list)
+            account.models_cached_at = time.time()
+            
+            # Update model_to_accounts mapping (new models may have appeared)
+            available_models = account.model_resolver.get_available_models()
+            for model in available_models:
+                if model not in self._model_to_accounts:
+                    self._model_to_accounts[model] = ModelAccountList()
+                if account_id not in self._model_to_accounts[model].accounts:
+                    self._model_to_accounts[model].accounts.append(account_id)
+            
+            self._dirty = True
+        else:
+            # Keep current cache as-is (don't override with fallback on refresh)
+            logger.warning(f"Account {account_id}: Could not refresh models, keeping current cache")
     
     async def get_next_account(self, model: str, exclude_accounts: Optional[set] = None) -> Optional[Account]:
         """

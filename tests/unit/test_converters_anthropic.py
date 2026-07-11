@@ -955,7 +955,7 @@ class TestConvertAnthropicMessages:
         messages = [AnthropicMessage(role="user", content="Hello!")]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -973,7 +973,7 @@ class TestConvertAnthropicMessages:
         messages = [AnthropicMessage(role="assistant", content="Hi there!")]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -997,7 +997,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -1025,7 +1025,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -1055,7 +1055,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -1077,7 +1077,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 3
@@ -1094,7 +1094,7 @@ class TestConvertAnthropicMessages:
         messages = []
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Comparing result: Expected [], Got {result}")
         assert result == []
@@ -1132,7 +1132,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         print(f"Images: {result[0].images}")
@@ -1185,7 +1185,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
 
@@ -1240,7 +1240,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(
             f"Result images count: {len(result[0].images) if result[0].images else 0}"
@@ -1295,7 +1295,7 @@ class TestConvertAnthropicMessages:
 
         print("Action: Converting messages with logging enabled...")
         with caplog.at_level(logging.DEBUG):
-            result = convert_anthropic_messages(messages)
+            _, result = convert_anthropic_messages(messages)
 
         print(f"Log records: {[r.message for r in caplog.records]}")
 
