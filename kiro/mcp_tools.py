@@ -40,6 +40,7 @@ import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
+from kiro.config import PROFILE_ARN
 from kiro.tokenizer import count_message_tokens, count_tokens
 
 # Import debug_logger
@@ -125,7 +126,17 @@ async def call_kiro_mcp_api(
     request_id = f"web_search_tooluse_{random_22}_{timestamp}_{random_8}"
     tool_use_id = f"srvtoolu_{uuid.uuid4().hex[:32]}"
     
-    # Build MCP request
+    # Build MCP request.
+    #
+    # Kiro's runtime endpoint (https://runtime.{region}.kiro.dev/mcp) requires
+    # a profileArn on every /mcp call now, same as /generateAssistantResponse.
+    # Without it the endpoint replies 400 with:
+    #   {"message":"profileArn is required for this request.","reason":null}
+    # and the whole web_search flow stalls (client sees "Searching the web..."
+    # forever because we return (None, None) to the caller).
+    #
+    # We pass PROFILE_ARN from config as an explicit override, otherwise rely
+    # on whatever the auth_manager resolved from the kiro-cli DB or SSO cache.
     mcp_request = {
         "id": request_id,
         "jsonrpc": "2.0",
@@ -135,6 +146,16 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+    profile_arn = getattr(auth_manager, "profile_arn", None) or PROFILE_ARN
+    if profile_arn:
+        mcp_request["profileArn"] = profile_arn
+    else:
+        # Not fatal - some tenants don't require it - but log so it's obvious
+        # if the endpoint later 400s with "profileArn is required".
+        logger.warning(
+            "call_kiro_mcp_api: no profileArn on auth_manager or PROFILE_ARN "
+            "config; the /mcp endpoint may reject this request"
+        )
     
     # Log MCP request
     try:
@@ -159,9 +180,21 @@ async def call_kiro_mcp_api(
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
-            
+
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                # Include response body and MCP url for debugging - Kiro's runtime
+                # endpoint has moved a few times, and a bare status code makes it
+                # impossible to tell whether we're hitting a wrong path, wrong
+                # body shape, an auth issue, or a missing profile ARN.
+                body_snippet = ""
+                try:
+                    body_snippet = response.text[:400]
+                except Exception:
+                    body_snippet = "<unreadable body>"
+                logger.error(
+                    f"MCP API error: {response.status_code} "
+                    f"(url={mcp_url}, body={body_snippet!r})"
+                )
                 return None, None
             
             mcp_response = response.json()
@@ -233,7 +266,20 @@ def generate_search_summary(query: str, results: Dict) -> str:
     """
     # Start with opening tag
     summary = f'\n<web_search>\nSearch results for "{query}":\n\n'
-    
+
+    # Error path: MCP call was made but returned an error (e.g. 403 not
+    # authorized on this account tier). Surface a short, model-legible
+    # explanation so it stops trying to browse and answers from its own
+    # knowledge.
+    if results and results.get("isError"):
+        err = results.get("errorMessage", "web_search unavailable")
+        summary += (
+            f"[web_search error] {err}\n"
+            "Fall back to prior knowledge or ask the user for a URL.\n"
+        )
+        summary += "</web_search>\n"
+        return summary
+
     if results and "results" in results:
         for i, result in enumerate(results["results"], 1):
             title = result.get("title", "Untitled")
@@ -361,25 +407,46 @@ async def generate_anthropic_web_search_sse(
         "index": 0
     })
     
-    # Event 5: content_block_start (web_search_tool_result)
-    search_content = []
-    for r in results.get("results", []):
-        search_content.append({
-            "type": "web_search_result",
-            "title": r.get("title", ""),
-            "url": r.get("url", ""),
-            "encrypted_content": r.get("snippet", ""),
-            "page_age": None
-        })
-    
+    # Event 5: content_block_start (web_search_tool_result).
+    #
+    # If the upstream MCP call flagged the result as an error (403 not
+    # authorized, quota, transient failure), emit Anthropic's documented
+    # error content block instead of an empty results array. The model
+    # is trained to recognize this shape and gracefully fall back to
+    # its own knowledge instead of hanging on an empty result set.
+    if results.get("isError"):
+        content_block = {
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
+            "content": {
+                "type": "web_search_tool_result_error",
+                "error_code": "unavailable",
+                "error_message": results.get(
+                    "errorMessage",
+                    "web_search unavailable on this account",
+                ),
+            },
+        }
+    else:
+        search_content = []
+        for r in results.get("results", []):
+            search_content.append({
+                "type": "web_search_result",
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "encrypted_content": r.get("snippet", ""),
+                "page_age": None,
+            })
+        content_block = {
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
+            "content": search_content,
+        }
+
     yield format_sse_event("content_block_start", {
         "type": "content_block_start",
         "index": 1,
-        "content_block": {
-            "type": "web_search_tool_result",
-            "tool_use_id": tool_use_id,
-            "content": search_content
-        }
+        "content_block": content_block,
     })
     
     # Event 6: content_block_stop (web_search_tool_result)
@@ -624,20 +691,36 @@ async def handle_native_web_search(
     
     logger.info(f"WebSearch query (Path A - native): {query}")
     
-    # Call MCP API
+    # Call MCP API.
+    #
+    # Kiro's /mcp endpoint is a gated feature: not every subscription tier or
+    # auth method (Builder ID, kiro-cli OIDC, Enterprise IDC) is entitled to
+    # call it. When it fails we must NOT return an HTTP 500 - Claude Desktop
+    # sees that as a hard error and stalls the conversation ("Searching the
+    # web..." spinner forever). Instead, emit a valid Anthropic
+    # `web_search_tool_result` block with `is_error: true`, which the model
+    # is trained to fall back from and answer with its own knowledge.
     tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
-    
+
     if results is None:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": "Web search failed. Please try again."
-                }
-            }
+        logger.warning(
+            "Native web_search unavailable for this account; returning "
+            "is_error result so the model falls back to its own knowledge"
         )
+        # Fabricate a valid tool_use_id if the MCP call didn't reach the
+        # point where one was generated. Anthropic requires it.
+        tool_use_id = tool_use_id or f"srvtoolu_{uuid.uuid4().hex[:32]}"
+        results = {
+            "results": [],
+            "totalResults": 0,
+            "query": query,
+            "isError": True,
+            "errorMessage": (
+                "web_search unavailable via Kiro on this account "
+                "(likely tier/entitlement restriction). Please answer "
+                "from prior knowledge or ask the user for a URL."
+            ),
+        }
     
     # Count tokens WITHOUT Claude correction (MCP API, not model)
     input_tokens = count_message_tokens(
