@@ -80,9 +80,9 @@ def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
 # Server Settings
 # ==================================================================================================
 
-# Server host (default: 0.0.0.0 - listen on all interfaces)
-# Use "127.0.0.1" to only allow local connections
-DEFAULT_SERVER_HOST: str = "0.0.0.0"
+# Server host (default: 127.0.0.1 - loopback only, safer default for personal use)
+# Set SERVER_HOST=0.0.0.0 to expose on all interfaces (LAN/Docker).
+DEFAULT_SERVER_HOST: str = "127.0.0.1"
 SERVER_HOST: str = os.getenv("SERVER_HOST", DEFAULT_SERVER_HOST)
 
 # Server port (default: 8000)
@@ -275,13 +275,21 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Update gateway regularly to get the latest model list
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
+    # Claude Sonnet (rolling; Kiro currently serves 4, 4.5, 4.6)
     {"modelId": "claude-sonnet-4"},
     {"modelId": "claude-sonnet-4.5"},
+    {"modelId": "claude-sonnet-4.5-1m"},
     {"modelId": "claude-sonnet-4.6"},
+    {"modelId": "claude-sonnet-4.6-1m"},
+    # Claude Haiku
     {"modelId": "claude-haiku-4.5"},
+    # Claude Opus (4.5 -> 4.8, plus 1M-context variants that Kiro exposes on paid tiers)
     {"modelId": "claude-opus-4.5"},
     {"modelId": "claude-opus-4.6"},
+    {"modelId": "claude-opus-4.6-1m"},
     {"modelId": "claude-opus-4.7"},
+    {"modelId": "claude-opus-4.8"},
+    # Open-weight models exposed by Kiro
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
     {"modelId": "minimax-m2.1"},
