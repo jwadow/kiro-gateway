@@ -256,6 +256,16 @@ async def stream_kiro_to_anthropic(
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
+
+    # Set when Path B intercepts a web_search tool_use and emits the
+    # server_tool_use + web_search_tool_result blocks directly. In that
+    # case we must force stop_reason=tool_use even though tool_blocks
+    # stays empty (server-side tools don't route through tool_blocks).
+    # Claude Desktop rejects a message whose last content block is
+    # web_search_tool_result but whose stop_reason is anything other
+    # than tool_use ("[ede_diagnostic] result_type=assistant
+    # last_content_type=web_search_tool_result stop_reason=end_turn").
+    emitted_server_tool: bool = False
     
     try:
         # Send message_start event
@@ -505,6 +515,14 @@ async def stream_kiro_to_anthropic(
                         # client resends the conversation. See the parallel fix
                         # in kiro/mcp_tools.py (generate_anthropic_web_search_sse).
 
+                        # Force stop_reason=tool_use in the terminal message_delta.
+                        # Claude Desktop validates that a message ending on a
+                        # web_search_tool_result block has stop_reason=tool_use;
+                        # without this flag the outer switch would fall through
+                        # to end_turn because server_tool_use doesn't populate
+                        # tool_blocks.
+                        emitted_server_tool = True
+
                         # Skip normal tool_use processing
                         continue
                 
@@ -675,10 +693,14 @@ async def stream_kiro_to_anthropic(
             if prompt_source != "unknown":
                 input_tokens = prompt_tokens
         
-        # Determine stop reason (truncation has highest priority)
+        # Determine stop reason (truncation has highest priority).
+        # `emitted_server_tool` covers Path B interception where we emitted
+        # a server_tool_use + web_search_tool_result pair; those blocks don't
+        # populate tool_blocks so the elif below would otherwise mis-classify
+        # as end_turn.
         if content_was_truncated:
             stop_reason = "max_tokens"
-        elif tool_blocks:
+        elif tool_blocks or emitted_server_tool:
             stop_reason = "tool_use"
         else:
             stop_reason = "end_turn"
