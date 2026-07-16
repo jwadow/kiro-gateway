@@ -183,11 +183,15 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Anthropic's Messages API only defines ``user`` and
+            ``assistant``, but some clients (notably Claude Desktop's
+            third-party inference feature) send ``system`` inside the messages
+            array as well. We accept it here and fold it into the top-level
+            ``system`` field in the route handler before conversion.
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

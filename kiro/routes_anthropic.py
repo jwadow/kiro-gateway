@@ -149,13 +149,55 @@ async def messages(
         HTTPException: On validation or API errors
     """
     logger.info(f"Request to /v1/messages (model={request_data.model}, stream={request_data.stream})")
-    
+
     if anthropic_version:
         logger.debug(f"Anthropic-Version header: {anthropic_version}")
-    
+
     # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
     # This ensures debug logging works even for requests that fail Pydantic validation (422 errors)
-    
+
+    # Fold any role=="system" messages (which Claude Desktop's third-party
+    # inference feature sends, even though Anthropic's public spec only allows
+    # user/assistant) into the top-level `system` field. We do this BEFORE any
+    # downstream processing so tokenizers, converters, and streaming all see a
+    # canonical shape.
+    system_msgs = [m for m in request_data.messages if m.role == "system"]
+    if system_msgs:
+        extracted_text_parts: list[str] = []
+        for m in system_msgs:
+            if isinstance(m.content, str):
+                if m.content:
+                    extracted_text_parts.append(m.content)
+            elif isinstance(m.content, list):
+                for block in m.content:
+                    # blocks can be Pydantic objects or plain dicts
+                    if isinstance(block, dict):
+                        if block.get("type") == "text" and block.get("text"):
+                            extracted_text_parts.append(block["text"])
+                    else:
+                        btype = getattr(block, "type", None)
+                        btext = getattr(block, "text", None)
+                        if btype == "text" and btext:
+                            extracted_text_parts.append(btext)
+
+        merged_system = "\n\n".join(extracted_text_parts).strip()
+        if merged_system:
+            if request_data.system is None or request_data.system == "":
+                request_data.system = merged_system
+            elif isinstance(request_data.system, str):
+                request_data.system = f"{request_data.system}\n\n{merged_system}"
+            elif isinstance(request_data.system, list):
+                # Preserve existing structured system blocks; append our extracted
+                # text as an additional text block.
+                request_data.system = list(request_data.system) + [
+                    {"type": "text", "text": merged_system}
+                ]
+
+        request_data.messages = [m for m in request_data.messages if m.role != "system"]
+        logger.info(
+            f"Folded {len(system_msgs)} system-role message(s) into top-level system field"
+        )
+
     # Check for truncation recovery opportunities
     from kiro.truncation_state import get_tool_truncation, get_content_truncation
     from kiro.truncation_recovery import generate_truncation_tool_result, generate_truncation_user_message
