@@ -341,6 +341,35 @@ For complete configuration examples (including per-account region settings), see
 
 ---
 
+## 🖥️ Claude Desktop (Third-Party Inference)
+
+Recent Claude Desktop builds ship a **Configure third-party inference** panel
+(under `Developer` -> `Model configuration`) where you can point the app at a
+custom inference gateway. Kiro Gateway works out of the box:
+
+| Field | Value |
+| --- | --- |
+| Gateway base URL | `http://localhost:8000` (or your `SERVER_HOST` / `SERVER_PORT`) |
+| Gateway API key | Your `PROXY_API_KEY` from `.env` |
+| Gateway auth scheme | `x-api-key` (or `Authorization: Bearer` - both work) |
+| Credential kind | `Static API key` |
+
+Hit **Test connection** - you should see two green checks (`Model discovery`
+and `Inference`). The gateway advertises models in a hybrid envelope that
+includes Anthropic's `type`, `display_name`, `created_at`, and `has_more`
+fields alongside the OpenAI-shaped payload, so the model dropdown populates
+automatically.
+
+Long-running requests (extended thinking, big tool loops) are kept alive with
+`event: ping` SSE keepalives every ~15 seconds, matching Anthropic's own
+streaming behavior - Claude Desktop won't disconnect mid-generation.
+
+Windows users can grab convenience scripts under [`windows/`](windows/README.md):
+one-click `Claude with Kiro.cmd` starts the gateway (if needed) and launches
+Claude Desktop in a single action.
+
+---
+
 ## 🐳 Docker Deployment
 
 > **Docker-based deployment.** Prefer native Python? See [Quick Start](#-quick-start) above.
@@ -855,6 +884,33 @@ Every contribution helps keep this project alive and growing
 | **TON** | TON | `UQBVh8T1H3GI7gd7b-_PPNnxHYYxptrcCVf3qQk5v41h3QTM` |
 
 </div>
+
+---
+
+## 🧪 Fork notes
+
+This fork adds a handful of improvements on top of upstream v2.3:
+
+- **Claude Desktop third-party inference** - extended the `/v1/models` envelope
+  with Anthropic-shape fields (`type`, `display_name`, `created_at`,
+  `has_more`) so Claude Desktop's model dropdown populates. Same endpoint
+  still serves OpenAI clients.
+- **Anthropic `GET /v1/models/{id}`** - added the missing retrieve route.
+- **SSE `event: ping` keepalives** - Anthropic streams now emit `ping` events
+  every ~15s of upstream silence, preventing Claude Desktop / proxies from
+  killing long thinking or tool loops.
+- **`input_tokens` in `message_delta.usage`** - matches the current Anthropic
+  streaming spec.
+- **Fresher fallback model list** - added Claude Opus 4.8 and 1M-context
+  variants (Sonnet 4.5-1m, 4.6-1m, Opus 4.6-1m).
+- **Constant-time API key comparison** on both routers.
+- **Loopback-by-default bind** - `SERVER_HOST` defaults to `127.0.0.1`; set
+  `0.0.0.0` explicitly for LAN / Docker exposure.
+- **Windows helper scripts** under [`windows/`](windows/README.md): start /
+  stop / status / ping, a Claude Desktop launcher, Task Scheduler auto-start,
+  and a shortcut generator.
+
+Full changelog in the PR body.
 
 ---
 
