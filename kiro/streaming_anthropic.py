@@ -31,10 +31,11 @@ This module formats Kiro events into Anthropic SSE format:
 Reference: https://docs.anthropic.com/en/api/messages-streaming
 """
 
+import asyncio
 import json
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
+from typing import TYPE_CHECKING, AsyncGenerator, AsyncIterator, Dict, List, Optional, Any
 
 import httpx
 from loguru import logger
@@ -83,6 +84,61 @@ def format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
         Formatted SSE string
     """
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+# Anthropic's spec doesn't require ping cadence, but real Anthropic streams send
+# `event: ping` roughly every 15s during long generations. Some clients (browsers,
+# reverse proxies, TLS terminators) will kill idle SSE sockets - Claude Desktop in
+# particular disconnects if it goes >~30s without any event during long
+# tool/thinking runs. Emitting a ping keepalive prevents that.
+ANTHROPIC_STREAM_PING_INTERVAL_SECONDS: float = 15.0
+
+
+async def _iter_with_ping(
+    source: AsyncIterator[str],
+    interval: float = ANTHROPIC_STREAM_PING_INTERVAL_SECONDS,
+) -> AsyncGenerator[str, None]:
+    """
+    Yield items from ``source``, injecting `event: ping` whenever the upstream
+    goes idle for longer than ``interval`` seconds.
+
+    Ping events are part of Anthropic's public streaming spec and clients ignore
+    unknown ping payloads, so this is safe for any Anthropic-compatible consumer.
+
+    Args:
+        source: Async iterator producing Anthropic-shaped SSE strings.
+        interval: Idle window (seconds) before a ping is emitted.
+
+    Yields:
+        Either an upstream chunk or a synthesized ping event.
+    """
+    if interval <= 0:
+        async for item in source:
+            yield item
+        return
+
+    iterator = source.__aiter__()
+    while True:
+        next_task = asyncio.create_task(iterator.__anext__())
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(asyncio.shield(next_task), timeout=interval)
+                    yield item
+                    break
+                except asyncio.TimeoutError:
+                    yield format_sse_event("ping", {"type": "ping"})
+                    continue
+        except StopAsyncIteration:
+            return
+        except BaseException:
+            if not next_task.done():
+                next_task.cancel()
+                try:
+                    await next_task
+                except BaseException:
+                    pass
+            raise
 
 
 def generate_thinking_signature() -> str:
@@ -642,9 +698,14 @@ async def stream_kiro_to_anthropic(
         else:
             stop_reason = "end_turn"
         
-        # Send message_delta with stop_reason and usage
-        usage_payload = {
-            "output_tokens": output_tokens
+        # Send message_delta with stop_reason and usage.
+        # Anthropic's current streaming spec places both input_tokens and
+        # output_tokens in message_delta.usage (input can be refined once the
+        # upstream returns context_usage_percentage). Cache fields are appended
+        # only when the upstream actually emitted them.
+        usage_payload: Dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         }
         usage_payload.update(upstream_cache_usage)
 
