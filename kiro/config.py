@@ -273,28 +273,35 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Some models may not be available on your Kiro plan (e.g., Opus on free tier)
 # - New models released after this version won't appear here
 # - Update gateway regularly to get the latest model list
-FALLBACK_MODELS: List[Dict[str, str]] = [
-    {"modelId": "auto"},
-    # Claude Sonnet (rolling; Kiro currently serves 4, 4.5, 4.6)
-    {"modelId": "claude-sonnet-4"},
-    {"modelId": "claude-sonnet-4.5"},
-    {"modelId": "claude-sonnet-4.5-1m"},
-    {"modelId": "claude-sonnet-4.6"},
-    {"modelId": "claude-sonnet-4.6-1m"},
+# Mirrors the output of `kiro-cli chat --list-models --format json-pretty`
+# (Kiro CLI 2.11.1, catalog snapshot 2026-07-16). Kiro does NOT expose separate
+# `-1m` variants: the 1M-context models advertise their window directly on the
+# base id. `context_window_tokens` here is authoritative so `/v1/models` can
+# advertise it to clients.
+FALLBACK_MODELS: List[Dict[str, object]] = [
+    {"modelId": "auto",                "contextWindowTokens": 1000000},
+    # Claude Sonnet
+    {"modelId": "claude-sonnet-5",     "contextWindowTokens": 1000000},
+    {"modelId": "claude-sonnet-4.6",   "contextWindowTokens": 1000000},
+    {"modelId": "claude-sonnet-4.5",   "contextWindowTokens":  200000},
+    {"modelId": "claude-sonnet-4",     "contextWindowTokens":  200000},
+    # Claude Opus
+    {"modelId": "claude-opus-4.8",     "contextWindowTokens": 1000000},
+    {"modelId": "claude-opus-4.7",     "contextWindowTokens": 1000000},
+    {"modelId": "claude-opus-4.6",     "contextWindowTokens": 1000000},
+    {"modelId": "claude-opus-4.5",     "contextWindowTokens":  200000},
     # Claude Haiku
-    {"modelId": "claude-haiku-4.5"},
-    # Claude Opus (4.5 -> 4.8, plus 1M-context variants that Kiro exposes on paid tiers)
-    {"modelId": "claude-opus-4.5"},
-    {"modelId": "claude-opus-4.6"},
-    {"modelId": "claude-opus-4.6-1m"},
-    {"modelId": "claude-opus-4.7"},
-    {"modelId": "claude-opus-4.8"},
-    # Open-weight models exposed by Kiro
-    {"modelId": "deepseek-3.2"},
-    {"modelId": "glm-5"},
-    {"modelId": "minimax-m2.1"},
-    {"modelId": "minimax-m2.5"},
-    {"modelId": "qwen3-coder-next"},
+    {"modelId": "claude-haiku-4.5",    "contextWindowTokens":  200000},
+    # OpenAI GPT-5.6 preview trio
+    {"modelId": "gpt-5.6-sol",         "contextWindowTokens":  272000},
+    {"modelId": "gpt-5.6-terra",       "contextWindowTokens":  272000},
+    {"modelId": "gpt-5.6-luna",        "contextWindowTokens":  272000},
+    # Open-weight models
+    {"modelId": "deepseek-3.2",        "contextWindowTokens":  164000},
+    {"modelId": "glm-5",               "contextWindowTokens":  200000},
+    {"modelId": "minimax-m2.5",        "contextWindowTokens":  196000},
+    {"modelId": "minimax-m2.1",        "contextWindowTokens":  196000},
+    {"modelId": "qwen3-coder-next",    "contextWindowTokens":  256000},
 ]
 
 # ==================================================================================================

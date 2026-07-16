@@ -129,16 +129,32 @@ class ModelInfoCache:
     def get_max_input_tokens(self, model_id: str) -> int:
         """
         Returns maxInputTokens for the model.
-        
+
+        Recognizes two upstream shapes:
+        - Legacy /ListAvailableModels: ``tokenLimits.maxInputTokens``
+        - Fallback catalog (config.FALLBACK_MODELS) and modern kiro-cli:
+          ``contextWindowTokens``
+
         Args:
             model_id: Model ID
-        
+
         Returns:
             Maximum number of input tokens or DEFAULT_MAX_INPUT_TOKENS
         """
         model = self._cache.get(model_id)
-        if model and model.get("tokenLimits"):
-            return model["tokenLimits"].get("maxInputTokens") or DEFAULT_MAX_INPUT_TOKENS
+        if not model:
+            return DEFAULT_MAX_INPUT_TOKENS
+
+        token_limits = model.get("tokenLimits")
+        if isinstance(token_limits, dict):
+            legacy = token_limits.get("maxInputTokens")
+            if legacy:
+                return int(legacy)
+
+        ctx = model.get("contextWindowTokens")
+        if ctx:
+            return int(ctx)
+
         return DEFAULT_MAX_INPUT_TOKENS
     
     def is_empty(self) -> bool:
