@@ -494,32 +494,17 @@ async def stream_kiro_to_anthropic(
                             "index": current_block_index
                         })
                         current_block_index += 1
-                        
-                        # Event: content_block_start (text)
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {"type": "text", "text": ""}
-                        })
-                        
-                        # Events: content_block_delta (text_delta) - stream summary
-                        summary = generate_search_summary(query, results)
-                        chunk_size = 100
-                        for i in range(0, len(summary), chunk_size):
-                            chunk = summary[i:i + chunk_size]
-                            yield format_sse_event("content_block_delta", {
-                                "type": "content_block_delta",
-                                "index": current_block_index,
-                                "delta": {"type": "text_delta", "text": chunk}
-                            })
-                        
-                        # Event: content_block_stop (text)
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": current_block_index
-                        })
-                        current_block_index += 1
-                        
+
+                        # DELIBERATELY do NOT emit a visible text block with the
+                        # <web_search>...</web_search> XML summary here. That
+                        # summary format was a debugging convenience that leaked
+                        # into Claude Desktop's chat UI as literal `<web_search>`
+                        # tags. Anthropic's native web_search flow keeps the
+                        # tool_result as structured context for the *next* turn -
+                        # the model composes the prose reply from it after the
+                        # client resends the conversation. See the parallel fix
+                        # in kiro/mcp_tools.py (generate_anthropic_web_search_sse).
+
                         # Skip normal tool_use processing
                         continue
                 

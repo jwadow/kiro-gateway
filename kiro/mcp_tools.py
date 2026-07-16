@@ -385,13 +385,15 @@ async def generate_anthropic_web_search_sse(
         SSE formatted strings
     """
     from kiro.streaming_anthropic import format_sse_event
-    
+
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    summary = generate_search_summary(query, results)
-    
-    # Count output tokens WITHOUT Claude correction (MCP API response, not model generation)
-    output_tokens = count_tokens(summary, apply_claude_correction=False)
-    
+
+    # In the corrected flow we no longer emit a text block containing the
+    # XML-tagged summary - the model will compose its own prose in the next
+    # turn from the structured tool_result. Output tokens for the tool_use
+    # + tool_result payload are tiny; a small nominal count is fine.
+    output_tokens = 0
+
     # Event 1: message_start
     yield format_sse_event("message_start", {
         "type": "message_start",
@@ -481,38 +483,32 @@ async def generate_anthropic_web_search_sse(
         "type": "content_block_stop",
         "index": 1
     })
-    
-    # Event 7: content_block_start (text)
-    yield format_sse_event("content_block_start", {
-        "type": "content_block_start",
-        "index": 2,
-        "content_block": {"type": "text", "text": ""}
-    })
-    
-    # Events 8-N: content_block_delta (text_delta) - stream summary in chunks
-    chunk_size = 100
-    for i in range(0, len(summary), chunk_size):
-        chunk = summary[i:i + chunk_size]
-        yield format_sse_event("content_block_delta", {
-            "type": "content_block_delta",
-            "index": 2,
-            "delta": {"type": "text_delta", "text": chunk}
-        })
-    
-    # Event N+1: content_block_stop (text)
-    yield format_sse_event("content_block_stop", {
-        "type": "content_block_stop",
-        "index": 2
-    })
-    
-    # Event N+2: message_delta
+
+    # NOTE: We deliberately do NOT emit a `text` content block containing
+    # the <web_search>...</web_search> summary here.
+    #
+    # In Anthropic's native web_search flow, the model is responsible for
+    # composing prose using the tool_result blocks - the tool_result itself
+    # is metadata for the model, not user-facing text. Our old behavior
+    # (streaming the XML-tagged summary as a visible text block) leaked
+    # `<web_search>` tags into Claude Desktop's chat UI.
+    #
+    # Anthropic's own web_search tool ends with stop_reason "tool_use" so
+    # the client loops back with the tool_result as context for a follow-up
+    # turn. We emulate that here: emit only the tool_use + tool_result
+    # blocks, then end the assistant turn with stop_reason=tool_use. The
+    # client (Claude Desktop, Anthropic SDK, etc.) automatically re-sends
+    # the conversation including our tool_result, and the model writes the
+    # real prose reply in the next turn.
+
+    # Event 7: message_delta (stop_reason=tool_use lets the client loop back)
     yield format_sse_event("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens}
+        "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     })
-    
-    # Event N+3: message_stop
+
+    # Event 8: message_stop
     yield format_sse_event("message_stop", {
         "type": "message_stop"
     })
@@ -783,19 +779,49 @@ async def handle_native_web_search(
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
         )
     else:
-        # Non-streaming mode - return full JSON
+        # Non-streaming mode - return full JSON.
+        #
+        # We emit ONLY the tool_use + tool_result blocks (no visible text
+        # block) and set stop_reason=tool_use so the client loops back with
+        # the structured tool_result as context. This matches Anthropic's
+        # native web_search flow. The old behavior appended a
+        # <web_search>...</web_search> XML summary as a visible text block,
+        # which leaked into Claude Desktop's chat UI as literal tags.
         logger.debug(f"Returning non-streaming web_search response (api_format={api_format})")
-        summary = generate_search_summary(query, results)
-        
-        # Count output tokens WITHOUT Claude correction (MCP API response)
-        output_tokens = count_tokens(summary, apply_claude_correction=False)
-        
+
+        output_tokens = 0
+
+        # Assemble structured tool_result content once for both API shapes.
+        if results.get("isError"):
+            tool_result_content = {
+                "type": "web_search_tool_result_error",
+                "error_code": "unavailable",
+                "error_message": results.get(
+                    "errorMessage",
+                    "web_search unavailable on this account",
+                ),
+            }
+        else:
+            tool_result_content = [
+                {
+                    "type": "web_search_result",
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "encrypted_content": r.get("snippet", ""),
+                    "page_age": None,
+                }
+                for r in results.get("results", [])
+            ]
+
         if api_format == "openai":
-            # OpenAI format: chat.completion
+            # OpenAI chat completions has no server-side-tool block type.
+            # Emulate by emitting a proper tool_calls response so the client
+            # re-sends the conversation for the model to write prose. The
+            # `content` stays empty - no leaked XML summary.
             from kiro.utils import generate_completion_id
             completion_id = generate_completion_id()
             created_time = int(time.time())
-            
+
             full_response = {
                 "id": completion_id,
                 "object": "chat.completion",
@@ -805,31 +831,26 @@ async def handle_native_web_search(
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": summary
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tool_use_id,
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": json.dumps({"query": query}),
+                            },
+                        }],
                     },
-                    "finish_reason": "stop"
+                    "finish_reason": "tool_calls",
                 }],
                 "usage": {
                     "prompt_tokens": input_tokens,
                     "completion_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens
-                }
+                    "total_tokens": input_tokens + output_tokens,
+                },
             }
         else:  # anthropic
-            # Anthropic format: message
             message_id = f"msg_{uuid.uuid4().hex[:24]}"
-            
-            # Build search results content
-            search_content = []
-            for r in results.get("results", []):
-                search_content.append({
-                    "type": "web_search_result",
-                    "title": r.get("title", ""),
-                    "url": r.get("url", ""),
-                    "encrypted_content": r.get("snippet", ""),
-                    "page_age": None
-                })
-            
             full_response = {
                 "id": message_id,
                 "type": "message",
@@ -839,25 +860,24 @@ async def handle_native_web_search(
                         "type": "server_tool_use",
                         "id": tool_use_id,
                         "name": "web_search",
-                        "input": {"query": query}
+                        "input": {"query": query},
                     },
                     {
                         "type": "web_search_tool_result",
                         "tool_use_id": tool_use_id,
-                        "content": search_content
+                        "content": tool_result_content,
                     },
-                    {
-                        "type": "text",
-                        "text": summary
-                    }
+                    # No trailing `text` block on purpose. The model will
+                    # compose its reply from the tool_result on the next
+                    # turn when the client resends the conversation.
                 ],
                 "model": request_data.model,
-                "stop_reason": "end_turn",
+                "stop_reason": "tool_use",
                 "stop_sequence": None,
                 "usage": {
                     "input_tokens": input_tokens,
-                    "output_tokens": output_tokens
-                }
+                    "output_tokens": output_tokens,
+                },
             }
-        
+
         return JSONResponse(content=full_response)
