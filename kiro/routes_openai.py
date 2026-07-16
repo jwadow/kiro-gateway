@@ -175,11 +175,12 @@ async def get_models(request: Request):
 
     # Local import avoids a circular dependency with routes_anthropic and keeps
     # the display-name helper in one place.
-    from kiro.routes_anthropic import _humanize_model_id
+    from kiro.routes_anthropic import _anthropic_public_alias, _humanize_model_id
 
     now = int(datetime.now(timezone.utc).timestamp())
-    data = [
-        {
+
+    def _entry(model_id: str) -> dict:
+        return {
             # OpenAI fields
             "id": model_id,
             "object": "model",
@@ -191,8 +192,27 @@ async def get_models(request: Request):
             "display_name": _humanize_model_id(model_id),
             "created_at": "2025-01-01T00:00:00Z",
         }
-        for model_id in available_model_ids
-    ]
+
+    # Emit each model once under its canonical Kiro id AND (for Claude models
+    # whose version segment uses a dot) a dash-form alias. The dash form is
+    # what Claude Desktop's in-chat model picker whitelists; without it, the
+    # dot-form ids show up as "Unavailable" in the picker even though they
+    # work over the wire. normalize_model_name() handles the reverse mapping
+    # on incoming requests, so both ids route to the same Kiro model.
+    data: list = []
+    seen: set = set()
+    for model_id in available_model_ids:
+        if model_id not in seen:
+            data.append(_entry(model_id))
+            seen.add(model_id)
+        alias = _anthropic_public_alias(model_id)
+        if alias and alias not in seen:
+            alias_entry = _entry(alias)
+            # Share the display name of the canonical id so the picker doesn't
+            # show two entries with slightly different labels.
+            alias_entry["display_name"] = _humanize_model_id(model_id)
+            data.append(alias_entry)
+            seen.add(alias)
 
     return {
         "object": "list",

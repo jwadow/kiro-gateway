@@ -983,6 +983,53 @@ def _humanize_model_id(model_id: str) -> str:
     return f"{display}{ctx_suffix}"
 
 
+def _anthropic_public_alias(kiro_id: str) -> Optional[str]:
+    """
+    Return the Anthropic-canonical dash-form id for a Kiro model, if applicable.
+
+    Claude Desktop's in-chat model picker matches gateway `/v1/models` ids
+    against an internal Anthropic whitelist that uses dashes throughout the
+    version (``claude-opus-4-8``, ``claude-sonnet-4-6``) rather than dots
+    (``claude-opus-4.8``, ``claude-sonnet-4.6``). Models whose id contains a
+    dot are marked "Unavailable" in the picker even when they work over the
+    wire. Advertising a parallel dash form makes the picker light them up.
+
+    Only rewrites Claude-family ids (haiku / sonnet / opus) that contain a
+    dot in the version segment. Everything else (``auto``, ``glm-5``,
+    ``gpt-5.6-sol``, ``minimax-m2.5``, ...) returns None to signal "no alias
+    needed"; those either work already or belong to non-Anthropic families
+    Claude Desktop's picker doesn't gate on.
+
+    The reverse direction is already handled by
+    :func:`kiro.model_resolver.normalize_model_name`, which folds dash form
+    back to the internal Kiro dot form on incoming requests.
+
+    Args:
+        kiro_id: Internal Kiro model id (e.g. ``"claude-opus-4.8"``).
+
+    Returns:
+        Dashed alias id (e.g. ``"claude-opus-4-8"``) or None if the model
+        doesn't need one.
+
+    Examples:
+        >>> _anthropic_public_alias("claude-opus-4.8")
+        'claude-opus-4-8'
+        >>> _anthropic_public_alias("claude-sonnet-4.6")
+        'claude-sonnet-4-6'
+        >>> _anthropic_public_alias("claude-sonnet-5") is None
+        True
+        >>> _anthropic_public_alias("glm-5") is None
+        True
+    """
+    if not kiro_id or "." not in kiro_id:
+        return None
+    lowered = kiro_id.lower()
+    if not any(family in lowered for family in ("claude-haiku", "claude-sonnet", "claude-opus")):
+        return None
+    alias = kiro_id.replace(".", "-")
+    return alias if alias != kiro_id else None
+
+
 # NOTE: GET /v1/models is registered on the OpenAI router only.
 # Its handler emits a hybrid envelope that includes the Anthropic-shaped fields
 # (type, display_name, created_at, has_more, first_id, last_id), so Anthropic
