@@ -175,8 +175,35 @@ async def call_kiro_mcp_api(
             "Content-Type": "application/json"
         }
         
-        mcp_url = f"{auth_manager.q_host}/mcp"
-        logger.debug(f"Calling MCP API: {mcp_url}")
+        # MCP endpoint host selection.
+        #
+        # Kiro serves two runtime endpoints with different entitlement rules:
+        #   - runtime.{region}.kiro.dev  (the "modern" streaming endpoint):
+        #       chat works for all account tiers, but /mcp returns 403 for
+        #       Builder ID / kiro-cli OIDC and some Enterprise IDC accounts.
+        #   - q.{region}.amazonaws.com   (the legacy Q Developer host):
+        #       /mcp works for those same accounts.
+        #
+        # The auth manager currently points both api_host and q_host at the
+        # runtime.kiro.dev URL (see kiro/config.py::KIRO_Q_HOST_TEMPLATE),
+        # which was correct for /generateAssistantResponse but wrong for /mcp.
+        # Explicitly build the legacy q.{region}.amazonaws.com URL for MCP
+        # calls, using the same region that the auth_manager resolved for its
+        # API host. Region extraction stays region-agnostic - if a tenant is
+        # ever in eu-central-1 or us-west-2 we still hit the right host.
+        api_host = auth_manager.q_host  # e.g. https://runtime.us-east-1.kiro.dev
+        region = "us-east-1"
+        try:
+            # Pull the region out of runtime.{region}.kiro.dev / q.{region}.amazonaws.com
+            import re as _re
+            m = _re.search(r"\.([a-z]{2}-[a-z]+-\d+)\.", api_host or "")
+            if m:
+                region = m.group(1)
+        except Exception:
+            pass
+
+        mcp_url = f"https://q.{region}.amazonaws.com/mcp"
+        logger.debug(f"Calling MCP API: {mcp_url} (routed off {api_host})")
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
