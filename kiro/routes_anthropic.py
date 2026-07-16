@@ -25,6 +25,7 @@ Contains the /v1/messages endpoint compatible with Anthropic's Messages API.
 Reference: https://docs.anthropic.com/en/api/messages
 """
 
+import hmac
 import json
 from typing import Optional
 
@@ -46,6 +47,7 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.streaming_anthropic import (
+    _iter_with_ping,
     stream_kiro_to_anthropic,
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
@@ -91,14 +93,15 @@ async def verify_anthropic_api_key(
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
+    # Use constant-time comparison to avoid leaking the key via timing.
     # Check x-api-key first (Anthropic native)
-    if x_api_key and x_api_key == PROXY_API_KEY:
+    if x_api_key and hmac.compare_digest(x_api_key, PROXY_API_KEY):
         return True
-    
+
     # Fall back to Authorization: Bearer
-    if authorization and authorization == f"Bearer {PROXY_API_KEY}":
+    if authorization and hmac.compare_digest(authorization, f"Bearer {PROXY_API_KEY}"):
         return True
-    
+
     logger.warning("Access attempt with invalid API key (Anthropic endpoint)")
     raise HTTPException(
         status_code=401,
@@ -447,8 +450,8 @@ async def messages(
                                     return await http_client.request_with_retry(
                                         "POST", url, kiro_payload, stream=True
                                     )
-                                
-                                async for chunk in stream_with_first_token_retry_anthropic(
+
+                                inner_stream = stream_with_first_token_retry_anthropic(
                                     make_request=make_retry_request,
                                     model=request_data.model,
                                     model_cache=model_cache,
@@ -457,7 +460,10 @@ async def messages(
                                     request_messages=messages_for_tokenizer,
                                     request_tools=tools_for_tokenizer,
                                     request_system=system_for_tokenizer,
-                                ):
+                                )
+                                # Interleave with ping keepalives so slow generations don't get
+                                # killed by clients (Claude Desktop) or intermediaries.
+                                async for chunk in _iter_with_ping(inner_stream):
                                     yield chunk
                             except GeneratorExit:
                                 client_disconnected = True
@@ -805,8 +811,7 @@ async def messages(
                             "POST", url, kiro_payload, stream=True
                         )
                     
-                    # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry_anthropic(
+                    inner_stream = stream_with_first_token_retry_anthropic(
                         make_request=make_retry_request,
                         model=request_data.model,
                         model_cache=model_cache,
@@ -815,7 +820,10 @@ async def messages(
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer,
                         request_system=system_for_tokenizer,
-                    ):
+                    )
+                    # Interleave with ping keepalives so slow generations don't get
+                    # killed by clients (Claude Desktop) or intermediaries.
+                    async for chunk in _iter_with_ping(inner_stream):
                         yield chunk
                 except GeneratorExit:
                     client_disconnected = True
@@ -904,6 +912,78 @@ async def messages(
                 }
             }
         )
+
+
+def _humanize_model_id(model_id: str) -> str:
+    """
+    Turn an internal Kiro model id into a display name suitable for Anthropic clients.
+
+    Examples:
+        "claude-opus-4.7"          -> "Claude Opus 4.7"
+        "claude-sonnet-4.6-1m"     -> "Claude Sonnet 4.6 (1M)"
+        "qwen3-coder-next"         -> "Qwen3 Coder Next"
+        "auto"                     -> "Auto"
+    """
+    if not model_id:
+        return model_id
+
+    # Normalize -1m / -200k context tags into a parenthesised suffix
+    ctx_suffix = ""
+    core = model_id
+    for tag, label in (("-1m", "1M"), ("-200k", "200K")):
+        if core.endswith(tag):
+            core = core[: -len(tag)]
+            ctx_suffix = f" ({label})"
+            break
+
+    words = [w for w in core.replace("_", "-").split("-") if w]
+    display = " ".join(w if w.isdigit() else w.capitalize() for w in words)
+    return f"{display}{ctx_suffix}"
+
+
+# NOTE: GET /v1/models is registered on the OpenAI router only.
+# Its handler emits a hybrid envelope that includes the Anthropic-shaped fields
+# (type, display_name, created_at, has_more, first_id, last_id), so Anthropic
+# clients - including Claude Desktop's third-party inference model dropdown -
+# can enumerate models without a second dedicated route.
+
+
+@router.get("/v1/models/{model_id}", dependencies=[Depends(verify_anthropic_api_key)])
+async def get_model_anthropic(request: Request, model_id: str):
+    """
+    Anthropic Models API - retrieve a single model.
+
+    Reference: https://docs.anthropic.com/en/api/models
+    Returns 404 in Anthropic error shape if the id isn't in the catalog.
+    """
+    logger.info(f"Request to /v1/models/{model_id} (Anthropic)")
+
+    if request.app.state.account_system:
+        available_model_ids = request.app.state.account_manager.get_all_available_models()
+    else:
+        account = request.app.state.account_manager.get_first_account()
+        available_model_ids = account.model_resolver.get_available_models()
+
+    if model_id not in available_model_ids:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "not_found_error",
+                    "message": f"model {model_id!r} not found",
+                },
+            },
+        )
+
+    return JSONResponse(
+        content={
+            "type": "model",
+            "id": model_id,
+            "display_name": _humanize_model_id(model_id),
+            "created_at": "2025-01-01T00:00:00Z",
+        }
+    )
 
 
 @router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_anthropic_api_key)])
