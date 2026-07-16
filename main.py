@@ -693,10 +693,15 @@ def resolve_server_config(args: argparse.Namespace) -> tuple[str, int]:
 def print_startup_banner(host: str, port: int) -> None:
     """
     Print a startup banner with server information.
-    
+
     Args:
         host: Server host address
         port: Server port
+
+    Note:
+        Reconfigures stdout to UTF-8 with ``errors="replace"`` on Windows so the
+        banner never dies with UnicodeEncodeError when the parent process (e.g.
+        a redirected file or a legacy cp1252 console) can't render the emoji.
     """
     # ANSI color codes
     GREEN = "\033[92m"
@@ -706,25 +711,39 @@ def print_startup_banner(host: str, port: int) -> None:
     BOLD = "\033[1m"
     DIM = "\033[2m"
     RESET = "\033[0m"
-    
+
+    # Force UTF-8 stdout with replacement so we never die on cp1252 consoles or
+    # redirected pipes. Best-effort - some stream types don't support reconfigure.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     # Determine display URL
     display_host = "localhost" if host == "0.0.0.0" else host
     url = f"http://{display_host}:{port}"
-    
-    print()
-    print(f"  {WHITE}{BOLD}👻 {APP_TITLE} v{APP_VERSION}{RESET}")
-    print()
-    print(f"  {WHITE}Server running at:{RESET}")
-    print(f"  {GREEN}{BOLD}➜  {url}{RESET}")
-    print()
-    print(f"  {DIM}API Docs:      {url}/docs{RESET}")
-    print(f"  {DIM}Health Check:  {url}/health{RESET}")
-    print()
-    print(f"  {DIM}{'─' * 48}{RESET}")
-    print(f"  {WHITE}💬 Found a bug? Need help? Have questions?{RESET}")
-    print(f"  {YELLOW}➜  https://github.com/jwadow/kiro-gateway/issues{RESET}")
-    print(f"  {DIM}{'─' * 48}{RESET}")
-    print()
+
+    lines = [
+        "",
+        f"  {WHITE}{BOLD}Kiro Gateway v{APP_VERSION}{RESET}",
+        "",
+        f"  {WHITE}Server running at:{RESET}",
+        f"  {GREEN}{BOLD}-> {url}{RESET}",
+        "",
+        f"  {DIM}API Docs:      {url}/docs{RESET}",
+        f"  {DIM}Health Check:  {url}/health{RESET}",
+        "",
+        f"  {DIM}{'-' * 48}{RESET}",
+        f"  {WHITE}Found a bug? Need help? Have questions?{RESET}",
+        f"  {YELLOW}-> https://github.com/jwadow/kiro-gateway/issues{RESET}",
+        f"  {DIM}{'-' * 48}{RESET}",
+        "",
+    ]
+    for line in lines:
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            print(line.encode("ascii", "replace").decode("ascii"))
 
 
 # --- Entry Point ---
