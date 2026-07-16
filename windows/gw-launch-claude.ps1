@@ -6,7 +6,7 @@
 #
 # Usage:
 #   windows\gw-launch-claude.ps1                # normal launch
-#   windows\gw-launch-claude.ps1 -Port 8000     # override gateway port
+#   windows\gw-launch-claude.ps1 -Port 8787     # override gateway port
 #   windows\gw-launch-claude.ps1 -NoWait        # don't block waiting for port
 #
 # Exit code 0 on success. Never blocks Claude from launching even if the
@@ -14,7 +14,7 @@
 # you can inspect logs at $env:TEMP\kiro-gateway.log.err.
 
 param(
-    [int]$Port = 8000,
+    [int]$Port = 8787,
     [switch]$NoWait,
     # Override the AppUserModelID if Claude Desktop ever changes it.
     [string]$ClaudeAppId = 'Claude_pzs8sxrjxfjjc!Claude'

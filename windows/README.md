@@ -17,7 +17,7 @@ terminal like on any other OS. These scripts just make daily use pleasant.
   PROXY_API_KEY="my-super-secret-password-123"
   KIRO_CLI_DB_FILE="C:\Users\<you>\AppData\Local\kiro-cli\data.sqlite3"
   SERVER_HOST="127.0.0.1"
-  SERVER_PORT="8000"
+  SERVER_PORT="8787"
   ```
 
 ## Everyday scripts
@@ -27,7 +27,7 @@ terminal like on any other OS. These scripts just make daily use pleasant.
 | `windows\gw-start.ps1` | Launch the gateway in the background, wait for the port to bind (≤20s), print the PID and log path, then exit. Idempotent — no-op if already running. |
 | `windows\gw-ping.ps1` | Fast liveness check (<1s). Prints `UP` / `DOWN` / `PORT-BUSY-BUT-NOT-HEALTHY`. Uses only local endpoints, does not hit Kiro. |
 | `windows\gw-status.ps1` | Full smoke test: port + `/health` + `/v1/models` + a real Kiro round-trip through `/v1/messages`. Takes ~3-4s. |
-| `windows\gw-stop.ps1` | Stop the background gateway (by pidfile or by whichever process holds port 8000). |
+| `windows\gw-stop.ps1` | Stop the background gateway (by pidfile or by whichever process holds port 8787). |
 
 Prefer to run in the foreground so you can Ctrl+C? `windows\gw-start.ps1 -Foreground`.
 

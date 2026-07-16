@@ -2,7 +2,7 @@
 # Usage: windows\gw-stop.ps1
 
 param(
-    [int]$Port = 8000
+    [int]$Port = 8787
 )
 
 $ErrorActionPreference = 'SilentlyContinue'

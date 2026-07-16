@@ -2,11 +2,11 @@
 # Does NOT hit Kiro's servers - only checks the local port + /health.
 #
 # Usage:
-#   windows\gw-ping.ps1              # default port 8000
+#   windows\gw-ping.ps1              # default port 8787
 #   windows\gw-ping.ps1 -Port 9000
 
 param(
-    [int]$Port = 8000
+    [int]$Port = 8787
 )
 
 $ErrorActionPreference = 'SilentlyContinue'

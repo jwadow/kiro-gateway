@@ -1,10 +1,10 @@
 # Simple status check for kiro-gateway.
 # Usage:
-#   windows\gw-status.ps1              # default port 8000
+#   windows\gw-status.ps1              # default port 8787
 #   windows\gw-status.ps1 -Port 9000
 
 param(
-    [int]$Port = 8000
+    [int]$Port = 8787
 )
 
 $ErrorActionPreference = 'Stop'

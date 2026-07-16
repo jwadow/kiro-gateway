@@ -5,7 +5,7 @@
 #   windows\gw-start.ps1 -Foreground  # run in current window (Ctrl+C to stop)
 
 param(
-    [int]$Port = 8000,
+    [int]$Port = 8787,
     [switch]$Foreground
 )
 
