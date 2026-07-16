@@ -1,0 +1,77 @@
+# Windows helper scripts
+
+Optional PowerShell / cmd shims for running kiro-gateway on Windows and wiring it up to
+[Claude Desktop's third-party inference](https://docs.anthropic.com/en/docs/build-with-claude/third-party-inference) feature.
+
+Nothing here is required — you can start the server manually with `python main.py` from a normal
+terminal like on any other OS. These scripts just make daily use pleasant.
+
+## Prerequisites
+
+- Python 3.10+ on `PATH`
+- Kiro credentials in one of the supported forms (`kiro-cli login`, Kiro IDE JSON cache, or a refresh
+  token). See the main [README](../README.md) for details.
+- A `.env` file in the repo root with at least `PROXY_API_KEY` and one credential source. Example:
+
+  ```env
+  PROXY_API_KEY="my-super-secret-password-123"
+  KIRO_CLI_DB_FILE="C:\Users\<you>\AppData\Local\kiro-cli\data.sqlite3"
+  SERVER_HOST="127.0.0.1"
+  SERVER_PORT="8000"
+  ```
+
+## Everyday scripts
+
+| Command | What it does |
+|---|---|
+| `windows\gw-start.ps1` | Launch the gateway in the background, wait for the port to bind (≤20s), print the PID and log path, then exit. Idempotent — no-op if already running. |
+| `windows\gw-ping.ps1` | Fast liveness check (<1s). Prints `UP` / `DOWN` / `PORT-BUSY-BUT-NOT-HEALTHY`. Uses only local endpoints, does not hit Kiro. |
+| `windows\gw-status.ps1` | Full smoke test: port + `/health` + `/v1/models` + a real Kiro round-trip through `/v1/messages`. Takes ~3-4s. |
+| `windows\gw-stop.ps1` | Stop the background gateway (by pidfile or by whichever process holds port 8000). |
+
+Prefer to run in the foreground so you can Ctrl+C? `windows\gw-start.ps1 -Foreground`.
+
+Double-clickable `.cmd` shims (`gw-start.cmd`, `gw-status.cmd`, `gw-stop.cmd`) run the same commands
+from Explorer.
+
+## Claude Desktop launcher
+
+`Claude with Kiro.cmd` (and the underlying `windows\gw-launch-claude.ps1`) makes the wiring seamless:
+
+1. Ensures the gateway is running (starts it if not).
+2. Waits briefly for the port to come up.
+3. Launches Claude Desktop via its `AppUserModelID`.
+
+Point your Claude Desktop shortcut at this file and you never need to think about the gateway again.
+
+```powershell
+# Register a shortcut on the Desktop AND in the Start Menu
+windows\gw-make-shortcut.ps1 -Location Both
+```
+
+The generated `.lnk` uses Claude Desktop's real icon (if available) and hides the PowerShell window,
+so it looks identical to launching Claude itself.
+
+### Auto-start at logon
+
+`windows\gw-install-autostart.ps1` registers a Windows Task Scheduler entry that runs
+`windows\gw-start.ps1` hidden at every logon. Must be run from an **elevated PowerShell**:
+
+```powershell
+# Run this once as administrator
+windows\gw-install-autostart.ps1
+# ...to remove:
+windows\gw-install-autostart.ps1 -Uninstall
+```
+
+## Notes and caveats
+
+- The launcher assumes Claude Desktop is installed from the Microsoft Store (Appx package) and uses
+  the AUMID `Claude_pzs8sxrjxfjjc!Claude`. If Anthropic ever changes it, pass a new value with the
+  `-ClaudeAppId` parameter to `gw-launch-claude.ps1` (or edit the script).
+- Logs live at `%TEMP%\kiro-gateway.log` and `%TEMP%\kiro-gateway.log.err`. Look there first if a
+  script says the port isn't binding.
+- If Claude Desktop's model dropdown filters your Kiro model list, that's client-side — the gateway
+  exposes 17 models by default but Claude Desktop only shows Claude-family entries.
+- Bind default is `127.0.0.1` in this fork (upstream defaults to `0.0.0.0`). If you need LAN access,
+  set `SERVER_HOST=0.0.0.0` in `.env`.

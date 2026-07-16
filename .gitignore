@@ -31,3 +31,7 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+# kiro-gateway runtime artifacts (Windows helper scripts)
+kiro-gateway.pid
+kiro-gateway.log
+kiro-gateway.log.err
