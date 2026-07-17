@@ -623,6 +623,101 @@ class TestAnthropicMessagesRequestWithImages:
 
 
 # ==================================================================================================
+# Tests for AnthropicMessage role acceptance
+# ==================================================================================================
+
+class TestAnthropicMessageRoleAcceptance:
+    """
+    Tests for AnthropicMessage role field accepting non-standard roles.
+
+    These tests verify the fix for Issue #190 / #226 - 422 Validation Error
+    when newer Claude Code clients inline role="system" messages in the
+    messages array (e.g. SessionStart hook context).
+
+    Before the fix, role was Literal["user", "assistant"], so Pydantic
+    rejected the request before normalize_message_roles() in
+    converters_core.py had a chance to coerce unknown roles to "user".
+    This mirrors the OpenAI path, where ChatMessage.role is already str.
+    """
+
+    def test_accepts_user_role(self):
+        """
+        What it does: Verifies AnthropicMessage still accepts role="user".
+        Purpose: Regression guard for the standard role.
+        """
+        print("Setup: Creating AnthropicMessage with role='user'...")
+        message = AnthropicMessage(role="user", content="Hello!")
+
+        print(f"Comparing role: Expected 'user', Got '{message.role}'")
+        assert message.role == "user"
+
+    def test_accepts_assistant_role(self):
+        """
+        What it does: Verifies AnthropicMessage still accepts role="assistant".
+        Purpose: Regression guard for the standard role.
+        """
+        print("Setup: Creating AnthropicMessage with role='assistant'...")
+        message = AnthropicMessage(role="assistant", content="Hi there!")
+
+        print(f"Comparing role: Expected 'assistant', Got '{message.role}'")
+        assert message.role == "assistant"
+
+    def test_accepts_system_role(self):
+        """
+        What it does: Verifies AnthropicMessage accepts role="system".
+        Purpose: This is the PRIMARY test for Issue #190 / #226 fix.
+
+        Before the fix, this raised a ValidationError:
+        "Input should be 'user' or 'assistant'".
+        """
+        print("Setup: Creating AnthropicMessage with role='system'...")
+        message = AnthropicMessage(
+            role="system",
+            content="<system-reminder>Injected hook context</system-reminder>"
+        )
+
+        print(f"Comparing role: Expected 'system', Got '{message.role}'")
+        assert message.role == "system"
+
+    def test_accepts_unknown_role(self):
+        """
+        What it does: Verifies AnthropicMessage accepts arbitrary roles
+        (e.g. "developer"), matching the OpenAI path where role is str.
+        Purpose: Handle the entire class of unknown-role issues, not just
+        "system" - normalize_message_roles() coerces them all downstream.
+        """
+        print("Setup: Creating AnthropicMessage with role='developer'...")
+        message = AnthropicMessage(role="developer", content="Context")
+
+        print(f"Comparing role: Expected 'developer', Got '{message.role}'")
+        assert message.role == "developer"
+
+    def test_request_with_inline_system_message_validates(self):
+        """
+        What it does: Verifies a full AnthropicMessagesRequest containing an
+        inline system-role message validates without a 422.
+        Purpose: Reproduces the exact Claude Code request shape from
+        Issue #190 / #226 (system message mid-conversation).
+        """
+        print("Setup: Request with inline system-role message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            system="You are a helpful assistant.",
+            messages=[
+                AnthropicMessage(role="user", content="Hello!"),
+                AnthropicMessage(role="assistant", content="Hi!"),
+                AnthropicMessage(role="system", content="Hook context update"),
+                AnthropicMessage(role="user", content="Continue please"),
+            ]
+        )
+
+        print(f"Result messages count: {len(request.messages)}")
+        assert len(request.messages) == 4
+        assert request.messages[2].role == "system"
+
+
+# ==================================================================================================
 # Tests for TextContentBlock
 # ==================================================================================================
 

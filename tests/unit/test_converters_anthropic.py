@@ -1499,6 +1499,54 @@ class TestAnthropicToKiro:
         print(f"Current content: {current_content}")
         assert "You are a helpful assistant." in current_content
 
+    def test_inline_system_role_message_is_normalized(self):
+        """
+        What it does: Verifies a request with an inline system-role message
+        converts end-to-end without errors and the message is normalized.
+        Purpose: End-to-end coverage for Issue #190 / #226 - newer Claude Code
+        clients inline role="system" hook context in the messages array.
+        The pipeline (normalize_message_roles) must coerce it to "user" so the
+        Kiro API only ever sees user/assistant history entries.
+        """
+        print("Setup: Request with inline system-role message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Hello!"),
+                AnthropicMessage(role="assistant", content="Hi!"),
+                AnthropicMessage(role="system", content="Injected hook context"),
+                AnthropicMessage(role="user", content="Continue please"),
+            ],
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        print(f"Result: {result}")
+        history = result["conversationState"].get("history", [])
+
+        print("Checking history only contains user/assistant entries...")
+        for entry in history:
+            assert (
+                "userInputMessage" in entry or "assistantResponseMessage" in entry
+            ), f"Unexpected history entry keys: {list(entry.keys())}"
+
+        print("Checking system-role content survived as a user message...")
+        history_user_contents = [
+            entry["userInputMessage"]["content"]
+            for entry in history
+            if "userInputMessage" in entry
+        ]
+        assert any(
+            "Injected hook context" in content for content in history_user_contents
+        ), "System-role message content was lost during normalization"
+
     def test_includes_tools(self):
         """
         What it does: Verifies that tools are included in payload.
