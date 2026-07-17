@@ -17,7 +17,9 @@ param(
     [int]$Port = 8787,
     [switch]$NoWait,
     # Override the AppUserModelID if Claude Desktop ever changes it.
-    [string]$ClaudeAppId = 'Claude_pzs8sxrjxfjjc!Claude'
+    # Default is discovered dynamically from Get-StartApps below - this
+    # parameter is only useful as an emergency escape hatch.
+    [string]$ClaudeAppId = $null
 )
 
 $ErrorActionPreference = 'Continue'
@@ -65,12 +67,53 @@ if (Test-GatewayUp -P $Port) {
     }
 }
 
-# 2) Launch Claude Desktop via its AppUserModelID (works for Store/Appx installs).
+# 2) Launch Claude Desktop.
+# Prefer the real Appx AppUserModelID (works reliably for Store apps). Fall
+# back to explorer.exe with the shell:AppsFolder URI if Start-Process refuses,
+# and finally to the direct Claude.exe path as a last resort.
+if (-not $ClaudeAppId) {
+    try {
+        $appEntry = Get-StartApps | Where-Object { $_.Name -eq 'Claude' -and $_.AppID -like 'Claude_*!Claude' } | Select-Object -First 1
+        if ($appEntry) { $ClaudeAppId = $appEntry.AppID }
+    } catch { }
+    if (-not $ClaudeAppId) { $ClaudeAppId = 'Claude_pzs8sxrjxfjjc!Claude' }
+}
+
+$launched = $false
 try {
-    # Use the shell activate-application helper. Reliable for packaged apps.
     Start-Process -FilePath ("shell:AppsFolder\$ClaudeAppId")
+    $launched = $true
 } catch {
-    Write-Host "[claude] failed to launch via AppsFolder: $($_.Exception.Message)" -ForegroundColor Red
-    # Last-resort fallback: try explorer.exe with the same URI.
-    Start-Process -FilePath 'explorer.exe' -ArgumentList "shell:AppsFolder\$ClaudeAppId"
+    Write-Host "[claude] Start-Process AppsFolder failed: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+if (-not $launched) {
+    try {
+        Start-Process -FilePath 'explorer.exe' -ArgumentList "shell:AppsFolder\$ClaudeAppId"
+        $launched = $true
+    } catch {
+        Write-Host "[claude] explorer AppsFolder fallback failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+if (-not $launched) {
+    try {
+        $pkg = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue |
+            Sort-Object -Property Version -Descending |
+            Select-Object -First 1
+        if ($pkg) {
+            $exe = Join-Path $pkg.InstallLocation 'app\Claude.exe'
+            if (Test-Path -LiteralPath $exe) {
+                Start-Process -FilePath $exe
+                $launched = $true
+            }
+        }
+    } catch {
+        Write-Host "[claude] direct Claude.exe fallback failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+if (-not $launched) {
+    Write-Host "[claude] could not launch Claude Desktop. Is it installed?" -ForegroundColor Red
+    exit 1
 }
