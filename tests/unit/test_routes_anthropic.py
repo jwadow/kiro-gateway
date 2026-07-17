@@ -337,26 +337,62 @@ class TestMessagesValidation:
         print(f"Status: {response.status_code}")
         assert response.status_code == 422
     
-    def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
+    def test_accepts_non_standard_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies non-standard message roles pass validation.
+        Purpose: Fix for Issue #190 / #226 - unknown roles must NOT be
+        rejected with 422; normalize_message_roles() in converters_core.py
+        coerces them to 'user' downstream, matching the OpenAI path where
+        role is already str.
+
+        Note: This inverts the previous behavior (strict Literal validation),
+        which rejected requests before the gateway's own normalization logic
+        could run.
         """
-        print("Action: POST /v1/messages with invalid role...")
+        print("Action: POST /v1/messages with non-standard role...")
         response = test_client.post(
             "/v1/messages",
             headers={"x-api-key": valid_proxy_api_key},
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 1024,
-                "messages": [{"role": "invalid_role", "content": "Hello"}]
+                "messages": [{"role": "developer", "content": "Hello"}]
             }
         )
-        
+
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
-    
+        # Should pass validation (not 422) - normalized to 'user' downstream
+        assert response.status_code != 422
+
+    def test_accepts_inline_system_role_message(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies inline system-role messages pass validation.
+        Purpose: This is the PRIMARY route-level test for Issue #190 / #226.
+        Newer Claude Code clients inline role="system" hook context in the
+        messages array; before the fix this returned:
+        422 "Input should be 'user' or 'assistant'".
+        """
+        print("Action: POST /v1/messages with inline system-role message...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "system": "You are a helpful assistant.",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi!"},
+                    {"role": "system", "content": "Injected hook context"},
+                    {"role": "user", "content": "Continue please"}
+                ]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        # Should pass validation (not 422)
+        assert response.status_code != 422
+
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """
         What it does: Verifies valid request format passes validation.
