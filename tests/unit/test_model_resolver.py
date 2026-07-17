@@ -623,11 +623,70 @@ class TestGetModelIdForKiro:
         What it does: Unknown models pass through as-is (gateway, not gatekeeper).
         Goal: Check that unknown models are returned unchanged.
         """
-        print("Action: get_model_id_for_kiro('claude-unknown-model', {})...")
-        result = get_model_id_for_kiro("claude-unknown-model", {})
+        print("Action: get_model_id_for_kiro('claude-unknown-model', {}, aliases={})...")
+        # Pass aliases={} explicitly to bypass the production alias map -
+        # otherwise auto-kiro / disguise aliases could rewrite the input.
+        result = get_model_id_for_kiro("claude-unknown-model", {}, aliases={})
 
         print(f"Comparing result: Expected 'claude-unknown-model' (pass-through), Got '{result}'")
         assert result == "claude-unknown-model"
+
+    @pytest.mark.parametrize("alias, expected", [
+        ("claude-sol-5.6",   "gpt-5.6-sol"),
+        ("claude-sol-5-6",   "gpt-5.6-sol"),
+        ("claude-terra-5.6", "gpt-5.6-terra"),
+        ("claude-terra-5-6", "gpt-5.6-terra"),
+        ("claude-luna-5.6",  "gpt-5.6-luna"),
+        ("claude-luna-5-6",  "gpt-5.6-luna"),
+        ("auto-kiro",        "auto"),
+    ])
+    def test_helper_applies_aliases_before_normalize(self, alias, expected):
+        """
+        What it does: ``get_model_id_for_kiro`` rewrites aliases before hitting
+        ``normalize_model_name``, matching the ``ModelResolver.resolve``
+        pipeline (layer 0 -> 1 -> 3).
+        Purpose: The two converters (OpenAI + Anthropic) call this helper
+        directly. If it doesn't apply aliases, disguised ids like
+        ``claude-luna-5.6`` end up on the wire and Kiro rejects them as
+        "Invalid model ID".
+        """
+        print(f"Action: get_model_id_for_kiro({alias!r}, {{}}) with production MODEL_ALIASES...")
+        # Default aliases=None -> pulled from kiro.config.MODEL_ALIASES.
+        result = get_model_id_for_kiro(alias, {})
+
+        print(f"Compare: expected {expected!r}, got {result!r}")
+        assert result == expected
+
+    def test_explicit_alias_map_wins_over_config(self):
+        """
+        What it does: Passing ``aliases={...}`` overrides ``kiro.config.MODEL_ALIASES``.
+        Purpose: Guarantees the helper is testable in isolation and that a
+        caller (like a future account-scoped resolver) can plug in a
+        custom alias map without touching global config.
+        """
+        print("Action: helper with custom alias map...")
+        result = get_model_id_for_kiro(
+            "my-custom-alias",
+            {},
+            aliases={"my-custom-alias": "claude-haiku-4.5"},
+        )
+        print(f"Compare: expected 'claude-haiku-4.5', got {result!r}")
+        assert result == "claude-haiku-4.5"
+
+    def test_empty_alias_map_disables_alias_layer(self):
+        """
+        What it does: Passing ``aliases={}`` skips alias resolution entirely.
+        Purpose: Sanity guarantee that callers can bypass the layer, useful
+        for tests that want raw normalization behavior.
+        """
+        print("Action: helper with aliases={} on a disguise id...")
+        # Without alias resolution, "claude-luna-5.6" is not a match for any
+        # normalize pattern (Pattern 1 needs `-\d+-\d{1,2}` structure), so
+        # it passes through verbatim.
+        result = get_model_id_for_kiro("claude-luna-5.6", {}, aliases={})
+
+        print(f"Compare: expected 'claude-luna-5.6' (raw pass-through), got {result!r}")
+        assert result == "claude-luna-5.6"
 
 
 # =============================================================================

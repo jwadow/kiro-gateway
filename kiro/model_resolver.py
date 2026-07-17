@@ -189,23 +189,42 @@ def normalize_model_name(name: str) -> str:
     return name
 
 
-def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str:
+def get_model_id_for_kiro(
+    model_name: str,
+    hidden_models: Dict[str, str],
+    aliases: Optional[Dict[str, str]] = None,
+) -> str:
     """
     Get the model ID to send to Kiro API.
-    
-    This is a simple helper for converters that don't have access to the full
-    ModelResolver. It normalizes the name and checks hidden models.
-    
-    For hidden models (like claude-3.7-sonnet), returns the internal Kiro ID.
-    For regular models, returns the normalized name.
-    
+
+    Mirrors :meth:`ModelResolver.resolve` for callers that don't have access
+    to the full resolver instance (currently the two converters). Applies
+    the same layer 0 -> 1 -> 3 pipeline:
+
+    0. **Alias rewrite** - if ``model_name`` is a key in ``aliases``, rewrite
+       to the aliased target *before* normalization. This is how disguised
+       ids like ``claude-luna-5.6`` route to their real Kiro id
+       (``gpt-5.6-luna``).
+    1. **Normalize** - dashes to dots, strip date/latest suffixes.
+    3. **Hidden model rewrite** - if the normalized name is a key in
+       ``hidden_models``, rewrite to the internal Kiro id.
+
+    The dynamic cache (layer 2) and pass-through decision (layer 4) don't
+    apply here because this helper has no cache handle - unknown models
+    simply travel through as-is, matching the "gateway, not gatekeeper"
+    principle. Kiro API is the final arbiter.
+
     Args:
-        model_name: External model name from client
-        hidden_models: Dict mapping display names to internal Kiro IDs
-    
+        model_name: External model name from client.
+        hidden_models: Dict mapping display names to internal Kiro IDs.
+        aliases: Optional dict mapping alias names to real model IDs.
+            When ``None`` (the default), the production ``MODEL_ALIASES``
+            table from ``kiro.config`` is used. Pass ``{}`` to disable
+            alias resolution entirely (mainly useful in tests).
+
     Returns:
-        Model ID to send to Kiro API
-    
+        Model ID to send to Kiro API.
+
     Examples:
         >>> get_model_id_for_kiro("claude-haiku-4-5-20251001", {})
         'claude-haiku-4.5'
@@ -213,8 +232,26 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
         'CLAUDE_3_7_SONNET_20250219_V1_0'
         >>> get_model_id_for_kiro("claude-3-7-sonnet", {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"})
         'CLAUDE_3_7_SONNET_20250219_V1_0'
+        >>> get_model_id_for_kiro("claude-luna-5.6", {}, aliases={"claude-luna-5.6": "gpt-5.6-luna"})
+        'gpt-5.6-luna'
+        >>> get_model_id_for_kiro("claude-luna-5-6", {}, aliases={"claude-luna-5-6": "gpt-5.6-luna"})
+        'gpt-5.6-luna'
     """
-    normalized = normalize_model_name(model_name)
+    if aliases is None:
+        # Late import: kiro.config imports nothing from model_resolver, so
+        # this is safe from cycles, but we still keep it local so test
+        # code that monkey-patches config.MODEL_ALIASES sees the update.
+        from kiro.config import MODEL_ALIASES
+        aliases = MODEL_ALIASES
+
+    # Layer 0: alias rewrite (must happen BEFORE normalization so alias keys
+    # like "claude-luna-5.6" aren't accidentally reshaped by the regex).
+    resolved = aliases.get(model_name, model_name)
+
+    # Layer 1: normalize
+    normalized = normalize_model_name(resolved)
+
+    # Layer 3: hidden models
     internal = hidden_models.get(normalized, normalized)
     return to_runtime_model_id(internal)
 

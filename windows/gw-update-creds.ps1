@@ -133,6 +133,15 @@ if ($oldExpiry) { Write-Host "[token]  currently expires: $oldExpiry" -Foregroun
 
 # 3) Interactive login (foreground - user needs to see the browser prompt)
 if (-not $SkipLogin) {
+    # kiro-cli refuses to log in while a stale session exists ("Already
+    # logged in, please logout with kiro-cli logout first"). Force a
+    # logout up front so the retry is guaranteed to be a clean login.
+    Write-Host ""
+    Write-Host "Clearing any existing kiro-cli session..." -ForegroundColor DarkGray
+    & $kiroCli logout 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    # Ignore logout exit code - "not logged in" also returns non-zero and
+    # that's fine, we just wanted the slate clean.
+
     Write-Host ""
     Write-Host "Launching 'kiro-cli login' - complete the flow in the window / browser..." -ForegroundColor Yellow
     # Do NOT run kiro-cli detached. It's an interactive command; keep it in
