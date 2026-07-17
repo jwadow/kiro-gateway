@@ -1738,3 +1738,179 @@ class TestAliasSystemSecurity:
         print(f"Received suggestions: {suggestions}")
         # This is expected behavior - alias name doesn't contain family
         assert len(suggestions) > 0
+
+
+# =============================================================================
+# TestGptAliasSystem - GPT-5.6 disguise aliases for Claude Desktop's picker
+# =============================================================================
+
+class TestGptDisguiseAliases:
+    """
+    Verify the GPT-5.6 disguise aliases used to sneak Kiro's ``gpt-5.6-*``
+    models past Claude Desktop's third-party inference model picker.
+
+    Claude Desktop's picker whitelists ids that start with ``claude-`` and
+    additionally rejects dots in the version segment. We ship six aliases
+    (three models x two forms) plus a HIDDEN_FROM_LIST rule that suppresses
+    the real ``gpt-5.6-*`` ids from ``/v1/models``. These tests break if
+    anyone silently drops an alias, changes the mapping, or lets the
+    ``normalize_model_name`` regex start eating alias keys.
+    """
+
+    def _cache_with_gpt(self):
+        """Model cache prepopulated with the raw GPT-5.6 ids."""
+        cache = ModelInfoCache()
+        cache._cache = {
+            "auto": {"modelId": "auto", "modelName": "Auto"},
+            "gpt-5.6-sol":   {"modelId": "gpt-5.6-sol",   "modelName": "GPT 5.6 Sol"},
+            "gpt-5.6-terra": {"modelId": "gpt-5.6-terra", "modelName": "GPT 5.6 Terra"},
+            "gpt-5.6-luna":  {"modelId": "gpt-5.6-luna",  "modelName": "GPT 5.6 Luna"},
+        }
+        return cache
+
+    def _gpt_aliases(self):
+        """The six alias entries expected in production config."""
+        return {
+            "claude-sol-5.6":   "gpt-5.6-sol",
+            "claude-sol-5-6":   "gpt-5.6-sol",
+            "claude-terra-5.6": "gpt-5.6-terra",
+            "claude-terra-5-6": "gpt-5.6-terra",
+            "claude-luna-5.6":  "gpt-5.6-luna",
+            "claude-luna-5-6":  "gpt-5.6-luna",
+        }
+
+    @pytest.mark.parametrize("alias, expected_kiro_id", [
+        ("claude-sol-5.6",   "gpt-5.6-sol"),
+        ("claude-sol-5-6",   "gpt-5.6-sol"),
+        ("claude-terra-5.6", "gpt-5.6-terra"),
+        ("claude-terra-5-6", "gpt-5.6-terra"),
+        ("claude-luna-5.6",  "gpt-5.6-luna"),
+        ("claude-luna-5-6",  "gpt-5.6-luna"),
+    ])
+    def test_gpt_alias_resolves_to_real_kiro_id(self, alias, expected_kiro_id):
+        """
+        What it does: Each disguised alias resolves to its real Kiro id.
+        Purpose: Guarantee the routing table Claude Desktop depends on.
+        """
+        print(f"Setup: cache holds {expected_kiro_id}, alias map has {alias!r}...")
+        resolver = ModelResolver(
+            cache=self._cache_with_gpt(),
+            aliases=self._gpt_aliases(),
+        )
+
+        print(f"Action: resolver.resolve({alias!r})...")
+        result = resolver.resolve(alias)
+
+        print(f"Compare internal_id: expected {expected_kiro_id!r}, got {result.internal_id!r}")
+        assert result.internal_id == expected_kiro_id
+        assert result.source == "cache", "Real id should be found in cache after alias rewrite"
+        assert result.original_request == alias
+        assert result.is_verified is True
+
+    @pytest.mark.parametrize("alias", [
+        "claude-sol-5.6",
+        "claude-sol-5-6",
+        "claude-terra-5.6",
+        "claude-terra-5-6",
+        "claude-luna-5.6",
+        "claude-luna-5-6",
+    ])
+    def test_normalize_leaves_gpt_alias_untouched(self, alias):
+        """
+        What it does: ``normalize_model_name`` returns each alias unchanged.
+        Purpose: If the Claude regex ever grows to swallow ``claude-sol-5.6``
+        or ``claude-luna-5-6``, alias resolution silently breaks. This
+        pins the identity behaviour so a regex regression fails loudly.
+        """
+        print(f"Action: normalize_model_name({alias!r})...")
+        result = normalize_model_name(alias)
+
+        print(f"Compare: expected {alias!r}, got {result!r}")
+        assert result == alias, (
+            f"Alias {alias!r} was mutated by normalize_model_name to {result!r}. "
+            "Update the regex or rename the alias to avoid collision."
+        )
+
+    def test_gpt_aliases_visible_and_raw_ids_hidden(self):
+        """
+        What it does: ``/v1/models`` sees six disguised aliases and none of
+        the raw ``gpt-5.6-*`` ids when HIDDEN_FROM_LIST is applied.
+        Purpose: Prevent Claude Desktop from showing duplicate "Unavailable"
+        entries next to each disguised alias.
+        """
+        print("Setup: resolver with gpt aliases + hidden_from_list...")
+        resolver = ModelResolver(
+            cache=self._cache_with_gpt(),
+            aliases=self._gpt_aliases(),
+            hidden_from_list=[
+                "auto",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ],
+        )
+
+        print("Action: get_available_models()...")
+        models = resolver.get_available_models()
+        print(f"Visible models: {models}")
+
+        # Every disguised alias is present.
+        for alias in self._gpt_aliases():
+            assert alias in models, f"Expected alias {alias!r} to be visible"
+
+        # No raw gpt-5.6-* id leaks into /v1/models.
+        for raw in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            assert raw not in models, (
+                f"Raw id {raw!r} should be hidden - Claude Desktop shows it as 'Unavailable'."
+            )
+
+    def test_raw_gpt_id_still_resolves_when_requested_directly(self):
+        """
+        What it does: Explicit request for a raw ``gpt-5.6-*`` id still works.
+        Purpose: HIDDEN_FROM_LIST is a display filter, not an access filter.
+        A user hitting ``/v1/messages`` with ``gpt-5.6-sol`` directly must
+        still get routed to Kiro.
+        """
+        print("Setup: resolver with hidden raw ids...")
+        resolver = ModelResolver(
+            cache=self._cache_with_gpt(),
+            aliases=self._gpt_aliases(),
+            hidden_from_list=[
+                "auto",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ],
+        )
+
+        print("Action: resolve raw 'gpt-5.6-sol'...")
+        result = resolver.resolve("gpt-5.6-sol")
+
+        print(f"Compare internal_id: expected 'gpt-5.6-sol', got {result.internal_id!r}")
+        assert result.internal_id == "gpt-5.6-sol"
+        assert result.source == "cache"
+        assert result.is_verified is True
+
+    def test_default_config_ships_the_gpt_aliases(self):
+        """
+        What it does: ``kiro.config.MODEL_ALIASES`` and ``HIDDEN_FROM_LIST``
+        actually contain the six disguised entries plus the three
+        hide-from-list entries.
+        Purpose: Guards against someone dropping the config block during
+        a merge conflict or a "clean up defaults" refactor.
+        """
+        print("Action: import kiro.config...")
+        from kiro import config as _kiro_config
+
+        print(f"MODEL_ALIASES keys: {sorted(_kiro_config.MODEL_ALIASES)}")
+        for alias, target in self._gpt_aliases().items():
+            assert _kiro_config.MODEL_ALIASES.get(alias) == target, (
+                f"MODEL_ALIASES[{alias!r}] should map to {target!r}, "
+                f"got {_kiro_config.MODEL_ALIASES.get(alias)!r}."
+            )
+
+        print(f"HIDDEN_FROM_LIST: {_kiro_config.HIDDEN_FROM_LIST}")
+        for raw in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            assert raw in _kiro_config.HIDDEN_FROM_LIST, (
+                f"HIDDEN_FROM_LIST must hide raw id {raw!r} so the disguise stays clean."
+            )

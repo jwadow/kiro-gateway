@@ -390,6 +390,34 @@ The gateway already advertises the correct `contextWindowTokens` per model on
 `GET /v1/models`, so the toggle merely tells Claude Desktop to trust that
 larger window when composing requests.
 
+### Using GPT-5.6 in Claude Desktop (disguise aliases)
+
+Kiro also exposes OpenAI's preview trio `gpt-5.6-sol`, `gpt-5.6-terra`, and
+`gpt-5.6-luna`, but Claude Desktop's model picker hard-filters ids to Claude
+family names and marks anything with a dot in the version segment as
+*Unavailable*. To keep them reachable, the gateway advertises each under a
+Claude-shaped alias so the picker whitelists them:
+
+| Kiro model | Claude Desktop id (dot form) | Companion (dash form) |
+| --- | --- | --- |
+| `gpt-5.6-sol` | `claude-sol-5.6` | `claude-sol-5-6` |
+| `gpt-5.6-terra` | `claude-terra-5.6` | `claude-terra-5-6` |
+| `gpt-5.6-luna` | `claude-luna-5.6` | `claude-luna-5-6` |
+
+Both forms route to the same underlying Kiro model - the dash companion is a
+safety net in case a Claude Desktop build enforces the "no dots" rule strictly.
+Add either id in the **Configure third-party inference** panel, or pick from
+the model dropdown.
+
+The context window for these models is **272k tokens** regardless of Claude
+Desktop's 1M-context toggle. Leave the toggle off for these chats - if a
+request overflows the 272k ceiling, Kiro will reject it and the gateway will
+surface the error verbatim.
+
+The mapping lives in `MODEL_ALIASES` inside [`kiro/config.py`](kiro/config.py).
+Add, rename, or remove entries there and restart the gateway to reshape the
+list.
+
 Windows users can grab convenience scripts under [`windows/`](windows/README.md):
 one-click `Claude with Kiro.cmd` starts the gateway (if needed) and launches
 Claude Desktop in a single action.

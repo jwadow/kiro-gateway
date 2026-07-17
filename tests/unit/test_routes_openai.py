@@ -380,6 +380,40 @@ class TestModelsEndpoint:
         for model in response.json()["data"]:
             assert model["owned_by"] == "anthropic"
 
+    def test_models_advertises_gpt_disguise_aliases(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Confirms the six ``claude-{sol,terra,luna}-{5.6,5-6}``
+        aliases appear in ``/v1/models`` and that the raw ``gpt-5.6-*`` ids
+        do NOT appear, matching the HIDDEN_FROM_LIST setup.
+        Purpose: End-to-end guarantee that Claude Desktop's picker sees the
+        disguised entries and never the raw ids (which would render as
+        "Unavailable" because they contain dots).
+        """
+        print("Action: GET /v1/models with valid auth...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        )
+        assert response.status_code == 200
+
+        model_ids = {m["id"] for m in response.json()["data"]}
+        print(f"Model IDs advertised: {sorted(model_ids)}")
+
+        expected_aliases = {
+            "claude-sol-5.6", "claude-sol-5-6",
+            "claude-terra-5.6", "claude-terra-5-6",
+            "claude-luna-5.6", "claude-luna-5-6",
+        }
+        missing = expected_aliases - model_ids
+        assert not missing, f"Missing GPT disguise aliases from /v1/models: {missing}"
+
+        raw_ids = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+        leaked = raw_ids & model_ids
+        assert not leaked, (
+            f"Raw GPT ids leaked into /v1/models: {leaked}. "
+            "HIDDEN_FROM_LIST should suppress them so Claude Desktop only shows the disguised aliases."
+        )
+
 
 # =============================================================================
 # Tests for chat completions endpoint (/v1/chat/completions)

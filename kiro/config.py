@@ -246,8 +246,37 @@ HIDDEN_MODELS: Dict[str, str] = {
 #   }
 #
 # Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
+#
+# Claude Desktop disguise aliases:
+# --------------------------------
+# Claude Desktop's third-party inference model picker hard-filters model ids
+# against an internal Anthropic whitelist that requires ids to start with
+# `claude-`. Non-Claude models (Kiro's GPT-5.6 preview trio) get marked
+# "Unavailable" in the dropdown even though they work over the wire. To
+# expose them, we advertise each real Kiro id under a `claude-*` alias.
+#
+# Two forms per model:
+#   1. Dot form  (e.g. `claude-luna-5.6`) - the intended user-facing id,
+#      matches the Kiro-native version format.
+#   2. Dash form (e.g. `claude-luna-5-6`) - Claude Desktop's picker rejects
+#      dots in the version segment, so we ship a dash companion as a safety
+#      net. Both route to the same underlying Kiro model.
+#
+# The gateway hides the real `gpt-5.6-*` ids from `/v1/models` via
+# HIDDEN_FROM_LIST below, so the model list stays clean; the raw ids still
+# resolve on request.
 MODEL_ALIASES: Dict[str, str] = {
     "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
+
+    # GPT-5.6 Sol
+    "claude-sol-5.6":   "gpt-5.6-sol",
+    "claude-sol-5-6":   "gpt-5.6-sol",
+    # GPT-5.6 Terra
+    "claude-terra-5.6": "gpt-5.6-terra",
+    "claude-terra-5-6": "gpt-5.6-terra",
+    # GPT-5.6 Luna
+    "claude-luna-5.6":  "gpt-5.6-luna",
+    "claude-luna-5-6":  "gpt-5.6-luna",
 }
 
 # Models to hide from /v1/models endpoint.
@@ -259,8 +288,16 @@ MODEL_ALIASES: Dict[str, str] = {
 # Example:
 #   HIDDEN_FROM_LIST = ["auto", "claude-old-model"]
 #
-# Default: ["auto"] to show only "auto-kiro" alias
-HIDDEN_FROM_LIST: List[str] = ["auto"]
+# Default: ["auto"] plus the raw GPT-5.6 ids that are exposed under
+# Claude-shaped aliases in MODEL_ALIASES above. Hiding them keeps the
+# `/v1/models` output tidy and prevents Claude Desktop from showing both
+# the dot-form raw id (marked "Unavailable") and the disguised alias.
+HIDDEN_FROM_LIST: List[str] = [
+    "auto",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+]
 
 # ==================================================================================================
 # Fallback Models Configuration (DNS Failure Recovery)

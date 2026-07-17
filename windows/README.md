@@ -95,6 +95,10 @@ in-memory access token and the device registration are guaranteed fresh.
 - Logs live at `%TEMP%\kiro-gateway.log` and `%TEMP%\kiro-gateway.log.err`. Look there first if a
   script says the port isn't binding.
 - If Claude Desktop's model dropdown filters your Kiro model list, that's client-side — the gateway
-  exposes 17 models by default but Claude Desktop only shows Claude-family entries.
+  exposes 17 models by default but Claude Desktop only shows Claude-family entries. GPT-5.6 is
+  exposed under Claude-shaped aliases (`claude-sol-5.6` / `claude-terra-5.6` / `claude-luna-5.6`
+  plus their dash-form companions) so the picker whitelists them; the raw `gpt-5.6-*` ids are
+  hidden from `/v1/models`. See the main README for the full table. Context window is 272k for
+  these — don't turn on Claude Desktop's 1M-context toggle for them.
 - Bind default is `127.0.0.1` in this fork (upstream defaults to `0.0.0.0`). If you need LAN access,
   set `SERVER_HOST=0.0.0.0` in `.env`.
