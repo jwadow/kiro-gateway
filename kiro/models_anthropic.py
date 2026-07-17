@@ -110,6 +110,55 @@ class ToolResultContentBlock(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class ServerToolUseContentBlock(BaseModel):
+    """
+    Server-side tool use content block (e.g. Anthropic native web_search).
+
+    Emitted by the gateway on assistant turns that use a server-side tool.
+    Anthropic clients (Claude Desktop's third-party inference feature in
+    particular) round-trip this block back to the gateway on the next turn
+    as part of the assistant message history, so we must accept it in
+    inbound requests too.
+
+    Attributes:
+        type: Always "server_tool_use"
+        id: Unique tool_use id assigned by the gateway
+        name: Server tool name (e.g. "web_search")
+        input: Tool arguments as a JSON object
+    """
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultContentBlock(BaseModel):
+    """
+    Server-side web_search result content block.
+
+    Anthropic's native web_search flow emits this block after a
+    ``server_tool_use`` on the assistant turn. The block's ``content`` is
+    either a list of ``web_search_result`` entries (success) or a single
+    ``web_search_tool_result_error`` object (failure). We accept a very
+    loose shape here so we can echo whatever a client (Claude Desktop)
+    sends back on subsequent turns without 422ing.
+
+    Attributes:
+        type: Always "web_search_tool_result"
+        tool_use_id: Matches the ``id`` of the preceding server_tool_use
+        content: Either a list of result dicts or a single error dict
+    """
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Union[List[Dict[str, Any]], Dict[str, Any]]
+
+    model_config = {"extra": "allow"}
+
+
 # ==================================================================================================
 # Image Content Block Models
 # ==================================================================================================
@@ -162,7 +211,10 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
-# Union type for all content blocks (including images and thinking)
+# Union type for all content blocks that a client can send us in a request.
+# Includes server-side tool blocks (server_tool_use, web_search_tool_result)
+# because clients round-trip previous assistant turns back to the gateway on
+# subsequent requests, so we must accept the blocks we've already emitted.
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
@@ -170,6 +222,8 @@ ContentBlock = Union[
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
 ]
 
 
@@ -183,11 +237,15 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Anthropic's Messages API only defines ``user`` and
+            ``assistant``, but some clients (notably Claude Desktop's
+            third-party inference feature) send ``system`` inside the messages
+            array as well. We accept it here and fold it into the top-level
+            ``system`` field in the route handler before conversion.
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

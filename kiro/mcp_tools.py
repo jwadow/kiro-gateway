@@ -40,6 +40,7 @@ import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
+from kiro.config import PROFILE_ARN
 from kiro.tokenizer import count_message_tokens, count_tokens
 
 # Import debug_logger
@@ -125,7 +126,17 @@ async def call_kiro_mcp_api(
     request_id = f"web_search_tooluse_{random_22}_{timestamp}_{random_8}"
     tool_use_id = f"srvtoolu_{uuid.uuid4().hex[:32]}"
     
-    # Build MCP request
+    # Build MCP request.
+    #
+    # Kiro's runtime endpoint (https://runtime.{region}.kiro.dev/mcp) requires
+    # a profileArn on every /mcp call now, same as /generateAssistantResponse.
+    # Without it the endpoint replies 400 with:
+    #   {"message":"profileArn is required for this request.","reason":null}
+    # and the whole web_search flow stalls (client sees "Searching the web..."
+    # forever because we return (None, None) to the caller).
+    #
+    # We pass PROFILE_ARN from config as an explicit override, otherwise rely
+    # on whatever the auth_manager resolved from the kiro-cli DB or SSO cache.
     mcp_request = {
         "id": request_id,
         "jsonrpc": "2.0",
@@ -135,6 +146,16 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+    profile_arn = getattr(auth_manager, "profile_arn", None) or PROFILE_ARN
+    if profile_arn:
+        mcp_request["profileArn"] = profile_arn
+    else:
+        # Not fatal - some tenants don't require it - but log so it's obvious
+        # if the endpoint later 400s with "profileArn is required".
+        logger.warning(
+            "call_kiro_mcp_api: no profileArn on auth_manager or PROFILE_ARN "
+            "config; the /mcp endpoint may reject this request"
+        )
     
     # Log MCP request
     try:
@@ -154,14 +175,53 @@ async def call_kiro_mcp_api(
             "Content-Type": "application/json"
         }
         
-        mcp_url = f"{auth_manager.q_host}/mcp"
-        logger.debug(f"Calling MCP API: {mcp_url}")
+        # MCP endpoint host selection.
+        #
+        # Kiro serves two runtime endpoints with different entitlement rules:
+        #   - runtime.{region}.kiro.dev  (the "modern" streaming endpoint):
+        #       chat works for all account tiers, but /mcp returns 403 for
+        #       Builder ID / kiro-cli OIDC and some Enterprise IDC accounts.
+        #   - q.{region}.amazonaws.com   (the legacy Q Developer host):
+        #       /mcp works for those same accounts.
+        #
+        # The auth manager currently points both api_host and q_host at the
+        # runtime.kiro.dev URL (see kiro/config.py::KIRO_Q_HOST_TEMPLATE),
+        # which was correct for /generateAssistantResponse but wrong for /mcp.
+        # Explicitly build the legacy q.{region}.amazonaws.com URL for MCP
+        # calls, using the same region that the auth_manager resolved for its
+        # API host. Region extraction stays region-agnostic - if a tenant is
+        # ever in eu-central-1 or us-west-2 we still hit the right host.
+        api_host = auth_manager.q_host  # e.g. https://runtime.us-east-1.kiro.dev
+        region = "us-east-1"
+        try:
+            # Pull the region out of runtime.{region}.kiro.dev / q.{region}.amazonaws.com
+            import re as _re
+            m = _re.search(r"\.([a-z]{2}-[a-z]+-\d+)\.", api_host or "")
+            if m:
+                region = m.group(1)
+        except Exception:
+            pass
+
+        mcp_url = f"https://q.{region}.amazonaws.com/mcp"
+        logger.debug(f"Calling MCP API: {mcp_url} (routed off {api_host})")
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
-            
+
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                # Include response body and MCP url for debugging - Kiro's runtime
+                # endpoint has moved a few times, and a bare status code makes it
+                # impossible to tell whether we're hitting a wrong path, wrong
+                # body shape, an auth issue, or a missing profile ARN.
+                body_snippet = ""
+                try:
+                    body_snippet = response.text[:400]
+                except Exception:
+                    body_snippet = "<unreadable body>"
+                logger.error(
+                    f"MCP API error: {response.status_code} "
+                    f"(url={mcp_url}, body={body_snippet!r})"
+                )
                 return None, None
             
             mcp_response = response.json()
@@ -233,7 +293,20 @@ def generate_search_summary(query: str, results: Dict) -> str:
     """
     # Start with opening tag
     summary = f'\n<web_search>\nSearch results for "{query}":\n\n'
-    
+
+    # Error path: MCP call was made but returned an error (e.g. 403 not
+    # authorized on this account tier). Surface a short, model-legible
+    # explanation so it stops trying to browse and answers from its own
+    # knowledge.
+    if results and results.get("isError"):
+        err = results.get("errorMessage", "web_search unavailable")
+        summary += (
+            f"[web_search error] {err}\n"
+            "Fall back to prior knowledge or ask the user for a URL.\n"
+        )
+        summary += "</web_search>\n"
+        return summary
+
     if results and "results" in results:
         for i, result in enumerate(results["results"], 1):
             title = result.get("title", "Untitled")
@@ -312,13 +385,15 @@ async def generate_anthropic_web_search_sse(
         SSE formatted strings
     """
     from kiro.streaming_anthropic import format_sse_event
-    
+
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    summary = generate_search_summary(query, results)
-    
-    # Count output tokens WITHOUT Claude correction (MCP API response, not model generation)
-    output_tokens = count_tokens(summary, apply_claude_correction=False)
-    
+
+    # In the corrected flow we no longer emit a text block containing the
+    # XML-tagged summary - the model will compose its own prose in the next
+    # turn from the structured tool_result. Output tokens for the tool_use
+    # + tool_result payload are tiny; a small nominal count is fine.
+    output_tokens = 0
+
     # Event 1: message_start
     yield format_sse_event("message_start", {
         "type": "message_start",
@@ -361,25 +436,46 @@ async def generate_anthropic_web_search_sse(
         "index": 0
     })
     
-    # Event 5: content_block_start (web_search_tool_result)
-    search_content = []
-    for r in results.get("results", []):
-        search_content.append({
-            "type": "web_search_result",
-            "title": r.get("title", ""),
-            "url": r.get("url", ""),
-            "encrypted_content": r.get("snippet", ""),
-            "page_age": None
-        })
-    
+    # Event 5: content_block_start (web_search_tool_result).
+    #
+    # If the upstream MCP call flagged the result as an error (403 not
+    # authorized, quota, transient failure), emit Anthropic's documented
+    # error content block instead of an empty results array. The model
+    # is trained to recognize this shape and gracefully fall back to
+    # its own knowledge instead of hanging on an empty result set.
+    if results.get("isError"):
+        content_block = {
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
+            "content": {
+                "type": "web_search_tool_result_error",
+                "error_code": "unavailable",
+                "error_message": results.get(
+                    "errorMessage",
+                    "web_search unavailable on this account",
+                ),
+            },
+        }
+    else:
+        search_content = []
+        for r in results.get("results", []):
+            search_content.append({
+                "type": "web_search_result",
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "encrypted_content": r.get("snippet", ""),
+                "page_age": None,
+            })
+        content_block = {
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
+            "content": search_content,
+        }
+
     yield format_sse_event("content_block_start", {
         "type": "content_block_start",
         "index": 1,
-        "content_block": {
-            "type": "web_search_tool_result",
-            "tool_use_id": tool_use_id,
-            "content": search_content
-        }
+        "content_block": content_block,
     })
     
     # Event 6: content_block_stop (web_search_tool_result)
@@ -387,38 +483,32 @@ async def generate_anthropic_web_search_sse(
         "type": "content_block_stop",
         "index": 1
     })
-    
-    # Event 7: content_block_start (text)
-    yield format_sse_event("content_block_start", {
-        "type": "content_block_start",
-        "index": 2,
-        "content_block": {"type": "text", "text": ""}
-    })
-    
-    # Events 8-N: content_block_delta (text_delta) - stream summary in chunks
-    chunk_size = 100
-    for i in range(0, len(summary), chunk_size):
-        chunk = summary[i:i + chunk_size]
-        yield format_sse_event("content_block_delta", {
-            "type": "content_block_delta",
-            "index": 2,
-            "delta": {"type": "text_delta", "text": chunk}
-        })
-    
-    # Event N+1: content_block_stop (text)
-    yield format_sse_event("content_block_stop", {
-        "type": "content_block_stop",
-        "index": 2
-    })
-    
-    # Event N+2: message_delta
+
+    # NOTE: We deliberately do NOT emit a `text` content block containing
+    # the <web_search>...</web_search> summary here.
+    #
+    # In Anthropic's native web_search flow, the model is responsible for
+    # composing prose using the tool_result blocks - the tool_result itself
+    # is metadata for the model, not user-facing text. Our old behavior
+    # (streaming the XML-tagged summary as a visible text block) leaked
+    # `<web_search>` tags into Claude Desktop's chat UI.
+    #
+    # Anthropic's own web_search tool ends with stop_reason "tool_use" so
+    # the client loops back with the tool_result as context for a follow-up
+    # turn. We emulate that here: emit only the tool_use + tool_result
+    # blocks, then end the assistant turn with stop_reason=tool_use. The
+    # client (Claude Desktop, Anthropic SDK, etc.) automatically re-sends
+    # the conversation including our tool_result, and the model writes the
+    # real prose reply in the next turn.
+
+    # Event 7: message_delta (stop_reason=tool_use lets the client loop back)
     yield format_sse_event("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens}
+        "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     })
-    
-    # Event N+3: message_stop
+
+    # Event 8: message_stop
     yield format_sse_event("message_stop", {
         "type": "message_stop"
     })
@@ -624,20 +714,36 @@ async def handle_native_web_search(
     
     logger.info(f"WebSearch query (Path A - native): {query}")
     
-    # Call MCP API
+    # Call MCP API.
+    #
+    # Kiro's /mcp endpoint is a gated feature: not every subscription tier or
+    # auth method (Builder ID, kiro-cli OIDC, Enterprise IDC) is entitled to
+    # call it. When it fails we must NOT return an HTTP 500 - Claude Desktop
+    # sees that as a hard error and stalls the conversation ("Searching the
+    # web..." spinner forever). Instead, emit a valid Anthropic
+    # `web_search_tool_result` block with `is_error: true`, which the model
+    # is trained to fall back from and answer with its own knowledge.
     tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
-    
+
     if results is None:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": "Web search failed. Please try again."
-                }
-            }
+        logger.warning(
+            "Native web_search unavailable for this account; returning "
+            "is_error result so the model falls back to its own knowledge"
         )
+        # Fabricate a valid tool_use_id if the MCP call didn't reach the
+        # point where one was generated. Anthropic requires it.
+        tool_use_id = tool_use_id or f"srvtoolu_{uuid.uuid4().hex[:32]}"
+        results = {
+            "results": [],
+            "totalResults": 0,
+            "query": query,
+            "isError": True,
+            "errorMessage": (
+                "web_search unavailable via Kiro on this account "
+                "(likely tier/entitlement restriction). Please answer "
+                "from prior knowledge or ask the user for a URL."
+            ),
+        }
     
     # Count tokens WITHOUT Claude correction (MCP API, not model)
     input_tokens = count_message_tokens(
@@ -673,19 +779,49 @@ async def handle_native_web_search(
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
         )
     else:
-        # Non-streaming mode - return full JSON
+        # Non-streaming mode - return full JSON.
+        #
+        # We emit ONLY the tool_use + tool_result blocks (no visible text
+        # block) and set stop_reason=tool_use so the client loops back with
+        # the structured tool_result as context. This matches Anthropic's
+        # native web_search flow. The old behavior appended a
+        # <web_search>...</web_search> XML summary as a visible text block,
+        # which leaked into Claude Desktop's chat UI as literal tags.
         logger.debug(f"Returning non-streaming web_search response (api_format={api_format})")
-        summary = generate_search_summary(query, results)
-        
-        # Count output tokens WITHOUT Claude correction (MCP API response)
-        output_tokens = count_tokens(summary, apply_claude_correction=False)
-        
+
+        output_tokens = 0
+
+        # Assemble structured tool_result content once for both API shapes.
+        if results.get("isError"):
+            tool_result_content = {
+                "type": "web_search_tool_result_error",
+                "error_code": "unavailable",
+                "error_message": results.get(
+                    "errorMessage",
+                    "web_search unavailable on this account",
+                ),
+            }
+        else:
+            tool_result_content = [
+                {
+                    "type": "web_search_result",
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "encrypted_content": r.get("snippet", ""),
+                    "page_age": None,
+                }
+                for r in results.get("results", [])
+            ]
+
         if api_format == "openai":
-            # OpenAI format: chat.completion
+            # OpenAI chat completions has no server-side-tool block type.
+            # Emulate by emitting a proper tool_calls response so the client
+            # re-sends the conversation for the model to write prose. The
+            # `content` stays empty - no leaked XML summary.
             from kiro.utils import generate_completion_id
             completion_id = generate_completion_id()
             created_time = int(time.time())
-            
+
             full_response = {
                 "id": completion_id,
                 "object": "chat.completion",
@@ -695,31 +831,26 @@ async def handle_native_web_search(
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": summary
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tool_use_id,
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": json.dumps({"query": query}),
+                            },
+                        }],
                     },
-                    "finish_reason": "stop"
+                    "finish_reason": "tool_calls",
                 }],
                 "usage": {
                     "prompt_tokens": input_tokens,
                     "completion_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens
-                }
+                    "total_tokens": input_tokens + output_tokens,
+                },
             }
         else:  # anthropic
-            # Anthropic format: message
             message_id = f"msg_{uuid.uuid4().hex[:24]}"
-            
-            # Build search results content
-            search_content = []
-            for r in results.get("results", []):
-                search_content.append({
-                    "type": "web_search_result",
-                    "title": r.get("title", ""),
-                    "url": r.get("url", ""),
-                    "encrypted_content": r.get("snippet", ""),
-                    "page_age": None
-                })
-            
             full_response = {
                 "id": message_id,
                 "type": "message",
@@ -729,25 +860,24 @@ async def handle_native_web_search(
                         "type": "server_tool_use",
                         "id": tool_use_id,
                         "name": "web_search",
-                        "input": {"query": query}
+                        "input": {"query": query},
                     },
                     {
                         "type": "web_search_tool_result",
                         "tool_use_id": tool_use_id,
-                        "content": search_content
+                        "content": tool_result_content,
                     },
-                    {
-                        "type": "text",
-                        "text": summary
-                    }
+                    # No trailing `text` block on purpose. The model will
+                    # compose its reply from the tool_result on the next
+                    # turn when the client resends the conversation.
                 ],
                 "model": request_data.model,
-                "stop_reason": "end_turn",
+                "stop_reason": "tool_use",
                 "stop_sequence": None,
                 "usage": {
                     "input_tokens": input_tokens,
-                    "output_tokens": output_tokens
-                }
+                    "output_tokens": output_tokens,
+                },
             }
-        
+
         return JSONResponse(content=full_response)

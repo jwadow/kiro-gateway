@@ -31,10 +31,11 @@ This module formats Kiro events into Anthropic SSE format:
 Reference: https://docs.anthropic.com/en/api/messages-streaming
 """
 
+import asyncio
 import json
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
+from typing import TYPE_CHECKING, AsyncGenerator, AsyncIterator, Dict, List, Optional, Any
 
 import httpx
 from loguru import logger
@@ -83,6 +84,61 @@ def format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
         Formatted SSE string
     """
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+# Anthropic's spec doesn't require ping cadence, but real Anthropic streams send
+# `event: ping` roughly every 15s during long generations. Some clients (browsers,
+# reverse proxies, TLS terminators) will kill idle SSE sockets - Claude Desktop in
+# particular disconnects if it goes >~30s without any event during long
+# tool/thinking runs. Emitting a ping keepalive prevents that.
+ANTHROPIC_STREAM_PING_INTERVAL_SECONDS: float = 15.0
+
+
+async def _iter_with_ping(
+    source: AsyncIterator[str],
+    interval: float = ANTHROPIC_STREAM_PING_INTERVAL_SECONDS,
+) -> AsyncGenerator[str, None]:
+    """
+    Yield items from ``source``, injecting `event: ping` whenever the upstream
+    goes idle for longer than ``interval`` seconds.
+
+    Ping events are part of Anthropic's public streaming spec and clients ignore
+    unknown ping payloads, so this is safe for any Anthropic-compatible consumer.
+
+    Args:
+        source: Async iterator producing Anthropic-shaped SSE strings.
+        interval: Idle window (seconds) before a ping is emitted.
+
+    Yields:
+        Either an upstream chunk or a synthesized ping event.
+    """
+    if interval <= 0:
+        async for item in source:
+            yield item
+        return
+
+    iterator = source.__aiter__()
+    while True:
+        next_task = asyncio.create_task(iterator.__anext__())
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(asyncio.shield(next_task), timeout=interval)
+                    yield item
+                    break
+                except asyncio.TimeoutError:
+                    yield format_sse_event("ping", {"type": "ping"})
+                    continue
+        except StopAsyncIteration:
+            return
+        except BaseException:
+            if not next_task.done():
+                next_task.cancel()
+                try:
+                    await next_task
+                except BaseException:
+                    pass
+            raise
 
 
 def generate_thinking_signature() -> str:
@@ -200,6 +256,16 @@ async def stream_kiro_to_anthropic(
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
+
+    # Set when Path B intercepts a web_search tool_use and emits the
+    # server_tool_use + web_search_tool_result blocks directly. In that
+    # case we must force stop_reason=tool_use even though tool_blocks
+    # stays empty (server-side tools don't route through tool_blocks).
+    # Claude Desktop rejects a message whose last content block is
+    # web_search_tool_result but whose stop_reason is anything other
+    # than tool_use ("[ede_diagnostic] result_type=assistant
+    # last_content_type=web_search_tool_result stop_reason=end_turn").
+    emitted_server_tool: bool = False
     
     try:
         # Send message_start event
@@ -438,32 +504,25 @@ async def stream_kiro_to_anthropic(
                             "index": current_block_index
                         })
                         current_block_index += 1
-                        
-                        # Event: content_block_start (text)
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {"type": "text", "text": ""}
-                        })
-                        
-                        # Events: content_block_delta (text_delta) - stream summary
-                        summary = generate_search_summary(query, results)
-                        chunk_size = 100
-                        for i in range(0, len(summary), chunk_size):
-                            chunk = summary[i:i + chunk_size]
-                            yield format_sse_event("content_block_delta", {
-                                "type": "content_block_delta",
-                                "index": current_block_index,
-                                "delta": {"type": "text_delta", "text": chunk}
-                            })
-                        
-                        # Event: content_block_stop (text)
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": current_block_index
-                        })
-                        current_block_index += 1
-                        
+
+                        # DELIBERATELY do NOT emit a visible text block with the
+                        # <web_search>...</web_search> XML summary here. That
+                        # summary format was a debugging convenience that leaked
+                        # into Claude Desktop's chat UI as literal `<web_search>`
+                        # tags. Anthropic's native web_search flow keeps the
+                        # tool_result as structured context for the *next* turn -
+                        # the model composes the prose reply from it after the
+                        # client resends the conversation. See the parallel fix
+                        # in kiro/mcp_tools.py (generate_anthropic_web_search_sse).
+
+                        # Force stop_reason=tool_use in the terminal message_delta.
+                        # Claude Desktop validates that a message ending on a
+                        # web_search_tool_result block has stop_reason=tool_use;
+                        # without this flag the outer switch would fall through
+                        # to end_turn because server_tool_use doesn't populate
+                        # tool_blocks.
+                        emitted_server_tool = True
+
                         # Skip normal tool_use processing
                         continue
                 
@@ -634,17 +693,26 @@ async def stream_kiro_to_anthropic(
             if prompt_source != "unknown":
                 input_tokens = prompt_tokens
         
-        # Determine stop reason (truncation has highest priority)
+        # Determine stop reason (truncation has highest priority).
+        # `emitted_server_tool` covers Path B interception where we emitted
+        # a server_tool_use + web_search_tool_result pair; those blocks don't
+        # populate tool_blocks so the elif below would otherwise mis-classify
+        # as end_turn.
         if content_was_truncated:
             stop_reason = "max_tokens"
-        elif tool_blocks:
+        elif tool_blocks or emitted_server_tool:
             stop_reason = "tool_use"
         else:
             stop_reason = "end_turn"
         
-        # Send message_delta with stop_reason and usage
-        usage_payload = {
-            "output_tokens": output_tokens
+        # Send message_delta with stop_reason and usage.
+        # Anthropic's current streaming spec places both input_tokens and
+        # output_tokens in message_delta.usage (input can be refined once the
+        # upstream returns context_usage_percentage). Cache fields are appended
+        # only when the upstream actually emitted them.
+        usage_payload: Dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         }
         usage_payload.update(upstream_cache_usage)
 

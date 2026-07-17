@@ -26,6 +26,7 @@ Contains all API endpoints:
 - /v1/chat/completions: Chat completions
 """
 
+import hmac
 import json
 from datetime import datetime, timezone
 
@@ -80,7 +81,9 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
-    if not auth_header or auth_header != f"Bearer {PROXY_API_KEY}":
+    # Constant-time comparison to avoid timing side-channel attacks against PROXY_API_KEY.
+    expected = f"Bearer {PROXY_API_KEY}"
+    if not auth_header or not hmac.compare_digest(auth_header, expected):
         logger.warning("Access attempt with invalid API key.")
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return True
@@ -119,22 +122,48 @@ async def health():
         "version": APP_VERSION
     }
 
-@router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
+async def _verify_any_key(
+    auth_header: str = Security(api_key_header),
+    x_api_key: str = Security(APIKeyHeader(name="x-api-key", auto_error=False)),
+) -> bool:
+    """
+    Verify PROXY_API_KEY under either OpenAI-style ``Authorization: Bearer ...``
+    or Anthropic-style ``x-api-key``.
+
+    Used only by /v1/models, which is shared between OpenAI and Anthropic
+    clients (Claude Desktop's third-party inference dropdown reads it via
+    x-api-key).
+    """
+    expected_bearer = f"Bearer {PROXY_API_KEY}"
+    if auth_header and hmac.compare_digest(auth_header, expected_bearer):
+        return True
+    if x_api_key and hmac.compare_digest(x_api_key, PROXY_API_KEY):
+        return True
+
+    logger.warning("Access attempt with invalid API key on /v1/models.")
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+
+@router.get("/v1/models", dependencies=[Depends(_verify_any_key)])
 async def get_models(request: Request):
     """
     Return list of available models.
-    
-    Models are loaded at startup (blocking) and cached.
-    This endpoint returns the cached list.
-    
+
+    Emits a hybrid envelope that satisfies both OpenAI SDKs (``object: "list"``,
+    per-item ``object`` / ``created`` / ``owned_by``) and Anthropic SDKs
+    (per-item ``type: "model"`` / ``display_name`` / ``created_at`` plus the
+    ``has_more`` / ``first_id`` / ``last_id`` cursor fields). Anthropic clients
+    ignore the OpenAI-only fields and vice-versa, so a single endpoint serves
+    both client families.
+
     Args:
-        request: FastAPI Request for accessing app.state
-    
+        request: FastAPI Request for accessing app.state.
+
     Returns:
-        ModelList with available models in consistent format (with dots)
+        JSON payload compatible with both API schemas.
     """
     logger.info("Request to /v1/models")
-    
+
     # Get available models based on mode
     if request.app.state.account_system:
         # Account system: collect models from all initialized accounts
@@ -143,18 +172,55 @@ async def get_models(request: Request):
         # Legacy: use resolver from first account
         account = request.app.state.account_manager.get_first_account()
         available_model_ids = account.model_resolver.get_available_models()
-    
-    # Build OpenAI-compatible model list
-    openai_models = [
-        OpenAIModel(
-            id=model_id,
-            owned_by="anthropic",
-            description="Claude model via Kiro API"
-        )
-        for model_id in available_model_ids
-    ]
-    
-    return ModelList(data=openai_models)
+
+    # Local import avoids a circular dependency with routes_anthropic and keeps
+    # the display-name helper in one place.
+    from kiro.routes_anthropic import _anthropic_public_alias, _humanize_model_id
+
+    now = int(datetime.now(timezone.utc).timestamp())
+
+    def _entry(model_id: str) -> dict:
+        return {
+            # OpenAI fields
+            "id": model_id,
+            "object": "model",
+            "created": now,
+            "owned_by": "anthropic",
+            "description": "Claude model via Kiro API",
+            # Anthropic fields
+            "type": "model",
+            "display_name": _humanize_model_id(model_id),
+            "created_at": "2025-01-01T00:00:00Z",
+        }
+
+    # Emit each model once under its canonical Kiro id AND (for Claude models
+    # whose version segment uses a dot) a dash-form alias. The dash form is
+    # what Claude Desktop's in-chat model picker whitelists; without it, the
+    # dot-form ids show up as "Unavailable" in the picker even though they
+    # work over the wire. normalize_model_name() handles the reverse mapping
+    # on incoming requests, so both ids route to the same Kiro model.
+    data: list = []
+    seen: set = set()
+    for model_id in available_model_ids:
+        if model_id not in seen:
+            data.append(_entry(model_id))
+            seen.add(model_id)
+        alias = _anthropic_public_alias(model_id)
+        if alias and alias not in seen:
+            alias_entry = _entry(alias)
+            # Share the display name of the canonical id so the picker doesn't
+            # show two entries with slightly different labels.
+            alias_entry["display_name"] = _humanize_model_id(model_id)
+            data.append(alias_entry)
+            seen.add(alias)
+
+    return {
+        "object": "list",
+        "data": data,
+        "has_more": False,
+        "first_id": data[0]["id"] if data else None,
+        "last_id": data[-1]["id"] if data else None,
+    }
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])

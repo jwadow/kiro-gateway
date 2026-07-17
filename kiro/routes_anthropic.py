@@ -25,6 +25,7 @@ Contains the /v1/messages endpoint compatible with Anthropic's Messages API.
 Reference: https://docs.anthropic.com/en/api/messages
 """
 
+import hmac
 import json
 from typing import Optional
 
@@ -46,6 +47,7 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.streaming_anthropic import (
+    _iter_with_ping,
     stream_kiro_to_anthropic,
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
@@ -91,14 +93,15 @@ async def verify_anthropic_api_key(
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
+    # Use constant-time comparison to avoid leaking the key via timing.
     # Check x-api-key first (Anthropic native)
-    if x_api_key and x_api_key == PROXY_API_KEY:
+    if x_api_key and hmac.compare_digest(x_api_key, PROXY_API_KEY):
         return True
-    
+
     # Fall back to Authorization: Bearer
-    if authorization and authorization == f"Bearer {PROXY_API_KEY}":
+    if authorization and hmac.compare_digest(authorization, f"Bearer {PROXY_API_KEY}"):
         return True
-    
+
     logger.warning("Access attempt with invalid API key (Anthropic endpoint)")
     raise HTTPException(
         status_code=401,
@@ -146,13 +149,55 @@ async def messages(
         HTTPException: On validation or API errors
     """
     logger.info(f"Request to /v1/messages (model={request_data.model}, stream={request_data.stream})")
-    
+
     if anthropic_version:
         logger.debug(f"Anthropic-Version header: {anthropic_version}")
-    
+
     # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
     # This ensures debug logging works even for requests that fail Pydantic validation (422 errors)
-    
+
+    # Fold any role=="system" messages (which Claude Desktop's third-party
+    # inference feature sends, even though Anthropic's public spec only allows
+    # user/assistant) into the top-level `system` field. We do this BEFORE any
+    # downstream processing so tokenizers, converters, and streaming all see a
+    # canonical shape.
+    system_msgs = [m for m in request_data.messages if m.role == "system"]
+    if system_msgs:
+        extracted_text_parts: list[str] = []
+        for m in system_msgs:
+            if isinstance(m.content, str):
+                if m.content:
+                    extracted_text_parts.append(m.content)
+            elif isinstance(m.content, list):
+                for block in m.content:
+                    # blocks can be Pydantic objects or plain dicts
+                    if isinstance(block, dict):
+                        if block.get("type") == "text" and block.get("text"):
+                            extracted_text_parts.append(block["text"])
+                    else:
+                        btype = getattr(block, "type", None)
+                        btext = getattr(block, "text", None)
+                        if btype == "text" and btext:
+                            extracted_text_parts.append(btext)
+
+        merged_system = "\n\n".join(extracted_text_parts).strip()
+        if merged_system:
+            if request_data.system is None or request_data.system == "":
+                request_data.system = merged_system
+            elif isinstance(request_data.system, str):
+                request_data.system = f"{request_data.system}\n\n{merged_system}"
+            elif isinstance(request_data.system, list):
+                # Preserve existing structured system blocks; append our extracted
+                # text as an additional text block.
+                request_data.system = list(request_data.system) + [
+                    {"type": "text", "text": merged_system}
+                ]
+
+        request_data.messages = [m for m in request_data.messages if m.role != "system"]
+        logger.info(
+            f"Folded {len(system_msgs)} system-role message(s) into top-level system field"
+        )
+
     # Check for truncation recovery opportunities
     from kiro.truncation_state import get_tool_truncation, get_content_truncation
     from kiro.truncation_recovery import generate_truncation_tool_result, generate_truncation_user_message
@@ -447,8 +492,8 @@ async def messages(
                                     return await http_client.request_with_retry(
                                         "POST", url, kiro_payload, stream=True
                                     )
-                                
-                                async for chunk in stream_with_first_token_retry_anthropic(
+
+                                inner_stream = stream_with_first_token_retry_anthropic(
                                     make_request=make_retry_request,
                                     model=request_data.model,
                                     model_cache=model_cache,
@@ -457,7 +502,10 @@ async def messages(
                                     request_messages=messages_for_tokenizer,
                                     request_tools=tools_for_tokenizer,
                                     request_system=system_for_tokenizer,
-                                ):
+                                )
+                                # Interleave with ping keepalives so slow generations don't get
+                                # killed by clients (Claude Desktop) or intermediaries.
+                                async for chunk in _iter_with_ping(inner_stream):
                                     yield chunk
                             except GeneratorExit:
                                 client_disconnected = True
@@ -805,8 +853,7 @@ async def messages(
                             "POST", url, kiro_payload, stream=True
                         )
                     
-                    # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry_anthropic(
+                    inner_stream = stream_with_first_token_retry_anthropic(
                         make_request=make_retry_request,
                         model=request_data.model,
                         model_cache=model_cache,
@@ -815,7 +862,10 @@ async def messages(
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer,
                         request_system=system_for_tokenizer,
-                    ):
+                    )
+                    # Interleave with ping keepalives so slow generations don't get
+                    # killed by clients (Claude Desktop) or intermediaries.
+                    async for chunk in _iter_with_ping(inner_stream):
                         yield chunk
                 except GeneratorExit:
                     client_disconnected = True
@@ -904,6 +954,125 @@ async def messages(
                 }
             }
         )
+
+
+def _humanize_model_id(model_id: str) -> str:
+    """
+    Turn an internal Kiro model id into a display name suitable for Anthropic clients.
+
+    Examples:
+        "claude-opus-4.7"          -> "Claude Opus 4.7"
+        "claude-sonnet-4.6-1m"     -> "Claude Sonnet 4.6 (1M)"
+        "qwen3-coder-next"         -> "Qwen3 Coder Next"
+        "auto"                     -> "Auto"
+    """
+    if not model_id:
+        return model_id
+
+    # Normalize -1m / -200k context tags into a parenthesised suffix
+    ctx_suffix = ""
+    core = model_id
+    for tag, label in (("-1m", "1M"), ("-200k", "200K")):
+        if core.endswith(tag):
+            core = core[: -len(tag)]
+            ctx_suffix = f" ({label})"
+            break
+
+    words = [w for w in core.replace("_", "-").split("-") if w]
+    display = " ".join(w if w.isdigit() else w.capitalize() for w in words)
+    return f"{display}{ctx_suffix}"
+
+
+def _anthropic_public_alias(kiro_id: str) -> Optional[str]:
+    """
+    Return the Anthropic-canonical dash-form id for a Kiro model, if applicable.
+
+    Claude Desktop's in-chat model picker matches gateway `/v1/models` ids
+    against an internal Anthropic whitelist that uses dashes throughout the
+    version (``claude-opus-4-8``, ``claude-sonnet-4-6``) rather than dots
+    (``claude-opus-4.8``, ``claude-sonnet-4.6``). Models whose id contains a
+    dot are marked "Unavailable" in the picker even when they work over the
+    wire. Advertising a parallel dash form makes the picker light them up.
+
+    Only rewrites Claude-family ids (haiku / sonnet / opus) that contain a
+    dot in the version segment. Everything else (``auto``, ``glm-5``,
+    ``gpt-5.6-sol``, ``minimax-m2.5``, ...) returns None to signal "no alias
+    needed"; those either work already or belong to non-Anthropic families
+    Claude Desktop's picker doesn't gate on.
+
+    The reverse direction is already handled by
+    :func:`kiro.model_resolver.normalize_model_name`, which folds dash form
+    back to the internal Kiro dot form on incoming requests.
+
+    Args:
+        kiro_id: Internal Kiro model id (e.g. ``"claude-opus-4.8"``).
+
+    Returns:
+        Dashed alias id (e.g. ``"claude-opus-4-8"``) or None if the model
+        doesn't need one.
+
+    Examples:
+        >>> _anthropic_public_alias("claude-opus-4.8")
+        'claude-opus-4-8'
+        >>> _anthropic_public_alias("claude-sonnet-4.6")
+        'claude-sonnet-4-6'
+        >>> _anthropic_public_alias("claude-sonnet-5") is None
+        True
+        >>> _anthropic_public_alias("glm-5") is None
+        True
+    """
+    if not kiro_id or "." not in kiro_id:
+        return None
+    lowered = kiro_id.lower()
+    if not any(family in lowered for family in ("claude-haiku", "claude-sonnet", "claude-opus")):
+        return None
+    alias = kiro_id.replace(".", "-")
+    return alias if alias != kiro_id else None
+
+
+# NOTE: GET /v1/models is registered on the OpenAI router only.
+# Its handler emits a hybrid envelope that includes the Anthropic-shaped fields
+# (type, display_name, created_at, has_more, first_id, last_id), so Anthropic
+# clients - including Claude Desktop's third-party inference model dropdown -
+# can enumerate models without a second dedicated route.
+
+
+@router.get("/v1/models/{model_id}", dependencies=[Depends(verify_anthropic_api_key)])
+async def get_model_anthropic(request: Request, model_id: str):
+    """
+    Anthropic Models API - retrieve a single model.
+
+    Reference: https://docs.anthropic.com/en/api/models
+    Returns 404 in Anthropic error shape if the id isn't in the catalog.
+    """
+    logger.info(f"Request to /v1/models/{model_id} (Anthropic)")
+
+    if request.app.state.account_system:
+        available_model_ids = request.app.state.account_manager.get_all_available_models()
+    else:
+        account = request.app.state.account_manager.get_first_account()
+        available_model_ids = account.model_resolver.get_available_models()
+
+    if model_id not in available_model_ids:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "not_found_error",
+                    "message": f"model {model_id!r} not found",
+                },
+            },
+        )
+
+    return JSONResponse(
+        content={
+            "type": "model",
+            "id": model_id,
+            "display_name": _humanize_model_id(model_id),
+            "created_at": "2025-01-01T00:00:00Z",
+        }
+    )
 
 
 @router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_anthropic_api_key)])
