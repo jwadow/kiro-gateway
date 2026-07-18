@@ -108,18 +108,55 @@ async def root():
 
 
 @router.get("/health")
-async def health():
+async def health(request: Request):
     """
-    Detailed health check.
-    
+    Detailed health check with token validity.
+
     Returns:
-        Status, timestamp and version
+        Status (healthy/degraded/unhealthy), timestamp, version, and auth info.
+        Returns HTTP 503 when token is expired (for Docker HEALTHCHECK).
     """
-    return {
-        "status": "healthy",
+    auth_status = "unknown"
+    auth_details = {}
+    status = "healthy"
+
+    try:
+        account_manager = getattr(request.app.state, "account_manager", None)
+        if account_manager:
+            accounts = list(account_manager._accounts.values())
+            if accounts:
+                account = accounts[0]
+                if account.auth_manager:
+                    am = account.auth_manager
+                    if am.is_token_expired():
+                        auth_status = "expired"
+                        status = "unhealthy"
+                    elif am.is_token_expiring_soon():
+                        auth_status = "expiring_soon"
+                        status = "degraded"
+                    else:
+                        auth_status = "valid"
+
+                    if am._expires_at:
+                        auth_details["expires_at"] = am._expires_at.isoformat()
+                        remaining = (am._expires_at - datetime.now(timezone.utc)).total_seconds()
+                        auth_details["expires_in_minutes"] = round(remaining / 60, 1)
+                    auth_details["auth_type"] = am.auth_type.value
+    except Exception as e:
+        auth_status = f"check_failed: {e}"
+        status = "degraded"
+
+    response_data = {
+        "status": status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": APP_VERSION
+        "version": APP_VERSION,
+        "auth": auth_status,
+        **auth_details,
     }
+
+    if status == "unhealthy":
+        return JSONResponse(content=response_data, status_code=503)
+    return response_data
 
 @router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
 async def get_models(request: Request):
