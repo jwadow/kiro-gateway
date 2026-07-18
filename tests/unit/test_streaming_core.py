@@ -1064,29 +1064,29 @@ class TestThinkingParserIntegration:
         events = []
         
         with patch('kiro.streaming_core.AwsEventStreamParser', return_value=mock_parser):
-            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', True):
-                with patch('kiro.streaming_core.ThinkingParser') as mock_thinking_parser_class:
-                    mock_thinking_parser = MagicMock()
-                    mock_thinking_parser.feed.return_value = MagicMock(
-                        thinking_content=None,
-                        regular_content="Hello",
-                        is_first_thinking_chunk=False,
-                        is_last_thinking_chunk=False
-                    )
-                    mock_thinking_parser.finalize.return_value = MagicMock(
-                        thinking_content=None,
-                        regular_content=None,
-                        is_first_thinking_chunk=False,
-                        is_last_thinking_chunk=False
-                    )
-                    mock_thinking_parser.found_thinking_block = False
-                    mock_thinking_parser_class.return_value = mock_thinking_parser
-                    
-                    async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
-                        events.append(event)
-                    
-                    # Verify ThinkingParser was instantiated
-                    mock_thinking_parser_class.assert_called_once()
+            with patch('kiro.streaming_core.NATIVE_REASONING_ENABLED', False):
+                with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', True):
+                    with patch('kiro.streaming_core.ThinkingParser') as mock_thinking_parser_class:
+                        mock_thinking_parser = MagicMock()
+                        mock_thinking_parser.feed.return_value = MagicMock(
+                            thinking_content=None,
+                            regular_content="Hello",
+                            is_first_thinking_chunk=False,
+                            is_last_thinking_chunk=False
+                        )
+                        mock_thinking_parser.finalize.return_value = MagicMock(
+                            thinking_content=None,
+                            regular_content=None,
+                            is_first_thinking_chunk=False,
+                            is_last_thinking_chunk=False
+                        )
+                        mock_thinking_parser.found_thinking_block = False
+                        mock_thinking_parser_class.return_value = mock_thinking_parser
+                        
+                        async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                            events.append(event)
+                        # Verify ThinkingParser was instantiated
+                        mock_thinking_parser_class.assert_called_once()
         
         print("✓ Thinking parser enabled when fake reasoning is on")
     

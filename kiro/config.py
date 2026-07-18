@@ -120,12 +120,31 @@ PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
 #   VPN_PROXY_URL=192.168.1.100:8080  (defaults to http://)
 VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
 
+# Disable proxy API key authentication (default: false)
+# When true, the gateway accepts requests without valid Authorization / x-api-key header.
+# Only use in trusted local environments - do NOT enable on public or shared servers.
+PROXY_AUTH_DISABLED: bool = os.getenv("PROXY_AUTH_DISABLED", "false").lower() in ("true", "1", "yes")
+
 # ==================================================================================================
 # Kiro API Credentials
 # ==================================================================================================
 
 # Refresh token for updating access token
 REFRESH_TOKEN: str = os.getenv("REFRESH_TOKEN", "")
+
+# Kiro IDE profile file used as a fallback source for profileArn.
+DEFAULT_KIRO_PROFILE_FILE: Path = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "Kiro"
+    / "User"
+    / "globalStorage"
+    / "kiro.kiroagent"
+    / "profile.json"
+)
+_raw_profile_file = _get_raw_env_value("KIRO_PROFILE_FILE") or os.getenv("KIRO_PROFILE_FILE", "")
+KIRO_PROFILE_FILE: str = str(Path(_raw_profile_file)) if _raw_profile_file else str(DEFAULT_KIRO_PROFILE_FILE)
 
 # Profile ARN for AWS CodeWhisperer
 PROFILE_ARN: str = os.getenv("PROFILE_ARN", "")
@@ -179,10 +198,17 @@ AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
 # Universal endpoint for all regions (us-east-1, eu-central-1, etc.)
 # See: https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/security-data-perimeter.html
 # Fixed in issue #58 - codewhisperer.{region}.amazonaws.com doesn't exist for non-us-east-1 regions
-KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+KIRO_API_HOST_TEMPLATE: str = os.getenv("KIRO_API_HOST_TEMPLATE", "https://runtime.{region}.kiro.dev")
 
 # Host for Q API (ListAvailableModels)
-KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+KIRO_Q_HOST_TEMPLATE: str = os.getenv("KIRO_Q_HOST_TEMPLATE", "https://runtime.{region}.kiro.dev")
+
+# Host for management API (billing, account info, etc.)
+KIRO_MANAGEMENT_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+
+# Override API host directly (bypasses template-based region resolution).
+# When set, this takes precedence over KIRO_API_HOST_TEMPLATE.
+KIRO_API_HOST_OVERRIDE: str = os.getenv("KIRO_API_HOST", "")
 
 # ==================================================================================================
 # Token Settings
@@ -282,8 +308,10 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "claude-opus-4.5"},
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-4.7"},
+    {"modelId": "claude-opus-4.8"},
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
+    {"modelId": "gpt-5.6-sol"},
     {"modelId": "minimax-m2.1"},
     {"modelId": "minimax-m2.5"},
     {"modelId": "qwen3-coder-next"},
@@ -295,6 +323,15 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
 
 # Model cache TTL in seconds (1 hour)
 MODEL_CACHE_TTL: int = 3600
+
+# Prompt cache accounting TTL in seconds (5 minutes)
+PROMPT_CACHE_TTL_SECONDS: int = int(os.getenv("PROMPT_CACHE_TTL_SECONDS", "300"))
+
+# Enable Anthropic prompt cache usage accounting.
+# This only adds usage fields; responses are never cached.
+PROMPT_CACHE_ACCOUNTING_ENABLED: bool = os.getenv(
+    "PROMPT_CACHE_ACCOUNTING_ENABLED", "true"
+).lower() in ("true", "1", "yes")
 
 # Default maximum number of input tokens
 DEFAULT_MAX_INPUT_TOKENS: int = 200000
@@ -351,7 +388,7 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 # This helps handle "stuck" requests when the model takes too long to think.
 # Default: 30 seconds (recommended for production)
 # Set a lower value (e.g., 10-15) for more aggressive retry.
-FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "15"))
+FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "300"))
 
 # Read timeout for streaming responses (in seconds).
 # This is the maximum time to wait for data between chunks during streaming.
@@ -359,6 +396,10 @@ FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "15"))
 # while "thinking" (especially for tool calls or complex reasoning).
 # Default: 300 seconds (5 minutes) - generous timeout to avoid premature disconnects.
 STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300"))
+
+# Strip billing header from Anthropic API responses (default: true)
+# When enabled, removes billing/usage metadata that may leak internal information.
+STRIP_BILLING_HEADER: bool = os.getenv("STRIP_BILLING_HEADER", "true").lower() in ("true", "1", "yes")
 
 # Maximum number of attempts on first token timeout.
 # After exhausting all attempts, an error will be returned.
@@ -479,6 +520,69 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_
 
 
 # ==================================================================================================
+# Native Reasoning Settings (Extended Thinking via Kiro API)
+# ==================================================================================================
+
+# Enable native reasoning support.
+# When enabled, requests can use the Kiro API's native extended thinking via output_config
+# or reasoning schemas in the payload.
+NATIVE_REASONING_ENABLED: bool = os.getenv("NATIVE_REASONING", "").lower() not in ("false", "0", "no", "disabled", "off")
+
+# Maps model IDs to their supported reasoning schema type.
+# "output_config" models use outputConfig.effortLevel in the payload.
+# "reasoning" models use a different reasoning block format.
+NATIVE_EFFORT_SCHEMA_BY_MODEL: dict = {
+    "auto": "output_config",
+    "claude-opus-4.6": "output_config",
+    "claude-opus-4.7": "output_config",
+    "claude-opus-4.8": "output_config",
+    "claude-sonnet-4.6": "output_config",
+    "gpt-5.6-sol": "reasoning",
+}
+
+# Valid effort levels accepted by the Kiro API.
+VALID_EFFORT_LEVELS: list = ["low", "medium", "high", "xhigh", "max"]
+
+# Common aliases that map to canonical effort level strings.
+EFFORT_LEVEL_ALIASES: dict = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+
+# Default effort level when the client does not specify one.
+_DEFAULT_EFFORT_RAW: str = os.getenv("DEFAULT_EFFORT_LEVEL", "").lower().strip()
+DEFAULT_EFFORT_LEVEL: Optional[str] = (
+    EFFORT_LEVEL_ALIASES.get(_DEFAULT_EFFORT_RAW)
+    if _DEFAULT_EFFORT_RAW in EFFORT_LEVEL_ALIASES
+    else None
+)
+
+
+# ==================================================================================================
+# Native Thinking Settings
+# ==================================================================================================
+
+# Native thinking mode - controls how the gateway handles thinking/reasoning.
+# - "off": Native thinking is disabled (default)
+# - "auto": Enable if client requests thinking via thinking budget
+# - "force": Always inject thinking mode regardless of client request
+KIRO_NATIVE_THINKING_MODE: str = os.getenv("KIRO_NATIVE_THINKING_MODE", "off").lower()
+if KIRO_NATIVE_THINKING_MODE not in ("off", "auto", "force"):
+    KIRO_NATIVE_THINKING_MODE = "off"
+
+# How to display thinking content in responses:
+# - "summarized": Show a short summary of the thinking process
+# - "omitted": Do not include thinking content in the response
+KIRO_NATIVE_THINKING_DISPLAY: str = os.getenv("KIRO_NATIVE_THINKING_DISPLAY", "summarized").lower()
+if KIRO_NATIVE_THINKING_DISPLAY not in ("summarized", "omitted"):
+    KIRO_NATIVE_THINKING_DISPLAY = "summarized"
+
+
+# ==================================================================================================
 # Payload Size Guard Settings
 # ==================================================================================================
 
@@ -555,7 +659,7 @@ STATE_SAVE_INTERVAL_SECONDS: int = int(os.getenv("STATE_SAVE_INTERVAL_SECONDS", 
 # Application Version
 # ==================================================================================================
 
-APP_VERSION: str = "2.4.dev.13"
+APP_VERSION: str = "2.5"
 APP_TITLE: str = "Kiro Gateway"
 APP_DESCRIPTION: str = "Proxy gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible. Made by @jwadow"
 
@@ -578,4 +682,9 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_management_host(region: str) -> str:
+    """Return management host for the specified region."""
+    return KIRO_MANAGEMENT_HOST_TEMPLATE.format(region=region)
 

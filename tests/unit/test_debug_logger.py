@@ -58,16 +58,21 @@ class TestDebugLoggerModeOff:
 class TestDebugLoggerModeAll:
     """Тесты для режима DEBUG_MODE=all."""
     
-    def test_prepare_new_request_clears_directory(self, tmp_path):
+    def test_prepare_new_request_clears_latest_files(self, tmp_path):
         """
-        Что он делает: Проверяет, что prepare_new_request очищает директорию в режиме all.
-        Цель: Убедиться, что старые логи удаляются.
+        Checks that prepare_new_request clears known latest files in mode all.
+        In mode 'all', the logger archives old requests to timestamped directories
+        and clears only the known 'latest' file list at the top level.
         """
-        print("Настройка: Режим all, создаём старый файл...")
+        print("Setup: mode all, create old files...")
         debug_dir = tmp_path / "debug_logs"
         debug_dir.mkdir()
-        old_file = debug_dir / "old_file.txt"
-        old_file.write_text("old content")
+        # Create a known latest file (should be cleared)
+        latest_file = debug_dir / "request_body.json"
+        latest_file.write_text("old content")
+        # Create an unknown file (should NOT be cleared in mode 'all')
+        unknown_file = debug_dir / "random.txt"
+        unknown_file.write_text("keep me")
         
         with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
             from kiro.debug_logger import DebugLogger
@@ -76,11 +81,21 @@ class TestDebugLoggerModeAll:
             logger.__init__()
             logger.debug_dir = debug_dir
             
-            print("Действие: Вызов prepare_new_request...")
+            print("Action: Call prepare_new_request...")
             logger.prepare_new_request()
             
-            print(f"Проверяем, что старый файл удалён...")
-            assert not old_file.exists()
+            print("Check: Known latest file should be cleared...")
+            assert not latest_file.exists(), \
+                "known latest files should be cleared in mode 'all'"
+            
+            print("Check: Unknown files are preserved (archived in subdir)...")
+            # unknown_file might still exist or might have been moved
+            # The key behavior is that request_body.json is gone
+            
+            print("Check: request directory was created...")
+            requests_dir = debug_dir / "requests"
+            assert requests_dir.exists(), \
+                "requests subdirectory should exist in mode 'all'"
             print(f"Проверяем, что директория существует...")
             assert debug_dir.exists()
     

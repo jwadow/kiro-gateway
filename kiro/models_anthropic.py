@@ -65,6 +65,20 @@ class ThinkingContentBlock(BaseModel):
     signature: str = ""
 
 
+class RedactedThinkingContentBlock(BaseModel):
+    """
+    Redacted thinking content block in Anthropic format.
+
+    Claude may return encrypted reasoning when extended thinking is enabled.
+    Clients can replay these blocks in later requests; the gateway accepts
+    them for schema compatibility without exposing the opaque data as prompt
+    text.
+    """
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
+
+
 class ToolUseContentBlock(BaseModel):
     """
     Tool use content block in Anthropic format.
@@ -162,14 +176,108 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
-# Union type for all content blocks (including images and thinking)
+class Base64DocumentSource(BaseModel):
+    """
+    Base64-encoded document source in Anthropic format.
+
+    Anthropic supports PDF documents as content blocks. Kiro does not expose a
+    matching document input field, so converters extract text from supported
+    documents and append it to the prompt.
+    """
+
+    type: Literal["base64"] = "base64"
+    media_type: str
+    data: str
+
+
+class DocumentContentBlock(BaseModel):
+    """
+    Document content block in Anthropic format.
+    """
+
+    type: Literal["document"] = "document"
+    source: Base64DocumentSource
+    title: Optional[str] = None
+
+    model_config = {"extra": "allow"}
+
+
+# ==================================================================================================
+# Server-Side Tool Content Block Models
+# ==================================================================================================
+
+
+class ServerToolUseContentBlock(BaseModel):
+    """
+    Server-side tool use block (Anthropic server tools).
+
+    Emitted by Anthropic server-side tools such as web_search, web_fetch and
+    code_execution, then replayed back into the conversation history by clients
+    like Claude Code. Accepted for validation only; the converters extract just
+    text/tool_use/tool_result blocks, so the raw server-tool call is ignored.
+    """
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultContentBlock(BaseModel):
+    """
+    Web search tool result block (Anthropic server tool).
+
+    Paired with a ServerToolUseContentBlock, this carries the search results
+    returned by Anthropic's server-side web_search tool. The ``content`` field
+    is a list of provider-specific result objects (or an error object), so it is
+    kept loosely typed. Accepted for validation; not forwarded to Kiro.
+    """
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Union[List[Dict[str, Any]], Dict[str, Any], str, None] = None
+
+    model_config = {"extra": "allow"}
+
+
+class UnknownContentBlock(BaseModel):
+    """
+    Forward-compatible fallback for unrecognized content blocks.
+
+    Anthropic periodically ships new server-side tool block types (e.g.
+    code_execution_tool_result, mcp_tool_use). Rather than 422 on every new
+    block, we accept any block that carries a ``type`` string and preserve its
+    extra fields. The converters ignore blocks they do not explicitly handle,
+    so unknown blocks are dropped safely instead of breaking the request.
+
+    MUST be the last member of the ContentBlock union: as a catch-all with only
+    a ``type: str`` field it would otherwise shadow the specific typed blocks
+    under Pydantic union resolution.
+    """
+
+    type: str
+
+    model_config = {"extra": "allow"}
+
+
+# Union type for all content blocks (including images and thinking).
+# Server-side tool blocks (server_tool_use, web_search_tool_result) are accepted
+# so clients replaying Anthropic server-tool output into history don't 422; the
+# catch-all UnknownContentBlock MUST stay last so it does not shadow typed blocks.
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
+    RedactedThinkingContentBlock,
     ImageContentBlock,
+    DocumentContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
+    UnknownContentBlock,
 ]
 
 
@@ -183,11 +291,14 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Anthropic spec only allows user/assistant, but newer
+            Claude Code clients sometimes inline "system" messages in the array.
+            We accept it here and let normalize_message_roles() in converters_core
+            collapse it to "user" downstream.
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

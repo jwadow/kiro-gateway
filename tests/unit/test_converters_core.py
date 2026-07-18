@@ -3537,9 +3537,10 @@ class TestInjectThinkingTags:
         content = "What is 2+2?"
         
         print("Action: Inject thinking tags with FAKE_REASONING_ENABLED=True...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print(f"Result: {result[:200]}...")
         print("Checking that thinking_mode tag is present...")
@@ -3560,9 +3561,10 @@ class TestInjectThinkingTags:
         content = "Analyze this code"
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 8000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 8000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print(f"Result length: {len(result)} chars")
         print("Checking that thinking_instruction tag is present...")
@@ -3578,9 +3580,10 @@ class TestInjectThinkingTags:
         content = "Test"
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print("Checking for English directive...")
         assert "Think in English" in result
@@ -3594,10 +3597,11 @@ class TestInjectThinkingTags:
         content = "Test"
         
         print("Action: Inject thinking tags with FAKE_REASONING_MAX_TOKENS=16000...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 16000):
-                with patch('kiro.converters_core.FAKE_REASONING_BUDGET_CAP', 0):  # Disable cap
-                    result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 16000):
+                    with patch('kiro.converters_core.FAKE_REASONING_BUDGET_CAP', 0):  # Disable cap
+                        result = inject_thinking_tags(content, ThinkingConfig())
         
         print(f"Result: {result[:300]}...")
         print("Checking that max_thinking_length uses configured value...")
@@ -3612,9 +3616,10 @@ class TestInjectThinkingTags:
         content = ""
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print(f"Result length: {len(result)} chars")
         print("Checking that tags are present even with empty content...")
@@ -3630,9 +3635,10 @@ class TestInjectThinkingTags:
         content = "Line 1\nLine 2\nLine 3"
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print("Checking that multiline content is preserved...")
         assert "Line 1\nLine 2\nLine 3" in result
@@ -3646,9 +3652,10 @@ class TestInjectThinkingTags:
         content = "Check this <code>example</code> and {json: 'value'}"
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print("Checking that special characters are preserved...")
         assert "<code>example</code>" in result
@@ -3663,9 +3670,10 @@ class TestInjectThinkingTags:
         content = "Test"
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print("Checking for systematic approach keywords...")
         assert "thorough" in result.lower() or "systematic" in result.lower()
@@ -3679,9 +3687,10 @@ class TestInjectThinkingTags:
         content = "Test"
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print("Checking for understanding step...")
         assert "understand" in result.lower()
@@ -3695,9 +3704,10 @@ class TestInjectThinkingTags:
         content = "Test"
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print("Checking for verification step...")
         assert "verify" in result.lower()
@@ -3711,9 +3721,10 @@ class TestInjectThinkingTags:
         content = "Test"
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print("Checking for quality emphasis...")
         assert "quality" in result.lower()
@@ -3727,9 +3738,10 @@ class TestInjectThinkingTags:
         content = "USER_CONTENT_HERE"
         
         print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags(content, ThinkingConfig())
         
         print("Checking tag order...")
         thinking_mode_pos = result.find("<thinking_mode>")
@@ -5715,11 +5727,18 @@ class TestBuildKiroPayloadImages:
         print(f"History length: {len(history)}")
         assert len(history) >= 1
         
-        print("Checking that first history message has images directly in userInputMessage (Issue #32 fix)...")
-        first_msg = history[0]["userInputMessage"]
-        assert "images" in first_msg
+        print("Checking that a history message has images directly in userInputMessage (Issue #32 fix)...")
+        # Find the history entry with images (may not be first due to system history entries)
+        history_msg_with_images = None
+        for entry in history:
+            if "userInputMessage" in entry:
+                msg = entry["userInputMessage"]
+                if "images" in msg:
+                    history_msg_with_images = msg
+                    break
+        assert history_msg_with_images is not None, "No history entry with images found"
         
-        images = first_msg["images"]
+        images = history_msg_with_images["images"]
         print(f"History images: {images}")
         assert len(images) == 1
         assert images[0]["format"] == "jpeg"
@@ -5914,17 +5933,18 @@ class TestBuildKiroPayloadImages:
         ]
         
         print("Action: Building Kiro payload with thinking injection...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = build_kiro_payload(
-                    messages=messages,
-                    system_prompt="",
-                    model_id="claude-sonnet-4",
-                    tools=None,
-                    conversation_id="test-conv",
-                    profile_arn="arn:test",
-                    thinking_config=ThinkingConfig(enabled=True)
-                )
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = build_kiro_payload(
+                        messages=messages,
+                        system_prompt="",
+                        model_id="claude-sonnet-4",
+                        tools=None,
+                        conversation_id="test-conv",
+                        profile_arn="arn:test",
+                        thinking_config=ThinkingConfig(enabled=True)
+                    )
         
         current_msg = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
         
@@ -6301,6 +6321,7 @@ class TestInjectThinkingTagsWithConfig:
         Purpose: Ensure client can disable thinking per-request
         """
         print("Setting FAKE_REASONING_ENABLED=True...")
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
         
         config = ThinkingConfig(enabled=False, budget_tokens=None)
@@ -6318,6 +6339,7 @@ class TestInjectThinkingTagsWithConfig:
         Purpose: Ensure default budget fallback works
         """
         print("Setting FAKE_REASONING_ENABLED=True, FAKE_REASONING_MAX_TOKENS=4000...")
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_MAX_TOKENS", 4000)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000)
@@ -6339,6 +6361,7 @@ class TestInjectThinkingTagsWithConfig:
         Purpose: Ensure client-provided budget is respected
         """
         print("Setting FAKE_REASONING_ENABLED=True...")
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000)
         
@@ -6361,6 +6384,7 @@ class TestInjectThinkingTagsWithConfig:
         from unittest.mock import patch, call
         
         print("Setting FAKE_REASONING_ENABLED=True, cap=10000...")
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000)
         
@@ -6391,6 +6415,7 @@ class TestInjectThinkingTagsWithConfig:
         Purpose: Ensure cap doesn't affect budgets below limit
         """
         print("Setting FAKE_REASONING_ENABLED=True, cap=10000...")
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000)
         
@@ -6409,6 +6434,7 @@ class TestInjectThinkingTagsWithConfig:
         Purpose: Ensure users can disable capping
         """
         print("Setting FAKE_REASONING_ENABLED=True, cap=0 (disabled)...")
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 0)
         
@@ -6431,6 +6457,7 @@ class TestBuildKiroPayloadWithThinkingConfig:
         Purpose: Ensure thinking configuration flows through the pipeline
         """
         print("Setting up mocks...")
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000)
         

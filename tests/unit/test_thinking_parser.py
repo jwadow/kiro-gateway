@@ -949,9 +949,10 @@ class TestInjectThinkingTags:
         print("Testing tag injection when enabled...")
         from kiro.converters_core import inject_thinking_tags, ThinkingConfig
         
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags("Hello", ThinkingConfig())
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = inject_thinking_tags("Hello", ThinkingConfig())
         
         print(f"Result: '{result}'")
         assert "<thinking_mode>enabled</thinking_mode>" in result

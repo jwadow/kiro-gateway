@@ -64,6 +64,74 @@ from kiro.account_errors import ErrorType
 from kiro.http_client import KiroHttpClient
 
 
+KIRO_IDE_PROFILE_PATHS = (
+    Path.home() / "Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/profile.json",
+    Path.home() / ".config/Kiro/User/globalStorage/kiro.kiroagent/profile.json",
+)
+MODEL_CATALOG_MAX_RESULTS = 50
+MODEL_CATALOG_MAX_PAGES = 10
+
+
+def _resolve_model_profile_arn(auth_manager: KiroAuthManager) -> Optional[str]:
+    """
+    Resolve the profile ARN required by Kiro's model control plane.
+
+    Refreshed Kiro IDE credential files may omit profileArn even though the IDE
+    persists the selected profile separately. This mirrors the IDE lookup while
+    still preferring an ARN explicitly supplied with gateway credentials.
+
+    Args:
+        auth_manager: Authenticated Kiro account.
+
+    Returns:
+        A Kiro profile ARN, or None when no valid local profile is available.
+    """
+    if auth_manager.profile_arn:
+        return auth_manager.profile_arn
+
+    for profile_path in KIRO_IDE_PROFILE_PATHS:
+        try:
+            with profile_path.open("r", encoding="utf-8") as profile_file:
+                profile_data = json.load(profile_file)
+        except FileNotFoundError:
+            continue
+        except (OSError, json.JSONDecodeError) as error:
+            logger.warning(
+                f"Unable to read Kiro IDE profile cache at {profile_path}: {error}"
+            )
+            continue
+
+        profile_arn = profile_data.get("arn")
+        if isinstance(profile_arn, str) and profile_arn.startswith("arn:"):
+            logger.debug(f"Using Kiro IDE profile cache at {profile_path}")
+            return profile_arn
+
+        logger.warning(f"Kiro IDE profile cache at {profile_path} has no valid ARN")
+
+    return None
+
+
+def _get_model_catalog_url(auth_manager: KiroAuthManager) -> str:
+    """
+    Return the control-plane endpoint for the account's Kiro region.
+
+    Args:
+        auth_manager: Authenticated Kiro account.
+
+    Returns:
+        Kiro List-Available-Models endpoint URL.
+    """
+    if "://runtime." in auth_manager.q_host:
+        control_plane_host = auth_manager.q_host.replace(
+            "://runtime.",
+            "://management.",
+            1,
+        )
+    else:
+        control_plane_host = f"https://management.{auth_manager.region}.kiro.dev"
+    return f"{control_plane_host}/List-Available-Models"
+
+
 def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
     """
     Check if auth manager uses runtime endpoint that doesn't provide /ListAvailableModels.
@@ -641,6 +709,27 @@ class AccountManager:
         
         finally:
             await http_client.close()
+    
+    async def refresh_initialized_account_models(self) -> None:
+        """
+        Refresh model lists for every initialized account.
+
+        This is used by the public model-list endpoint so that additions and
+        removals made by Kiro are visible on the next client request. A failed
+        refresh preserves the last successfully fetched cache for that account.
+
+        Returns:
+            None.
+        """
+        async with self._lock:
+            initialized_account_ids = [
+                account_id
+                for account_id, account in self._accounts.items()
+                if account.auth_manager and account.model_cache and account.model_resolver
+            ]
+
+            for account_id in initialized_account_ids:
+                await self._refresh_account_models(account_id)
     
     async def get_next_account(self, model: str, exclude_accounts: Optional[set] = None) -> Optional[Account]:
         """

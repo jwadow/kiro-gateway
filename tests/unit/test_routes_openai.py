@@ -970,13 +970,13 @@ class TestHTTPClientSelection:
         except Exception:
             pass
         
-        print("Checking: KiroHttpClient(shared_client=app.state.http_client)...")
+        print("Checking: KiroHttpClient(shared_client=None)...")
         assert mock_kiro_http_client_class.called
         call_args = mock_kiro_http_client_class.call_args
         print(f"Call args: {call_args}")
-        assert call_args[1]['shared_client'] is not None, \
-            "Non-streaming should use shared client"
-        print("✅ Non-streaming correctly uses shared client")
+        assert call_args[1]['shared_client'] is None, \
+            "All requests now use per-request clients (shared_client=None) for runtime stability"
+        print("✅ Non-streaming correctly uses per-request client")
 
 
 # =============================================================================

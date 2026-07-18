@@ -1493,11 +1493,21 @@ class TestAnthropicToKiro:
                 result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
 
         print(f"Result: {result}")
-        current_content = result["conversationState"]["currentMessage"][
-            "userInputMessage"
-        ]["content"]
-        print(f"Current content: {current_content}")
-        assert "You are a helpful assistant." in current_content
+        # System prompt now goes into history via build_kiro_system_history
+        history = result["conversationState"].get("history", [])
+        found_system = False
+        for entry in history:
+            if "userInputMessage" in entry:
+                content = entry["userInputMessage"].get("content", "")
+                if isinstance(content, str) and "You are a helpful assistant." in content:
+                    found_system = True
+                    break
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and "You are a helpful assistant." in str(block.get("text", "")):
+                            found_system = True
+                            break
+        assert found_system, f"System prompt not found in history. History: {history}"
 
     def test_includes_tools(self):
         """
@@ -1565,9 +1575,13 @@ class TestAnthropicToKiro:
         print(f"Result: {result}")
         history = result["conversationState"].get("history", [])
         print(f"History length: {len(history)}")
-        assert len(history) == 2  # First user + assistant
-        assert "userInputMessage" in history[0]
-        assert "assistantResponseMessage" in history[1]
+        # History includes system history entries + conversation history
+        assert len(history) >= 2  # At least conversation history
+        # Find conversation history entries (skip system history)
+        user_msgs = [h for h in history if "userInputMessage" in h and h["userInputMessage"].get("content") != ""]
+        assistant_msgs = [h for h in history if "assistantResponseMessage" in h and h["assistantResponseMessage"].get("content") != ""]
+        assert len(user_msgs) >= 1, "Should have at least one user message"
+        assert len(assistant_msgs) >= 1, "Should have at least one assistant message"
 
     def test_handles_tool_use_and_result_flow(self):
         """
@@ -1676,9 +1690,10 @@ class TestAnthropicToKiro:
             "kiro.converters_anthropic.get_model_id_for_kiro",
             return_value="claude-sonnet-4.5",
         ):
-            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
-                with patch("kiro.converters_core.FAKE_REASONING_MAX_TOKENS", 4000):
-                    result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+            with patch("kiro.converters_core.NATIVE_REASONING_ENABLED", False):
+                with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+                    with patch("kiro.converters_core.FAKE_REASONING_MAX_TOKENS", 4000):
+                        result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
 
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"][
@@ -1726,9 +1741,10 @@ class TestAnthropicToKiro:
             "kiro.converters_anthropic.get_model_id_for_kiro",
             return_value="claude-sonnet-4.5",
         ):
-            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
-                with patch("kiro.converters_core.FAKE_REASONING_MAX_TOKENS", 4000):
-                    result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+            with patch("kiro.converters_core.NATIVE_REASONING_ENABLED", False):
+                with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+                    with patch("kiro.converters_core.FAKE_REASONING_MAX_TOKENS", 4000):
+                        result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
 
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"][
@@ -1873,9 +1889,10 @@ class TestAnthropicToKiroIntegration:
         
         print("Calling anthropic_to_kiro...")
         with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4.5"):
-            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
-                with patch("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000):
-                    payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+            with patch("kiro.converters_core.NATIVE_REASONING_ENABLED", False):
+                with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+                    with patch("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000):
+                        payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
         
         print("Extracting userInputMessage content...")
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
