@@ -267,6 +267,7 @@ class KiroAuthManager:
         Args:
             db_path: Path to SQLite database file
         """
+        conn = None
         try:
             path = Path(db_path).expanduser()
             if not path.exists():
@@ -371,7 +372,6 @@ class KiroAuthManager:
             except Exception as e:
                 logger.debug(f"Failed to auto-detect API region from profile ARN: {e}")
 
-            conn.close()
             logger.info(f"Credentials loaded from SQLite database: {db_path}")
             
         except sqlite3.Error as e:
@@ -380,6 +380,9 @@ class KiroAuthManager:
             logger.error(f"JSON decode error in SQLite data: {e}")
         except Exception as e:
             logger.error(f"Error loading credentials from SQLite: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
     
     def _load_credentials_from_file(self, file_path: str) -> None:
         """
@@ -544,6 +547,7 @@ class KiroAuthManager:
             logger.debug("SQLite write-back disabled (SQLITE_READONLY=true)")
             return
         
+        conn = None
         try:
             path = Path(self._sqlite_db).expanduser()
             if not path.exists():
@@ -558,7 +562,6 @@ class KiroAuthManager:
             if self._sqlite_token_key:
                 if self._try_save_to_key(cursor, self._sqlite_token_key):
                     conn.commit()
-                    conn.close()
                     logger.debug(f"Credentials saved to SQLite key: {self._sqlite_token_key} (merged)")
                     return
                 else:
@@ -568,18 +571,19 @@ class KiroAuthManager:
             for key in SQLITE_TOKEN_KEYS:
                 if self._try_save_to_key(cursor, key):
                     conn.commit()
-                    conn.close()
                     logger.debug(f"Credentials saved to SQLite key: {key} (fallback, merged)")
                     return
             
             # If we get here, no keys were updated
-            conn.close()
             logger.warning(f"Failed to save credentials to SQLite: no matching keys found")
             
         except sqlite3.Error as e:
             logger.error(f"SQLite error saving credentials: {e}")
         except Exception as e:
             logger.error(f"Error saving credentials to SQLite: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
     
     def _try_save_to_key(self, cursor: sqlite3.Cursor, key: str) -> bool:
         """

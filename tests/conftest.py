@@ -8,6 +8,7 @@ All tests MUST be completely isolated from the network.
 """
 
 import asyncio
+import warnings
 import json
 import pytest
 import time
@@ -16,6 +17,11 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from datetime import datetime, timezone
 
 import httpx
+
+# Suppress StarletteDeprecationWarning: httpx2 package doesn't exist yet,
+# and starlette.testclient always falls back to httpx with a deprecation warning.
+warnings.filterwarnings("ignore", message=".*httpx.*starlette.testclient.*")
+
 from fastapi.testclient import TestClient
 
 

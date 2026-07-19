@@ -141,6 +141,7 @@ async def parse_kiro_stream(
     """
     parser = AwsEventStreamParser()
     first_token_received = False
+    byte_iterator = None
     
     # Initialize thinking parser only for legacy fake-reasoning mode.
     # When native reasoning is active, the model emits a dedicated
@@ -255,6 +256,12 @@ async def parse_kiro_stream(
         error_msg = str(e) if str(e) else "(empty message)"
         logger.error(f"Error during stream parsing: [{error_type}] {error_msg}", exc_info=True)
         raise
+    finally:
+        if byte_iterator is not None:
+            try:
+                await byte_iterator.aclose()
+            except Exception:
+                pass
 
 
 async def _process_chunk(
