@@ -203,8 +203,13 @@ KIRO_API_HOST_TEMPLATE: str = os.getenv("KIRO_API_HOST_TEMPLATE", "https://runti
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = os.getenv("KIRO_Q_HOST_TEMPLATE", "https://runtime.{region}.kiro.dev")
 
-# Host for management API (billing, account info, etc.)
-KIRO_MANAGEMENT_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+# Host for the Kiro control plane (ListAvailableModels, GetProfile).
+# The runtime plane (runtime.{region}.kiro.dev) does not serve ListAvailableModels;
+# the model catalog — including each model's additionalModelRequestFieldsSchema — is
+# served here. See kiro-analysis: MITM-confirmed on management.us-east-1.kiro.dev.
+KIRO_MANAGEMENT_HOST_TEMPLATE: str = os.getenv(
+    "KIRO_MANAGEMENT_HOST_TEMPLATE", "https://management.{region}.kiro.dev"
+)
 
 # Override API host directly (bypasses template-based region resolution).
 # When set, this takes precedence over KIRO_API_HOST_TEMPLATE.
