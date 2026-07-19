@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from kiro.config import HIDDEN_MODELS
+from kiro.config import HIDDEN_MODELS, MODEL_ALIASES
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
 
@@ -44,6 +44,9 @@ from kiro.converters_core import (
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
+    NativeThinkingConfig,
+    build_native_thinking_config,
+    reasoning_effort_to_budget,
     build_kiro_payload as core_build_kiro_payload,
 )
 
@@ -334,7 +337,7 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
     
     Handles reasoning_effort parameter:
     - "none" → disabled (no thinking tags injected)
-    - "minimal", "low", "medium", "high", "xhigh" → enabled with percentage-based budget
+    - "minimal", "low", "medium", "high", "xhigh", "max" → enabled with percentage-based budget
     - None (not specified) → enabled with default budget
     
     Args:
@@ -358,7 +361,7 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         >>> request.reasoning_effort = "high"
         >>> request.max_tokens = 4096
         >>> extract_thinking_config_from_openai(request)
-        ThinkingConfig(enabled=True, budget_tokens=3276)  # 80% of 4096
+        ThinkingConfig(enabled=True, budget_tokens=3276, effort_level='high')  # 80% of 4096
     """
     if not request.reasoning_effort:
         # No reasoning_effort specified → use defaults
@@ -367,6 +370,10 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
     if request.reasoning_effort == "none":
         # Explicitly disabled
         return ThinkingConfig(enabled=False, budget_tokens=None)
+    
+    # Resolve model aliases for downstream native effort support
+    raw_model = request.model
+    resolved_model = MODEL_ALIASES.get(raw_model, raw_model)
     
     # Calculate budget from reasoning_effort
     # Get max_tokens from request (OUTPUT tokens limit)
@@ -380,10 +387,11 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
     
     logger.debug(
         f"Extracted thinking config from OpenAI: reasoning_effort='{request.reasoning_effort}', "
+        f"model='{raw_model}' -> '{resolved_model}', "
         f"max_tokens={max_tokens}, budget={budget}"
     )
     
-    return ThinkingConfig(enabled=True, budget_tokens=budget)
+    return ThinkingConfig(enabled=True, budget_tokens=budget, effort_level=request.reasoning_effort)
 
 
 # ==================================================================================================
@@ -425,11 +433,15 @@ def build_kiro_payload(
     # Extract thinking configuration from reasoning_effort
     thinking_config = extract_thinking_config_from_openai(request_data)
     
+    # Build native thinking config from model and reasoning_effort
+    native_thinking_config = build_native_thinking_config(model_id, request_data.reasoning_effort)
+    
     logger.debug(
         f"Converting OpenAI request: model={request_data.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"native_thinking_enabled={native_thinking_config.enabled}, native_thinking_effort={native_thinking_config.effort}"
     )
     
     # Use core function to build payload
@@ -440,7 +452,8 @@ def build_kiro_payload(
         tools=unified_tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
-        thinking_config=thinking_config
+        thinking_config=thinking_config,
+        native_thinking_config=native_thinking_config,
     )
     
     return result.payload

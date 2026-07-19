@@ -34,7 +34,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY, PROFILE_ARN
+from kiro.config import PROXY_API_KEY, PROXY_AUTH_DISABLED
+from kiro.profile_arn import profile_arn_for_payload
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicCountTokensRequest,
@@ -51,7 +52,7 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.http_client import KiroHttpClient
-from kiro.utils import generate_conversation_id
+from kiro.utils import generate_conversation_id, derive_conversation_id_from_metadata
 from kiro.tokenizer import estimate_request_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
@@ -81,6 +82,9 @@ async def verify_anthropic_api_key(
     1. x-api-key header (Anthropic native)
     2. Authorization: Bearer header (for compatibility)
     
+    When PROXY_AUTH_DISABLED is True, authentication is bypassed entirely
+    for trusted local networks.
+    
     Args:
         x_api_key: Value from x-api-key header
         authorization: Value from Authorization header
@@ -91,6 +95,9 @@ async def verify_anthropic_api_key(
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
+    if PROXY_AUTH_DISABLED:
+        return True
+
     # Check x-api-key first (Anthropic native)
     if x_api_key and x_api_key == PROXY_API_KEY:
         return True
@@ -373,17 +380,23 @@ async def messages(
             model_resolver = account.model_resolver
             
             # Generate conversation ID
-            conversation_id = generate_conversation_id()
+            # Claude Code Desktop provides metadata.user_id.session_id, which lets us
+            # keep a stable Kiro conversation ID across turns. Other clients keep the
+            # previous random UUID behavior.
+            conversation_id = (
+                derive_conversation_id_from_metadata(request_data.metadata)
+                or generate_conversation_id()
+            )
             
             # Build payload for Kiro
             # profileArn is required by runtime.kiro.dev for all auth types
-            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+            profile_arn = profile_arn_for_payload(auth_manager)
             
             try:
                 kiro_payload = anthropic_to_kiro(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn
                 )
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
@@ -413,8 +426,7 @@ async def messages(
             if request_data.stream:
                 http_client = KiroHttpClient(auth_manager, shared_client=None)
             else:
-                shared_client = request.app.state.http_client
-                http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+                http_client = KiroHttpClient(auth_manager, shared_client=None)
             
             # Prepare data for token counting
             messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
@@ -554,12 +566,20 @@ async def messages(
                         if debug_logger:
                             debug_logger.flush_on_error(response.status_code, last_error_message)
                         
+                        # Map context overflow to the Anthropic error type Claude Code
+                        # recognises, so /compact and auto-retry can recover natively
+                        # instead of treating it as a generic API failure.
+                        anthropic_error_type = (
+                            "invalid_request_error"
+                            if error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                            else "api_error"
+                        )
                         return JSONResponse(
                             status_code=response.status_code,
                             content={
                                 "type": "error",
                                 "error": {
-                                    "type": "api_error",
+                                    "type": anthropic_error_type,
                                     "message": last_error_message
                                 }
                             }
@@ -680,8 +700,14 @@ async def messages(
     # Normal Flow (Path B will be intercepted in streaming, or no web_search)
     # ==============================================================================
     
-    # Generate conversation ID for Kiro API (random UUID, not used for tracking)
-    conversation_id = generate_conversation_id()
+    # Generate conversation ID for Kiro API.
+    # Claude Code Desktop provides metadata.user_id.session_id, which lets us
+    # keep a stable Kiro conversation ID across turns. Other clients keep the
+    # previous random UUID behavior.
+    conversation_id = (
+        derive_conversation_id_from_metadata(request_data.metadata)
+        or generate_conversation_id()
+    )
     
     # Build payload for Kiro
     # profileArn is required by runtime.kiro.dev for all auth types
@@ -725,9 +751,7 @@ async def messages(
         # when network interface changes (VPN disconnect/reconnect)
         http_client = KiroHttpClient(auth_manager, shared_client=None)
     else:
-        # Non-streaming mode: shared client for efficient connection reuse
-        shared_client = request.app.state.http_client
-        http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+        http_client = KiroHttpClient(auth_manager, shared_client=None)
     
     # Prepare data for token counting
     # Convert Pydantic models to dicts for tokenizer
@@ -761,12 +785,14 @@ async def messages(
             
             # Try to parse JSON response from Kiro to extract error message
             error_message = error_text
+            error_reason = None
             try:
                 error_json = json.loads(error_text)
                 # Enhance Kiro API errors with user-friendly messages
                 from kiro.kiro_errors import enhance_kiro_error
                 error_info = enhance_kiro_error(error_json)
                 error_message = error_info.user_message
+                error_reason = error_info.reason
                 # Log original error for debugging
                 logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
             except (json.JSONDecodeError, KeyError):
@@ -781,13 +807,20 @@ async def messages(
             if debug_logger:
                 debug_logger.flush_on_error(response.status_code, error_message)
             
+            # Map context overflow to the Anthropic error type Claude Code recognises,
+            # so /compact and auto-retry can recover natively.
+            anthropic_error_type = (
+                "invalid_request_error"
+                if error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                else "api_error"
+            )
             # Return error in Anthropic format
             return JSONResponse(
                 status_code=response.status_code,
                 content={
                     "type": "error",
                     "error": {
-                        "type": "api_error",
+                        "type": anthropic_error_type,
                         "message": error_message
                     }
                 }

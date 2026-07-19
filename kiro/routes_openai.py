@@ -29,6 +29,8 @@ Contains all API endpoints:
 import json
 from datetime import datetime, timezone
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -37,8 +39,9 @@ from loguru import logger
 from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
-    PROFILE_ARN,
+    PROXY_AUTH_DISABLED,
 )
+from kiro.profile_arn import profile_arn_for_payload
 from kiro.models_openai import (
     OpenAIModel,
     ModelList,
@@ -50,7 +53,7 @@ from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
-from kiro.utils import generate_conversation_id
+from kiro.utils import generate_conversation_id, get_kiro_headers
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
 
@@ -63,16 +66,25 @@ except ImportError:
 
 # --- Security scheme ---
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+x_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 
-async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
+async def verify_api_key(
+    auth_header: Optional[str] = Security(api_key_header),
+    x_api_key: Optional[str] = Security(x_api_key_header),
+) -> bool:
     """
-    Verify API key in Authorization header.
+    Verify API key in Authorization or x-api-key header.
     
-    Expects format: "Bearer {PROXY_API_KEY}"
+    Supports OpenAI-style "Authorization: Bearer {PROXY_API_KEY}" and
+    Anthropic-style "x-api-key: {PROXY_API_KEY}" for model discovery clients.
+    
+    When PROXY_AUTH_DISABLED is True, authentication is bypassed entirely
+    for trusted local networks.
     
     Args:
         auth_header: Authorization header value
+        x_api_key: x-api-key header value
     
     Returns:
         True if key is valid
@@ -80,10 +92,17 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
-    if not auth_header or auth_header != f"Bearer {PROXY_API_KEY}":
-        logger.warning("Access attempt with invalid API key.")
-        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
-    return True
+    if PROXY_AUTH_DISABLED:
+        return True
+
+    if auth_header and auth_header == f"Bearer {PROXY_API_KEY}":
+        return True
+
+    if x_api_key and x_api_key == PROXY_API_KEY:
+        return True
+
+    logger.warning("Access attempt with invalid API key.")
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
 # --- Router ---
@@ -119,13 +138,50 @@ async def health():
         "version": APP_VERSION
     }
 
+
+@router.get("/usage", dependencies=[Depends(verify_api_key)])
+async def get_usage(request: Request):
+    """
+    Query Kiro credit usage via GetUsageLimits API.
+
+    Returns subscription info, credit usage breakdown, overage config,
+    and reset date — the same data shown by kiro-cli's /usage command.
+    """
+    logger.info("Request to /v1/usage")
+
+    account = request.app.state.account_manager.get_first_account()
+    auth_manager: KiroAuthManager = account.auth_manager
+    shared_client = request.app.state.http_client
+
+    token = await auth_manager.get_access_token()
+    headers = get_kiro_headers(auth_manager, token)
+    headers["x-amz-target"] = "com.amazon.aws.codewhisperer.runtime.AmazonCodeWhispererService.GetUsageLimits"
+    headers["Content-Type"] = "application/json"
+
+    url = auth_manager.management_host
+    body = {"origin": "AI_EDITOR"}
+    if auth_manager.profile_arn:
+        body["profileArn"] = auth_manager.profile_arn
+
+    try:
+        response = await shared_client.post(url, json=body, headers=headers)
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return JSONResponse(content=response.json())
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching usage: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Failed to fetch usage: {str(e)}")
+
 @router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
 async def get_models(request: Request):
     """
     Return list of available models.
     
-    Models are loaded at startup (blocking) and cached.
-    This endpoint returns the cached list.
+    On each request, the model cache is refreshed for all initialized accounts
+    so that additions and removals made by Kiro are visible immediately.
+    A failed refresh preserves the last successfully fetched cache.
     
     Args:
         request: FastAPI Request for accessing app.state
@@ -134,6 +190,12 @@ async def get_models(request: Request):
         ModelList with available models in consistent format (with dots)
     """
     logger.info("Request to /v1/models")
+    
+    # Refresh model cache before returning
+    try:
+        await request.app.state.account_manager.refresh_initialized_account_models()
+    except Exception:
+        logger.warning("Model refresh failed, using cached models")
     
     # Get available models based on mode
     if request.app.state.account_system:
@@ -324,13 +386,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             
             # Build payload for Kiro
             # profileArn is required by runtime.kiro.dev for all auth types
-            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+            profile_arn = profile_arn_for_payload(auth_manager)
             
             try:
                 kiro_payload = build_kiro_payload(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -350,8 +412,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             if request_data.stream:
                 http_client = KiroHttpClient(auth_manager, shared_client=None)
             else:
-                shared_client = request.app.state.http_client
-                http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+                http_client = KiroHttpClient(auth_manager, shared_client=None)
             
             try:
                 # Make request to Kiro API
@@ -479,12 +540,20 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         if debug_logger:
                             debug_logger.flush_on_error(response.status_code, last_error_message)
                         
+                        # Map context overflow to the standard OpenAI error type so
+                        # clients (Claude Code / claude-code-router) trigger context
+                        # recovery instead of treating it as a generic API failure.
+                        openai_error_type = (
+                            "context_length_exceeded"
+                            if error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                            else "kiro_api_error"
+                        )
                         return JSONResponse(
                             status_code=response.status_code,
                             content={
                                 "error": {
                                     "message": last_error_message,
-                                    "type": "kiro_api_error",
+                                    "type": openai_error_type,
                                     "code": response.status_code
                                 }
                             }
@@ -572,13 +641,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     
     # Build payload for Kiro
     # profileArn is required by runtime.kiro.dev for all auth types
-    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+    profile_arn = profile_arn_for_payload(auth_manager)
     
     try:
         kiro_payload = build_kiro_payload(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -602,9 +671,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         # when network interface changes (VPN disconnect/reconnect)
         http_client = KiroHttpClient(auth_manager, shared_client=None)
     else:
-        # Non-streaming mode: shared client for efficient connection reuse
-        shared_client = request.app.state.http_client
-        http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+        http_client = KiroHttpClient(auth_manager, shared_client=None)
     try:
         # Make request to Kiro API (for both streaming and non-streaming modes)
         # Important: we wait for Kiro response BEFORE returning StreamingResponse,
@@ -627,12 +694,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             
             # Try to parse JSON response from Kiro to extract error message
             error_message = error_text
+            error_reason = None
             try:
                 error_json = json.loads(error_text)
                 # Enhance Kiro API errors with user-friendly messages
                 from kiro.kiro_errors import enhance_kiro_error
                 error_info = enhance_kiro_error(error_json)
                 error_message = error_info.user_message
+                error_reason = error_info.reason
                 # Log original error for debugging
                 logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
             except (json.JSONDecodeError, KeyError):
@@ -647,13 +716,20 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             if debug_logger:
                 debug_logger.flush_on_error(response.status_code, error_message)
             
+            # Map context overflow to the standard OpenAI error type so clients
+            # trigger context recovery instead of treating it as a generic failure.
+            openai_error_type = (
+                "context_length_exceeded"
+                if error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                else "kiro_api_error"
+            )
             # Return error in OpenAI API format
             return JSONResponse(
                 status_code=response.status_code,
                 content={
                     "error": {
                         "message": error_message,
-                        "type": "kiro_api_error",
+                        "type": openai_error_type,
                         "code": response.status_code
                     }
                 }

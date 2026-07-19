@@ -25,12 +25,15 @@ with TTL and lazy loading support.
 """
 
 import asyncio
+import hashlib
+import json
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from kiro.config import MODEL_CACHE_TTL, DEFAULT_MAX_INPUT_TOKENS
+from kiro.config import MODEL_CACHE_TTL, DEFAULT_MAX_INPUT_TOKENS, PROMPT_CACHE_TTL_SECONDS, PROMPT_CACHE_ACCOUNTING_ENABLED
 
 
 class ModelInfoCache:
@@ -180,3 +183,347 @@ class ModelInfoCache:
     def last_update_time(self) -> Optional[float]:
         """Last update time (timestamp) or None."""
         return self._last_update
+
+
+@dataclass
+class PromptCacheUsage:
+    """Anthropic-compatible prompt cache usage fields."""
+
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+
+    def to_anthropic_usage_fields(self) -> Dict[str, int]:
+        """Return non-zero Anthropic usage fields."""
+        fields: Dict[str, int] = {}
+        if self.cache_read_input_tokens > 0:
+            fields["cache_read_input_tokens"] = self.cache_read_input_tokens
+        if self.cache_creation_input_tokens > 0:
+            fields["cache_creation_input_tokens"] = self.cache_creation_input_tokens
+        return fields
+
+
+@dataclass
+class _PromptCacheEntry:
+    tokens: int
+    expires_at: float
+
+
+@dataclass
+class _PromptCacheBlock:
+    prefix_fingerprint: str
+    cumulative_tokens: int
+    breakpoint: bool = False
+    implicit_breakpoint: bool = False
+
+
+class PromptCacheTracker:
+    """
+    In-memory prompt cache accounting using cacheable prompt prefixes.
+
+    This only reports Anthropic cache usage fields. It does not cache model
+    responses and does not alter upstream requests. When Anthropic
+    ``cache_control`` markers are present, cache reads are matched on the
+    stable prompt prefix up to the most recent cacheable breakpoint, so
+    appended turns can reuse earlier cached context. Entry TTL is fixed when
+    the entry is created and is not refreshed by cache hits.
+    """
+
+    def __init__(
+        self,
+        cache_ttl: int = PROMPT_CACHE_TTL_SECONDS,
+        enabled: bool = PROMPT_CACHE_ACCOUNTING_ENABLED,
+    ):
+        self._cache_ttl = cache_ttl
+        self._enabled = enabled
+        self._entries: Dict[str, _PromptCacheEntry] = {}
+        self._lock = asyncio.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def size(self) -> int:
+        self._prune_expired(time.time())
+        return len(self._entries)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    async def record(
+        self,
+        *,
+        model: str,
+        messages: Optional[List[Dict[str, Any]]],
+        tools: Optional[List[Dict[str, Any]]],
+        system: Optional[Any],
+        input_tokens: int,
+    ) -> PromptCacheUsage:
+        """
+        Record a successful request and return cache accounting usage.
+
+        Args:
+            model: Requested model name
+            messages: Anthropic request messages as dictionaries
+            tools: Anthropic request tools as dictionaries
+            system: Anthropic system prompt
+            input_tokens: Estimated input tokens for this request
+        """
+        if not self._enabled or input_tokens <= 0:
+            return PromptCacheUsage()
+
+        blocks = self._build_prefix_blocks(
+            model=model,
+            messages=messages or [],
+            tools=tools,
+            system=system,
+            input_tokens=input_tokens,
+        )
+        breakpoints = [block for block in blocks if block.breakpoint]
+        if not breakpoints:
+            return PromptCacheUsage()
+
+        last_breakpoint_tokens = min(breakpoints[-1].cumulative_tokens, input_tokens)
+        now = time.time()
+
+        async with self._lock:
+            self._prune_expired(now)
+
+            matched_tokens = 0
+            for block in reversed(breakpoints[-10:]):
+                entry = self._entries.get(block.prefix_fingerprint)
+                if entry and entry.expires_at > now:
+                    matched_tokens = min(entry.tokens, block.cumulative_tokens, input_tokens)
+                    break
+
+            for block in breakpoints:
+                self._entries.setdefault(
+                    block.prefix_fingerprint,
+                    _PromptCacheEntry(
+                        tokens=min(block.cumulative_tokens, input_tokens),
+                        expires_at=now + self._cache_ttl,
+                    ),
+                )
+
+            return PromptCacheUsage(
+                cache_read_input_tokens=matched_tokens,
+                cache_creation_input_tokens=max(last_breakpoint_tokens - matched_tokens, 0),
+            )
+
+    def _prune_expired(self, now: float) -> None:
+        expired_keys = [
+            key for key, entry in self._entries.items()
+            if entry.expires_at <= now
+        ]
+        for key in expired_keys:
+            self._entries.pop(key, None)
+
+    def _build_prefix_blocks(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        system: Optional[Any],
+        input_tokens: int,
+    ) -> List[_PromptCacheBlock]:
+        flattened = self._flatten_cache_blocks(
+            messages=messages,
+            tools=tools or [],
+            system=system,
+        )
+        if not flattened:
+            return []
+
+        prelude = {
+            "model": model,
+        }
+        prefix_hash = self._hash_payload(prelude)
+        blocks: List[_PromptCacheBlock] = []
+        cumulative_tokens = 0
+        has_explicit_breakpoint = False
+        active_cache = False
+
+        for value, tokens, has_cache_control, is_message_end in flattened:
+            cumulative_tokens += max(tokens, 0)
+            prefix_hash = self._hash_payload({
+                "previous": prefix_hash,
+                "block": value,
+            })
+
+            if has_cache_control:
+                has_explicit_breakpoint = True
+                active_cache = True
+                blocks.append(_PromptCacheBlock(
+                    prefix_fingerprint=prefix_hash,
+                    cumulative_tokens=cumulative_tokens,
+                    breakpoint=True,
+                ))
+            elif active_cache and is_message_end:
+                blocks.append(_PromptCacheBlock(
+                    prefix_fingerprint=prefix_hash,
+                    cumulative_tokens=cumulative_tokens,
+                    breakpoint=True,
+                ))
+            else:
+                blocks.append(_PromptCacheBlock(
+                    prefix_fingerprint=prefix_hash,
+                    cumulative_tokens=cumulative_tokens,
+                    breakpoint=False,
+                    implicit_breakpoint=is_message_end,
+                ))
+
+        if not has_explicit_breakpoint:
+            min_cacheable_tokens = self._minimum_cacheable_tokens(model)
+            implicit_blocks = [
+                _PromptCacheBlock(
+                    prefix_fingerprint=block.prefix_fingerprint,
+                    cumulative_tokens=block.cumulative_tokens,
+                    breakpoint=block.cumulative_tokens >= min_cacheable_tokens,
+                    implicit_breakpoint=block.implicit_breakpoint,
+                )
+                for block in blocks
+            ]
+            if any(block.breakpoint for block in implicit_blocks):
+                blocks = implicit_blocks
+            else:
+                # Preserve the old behavior for short callers without
+                # Anthropic cache_control markers: exact repeated requests
+                # still report cache reads, but appended short conversations do
+                # not accidentally match.
+                blocks[-1] = _PromptCacheBlock(
+                    prefix_fingerprint=prefix_hash,
+                    cumulative_tokens=input_tokens,
+                    breakpoint=True,
+                )
+
+        return blocks
+
+    def _flatten_cache_blocks(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        system: Optional[Any],
+    ) -> List[Tuple[Any, int, bool, bool]]:
+        blocks: List[Tuple[Any, int, bool, bool]] = []
+
+        for index, tool in enumerate(tools):
+            normalized, has_cache_control = self._strip_cache_control(tool)
+            blocks.append((
+                {"kind": "tool", "tool_index": index, "tool": normalized},
+                self._estimate_tokens(normalized),
+                has_cache_control,
+                False,
+            ))
+
+        system_blocks = system if isinstance(system, list) else ([system] if system else [])
+        for index, block in enumerate(system_blocks):
+            normalized, has_cache_control = self._strip_cache_control(block)
+            blocks.append((
+                {"kind": "system", "system_index": index, "block": normalized},
+                self._estimate_tokens(normalized),
+                has_cache_control,
+                False,
+            ))
+
+        for message_index, message in enumerate(messages):
+            role = message.get("role", "")
+            content = message.get("content")
+            if isinstance(content, list):
+                last_block_index = len(content) - 1
+                for block_index, content_block in enumerate(content):
+                    normalized, has_cache_control = self._strip_cache_control(content_block)
+                    blocks.append((
+                        {
+                            "kind": "message",
+                            "message_index": message_index,
+                            "role": role,
+                            "block_index": block_index,
+                            "block": normalized,
+                        },
+                        self._estimate_tokens(normalized),
+                        has_cache_control,
+                        block_index == last_block_index,
+                    ))
+            else:
+                normalized, has_cache_control = self._strip_cache_control(content)
+                blocks.append((
+                    {
+                        "kind": "message",
+                        "message_index": message_index,
+                        "role": role,
+                        "block_index": 0,
+                        "block": normalized,
+                    },
+                    self._estimate_tokens(normalized),
+                    has_cache_control,
+                    True,
+                ))
+
+        return blocks
+
+    def _strip_cache_control(self, value: Any) -> Tuple[Any, bool]:
+        normalized = self._normalize(value)
+        found = False
+
+        def strip(item: Any) -> Any:
+            nonlocal found
+            if isinstance(item, dict):
+                output = {}
+                for key, subvalue in item.items():
+                    if key == "cache_control":
+                        if isinstance(subvalue, dict) and subvalue.get("type") == "ephemeral":
+                            found = True
+                        continue
+                    output[key] = strip(subvalue)
+                return output
+            if isinstance(item, list):
+                return [strip(subvalue) for subvalue in item]
+            return item
+
+        return strip(normalized), found
+
+    def _estimate_tokens(self, value: Any) -> int:
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        try:
+            from kiro.tokenizer import count_tokens
+            return count_tokens(text)
+        except Exception:
+            return len(text) // 4 + 1
+
+    def _hash_payload(self, value: Any) -> str:
+        serialized = json.dumps(
+            self._normalize(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _minimum_cacheable_tokens(self, model: str) -> int:
+        model_lower = model.lower()
+        if "opus" in model_lower:
+            return 4096
+        if "haiku-3" in model_lower or "haiku_3" in model_lower:
+            return 2048
+        return 1024
+
+    def _normalize(self, value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            return self._normalize(value.model_dump(exclude_none=True))
+        if isinstance(value, dict):
+            return {
+                str(key): self._normalize(item)
+                for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
+                if item is not None
+            }
+        if isinstance(value, list):
+            return [self._normalize(item) for item in value]
+        return value
+
+
+prompt_cache_tracker = PromptCacheTracker()

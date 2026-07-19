@@ -30,7 +30,9 @@ The core layer provides a unified interface that API-specific adapters use
 to convert their formats to Kiro API format.
 """
 
+import base64
 import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,8 +45,20 @@ from kiro.config import (
     FAKE_REASONING_BUDGET_CAP,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
+    NATIVE_REASONING_ENABLED,
+    NATIVE_EFFORT_SCHEMA_BY_MODEL,
+    VALID_EFFORT_LEVELS,
+    EFFORT_LEVEL_ALIASES,
+    DEFAULT_EFFORT_LEVEL,
+    KIRO_NATIVE_THINKING_MODE,
+    KIRO_NATIVE_THINKING_DISPLAY,
 )
+from kiro import native_reasoning
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
+
+
+SYSTEM_PROMPT_ACK = "I will follow these instructions."
+KIRO_CACHE_POINT: Dict[str, str] = {"type": "default"}
 
 
 # ==================================================================================================
@@ -78,6 +92,22 @@ class ThinkingConfig:
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+    effort_level: Optional[str] = None  # raw reasoning_effort (low/medium/high/xhigh/max) for native effort
+
+
+@dataclass
+class NativeThinkingConfig:
+    """
+    Native Kiro/Claude adaptive thinking configuration.
+
+    Attributes:
+        enabled: Whether to add native adaptive thinking fields.
+        effort: Adaptive thinking effort level.
+        display: Whether upstream should return summarized or omitted thinking text.
+    """
+    enabled: bool = False
+    effort: Optional[str] = None
+    display: str = "summarized"
 
 
 @dataclass
@@ -101,6 +131,7 @@ class UnifiedMessage:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
     images: Optional[List[Dict[str, Any]]] = None
+    cache_point: bool = False
 
 
 @dataclass
@@ -129,6 +160,441 @@ class KiroPayloadResult:
     """
     payload: Dict[str, Any]
     tool_documentation: str = ""
+
+
+# ==================================================================================================
+# Native Thinking Support
+# ==================================================================================================
+
+REASONING_EFFORT_BUDGET_RATIOS: Dict[str, float] = {
+    "none": 0.0,
+    "minimal": 0.10,
+    "low": 0.20,
+    "medium": 0.50,
+    "high": 0.80,
+    "xhigh": 0.95,
+    "max": 1.0,
+}
+
+
+NATIVE_THINKING_SUPPORTED_MODELS = (
+    "claude-opus-4.8",
+    "claude-opus-4.7",
+    "claude-opus-4.6",
+    "claude-sonnet-4.6",
+)
+
+
+def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
+    """
+    Convert a reasoning effort level to a fake thinking token budget.
+
+    Args:
+        max_tokens: Maximum output tokens for the request.
+        effort: Reasoning effort level.
+
+    Returns:
+        Thinking budget in tokens.
+
+    Raises:
+        ValueError: If the effort level is not supported.
+    """
+    try:
+        ratio = REASONING_EFFORT_BUDGET_RATIOS[effort]
+    except KeyError as exc:
+        supported_efforts = ", ".join(sorted(REASONING_EFFORT_BUDGET_RATIOS))
+        raise ValueError(
+            f"Unsupported reasoning effort '{effort}'. Supported values: {supported_efforts}"
+        ) from exc
+
+    return int(max_tokens * ratio)
+
+
+def supports_native_adaptive_thinking(model_id: str) -> bool:
+    """
+    Check whether a Kiro model is known to support native adaptive thinking.
+
+    Args:
+        model_id: Internal Kiro model ID.
+
+    Returns:
+        True when native adaptive thinking should be attempted.
+    """
+    normalized_model = model_id.lower()
+    return any(model in normalized_model for model in NATIVE_THINKING_SUPPORTED_MODELS)
+
+
+def normalize_native_thinking_effort(effort: Optional[str]) -> Optional[str]:
+    """
+    Normalize client effort values to Claude adaptive thinking effort values.
+
+    Args:
+        effort: Client-provided effort level.
+
+    Returns:
+        Native effort level, or None if the value disables or cannot map to native thinking.
+    """
+    if effort is None:
+        return None
+
+    if effort == "none":
+        return None
+
+    if effort == "minimal":
+        return "low"
+
+    if effort in ("low", "medium", "high", "xhigh", "max"):
+        return effort
+
+    logger.warning(f"Unsupported native thinking effort '{effort}'. Native thinking disabled.")
+    return None
+
+
+def build_native_thinking_config(model_id: str, effort: Optional[str]) -> NativeThinkingConfig:
+    """
+    Build native adaptive thinking configuration from model and client effort.
+
+    Args:
+        model_id: Internal Kiro model ID.
+        effort: Client effort level.
+
+    Returns:
+        NativeThinkingConfig for payload construction.
+    """
+    if KIRO_NATIVE_THINKING_MODE == "off":
+        return NativeThinkingConfig(enabled=False)
+
+    if not supports_native_adaptive_thinking(model_id):
+        return NativeThinkingConfig(enabled=False)
+
+    native_effort = normalize_native_thinking_effort(effort)
+    if native_effort is None:
+        if KIRO_NATIVE_THINKING_MODE != "force":
+            return NativeThinkingConfig(enabled=False)
+        native_effort = "high"
+
+    return NativeThinkingConfig(
+        enabled=True,
+        effort=native_effort,
+        display=KIRO_NATIVE_THINKING_DISPLAY,
+    )
+
+
+def apply_native_thinking_fields(
+    payload: Dict[str, Any],
+    native_thinking_config: Optional[NativeThinkingConfig],
+) -> None:
+    """
+    Add native Kiro/Claude adaptive thinking fields to the payload in-place.
+
+    Args:
+        payload: Kiro API payload.
+        native_thinking_config: Native thinking configuration.
+    """
+    if not native_thinking_config or not native_thinking_config.enabled:
+        return
+
+    payload["thinking"] = {
+        "type": "adaptive",
+        "effort": native_thinking_config.effort,
+        "display": native_thinking_config.display,
+    }
+
+
+def build_native_effort_fields(
+    model_id: str,
+    effort_level: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Build the Bedrock Converse additionalModelRequestFields object that carries
+    native reasoning effort to the Kiro backend.
+
+    Args:
+        model_id: Resolved Kiro model ID (dot form, e.g. "claude-opus-4.8")
+        effort_level: Client-supplied reasoning_effort (low/medium/high/xhigh/max,
+                      or aliases like "minimal"). None disables native effort.
+
+    Returns:
+        The additionalModelRequestFields dict, or None if not applicable.
+    """
+    if not effort_level:
+        return None
+
+    # Normalize aliases (minimal->low, etc.) before matching against advertised efforts.
+    level = EFFORT_LEVEL_ALIASES.get(effort_level.lower(), effort_level.lower())
+
+    # Prefer the live catalog's advertised schema (per-model schema type + valid effort
+    # enum). Fall back to the static config table only when the catalog is unavailable.
+    descriptor = native_reasoning.get_descriptor(model_id)
+    if descriptor is not None:
+        schema = descriptor.schema_type
+        clamped = native_reasoning.clamp_effort(level, descriptor.valid_efforts)
+        if clamped is None:
+            logger.debug(f"Model '{model_id}' advertises no effort levels; skipping")
+            return None
+        if clamped != level:
+            logger.debug(
+                f"Clamped effort '{level}' -> '{clamped}' for '{model_id}' "
+                f"(advertised: {'/'.join(descriptor.valid_efforts)})"
+            )
+        level = clamped
+    else:
+        schema = NATIVE_EFFORT_SCHEMA_BY_MODEL.get(model_id)
+        if not schema:
+            logger.debug(f"Model '{model_id}' does not support native effort; skipping")
+            return None
+        if level not in VALID_EFFORT_LEVELS:
+            logger.warning(f"Invalid effort level '{effort_level}' for native effort; skipping")
+            return None
+
+    if schema == "output_config":
+        fields = {
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": level},
+        }
+    elif schema == "reasoning":
+        fields = {"reasoning": {"effort": level}}
+    else:
+        logger.warning(f"Unknown effort schema '{schema}' for model '{model_id}'; skipping")
+        return None
+
+    logger.debug(f"Native effort for '{model_id}': schema={schema}, effort={level}")
+    return fields
+
+
+# ==================================================================================================
+# Document / PDF Extraction
+# ==================================================================================================
+
+import re as _re
+
+_PDF_TEXT_OPERAND_RE = _re.compile(rb"\((.+?)\)\s*Tj")
+_PDF_STRING_RE = _re.compile(rb"^\((.+)\)$")
+
+
+def _parse_data_url(data_url: str) -> Tuple[str, bytes]:
+    """
+    Parse a data URL and return (mime_type, decoded_bytes).
+
+    Raises:
+        ValueError: If the data URL is malformed or contains invalid base64 data.
+    """
+    if not data_url.startswith("data:"):
+        raise ValueError("Not a data URL")
+
+    header, data = data_url.split(",", 1)
+    mime = header.split(":", 1)[1].split(";", 1)[0]
+    try:
+        raw = base64.b64decode(data)
+    except Exception as exc:
+        raise ValueError(f"Invalid base64 data in data URL: {exc}") from exc
+    return mime, raw
+
+
+def _decode_base64_document(base64_content: str) -> Tuple[str, bytes]:
+    """
+    Decode a base64 document and detect its MIME type from magic bytes.
+
+    Args:
+        base64_content: Base64-encoded document data.
+
+    Returns:
+        Tuple of (mime_type, decoded_bytes).
+    """
+    try:
+        raw = base64.b64decode(base64_content)
+    except Exception:
+        return "application/octet-stream", base64.b64decode(base64_content)
+
+    if raw[:4] == b"%PDF":
+        return "application/pdf", raw
+    if raw[:4] == b"\x89PNG":
+        return "image/png", raw
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg", raw
+    if raw[:4] in (b"RIFF", b"\x00\x00\x00\x1c"):
+        return "image/webp", raw
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif", raw
+    if raw[:4] == b"\x00\x00\x01\x00":
+        return "image/x-icon", raw
+
+    return "application/octet-stream", raw
+
+
+def _decode_pdf_string(raw: bytes) -> str:
+    """Decode a PDF literal string, handling common escape sequences."""
+    try:
+        decoded = raw.decode("latin-1")
+    except Exception:
+        return raw.decode("utf-8", errors="replace")
+
+    result: list[str] = []
+    i = 0
+    while i < len(decoded):
+        ch = decoded[i]
+        if ch == "\\" and i + 1 < len(decoded):
+            nxt = decoded[i + 1]
+            if nxt == "n":
+                result.append("\n")
+            elif nxt == "r":
+                result.append("\r")
+            elif nxt == "t":
+                result.append("\t")
+            elif nxt == "b":
+                result.append("\b")
+            elif nxt == "f":
+                result.append("\f")
+            elif nxt == "(":
+                result.append("(")
+            elif nxt == ")":
+                result.append(")")
+            elif nxt == "\\":
+                result.append("\\")
+            elif nxt.isdigit():
+                octal = nxt
+                for _ in range(2):
+                    if i + 2 < len(decoded) and decoded[i + 2].isdigit():
+                        octal += decoded[i + 2]
+                        i += 1
+                result.append(chr(int(octal, 8)))
+                i += 1
+            else:
+                result.append(nxt)
+            i += 2
+        else:
+            result.append(ch)
+            i += 1
+
+    return "".join(result)
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    """
+    Extract text from a PDF using regex-based parsing of the raw content stream.
+
+    Falls back to a simpler approach for PDFs that don't match the standard pattern.
+    """
+    pages: list[str] = []
+    pos = 0
+
+    while True:
+        page_start = pdf_bytes.find(b"BT", pos)
+        if page_start == -1:
+            break
+
+        page_end = pdf_bytes.find(b"ET", page_start)
+        if page_end == -1:
+            break
+
+        page_stream = pdf_bytes[page_start:page_end]
+        text_parts: list[str] = []
+
+        for match in _PDF_TEXT_OPERAND_RE.finditer(page_stream):
+            raw_group = match.group(1)
+            if not raw_group:
+                continue
+
+            string_match = _PDF_STRING_RE.match(raw_group)
+            if string_match:
+                text_parts.append(_decode_pdf_string(string_match.group(1)))
+            else:
+                text_parts.append(_decode_pdf_string(raw_group))
+
+        pages.append(" ".join(text_parts))
+        pos = page_end + 2
+
+    return "\n\n".join(page.strip() for page in pages if page.strip())
+
+
+async def _extract_document_source(source: Dict[str, Any], filename: str) -> Optional[Dict[str, Any]]:
+    """
+    Normalize an Anthropic document source into a dict suitable for the
+    Kiro messages payload: ``{"data": "<base64>", "media_type": "<mime>"}``.
+
+    Supports:
+    - ``{"type": "base64", "data": "...", "media_type": "..."}``
+    - ``{"type": "url", "url": "data:..."}``
+
+    Returns ``None`` when the source is unsupported or empty.
+    """
+    if not source:
+        return None
+
+    source_type = source.get("type", "")
+
+    if source_type == "base64":
+        data = source.get("data", "")
+        media_type = source.get("media_type", "application/octet-stream")
+
+        if media_type == "application/pdf" and data:
+            try:
+                _, raw = _decode_base64_document(data)
+                text = _extract_pdf_text(raw)
+                if text:
+                    return {"type": "text", "text": text}
+            except Exception as exc:
+                logger.warning(f"PDF extraction failed for '{filename}': {exc}")
+
+        if data:
+            mime, _ = _decode_base64_document(data)
+            return {"data": data, "media_type": mime}
+        return None
+
+    if source_type == "url":
+        url = source.get("url", "")
+        if url.startswith("data:"):
+            try:
+                mime, raw = _parse_data_url(url)
+
+                if mime == "application/pdf":
+                    text = _extract_pdf_text(raw)
+                    if text:
+                        return {"type": "text", "text": text}
+
+                return {"data": base64.b64encode(raw).decode("ascii"), "media_type": mime}
+            except ValueError as exc:
+                logger.warning(f"Failed to parse data URL for '{filename}': {exc}")
+                return None
+
+    return None
+
+
+def extract_document_text_from_content_block(content_block: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract text from an Anthropic document content block.
+
+    For PDFs, attempts to extract text content directly.
+    For other document types, returns None (caller should pass through as-is).
+
+    Returns:
+        Extracted text if available, None otherwise.
+    """
+    if content_block.get("type") != "document":
+        return None
+
+    source = content_block.get("source", {})
+    source_type = source.get("type", "")
+    media_type = source.get("media_type", "")
+
+    if media_type != "application/pdf":
+        return None
+
+    try:
+        if source_type == "base64":
+            data = source.get("data", "")
+            if data:
+                _, raw = _decode_base64_document(data)
+                return _extract_pdf_text(raw)
+        elif source_type == "url":
+            url = source.get("url", "")
+            if url.startswith("data:"):
+                _, raw = _parse_data_url(url)
+                return _extract_pdf_text(raw)
+    except Exception as exc:
+        logger.warning(f"PDF text extraction failed: {exc}")
+
+    return None
 
 
 # ==================================================================================================
@@ -166,8 +632,14 @@ def extract_text_content(content: Any) -> str:
         text_parts = []
         for item in content:
             if isinstance(item, dict):
-                # Skip image and tool_reference blocks - they're handled separately
+                # Skip image, tool_reference blocks - they're handled separately
                 if item.get("type") in ("image", "image_url", "tool_reference"):
+                    continue
+                # Extract text from document blocks (e.g., PDFs)
+                if item.get("type") == "document":
+                    doc_text = extract_document_text_from_content_block(item)
+                    if doc_text:
+                        text_parts.append(doc_text)
                     continue
                 if item.get("type") == "text":
                     text_parts.append(item.get("text", ""))
@@ -315,6 +787,8 @@ def get_thinking_system_prompt_addition() -> str:
     """
     if not FAKE_REASONING_ENABLED:
         return ""
+    if NATIVE_REASONING_ENABLED:
+        return ""
     
     return (
         "\n\n---\n"
@@ -386,6 +860,8 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
     """
     # Check if thinking is enabled globally
     if not FAKE_REASONING_ENABLED:
+        return content
+    if NATIVE_REASONING_ENABLED:
         return content
     
     # Check if thinking is enabled for this request
@@ -1402,6 +1878,56 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
 # Main Payload Building
 # ==================================================================================================
 
+def build_kiro_system_history(
+    system_prompt: str,
+    model_id: str,
+    system_cache_point: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Build a synthetic Kiro history entry wrapping the system prompt as a
+    user/assistant exchange.
+
+    When Kiro API receives a ``systemPrompt``, it is passed directly to the
+    model but does not appear in conversation history. For clients like OpenAI
+    Codex that depend on the system prompt being present in history for
+    continuation, this function creates a minimal synthetic exchange.
+
+    Args:
+        system_prompt: System prompt content to wrap.
+        model_id: Internal Kiro model ID.
+        system_cache_point: Whether to add a cache point to the system prompt.
+
+    Returns:
+        List containing a single history entry, or empty list if the prompt is empty.
+    """
+    if not system_prompt:
+        return []
+
+    system_content = system_prompt
+
+    if system_cache_point:
+        system_content = [
+            {"text": system_prompt},
+            {"text": SYSTEM_PROMPT_ACK},
+            KIRO_CACHE_POINT,
+        ]
+
+    return [
+        {
+            "userInputMessage": {
+                "content": system_content,
+                "modelId": model_id,
+                "origin": "AI_EDITOR",
+            }
+        },
+        {
+            "assistantResponseMessage": {
+                "content": "",
+            }
+        },
+    ]
+
+
 def build_kiro_payload(
     messages: List[UnifiedMessage],
     system_prompt: str,
@@ -1409,7 +1935,9 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    system_cache_point: bool = False,
+    native_thinking_config: Optional[NativeThinkingConfig] = None,
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1425,6 +1953,8 @@ def build_kiro_payload(
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
         thinking_config: Thinking configuration from API adapter
+        system_cache_point: Whether to add cache point to system prompt in history
+        native_thinking_config: Native Kiro/Claude adaptive thinking configuration
     
     Returns:
         KiroPayloadResult with payload and tool documentation
@@ -1485,22 +2015,18 @@ def build_kiro_payload(
     # Build history (all messages except the last one)
     history_messages = merged_messages[:-1] if len(merged_messages) > 1 else []
     
-    # If there's a system prompt, add it to the first user message in history
-    if full_system_prompt and history_messages:
-        first_msg = history_messages[0]
-        if first_msg.role == "user":
-            original_content = extract_text_content(first_msg.content)
-            first_msg.content = f"{full_system_prompt}\n\n{original_content}"
+    # Build system history from system prompt
+    system_history = build_kiro_system_history(full_system_prompt, model_id, system_cache_point)
     
     history = build_kiro_history(history_messages, model_id)
+    
+    # Prepend system history to conversation history
+    if system_history:
+        history = system_history + history
     
     # Current message (the last one)
     current_message = merged_messages[-1]
     current_content = extract_text_content(current_message.content)
-    
-    # If system prompt exists but history is empty - add to current message
-    if full_system_prompt and not history:
-        current_content = f"{full_system_prompt}\n\n{current_content}"
     
     # If current message is assistant, need to add it to history
     # and create user message placeholder
@@ -1570,6 +2096,8 @@ def build_kiro_payload(
         "conversationState": {
             "chatTriggerType": "MANUAL",
             "conversationId": conversation_id,
+            "agentContinuationId": str(uuid.uuid4()),
+            "agentTaskType": "vibe",
             "currentMessage": {
                 "userInputMessage": user_input_message
             }
@@ -1583,6 +2111,14 @@ def build_kiro_payload(
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn
+
+    # Build additionalModelRequestFields for native reasoning effort
+    native_effort_fields = build_native_effort_fields(model_id, thinking_config.effort_level)
+    if native_effort_fields:
+        payload["additionalModelRequestFields"] = native_effort_fields
+
+    # Apply native thinking fields (thinking.type=adaptive, display, effort)
+    apply_native_thinking_fields(payload, native_thinking_config)
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:

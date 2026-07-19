@@ -692,8 +692,8 @@ class TestBuildKiroPayload:
     
     def test_includes_system_prompt_in_first_message(self):
         """
-        What it does: Verifies adding system prompt to first message.
-        Purpose: Ensure system prompt is merged with user message.
+        What it does: Verifies system prompt is included in history via build_kiro_system_history.
+        Purpose: Ensure system prompt appears in conversation history.
         """
         print("Setup: Request with system prompt...")
         request = ChatCompletionRequest(
@@ -708,9 +708,12 @@ class TestBuildKiroPayload:
         result = build_kiro_payload(request, "conv-123", "")
         
         print(f"Result: {result}")
-        current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert "You are helpful" in current_content
-        assert "Hello" in current_content
+        # System prompt now goes into history via build_kiro_system_history
+        history = result["conversationState"].get("history", [])
+        assert len(history) >= 2
+        system_entry = history[0]
+        assert "userInputMessage" in system_entry
+        assert "You are helpful" in str(system_entry["userInputMessage"]["content"])
     
     def test_builds_history_for_multi_turn(self):
         """
@@ -732,7 +735,8 @@ class TestBuildKiroPayload:
         
         print(f"Result: {result}")
         assert "history" in result["conversationState"]
-        assert len(result["conversationState"]["history"]) == 2
+        # History includes conversation messages (may also include system history entries)
+        assert len(result["conversationState"]["history"]) >= 2
     
     def test_handles_assistant_as_last_message(self):
         """
@@ -880,9 +884,10 @@ class TestBuildKiroPayload:
         )
         
         print("Action: Building payload with FAKE_REASONING_ENABLED=True...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = build_kiro_payload(request, "conv-123", "")
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = build_kiro_payload(request, "conv-123", "")
         
         current_msg = result["conversationState"]["currentMessage"]["userInputMessage"]
         content = current_msg["content"]
@@ -907,9 +912,10 @@ class TestBuildKiroPayload:
         )
         
         print("Action: Building payload with FAKE_REASONING_ENABLED=True...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = build_kiro_payload(request, "conv-123", "")
+        with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+            with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = build_kiro_payload(request, "conv-123", "")
         
         current_msg = result["conversationState"]["currentMessage"]["userInputMessage"]
         content = current_msg["content"]
@@ -1297,13 +1303,21 @@ class TestBuildKiroPayloadToolCallsIntegration:
         # Should have userInputMessage and assistantResponseMessage in history
         assert len(history) >= 2, f"Expected at least 2 elements in history, got {len(history)}"
         
-        # Find assistantResponseMessage
+        # Find assistantResponseMessage with toolUses (skip system history entries)
         assistant_msgs = [h for h in history if "assistantResponseMessage" in h]
-        print(f"Assistant messages in history: {assistant_msgs}")
+        print(f"Assistant messages in history: {len(assistant_msgs)}")
         assert len(assistant_msgs) >= 1, "Should have at least one assistantResponseMessage"
         
+        # Find the assistant message that has toolUses (not the system history one)
+        assistant_msg = None
+        for msg in assistant_msgs:
+            arm = msg["assistantResponseMessage"]
+            if arm.get("toolUses"):
+                assistant_msg = arm
+                break
+        assert assistant_msg is not None, "Should have an assistantResponseMessage with toolUses"
+        
         # Check that assistantResponseMessage has both toolUses
-        assistant_msg = assistant_msgs[0]["assistantResponseMessage"]
         tool_uses = assistant_msg.get("toolUses", [])
         print(f"ToolUses in assistant: {tool_uses}")
         print(f"Comparing toolUses count: Expected 2, Got {len(tool_uses)}")
@@ -1356,10 +1370,18 @@ class TestBuildKiroPayloadToolCallsIntegration:
             result = build_kiro_payload(request, "conv-123", "")
         
         print("Checking that system prompt contains tool documentation...")
-        current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert "You are helpful" in current_content
-        assert "## Tool: long_tool" in current_content
-        assert long_desc in current_content
+        # System prompt + tool documentation now goes into history
+        history = result["conversationState"].get("history", [])
+        system_content = ""
+        for entry in history:
+            if "userInputMessage" in entry:
+                content = entry["userInputMessage"].get("content", "")
+                if isinstance(content, str) and "You are helpful" in content:
+                    system_content = content
+                    break
+        assert "You are helpful" in system_content, f"System prompt not found in history. History: {history}"
+        assert "## Tool: long_tool" in system_content
+        assert long_desc in system_content
         
         print("Checking that tool in context has reference description...")
         tools_context = result["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
@@ -1846,6 +1868,7 @@ class TestBuildKiroPayloadIntegration:
         Purpose: Ensure end-to-end thinking configuration flow works
         """
         print("Setting up mocks...")
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000)
         

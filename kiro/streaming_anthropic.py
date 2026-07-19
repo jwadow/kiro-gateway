@@ -50,6 +50,7 @@ from kiro.streaming_core import (
 from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
+from kiro.cache import prompt_cache_tracker
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -634,6 +635,16 @@ async def stream_kiro_to_anthropic(
             if prompt_source != "unknown":
                 input_tokens = prompt_tokens
         
+        local_cache_usage = (
+            await prompt_cache_tracker.record(
+                model=model,
+                messages=request_messages,
+                tools=request_tools,
+                system=request_system,
+                input_tokens=input_tokens,
+            )
+        ).to_anthropic_usage_fields()
+        
         # Determine stop reason (truncation has highest priority)
         if content_was_truncated:
             stop_reason = "max_tokens"
@@ -647,6 +658,8 @@ async def stream_kiro_to_anthropic(
             "output_tokens": output_tokens
         }
         usage_payload.update(upstream_cache_usage)
+        if not upstream_cache_usage:
+            usage_payload.update(local_cache_usage)
 
         yield format_sse_event("message_delta", {
             "type": "message_delta",
@@ -815,6 +828,16 @@ async def collect_anthropic_response(
         if prompt_source != "unknown":
             input_tokens = prompt_tokens
     
+    local_cache_usage = (
+        await prompt_cache_tracker.record(
+            model=model,
+            messages=request_messages,
+            tools=request_tools,
+            system=request_system,
+            input_tokens=input_tokens,
+        )
+    ).to_anthropic_usage_fields()
+    
     # Detect content truncation (missing completion signals)
     stream_completed_normally = result.context_usage_percentage is not None
     content_was_truncated = (
@@ -850,6 +873,8 @@ async def collect_anthropic_response(
         "output_tokens": output_tokens
     }
     usage_payload.update(upstream_cache_usage)
+    if not upstream_cache_usage:
+        usage_payload.update(local_cache_usage)
 
     return {
         "id": message_id,

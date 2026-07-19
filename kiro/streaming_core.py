@@ -37,12 +37,13 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict
 import httpx
 from loguru import logger
 
-from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls, parse_xml_tool_calls, strip_xml_tool_calls
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_HANDLING,
+    NATIVE_REASONING_ENABLED,
 )
 from kiro.thinking_parser import ThinkingParser
 
@@ -85,6 +86,7 @@ class KiroEvent:
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
+    is_native_thinking: bool = False
 
 
 @dataclass
@@ -139,12 +141,19 @@ async def parse_kiro_stream(
     """
     parser = AwsEventStreamParser()
     first_token_received = False
+    byte_iterator = None
     
-    # Initialize thinking parser if fake reasoning is enabled
+    # Initialize thinking parser only for legacy fake-reasoning mode.
+    # When native reasoning is active, the model emits a dedicated
+    # reasoningContentEvent stream (no thinking tags in content), so the
+    # tag-detecting ThinkingParser is unnecessary and would only add buffering
+    # latency to the content channel.
     thinking_parser: Optional[ThinkingParser] = None
-    if FAKE_REASONING_ENABLED and enable_thinking_parser:
+    if FAKE_REASONING_ENABLED and enable_thinking_parser and not NATIVE_REASONING_ENABLED:
         thinking_parser = ThinkingParser(handling_mode=FAKE_REASONING_HANDLING)
         logger.debug(f"Thinking parser initialized with mode: {FAKE_REASONING_HANDLING}")
+    elif NATIVE_REASONING_ENABLED:
+        logger.debug("Native reasoning enabled - thinking parser skipped (using reasoningContentEvent)")
     
     try:
         # Create iterator for reading bytes
@@ -165,6 +174,16 @@ async def parse_kiro_stream(
             # Empty response - this is normal, just finish
             logger.debug("Empty response from Kiro API")
             return
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            # Upstream dropped the connection before sending any token. Nothing has
+            # been emitted to the client yet, so it is safe to retry. Reuse the
+            # first-token retry path by raising FirstTokenTimeoutError.
+            logger.warning(
+                "Upstream closed connection before first token [{}: {}] - triggering retry",
+                type(e).__name__,
+                str(e) if str(e) else "(empty message)",
+            )
+            raise FirstTokenTimeoutError("Upstream closed connection before first token")
         
         # Process first chunk
         if debug_logger:
@@ -176,12 +195,24 @@ async def parse_kiro_stream(
             yield event
         
         # Continue reading remaining chunks
-        async for chunk in byte_iterator:
-            if debug_logger:
-                debug_logger.log_raw_chunk(chunk)
-            
-            async for event in _process_chunk(parser, chunk, thinking_parser):
-                yield event
+        try:
+            async for chunk in byte_iterator:
+                if debug_logger:
+                    debug_logger.log_raw_chunk(chunk)
+                
+                async for event in _process_chunk(parser, chunk, thinking_parser):
+                    yield event
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            # Upstream Kiro closed the connection before completing the chunked
+            # body (incomplete chunked read). Content was already streamed, so we
+            # cannot retry without duplicating output to the client. End the stream
+            # gracefully and fall through to the finalization below so the client
+            # keeps the partial content + a proper finish marker instead of HTTP 500.
+            logger.warning(
+                "Upstream connection dropped mid-stream [{}: {}] - finalizing with partial content",
+                type(e).__name__,
+                str(e) if str(e) else "(empty message)",
+            )
         
         # Finalize thinking parser and yield any remaining content
         if thinking_parser:
@@ -225,6 +256,12 @@ async def parse_kiro_stream(
         error_msg = str(e) if str(e) else "(empty message)"
         logger.error(f"Error during stream parsing: [{error_type}] {error_msg}", exc_info=True)
         raise
+    finally:
+        if byte_iterator is not None:
+            try:
+                await byte_iterator.aclose()
+            except Exception:
+                pass
 
 
 async def _process_chunk(
@@ -281,6 +318,27 @@ async def _process_chunk(
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
 
+        elif event["type"] == "reasoning":
+            # Native extended thinking from the model (reasoningContentEvent).
+            # This is NOT wrapped in tags, so it bypasses the ThinkingParser
+            # entirely and is emitted directly as a thinking event.
+            if event["data"]:
+                yield KiroEvent(
+                    type="thinking",
+                    thinking_content=event["data"],
+                    is_first_thinking_chunk=event.get("is_first", False),
+                    is_native_thinking=event.get("is_native", False),
+                )
+
+        elif event["type"] == "thinking_signature":
+            logger.debug("Received native thinking signature from Kiro stream")
+            yield KiroEvent(
+                type="thinking",
+                thinking_content="",
+                is_last_thinking_chunk=True,
+                is_native_thinking=True,
+            )
+
 
 # ==================================================================================================
 # Full Response Collection
@@ -326,7 +384,14 @@ async def collect_stream_to_result(
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
-    
+
+    # Recover XML tool calls that leaked into the text channel and strip
+    # the raw XML from the visible content so it doesn't render as text.
+    xml_tool_calls = parse_xml_tool_calls(result.content)
+    if xml_tool_calls:
+        result.tool_calls = deduplicate_tool_calls(result.tool_calls + xml_tool_calls)
+        result.content = strip_xml_tool_calls(result.content)
+
     return result
 
 
@@ -431,7 +496,35 @@ async def stream_with_first_token_retry(
                 response = initial_response
                 logger.debug("Reusing initial response for first attempt")
             else:
-                response = await make_request()
+                # Make request with keep-alive chunks during prefill (TTFT) to
+                # prevent client disconnect on large-context requests where the
+                # upstream withholds HTTP 200 headers until the first token is
+                # ready. Without this, the route stays byte-silent for the entire
+                # prefill window, and the client treats the silence as a dead stream.
+                async def _run_make_request() -> httpx.Response:
+                    return await make_request()
+
+                req_task = asyncio.create_task(_run_make_request())
+                _ka_count = 0
+                try:
+                    while not req_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(req_task), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            _ka_count += 1
+                            yield ": keepalive\n\n"
+                    if _ka_count:
+                        logger.debug(f"Sent {_ka_count} keep-alive chunk(s) during prefill ({_ka_count * 3}s+ TTFT)")
+                    response = req_task.result()
+                finally:
+                    if not req_task.done():
+                        req_task.cancel()
+                        try:
+                            await req_task
+                        except BaseException:
+                            pass
+
+            assert response is not None
             
             if response.status_code != 200:
                 # Error from API - close response and raise exception

@@ -24,11 +24,18 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from kiro.config import HIDDEN_MODELS
+from kiro.config import (
+    HIDDEN_MODELS,
+    MODEL_ALIASES,
+    STRIP_BILLING_HEADER,
+    KIRO_NATIVE_THINKING_MODE,
+    KIRO_NATIVE_THINKING_DISPLAY,
+)
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
@@ -39,10 +46,283 @@ from kiro.converters_core import (
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
+    NativeThinkingConfig,
+    build_native_thinking_config,
     build_kiro_payload,
     extract_text_content,
     extract_images_from_content,
+    extract_document_text_from_content_block,
+    KIRO_CACHE_POINT,
 )
+
+
+# ==================================================================================================
+# Billing Attribution Stripping
+# ==================================================================================================
+
+_BILLING_HEADER_LINE_PATTERN = re.compile(
+    r"^x-anthropic-billing-header:[^\n]*\n?", re.IGNORECASE
+)
+_BILLING_FOOTER_RE = re.compile(r"Response from [^.]+\.model\..+?\.(.+?) via", re.DOTALL)
+
+
+def _strip_billing_attribution(text: str) -> str:
+    """
+    Strip AWS Q Developer / Kiro billing attribution from response text.
+
+    Handles two patterns:
+    1. Claude Code's per-request billing header line:
+       ``x-anthropic-billing-header: cc_version=...; cc_entrypoint=...``
+    2. Kiro API's billing footer:
+       ``Response from prod.us-east-1.deflector.9x7g0y8h model.claude-3-5-sonnet-20241022-v2:0 via ...``
+
+    Both are billing/metering metadata, not assistant content.
+
+    Args:
+        text: Response text that may contain billing attribution.
+
+    Returns:
+        Text with billing attribution stripped.
+    """
+    if not text or not STRIP_BILLING_HEADER:
+        return text
+
+    # Strip Claude Code billing header line
+    stripped = _BILLING_HEADER_LINE_PATTERN.sub("", text, count=1)
+    if stripped != text:
+        text = stripped.lstrip("\n")
+
+    # Strip Kiro billing footer
+    match = _BILLING_FOOTER_RE.search(text)
+    if match:
+        start = match.start()
+        text = text[:start].rstrip()
+
+    return text
+
+
+# ==================================================================================================
+# Inline System Message Extraction
+# ==================================================================================================
+
+def separate_inline_system_messages(
+    messages: List[UnifiedMessage],
+) -> Tuple[Optional[str], List[UnifiedMessage]]:
+    """
+    Separate inline system messages from conversation messages.
+
+    Some clients send system instructions as user messages with specific prefixes.
+    This function extracts them and returns them as a system prompt string,
+    along with the remaining conversation messages.
+
+    Args:
+        messages: List of unified messages.
+
+    Returns:
+        Tuple of (system_prompt_or_None, remaining_messages).
+    """
+    system_parts: List[str] = []
+    remaining: List[UnifiedMessage] = []
+
+    for msg in messages:
+        if msg.role == "user":
+            text = extract_text_content(msg.content) if msg.content else ""
+            if text.startswith("[SYSTEM INSTRUCTION]"):
+                system_parts.append(text.replace("[SYSTEM INSTRUCTION]", "").strip())
+                continue
+        remaining.append(msg)
+
+    system_prompt = "\n\n".join(system_parts) if system_parts else None
+    return system_prompt, remaining
+
+
+# ==================================================================================================
+# Cache Control Detection
+# ==================================================================================================
+
+def get_cache_control(value: Any) -> Optional[Dict[str, str]]:
+    """
+    Extract cache_control from a value if present.
+
+    Args:
+        value: Dict or object that may have a cache_control field.
+
+    Returns:
+        Cache control dict if present, None otherwise.
+    """
+    if isinstance(value, dict):
+        cc = value.get("cache_control")
+        if isinstance(cc, dict):
+            return cc
+    elif hasattr(value, "cache_control"):
+        cc = getattr(value, "cache_control", None)
+        if isinstance(cc, dict):
+            return cc
+    return None
+
+
+def has_supported_cache_control(value: Any) -> bool:
+    """
+    Check if a value has a supported cache_control field (type: "ephemeral").
+
+    Args:
+        value: Dict or object that may have a cache_control field.
+
+    Returns:
+        True if cache_control is present and supported.
+    """
+    cc = get_cache_control(value)
+    return cc is not None and cc.get("type") == "ephemeral"
+
+
+# ==================================================================================================
+# Budget to Effort Mapping
+# =================================================================================================>
+
+def _budget_to_effort_level(budget_tokens: Optional[int], max_tokens: int) -> str:
+    """
+    Map a fake thinking budget token count back to an effort level string
+    for native thinking support.
+
+    Args:
+        budget_tokens: The fake thinking budget in tokens.
+        max_tokens: Maximum output tokens for the request.
+
+    Returns:
+        Effort level string (low/medium/high/xhigh/max).
+    """
+    if not budget_tokens or not max_tokens:
+        return "medium"
+
+    ratio = budget_tokens / max_tokens
+
+    if ratio >= 0.95:
+        return "max"
+    if ratio >= 0.80:
+        return "xhigh"
+    if ratio >= 0.50:
+        return "high"
+    if ratio >= 0.20:
+        return "medium"
+    return "low"
+
+
+# ==================================================================================================
+# Tool Choice Prompt Addition
+# ==================================================================================================
+
+def build_tool_choice_prompt_addition(tool_choice: Optional[Dict[str, Any]]) -> str:
+    """
+    Build system prompt addition for tool_choice instruction.
+
+    When the client specifies a tool_choice, we need to add JSON instructions
+    to the system prompt so the model knows to output a tool call in the
+    specified format.
+
+    Args:
+        tool_choice: Tool choice configuration from Anthropic request.
+
+    Returns:
+        System prompt addition text (empty string if not applicable).
+    """
+    if not tool_choice:
+        return ""
+
+    choice_type = tool_choice.get("type", "")
+
+    if choice_type == "auto":
+        return ""
+
+    if choice_type == "any":
+        return (
+            "\n\n---\n"
+            "# Tool Use Instruction\n\n"
+            "You MUST use a tool in your response. Select the most appropriate tool "
+            "for the task and provide the necessary input parameters."
+        )
+
+    if choice_type == "tool":
+        tool_name = tool_choice.get("name", "")
+        if tool_name:
+            return (
+                f"\n\n---\n"
+                f"# Tool Use Instruction\n\n"
+                f"You MUST use the `{tool_name}` tool in your response. "
+                f"Provide the necessary input parameters for this tool."
+            )
+
+    return ""
+
+
+# ==================================================================================================
+# JSON Schema Output Support
+# ==================================================================================================
+
+def extract_json_schema_output_config(
+    response_format: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Extract JSON schema configuration from response_format.
+
+    Args:
+        response_format: Response format configuration from Anthropic request.
+
+    Returns:
+        JSON schema dict if present and valid, None otherwise.
+    """
+    if not response_format:
+        return None
+
+    fmt_type = response_format.get("type", "")
+    if fmt_type != "json_schema":
+        return None
+
+    json_schema = response_format.get("json_schema")
+    if not json_schema:
+        return None
+
+    schema = json_schema.get("schema")
+    if not schema:
+        return None
+
+    name = json_schema.get("name", "response")
+    return {"name": name, "schema": schema}
+
+
+def build_json_schema_prompt_addition(
+    response_format: Optional[Dict[str, Any]],
+) -> str:
+    """
+    Build system prompt addition for JSON schema output instruction.
+
+    Args:
+        response_format: Response format configuration from Anthropic request.
+
+    Returns:
+        System prompt addition text (empty string if not applicable).
+    """
+    json_schema_config = extract_json_schema_output_config(response_format)
+    if not json_schema_config:
+        return ""
+
+    import json as _json
+    schema_str = _json.dumps(json_schema_config["schema"], indent=2)
+    name = json_schema_config["name"]
+
+    return (
+        f"\n\n---\n"
+        f"# Output Format Instruction\n\n"
+        f"You MUST respond with a valid JSON object that conforms to the following schema "
+        f"(named `{name}`):\n\n"
+        f"```json\n{schema_str}\n```\n\n"
+        f"Your response should be ONLY the JSON object, with no additional text, "
+        f"markdown formatting, or explanation outside the JSON."
+    )
+
+
+# ==================================================================================================
+# Content Processing Helpers
+# ==================================================================================================
 
 
 def convert_anthropic_content_to_text(content: Any) -> str:
@@ -68,6 +348,10 @@ def convert_anthropic_content_to_text(content: Any) -> str:
             if isinstance(block, dict):
                 if block.get("type") == "text":
                     text_parts.append(block.get("text", ""))
+                elif block.get("type") == "document":
+                    doc_text = extract_document_text_from_content_block(block)
+                    if doc_text:
+                        text_parts.append(doc_text)
             elif hasattr(block, "type") and block.type == "text":
                 text_parts.append(block.text)
         return "".join(text_parts)
@@ -96,7 +380,7 @@ def extract_system_prompt(system: Any) -> str:
         return ""
 
     if isinstance(system, str):
-        return system
+        return _strip_billing_attribution(system)
 
     if isinstance(system, list):
         text_parts = []
@@ -104,10 +388,12 @@ def extract_system_prompt(system: Any) -> str:
             if isinstance(block, dict):
                 # Handle {"type": "text", "text": "...", "cache_control": {...}}
                 if block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
+                    text = block.get("text", "")
+                    text_parts.append(_strip_billing_attribution(text))
             elif hasattr(block, "type") and block.type == "text":
                 # Handle Pydantic model
-                text_parts.append(getattr(block, "text", ""))
+                text = getattr(block, "text", "")
+                text_parts.append(_strip_billing_attribution(text))
         return "\n".join(text_parts)
 
     return str(system)
@@ -200,8 +486,6 @@ def extract_images_from_tool_results(content: Any) -> List[Dict[str, Any]]:
         logger.debug(f"Extracted {len(images)} image(s) from tool_result content")
 
     return images
-
-    return tool_results
 
 
 def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
@@ -357,11 +641,17 @@ def convert_anthropic_tools(
         if isinstance(tool, dict):
             name = tool.get("name", "")
             description = tool.get("description")
-            input_schema = tool.get("input_schema", {})
+            input_schema = tool.get("input_schema")
         else:
             name = tool.name
             description = tool.description
-            input_schema = tool.input_schema
+            input_schema = getattr(tool, "input_schema", None)
+
+        # Skip server-managed tools without input_schema (e.g., web_search)
+        # Kiro API requires tools to have a valid input_schema
+        if input_schema is None:
+            logger.debug(f"Skipping tool '{name}' without input_schema (server-managed)")
+            continue
 
         unified_tools.append(
             UnifiedTool(name=name, description=description, input_schema=input_schema)
@@ -376,6 +666,7 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     
     Handles thinking parameter:
     - {"type": "enabled", "budget_tokens": N} → enabled with budget
+    - {"type": "adaptive", "effort": "max"} → enabled with effort-based budget
     - {"type": "disabled"} → disabled
     - None → enabled with default budget
     
@@ -400,6 +691,11 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         >>> request.thinking = {"type": "enabled", "budget_tokens": 8000}
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=8000)
+
+        >>> # Adaptive effort translated to gateway fake thinking budget
+        >>> request.thinking = {"type": "adaptive", "effort": "max"}
+        >>> extract_thinking_config_from_anthropic(request)
+        ThinkingConfig(enabled=True, budget_tokens=4096)
     """
     if not request.thinking:
         # No thinking specified → use defaults
@@ -422,6 +718,31 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
             logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
         return ThinkingConfig(enabled=True, budget_tokens=budget)
     
+    if thinking_type == "adaptive":
+        effort = request.thinking.get("effort")
+        if not effort:
+            logger.debug("Extracted adaptive thinking config from Anthropic without effort")
+            return ThinkingConfig(enabled=True, budget_tokens=None)
+
+        if effort == "none":
+            logger.debug("Extracted adaptive thinking config from Anthropic: effort='none'")
+            return ThinkingConfig(enabled=False, budget_tokens=None)
+
+        try:
+            budget = reasoning_effort_to_budget(request.max_tokens, effort)
+        except ValueError:
+            logger.warning(
+                f"Unsupported Anthropic adaptive thinking effort '{effort}'. "
+                "Using default fake thinking budget."
+            )
+            return ThinkingConfig(enabled=True, budget_tokens=None)
+
+        logger.debug(
+            f"Extracted adaptive thinking config from Anthropic: effort='{effort}', "
+            f"max_tokens={request.max_tokens}, budget={budget}"
+        )
+        return ThinkingConfig(enabled=True, budget_tokens=budget)
+
     # Unknown type → use defaults
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
@@ -453,12 +774,36 @@ def anthropic_to_kiro(
     # Convert messages to unified format
     unified_messages = convert_anthropic_messages(request.messages)
 
+    # Separate inline system messages from conversation
+    inline_system_prompt, unified_messages = separate_inline_system_messages(unified_messages)
+
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
 
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
     system_prompt = extract_system_prompt(request.system)
+
+    # Merge inline system prompt with main system prompt
+    if inline_system_prompt:
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n\n{inline_system_prompt}"
+        else:
+            system_prompt = inline_system_prompt
+
+    # Add tool choice prompt addition if specified
+    tool_choice_addition = build_tool_choice_prompt_addition(
+        getattr(request, "tool_choice", None)
+    )
+    if tool_choice_addition:
+        system_prompt = system_prompt + tool_choice_addition if system_prompt else tool_choice_addition
+
+    # Add JSON schema output prompt addition if specified
+    json_schema_addition = build_json_schema_prompt_addition(
+        getattr(request, "response_format", None)
+    )
+    if json_schema_addition:
+        system_prompt = system_prompt + json_schema_addition if system_prompt else json_schema_addition
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
@@ -467,11 +812,25 @@ def anthropic_to_kiro(
     # Extract thinking configuration from thinking parameter
     thinking_config = extract_thinking_config_from_anthropic(request)
 
+    # Build native thinking config from model and thinking effort
+    native_effort: Optional[str] = None
+    native_display: Optional[str] = None
+    if isinstance(request.thinking, dict) and request.thinking.get("type") == "adaptive":
+        native_effort = request.thinking.get("effort") or "high"
+        native_display = request.thinking.get("display")
+    native_thinking_config = build_native_thinking_config(model_id, native_effort)
+    if native_display in ("summarized", "omitted"):
+        native_thinking_config.display = native_display
+    if native_thinking_config.enabled:
+        # Native adaptive thinking supersedes fake tag injection for this request.
+        thinking_config = ThinkingConfig(enabled=False, budget_tokens=None)
+
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"native_thinking_enabled={native_thinking_config.enabled}, native_effort={native_thinking_config.effort}"
     )
 
     # Use core function to build payload
@@ -483,6 +842,7 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        native_thinking_config=native_thinking_config,
     )
 
     return result.payload

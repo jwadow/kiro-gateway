@@ -8,6 +8,7 @@ All tests MUST be completely isolated from the network.
 """
 
 import asyncio
+import warnings
 import json
 import pytest
 import time
@@ -16,6 +17,11 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from datetime import datetime, timezone
 
 import httpx
+
+# Suppress StarletteDeprecationWarning: httpx2 package doesn't exist yet,
+# and starlette.testclient always falls back to httpx with a deprecation warning.
+warnings.filterwarnings("ignore", message=".*httpx.*starlette.testclient.*")
+
 from fastapi.testclient import TestClient
 
 
@@ -86,6 +92,13 @@ def setup_test_environment(tmp_path_factory):
     import kiro.config
     original_creds_file = kiro.config.ACCOUNTS_CONFIG_FILE
     original_state_file = kiro.config.ACCOUNTS_STATE_FILE
+    # Also set OS env vars so that config module reloads (e.g. in test_config.py)
+    # pick up the correct temp paths instead of defaults.
+    import os
+    original_env_creds = os.environ.get("ACCOUNTS_CONFIG_FILE")
+    original_env_state = os.environ.get("ACCOUNTS_STATE_FILE")
+    os.environ["ACCOUNTS_CONFIG_FILE"] = str(creds_file)
+    os.environ["ACCOUNTS_STATE_FILE"] = str(tmp_dir / "state.json")
     
     kiro.config.ACCOUNTS_CONFIG_FILE = str(creds_file)
     kiro.config.ACCOUNTS_STATE_FILE = str(tmp_dir / "state.json")
@@ -98,6 +111,14 @@ def setup_test_environment(tmp_path_factory):
     # Restore original paths
     kiro.config.ACCOUNTS_CONFIG_FILE = original_creds_file
     kiro.config.ACCOUNTS_STATE_FILE = original_state_file
+    if original_env_creds is not None:
+        os.environ["ACCOUNTS_CONFIG_FILE"] = original_env_creds
+    else:
+        os.environ.pop("ACCOUNTS_CONFIG_FILE", None)
+    if original_env_state is not None:
+        os.environ["ACCOUNTS_STATE_FILE"] = original_env_state
+    else:
+        os.environ.pop("ACCOUNTS_STATE_FILE", None)
     
     print("🧹 Test environment cleaned up")
 
@@ -525,7 +546,17 @@ def block_all_network_calls():
 def clean_app():
     """
     Returns a "clean" application instance for each test.
+    
+    Ensures config module attributes are synchronized with OS env vars,
+    which is needed when test_config.py reloads the config module.
     """
+    import os
+    import kiro.config
+    if "ACCOUNTS_CONFIG_FILE" in os.environ:
+        kiro.config.ACCOUNTS_CONFIG_FILE = os.environ["ACCOUNTS_CONFIG_FILE"]
+    if "ACCOUNTS_STATE_FILE" in os.environ:
+        kiro.config.ACCOUNTS_STATE_FILE = os.environ["ACCOUNTS_STATE_FILE"]
+    
     print("Importing application for test...")
     from main import app
     # Reset all dependency overrides before test
@@ -543,6 +574,13 @@ def test_client(clean_app):
     with TestClient(clean_app) as client:
         yield client
     print("Closing TestClient...")
+    # Cleanup: uninstall tool name aliasing patches so subsequent tests
+    # in the same process see unpatched module state.
+    try:
+        from extensions.tool_name_alias import uninstall_tool_name_aliasing
+        uninstall_tool_name_aliasing()
+    except ImportError:
+        pass
 
 
 @pytest.fixture

@@ -448,22 +448,23 @@ class TestParseKiroStream:
         print("Setup: Mock response that times out...")
         
         async def mock_aiter_bytes():
+            await asyncio.sleep(float('inf'))
             yield b'chunk'
         
         mock_response.aiter_bytes = mock_aiter_bytes
         
-        async def mock_wait_for_timeout(*args, **kwargs):
-            raise asyncio.TimeoutError()
-        
         print("Action: Parsing stream with timeout...")
         
-        with patch('kiro.streaming_core.asyncio.wait_for', side_effect=mock_wait_for_timeout):
+        gen = parse_kiro_stream(mock_response, first_token_timeout=0.1)
+        try:
             with pytest.raises(FirstTokenTimeoutError) as exc_info:
-                async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                async for event in gen:
                     pass
+        finally:
+            await gen.aclose()
         
         print(f"Caught exception: {exc_info.value}")
-        assert "30" in str(exc_info.value)
+        assert "0.1" in str(exc_info.value)
         print("✓ FirstTokenTimeoutError raised on timeout")
     
     @pytest.mark.asyncio
@@ -480,16 +481,15 @@ class TestParseKiroStream:
         
         mock_response.aiter_bytes = mock_aiter_bytes
         
-        # Mock wait_for to raise StopAsyncIteration (empty response)
-        async def mock_wait_for_empty(*args, **kwargs):
-            raise StopAsyncIteration()
-        
         print("Action: Parsing empty stream...")
         events = []
         
-        with patch('kiro.streaming_core.asyncio.wait_for', side_effect=mock_wait_for_empty):
-            async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+        gen = parse_kiro_stream(mock_response, first_token_timeout=30)
+        try:
+            async for event in gen:
                 events.append(event)
+        finally:
+            await gen.aclose()
         
         print(f"Received {len(events)} events")
         assert len(events) == 0
@@ -1064,29 +1064,29 @@ class TestThinkingParserIntegration:
         events = []
         
         with patch('kiro.streaming_core.AwsEventStreamParser', return_value=mock_parser):
-            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', True):
-                with patch('kiro.streaming_core.ThinkingParser') as mock_thinking_parser_class:
-                    mock_thinking_parser = MagicMock()
-                    mock_thinking_parser.feed.return_value = MagicMock(
-                        thinking_content=None,
-                        regular_content="Hello",
-                        is_first_thinking_chunk=False,
-                        is_last_thinking_chunk=False
-                    )
-                    mock_thinking_parser.finalize.return_value = MagicMock(
-                        thinking_content=None,
-                        regular_content=None,
-                        is_first_thinking_chunk=False,
-                        is_last_thinking_chunk=False
-                    )
-                    mock_thinking_parser.found_thinking_block = False
-                    mock_thinking_parser_class.return_value = mock_thinking_parser
-                    
-                    async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
-                        events.append(event)
-                    
-                    # Verify ThinkingParser was instantiated
-                    mock_thinking_parser_class.assert_called_once()
+            with patch('kiro.streaming_core.NATIVE_REASONING_ENABLED', False):
+                with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', True):
+                    with patch('kiro.streaming_core.ThinkingParser') as mock_thinking_parser_class:
+                        mock_thinking_parser = MagicMock()
+                        mock_thinking_parser.feed.return_value = MagicMock(
+                            thinking_content=None,
+                            regular_content="Hello",
+                            is_first_thinking_chunk=False,
+                            is_last_thinking_chunk=False
+                        )
+                        mock_thinking_parser.finalize.return_value = MagicMock(
+                            thinking_content=None,
+                            regular_content=None,
+                            is_first_thinking_chunk=False,
+                            is_last_thinking_chunk=False
+                        )
+                        mock_thinking_parser.found_thinking_block = False
+                        mock_thinking_parser_class.return_value = mock_thinking_parser
+                        
+                        async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                            events.append(event)
+                        # Verify ThinkingParser was instantiated
+                        mock_thinking_parser_class.assert_called_once()
         
         print("✓ Thinking parser enabled when fake reasoning is on")
     
@@ -1169,19 +1169,20 @@ class TestStreamingCoreErrorHandling:
         print("Setup: Mock response that times out...")
         
         async def mock_aiter_bytes():
+            await asyncio.sleep(float('inf'))
             yield b'chunk'
         
         mock_response.aiter_bytes = mock_aiter_bytes
         
-        async def mock_wait_for_timeout(*args, **kwargs):
-            raise asyncio.TimeoutError()
-        
         print("Action: Parsing stream with timeout...")
         
-        with patch('kiro.streaming_core.asyncio.wait_for', side_effect=mock_wait_for_timeout):
+        gen = parse_kiro_stream(mock_response, first_token_timeout=0.1)
+        try:
             with pytest.raises(FirstTokenTimeoutError):
-                async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                async for event in gen:
                     pass
+        finally:
+            await gen.aclose()
         
         print("✓ FirstTokenTimeoutError propagated correctly")
     

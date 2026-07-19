@@ -88,6 +88,8 @@ from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
+from kiro.routes_responses import router as responses_router
+from extensions.tool_name_alias import install_tool_name_aliasing
 
 
 # --- Loguru Configuration ---
@@ -97,6 +99,17 @@ logger.add(
     level=LOG_LEVEL,
     colorize=True,
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+)
+
+logger.add(
+    Path(__file__).parent / "errors.log",
+    level="ERROR",
+    rotation="10 MB",
+    retention=5,
+    encoding="utf-8",
+    backtrace=True,
+    diagnose=True,
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
 )
 
 
@@ -332,7 +345,10 @@ async def lifespan(app: FastAPI):
     concurrent requests efficiently (fixes issue #24).
     """
     logger.info("Starting application... Creating state managers.")
-    
+
+    # Install tool-name aliasing patch (handles MCP tool names exceeding Kiro's 64-char limit)
+    install_tool_name_aliasing()
+
     # Create shared HTTP client with connection pooling
     # This reduces memory usage and enables connection reuse across requests
     # Limits: max 100 total connections, max 20 keep-alive connections
@@ -570,6 +586,9 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Responses API
+app.include_router(responses_router)
 
 
 # --- Uvicorn log config ---
