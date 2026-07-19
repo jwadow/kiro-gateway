@@ -294,6 +294,67 @@ class SystemContentBlock(BaseModel):
 SystemPrompt = Union[str, List[SystemContentBlock], List[Dict[str, Any]]]
 
 
+def _promote_embedded_system_messages(data: Any) -> Any:
+    """Move Claude Code's embedded system messages to the system prompt.
+
+    Claude Code may insert runtime reminders into the ``messages`` array with
+    role ``system``. The Anthropic API only permits ``user`` and ``assistant``
+    there, so merge valid embedded system content into the top-level ``system``
+    field before normal request validation. Invalid content is deliberately
+    left untouched so Pydantic reports it instead of silently discarding it.
+
+    Args:
+        data: Raw request data supplied to the Pydantic model.
+
+    Returns:
+        Normalized request data, or the original value when normalization does
+        not apply.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return data
+
+    conversation_messages = []
+    embedded_system_blocks = []
+    promoted_message = False
+
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            conversation_messages.append(message)
+            continue
+
+        content = message.get("content")
+        if isinstance(content, str):
+            embedded_system_blocks.append({"type": "text", "text": content})
+            promoted_message = True
+        elif isinstance(content, list):
+            embedded_system_blocks.extend(content)
+            promoted_message = True
+        else:
+            conversation_messages.append(message)
+
+    if not promoted_message:
+        return data
+
+    existing_system = data.get("system")
+    if existing_system is None:
+        system_blocks = []
+    elif isinstance(existing_system, str):
+        system_blocks = [{"type": "text", "text": existing_system}]
+    elif isinstance(existing_system, list):
+        system_blocks = list(existing_system)
+    else:
+        return data
+
+    normalized = dict(data)
+    normalized["messages"] = conversation_messages
+    normalized["system"] = system_blocks + embedded_system_blocks
+    return normalized
+
+
 class AnthropicMessagesRequest(BaseModel):
     """
     Request to Anthropic Messages API (/v1/messages).
@@ -337,6 +398,12 @@ class AnthropicMessagesRequest(BaseModel):
     stop_sequences: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def promote_embedded_system_messages(cls, data: Any) -> Any:
+        """Normalize Claude Code runtime reminders before validation."""
+        return _promote_embedded_system_messages(data)
+
     model_config = {"extra": "allow"}
 
 
@@ -360,6 +427,12 @@ class AnthropicCountTokensRequest(BaseModel):
     # Optional parameters - only those that affect token count
     system: Optional[SystemPrompt] = None
     tools: Optional[List[AnthropicTool]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def promote_embedded_system_messages(cls, data: Any) -> Any:
+        """Normalize Claude Code runtime reminders before validation."""
+        return _promote_embedded_system_messages(data)
     
     model_config = {"extra": "allow"}
 

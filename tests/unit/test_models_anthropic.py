@@ -38,6 +38,7 @@ from kiro.models_anthropic import (
     # Request models
     SystemContentBlock,
     AnthropicMessagesRequest,
+    AnthropicCountTokensRequest,
     # Response models
     AnthropicUsage,
     AnthropicMessagesResponse,
@@ -527,6 +528,151 @@ class TestAnthropicMessageWithImages:
 # ==================================================================================================
 # Tests for AnthropicMessagesRequest with Image Content
 # ==================================================================================================
+
+class TestEmbeddedSystemMessageNormalization:
+    """Tests for clients that place system instructions in messages[]."""
+
+    def test_promotes_string_content_after_existing_string_system(self):
+        """
+        What it does: Promotes an embedded string system message after a top-level string.
+        Purpose: Preserve both instruction sources in deterministic order.
+        """
+        print("Action: Validating request with string system sources...")
+        request = AnthropicMessagesRequest.model_validate({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1024,
+            "system": "base system",
+            "messages": [
+                {"role": "user", "content": "ping"},
+                {"role": "system", "content": "runtime system"},
+            ],
+        })
+
+        print("Verifying system ordering and conversation roles...")
+        assert [message.role for message in request.messages] == ["user"]
+        assert [block.text for block in request.system] == ["base system", "runtime system"]
+
+    def test_promotes_multiple_block_messages_and_preserves_cache_control(self):
+        """
+        What it does: Promotes multiple embedded block-list system messages.
+        Purpose: Preserve ordering, extra fields, and prompt-cache metadata.
+        """
+        print("Action: Validating multiple embedded system messages...")
+        request = AnthropicMessagesRequest.model_validate({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1024,
+            "system": [{"type": "text", "text": "base system"}],
+            "messages": [
+                {"role": "user", "content": "first"},
+                {
+                    "role": "system",
+                    "content": [{
+                        "type": "text",
+                        "text": "runtime one",
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                },
+                {"role": "assistant", "content": "second"},
+                {"role": "system", "content": [{"type": "text", "text": "runtime two"}]},
+            ],
+        })
+
+        system_blocks = [block.model_dump() for block in request.system]
+        print("Verifying promoted content and cache metadata...")
+        assert [message.role for message in request.messages] == ["user", "assistant"]
+        assert [block["text"] for block in system_blocks] == [
+            "base system",
+            "runtime one",
+            "runtime two",
+        ]
+        assert system_blocks[1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_removes_empty_embedded_system_block_list(self):
+        """
+        What it does: Removes an embedded system message with an empty block list.
+        Purpose: Avoid leaving a role that fails conversation-role validation.
+        """
+        print("Action: Validating an empty embedded system block list...")
+        request = AnthropicMessagesRequest.model_validate({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "ping"},
+                {"role": "system", "content": []},
+            ],
+        })
+
+        print("Verifying empty system message is removed without inventing content...")
+        assert [message.role for message in request.messages] == ["user"]
+        assert request.system == []
+
+    def test_rejects_embedded_system_message_with_invalid_content(self):
+        """
+        What it does: Rejects embedded system content that is neither text nor blocks.
+        Purpose: Prevent compatibility normalization from silently dropping invalid content.
+        """
+        print("Action: Validating invalid embedded system content...")
+        with pytest.raises(ValidationError):
+            AnthropicMessagesRequest.model_validate({
+                "model": "claude-sonnet-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "ping"},
+                    {"role": "system", "content": 42},
+                ],
+            })
+
+    def test_rejects_request_when_normalization_leaves_no_conversation_messages(self):
+        """
+        What it does: Rejects a request containing only embedded system messages.
+        Purpose: Preserve the API requirement for at least one conversation message.
+        """
+        print("Action: Validating a system-only messages list...")
+        with pytest.raises(ValidationError) as exc_info:
+            AnthropicMessagesRequest.model_validate({
+                "model": "claude-sonnet-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "system", "content": "runtime system"}],
+            })
+
+        print("Verifying messages min-length validation still applies...")
+        assert "messages" in str(exc_info.value)
+
+    def test_leaves_standard_request_unchanged(self):
+        """
+        What it does: Validates a standard Anthropic request without embedded systems.
+        Purpose: Prevent normalization from changing compliant requests.
+        """
+        print("Action: Validating a standard request...")
+        request = AnthropicMessagesRequest.model_validate({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1024,
+            "system": "base system",
+            "messages": [{"role": "user", "content": "ping"}],
+        })
+
+        print("Verifying standard field representations are unchanged...")
+        assert request.system == "base system"
+        assert [message.role for message in request.messages] == ["user"]
+
+    def test_count_tokens_request_promotes_embedded_system_message(self):
+        """
+        What it does: Normalizes embedded system content for token-count requests.
+        Purpose: Keep /v1/messages and /v1/messages/count_tokens compatible.
+        """
+        print("Action: Validating token-count request with embedded system content...")
+        request = AnthropicCountTokensRequest.model_validate({
+            "model": "claude-sonnet-5",
+            "messages": [
+                {"role": "user", "content": "ping"},
+                {"role": "system", "content": "runtime system"},
+            ],
+        })
+
+        print("Verifying token-count request normalization...")
+        assert [message.role for message in request.messages] == ["user"]
+        assert [block.text for block in request.system] == ["runtime system"]
+
 
 class TestAnthropicMessagesRequestWithImages:
     """Tests for full AnthropicMessagesRequest with image content."""
