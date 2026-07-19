@@ -448,22 +448,23 @@ class TestParseKiroStream:
         print("Setup: Mock response that times out...")
         
         async def mock_aiter_bytes():
+            await asyncio.sleep(float('inf'))
             yield b'chunk'
         
         mock_response.aiter_bytes = mock_aiter_bytes
         
-        async def mock_wait_for_timeout(*args, **kwargs):
-            raise asyncio.TimeoutError()
-        
         print("Action: Parsing stream with timeout...")
         
-        with patch('kiro.streaming_core.asyncio.wait_for', side_effect=mock_wait_for_timeout):
+        gen = parse_kiro_stream(mock_response, first_token_timeout=0.1)
+        try:
             with pytest.raises(FirstTokenTimeoutError) as exc_info:
-                async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                async for event in gen:
                     pass
+        finally:
+            await gen.aclose()
         
         print(f"Caught exception: {exc_info.value}")
-        assert "30" in str(exc_info.value)
+        assert "0.1" in str(exc_info.value)
         print("✓ FirstTokenTimeoutError raised on timeout")
     
     @pytest.mark.asyncio
@@ -480,16 +481,15 @@ class TestParseKiroStream:
         
         mock_response.aiter_bytes = mock_aiter_bytes
         
-        # Mock wait_for to raise StopAsyncIteration (empty response)
-        async def mock_wait_for_empty(*args, **kwargs):
-            raise StopAsyncIteration()
-        
         print("Action: Parsing empty stream...")
         events = []
         
-        with patch('kiro.streaming_core.asyncio.wait_for', side_effect=mock_wait_for_empty):
-            async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+        gen = parse_kiro_stream(mock_response, first_token_timeout=30)
+        try:
+            async for event in gen:
                 events.append(event)
+        finally:
+            await gen.aclose()
         
         print(f"Received {len(events)} events")
         assert len(events) == 0
@@ -1169,19 +1169,20 @@ class TestStreamingCoreErrorHandling:
         print("Setup: Mock response that times out...")
         
         async def mock_aiter_bytes():
+            await asyncio.sleep(float('inf'))
             yield b'chunk'
         
         mock_response.aiter_bytes = mock_aiter_bytes
         
-        async def mock_wait_for_timeout(*args, **kwargs):
-            raise asyncio.TimeoutError()
-        
         print("Action: Parsing stream with timeout...")
         
-        with patch('kiro.streaming_core.asyncio.wait_for', side_effect=mock_wait_for_timeout):
+        gen = parse_kiro_stream(mock_response, first_token_timeout=0.1)
+        try:
             with pytest.raises(FirstTokenTimeoutError):
-                async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                async for event in gen:
                     pass
+        finally:
+            await gen.aclose()
         
         print("✓ FirstTokenTimeoutError propagated correctly")
     
