@@ -23,7 +23,8 @@ from kiro.account_manager import (
     AccountStats,
     ModelAccountList,
     AccountManager,
-    _format_duration
+    _format_duration,
+    _fetch_model_catalog,
 )
 from kiro.account_errors import ErrorType
 from kiro.auth import KiroAuthManager, AuthType
@@ -1300,3 +1301,76 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+class TestFetchModelCatalog:
+    """The control-plane ListAvailableModels call (management host, JSON-1.0 RPC)."""
+
+    @pytest.mark.asyncio
+    async def test_hits_management_host_with_target_header(self):
+        auth = MagicMock()
+        auth.management_host = "https://management.us-east-1.kiro.dev"
+        auth.profile_arn = "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"models": [{"modelId": "claude-opus-4.6"}]}
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = AsyncMock()
+            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+
+            models = await _fetch_model_catalog(auth)
+
+        assert models == [{"modelId": "claude-opus-4.6"}]
+        _, kwargs = mock_client.request_with_retry.call_args
+        assert kwargs["method"] == "POST"
+        assert kwargs["url"] == "https://management.us-east-1.kiro.dev/"
+        assert kwargs["extra_headers"]["x-amz-target"] == \
+            "AmazonCodeWhispererService.ListAvailableModels"
+        assert kwargs["extra_headers"]["Content-Type"] == "application/x-amz-json-1.0"
+        assert kwargs["json_data"]["profileArn"] == auth.profile_arn
+        mock_client.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_omits_profile_arn_when_absent(self):
+        auth = MagicMock()
+        auth.management_host = "https://management.us-east-1.kiro.dev"
+        auth.profile_arn = None
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"models": []}
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = AsyncMock()
+            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+
+            await _fetch_model_catalog(auth)
+
+        _, kwargs = mock_client.request_with_retry.call_args
+        assert "profileArn" not in kwargs["json_data"]
+
+    @pytest.mark.asyncio
+    async def test_non_200_raises_and_closes(self):
+        auth = MagicMock()
+        auth.management_host = "https://management.us-east-1.kiro.dev"
+        auth.profile_arn = None
+
+        mock_response = Mock()
+        mock_response.status_code = 500
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = AsyncMock()
+            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+
+            with pytest.raises(Exception):
+                await _fetch_model_catalog(auth)
+
+        mock_client.close.assert_awaited_once()

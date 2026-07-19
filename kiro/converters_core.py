@@ -53,6 +53,7 @@ from kiro.config import (
     KIRO_NATIVE_THINKING_MODE,
     KIRO_NATIVE_THINKING_DISPLAY,
 )
+from kiro import native_reasoning
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 
 
@@ -319,15 +320,32 @@ def build_native_effort_fields(
     if not effort_level:
         return None
 
-    schema = NATIVE_EFFORT_SCHEMA_BY_MODEL.get(model_id)
-    if not schema:
-        logger.debug(f"Model '{model_id}' does not support native effort; skipping")
-        return None
+    # Normalize aliases (minimal->low, etc.) before matching against advertised efforts.
+    level = EFFORT_LEVEL_ALIASES.get(effort_level.lower(), effort_level.lower())
 
-    level = EFFORT_LEVEL_ALIASES.get(effort_level.lower())
-    if level not in VALID_EFFORT_LEVELS:
-        logger.warning(f"Invalid effort level '{effort_level}' for native effort; skipping")
-        return None
+    # Prefer the live catalog's advertised schema (per-model schema type + valid effort
+    # enum). Fall back to the static config table only when the catalog is unavailable.
+    descriptor = native_reasoning.get_descriptor(model_id)
+    if descriptor is not None:
+        schema = descriptor.schema_type
+        clamped = native_reasoning.clamp_effort(level, descriptor.valid_efforts)
+        if clamped is None:
+            logger.debug(f"Model '{model_id}' advertises no effort levels; skipping")
+            return None
+        if clamped != level:
+            logger.debug(
+                f"Clamped effort '{level}' -> '{clamped}' for '{model_id}' "
+                f"(advertised: {'/'.join(descriptor.valid_efforts)})"
+            )
+        level = clamped
+    else:
+        schema = NATIVE_EFFORT_SCHEMA_BY_MODEL.get(model_id)
+        if not schema:
+            logger.debug(f"Model '{model_id}' does not support native effort; skipping")
+            return None
+        if level not in VALID_EFFORT_LEVELS:
+            logger.warning(f"Invalid effort level '{effort_level}' for native effort; skipping")
+            return None
 
     if schema == "output_config":
         fields = {
