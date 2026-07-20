@@ -1064,6 +1064,60 @@ class TestConvertAnthropicMessages:
         assert len(result[0].tool_results) == 1
         assert result[0].tool_results[0]["tool_use_id"] == "call_123"
 
+    def test_preserves_server_search_result_with_mixed_client_tool_history(self):
+        """Server search results join the following user tool results for Kiro history."""
+        messages = [
+            AnthropicMessage.model_validate({
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_search",
+                        "name": "web_search",
+                        "input": {"query": "synthetic query"},
+                    },
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srvtoolu_search",
+                        "content": [{
+                            "type": "web_search_result",
+                            "title": "Synthetic result",
+                            "url": "https://example.com/result",
+                            "encrypted_content": "Synthetic result text.",
+                            "page_age": None,
+                        }],
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_client",
+                        "name": "read_file",
+                        "input": {"path": "example.txt"},
+                    },
+                ],
+            }),
+            AnthropicMessage.model_validate({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_client",
+                    "content": "Synthetic file content.",
+                }],
+            }),
+        ]
+
+        result = convert_anthropic_messages(messages)
+
+        assert [call["function"]["name"] for call in result[0].tool_calls] == [
+            "web_search",
+            "read_file",
+        ]
+        assert [item["tool_use_id"] for item in result[1].tool_results] == [
+            "srvtoolu_search",
+            "toolu_client",
+        ]
+        assert "synthetic query" in result[1].tool_results[0]["content"]
+        assert "Synthetic result text." in result[1].tool_results[0]["content"]
+
     def test_converts_full_conversation(self):
         """
         What it does: Verifies conversion of full conversation.
@@ -1636,6 +1690,88 @@ class TestAnthropicToKiro:
         tool_results = context.get("toolResults", [])
         print(f"Tool results: {tool_results}")
         assert len(tool_results) == 1
+
+    def test_builds_mixed_server_search_and_client_tool_history(self):
+        """Kiro receives both the completed server search and client tool result."""
+        request = AnthropicMessagesRequest.model_validate({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "Complete a synthetic task."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_search",
+                            "name": "web_search",
+                            "input": {"query": "synthetic query"},
+                        },
+                        {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": "srvtoolu_search",
+                            "content": [{
+                                "type": "web_search_result",
+                                "title": "Synthetic result",
+                                "url": "https://example.com/result",
+                                "encrypted_content": "Synthetic result text.",
+                                "page_age": None,
+                            }],
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_client",
+                            "name": "read_file",
+                            "input": {"path": "example.txt"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_client",
+                        "content": "Synthetic file content.",
+                    }],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "web_search",
+                    "description": "Search the web.",
+                    "input_schema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "input_schema": {"type": "object", "properties": {}},
+                },
+            ],
+        })
+
+        with (
+            patch(
+                "kiro.converters_anthropic.get_model_id_for_kiro",
+                return_value="claude-sonnet-5",
+            ),
+            patch("kiro.converters_core.FAKE_REASONING_ENABLED", False),
+        ):
+            result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        assistant = result["conversationState"]["history"][1][
+            "assistantResponseMessage"
+        ]
+        current_user = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]
+        assert [item["name"] for item in assistant["toolUses"]] == [
+            "web_search",
+            "read_file",
+        ]
+        assert [
+            item["toolUseId"]
+            for item in current_user["userInputMessageContext"]["toolResults"]
+        ] == ["srvtoolu_search", "toolu_client"]
 
     def test_raises_for_empty_messages(self):
         """

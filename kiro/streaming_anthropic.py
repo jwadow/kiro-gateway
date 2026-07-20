@@ -34,7 +34,17 @@ Reference: https://docs.anthropic.com/en/api/messages-streaming
 import json
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    TypedDict,
+)
 
 import httpx
 from loguru import logger
@@ -54,6 +64,20 @@ from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASO
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
     from kiro.cache import ModelInfoCache
+
+
+class WebSearchContinuationItem(TypedDict):
+    """One completed web search passed back to Kiro for continuation."""
+
+    tool_use_id: str
+    query: str
+    results: Dict[str, Any]
+
+
+WebSearchContinuation = Callable[
+    [str, List[WebSearchContinuationItem], bool],
+    Awaitable[httpx.Response],
+]
 
 # Import debug_logger for logging
 try:
@@ -135,7 +159,9 @@ async def stream_kiro_to_anthropic(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    web_search_continuation: Optional[WebSearchContinuation] = None,
+    max_web_search_rounds: int = 5,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -153,6 +179,8 @@ async def stream_kiro_to_anthropic(
         request_tools: Original request tools (for token counting)
         request_system: Original system prompt (for token counting)
         conversation_id: Stable conversation ID for truncation recovery (optional)
+        web_search_continuation: Callback that sends completed search results back to Kiro
+        max_web_search_rounds: Maximum internal search continuation rounds
     
     Yields:
         Strings in Anthropic SSE format
@@ -200,6 +228,7 @@ async def stream_kiro_to_anthropic(
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
+    pending_searches: List[WebSearchContinuationItem] = []
     
     try:
         # Send message_start event
@@ -439,30 +468,11 @@ async def stream_kiro_to_anthropic(
                         })
                         current_block_index += 1
                         
-                        # Event: content_block_start (text)
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {"type": "text", "text": ""}
+                        pending_searches.append({
+                            "tool_use_id": tool_id,
+                            "query": query,
+                            "results": results,
                         })
-                        
-                        # Events: content_block_delta (text_delta) - stream summary
-                        summary = generate_search_summary(query, results)
-                        chunk_size = 100
-                        for i in range(0, len(summary), chunk_size):
-                            chunk = summary[i:i + chunk_size]
-                            yield format_sse_event("content_block_delta", {
-                                "type": "content_block_delta",
-                                "index": current_block_index,
-                                "delta": {"type": "text_delta", "text": chunk}
-                            })
-                        
-                        # Event: content_block_stop (text)
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": current_block_index
-                        })
-                        current_block_index += 1
                         
                         # Skip normal tool_use processing
                         continue
@@ -522,6 +532,286 @@ async def stream_kiro_to_anthropic(
                 context_usage_percentage = event.context_usage_percentage
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
+
+        if pending_searches and not tool_blocks:
+            from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
+
+            searches_for_continuation = pending_searches
+            assistant_text_for_continuation = full_content
+            search_round = 0
+            search_round_limit = max(1, max_web_search_rounds)
+
+            while searches_for_continuation and not tool_blocks:
+                continuation_failed = web_search_continuation is None
+                continuation_response: Optional[httpx.Response] = None
+
+                if web_search_continuation is not None:
+                    try:
+                        search_round += 1
+                        continuation_response = await web_search_continuation(
+                            assistant_text_for_continuation,
+                            searches_for_continuation,
+                            search_round < search_round_limit,
+                        )
+                        if continuation_response.status_code != 200:
+                            raise RuntimeError(
+                                f"Web search continuation returned HTTP "
+                                f"{continuation_response.status_code}"
+                            )
+
+                        continuation_result = await collect_stream_to_result(
+                            continuation_response
+                        )
+                        continuation_failed = False
+                        context_usage_percentage = (
+                            continuation_result.context_usage_percentage
+                        )
+                        upstream_cache_usage.update(
+                            _extract_cache_usage_fields(continuation_result.usage)
+                        )
+
+                        continuation_thinking = (
+                            continuation_result.thinking_content or ""
+                        )
+                        continuation_text = continuation_result.content or ""
+                        full_thinking_content += continuation_thinking
+                        full_content += continuation_text
+
+                        if (
+                            continuation_thinking
+                            and FAKE_REASONING_HANDLING == "as_reasoning_content"
+                        ):
+                            thinking_block_index = current_block_index
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": thinking_block_index,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": "",
+                                    "signature": thinking_signature,
+                                },
+                            })
+                            yield format_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": thinking_block_index,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": continuation_thinking,
+                                },
+                            })
+                            thinking_block_started = True
+                        elif (
+                            continuation_thinking
+                            and FAKE_REASONING_HANDLING == "include_as_text"
+                        ):
+                            continuation_text = continuation_thinking + continuation_text
+
+                        if continuation_text:
+                            if thinking_block_started and thinking_block_index is not None:
+                                yield format_sse_event("content_block_stop", {
+                                    "type": "content_block_stop",
+                                    "index": thinking_block_index,
+                                })
+                                thinking_block_started = False
+                                current_block_index += 1
+
+                            text_block_index = current_block_index
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": text_block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            })
+                            yield format_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": text_block_index,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": continuation_text,
+                                },
+                            })
+                            text_block_started = True
+
+                        next_searches: List[WebSearchContinuationItem] = []
+                        for tool_call in continuation_result.tool_calls:
+                            if text_block_started and text_block_index is not None:
+                                yield format_sse_event("content_block_stop", {
+                                    "type": "content_block_stop",
+                                    "index": text_block_index,
+                                })
+                                text_block_started = False
+                                current_block_index += 1
+                            if thinking_block_started and thinking_block_index is not None:
+                                yield format_sse_event("content_block_stop", {
+                                    "type": "content_block_stop",
+                                    "index": thinking_block_index,
+                                })
+                                thinking_block_started = False
+                                current_block_index += 1
+
+                            continuation_tool_id = (
+                                tool_call.get("id")
+                                or f"toolu_{uuid.uuid4().hex[:24]}"
+                            )
+                            continuation_tool_name = (
+                                tool_call.get("function", {}).get("name", "")
+                                or tool_call.get("name", "")
+                            )
+                            continuation_tool_input = (
+                                tool_call.get("function", {}).get("arguments", {})
+                                or tool_call.get("input", {})
+                            )
+                            if isinstance(continuation_tool_input, str):
+                                try:
+                                    continuation_tool_input = json.loads(
+                                        continuation_tool_input
+                                    )
+                                except json.JSONDecodeError:
+                                    continuation_tool_input = {}
+
+                            if (
+                                continuation_tool_name == "web_search"
+                                and search_round < search_round_limit
+                            ):
+                                query = continuation_tool_input.get("query", "")
+                                if query:
+                                    mcp_tool_use_id, results = await call_kiro_mcp_api(
+                                        query, auth_manager
+                                    )
+                                    if results is not None:
+                                        yield format_sse_event("content_block_start", {
+                                            "type": "content_block_start",
+                                            "index": current_block_index,
+                                            "content_block": {
+                                                "id": mcp_tool_use_id,
+                                                "type": "server_tool_use",
+                                                "name": "web_search",
+                                                "input": {},
+                                            },
+                                        })
+                                        yield format_sse_event("content_block_delta", {
+                                            "type": "content_block_delta",
+                                            "index": current_block_index,
+                                            "delta": {
+                                                "type": "input_json_delta",
+                                                "partial_json": json.dumps({"query": query}),
+                                            },
+                                        })
+                                        yield format_sse_event("content_block_stop", {
+                                            "type": "content_block_stop",
+                                            "index": current_block_index,
+                                        })
+                                        current_block_index += 1
+
+                                        search_content = [
+                                            {
+                                                "type": "web_search_result",
+                                                "title": result.get("title", ""),
+                                                "url": result.get("url", ""),
+                                                "encrypted_content": result.get("snippet", ""),
+                                                "page_age": None,
+                                            }
+                                            for result in results.get("results", [])
+                                        ]
+                                        yield format_sse_event("content_block_start", {
+                                            "type": "content_block_start",
+                                            "index": current_block_index,
+                                            "content_block": {
+                                                "type": "web_search_tool_result",
+                                                "tool_use_id": mcp_tool_use_id,
+                                                "content": search_content,
+                                            },
+                                        })
+                                        yield format_sse_event("content_block_stop", {
+                                            "type": "content_block_stop",
+                                            "index": current_block_index,
+                                        })
+                                        current_block_index += 1
+                                        next_searches.append({
+                                            "tool_use_id": continuation_tool_id,
+                                            "query": query,
+                                            "results": results,
+                                        })
+                                        continue
+
+                            if (
+                                continuation_tool_name == "web_search"
+                                and search_round >= search_round_limit
+                            ):
+                                logger.warning(
+                                    "Web search round limit reached; ignoring additional "
+                                    "model search request"
+                                )
+                                continue
+
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": current_block_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": continuation_tool_id,
+                                    "name": continuation_tool_name,
+                                    "input": {},
+                                },
+                            })
+                            yield format_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": current_block_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": json.dumps(
+                                        continuation_tool_input,
+                                        ensure_ascii=False,
+                                    ),
+                                },
+                            })
+                            yield format_sse_event("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": current_block_index,
+                            })
+                            tool_blocks.append({
+                                "id": continuation_tool_id,
+                                "name": continuation_tool_name,
+                                "input": continuation_tool_input,
+                            })
+                            current_block_index += 1
+
+                        assistant_text_for_continuation = continuation_text
+                        searches_for_continuation = next_searches
+                    except Exception as continuation_error:
+                        continuation_failed = True
+                        logger.error(
+                            f"Web search model continuation failed: {continuation_error}"
+                        )
+                    finally:
+                        if continuation_response is not None:
+                            try:
+                                await continuation_response.aclose()
+                            except Exception as close_error:
+                                logger.debug(
+                                    "Error closing web search continuation response: "
+                                    f"{close_error}"
+                                )
+
+                if continuation_failed:
+                    for search in searches_for_continuation:
+                        summary = generate_search_summary(
+                            search["query"], search["results"]
+                        )
+                        full_content += summary
+                        if not text_block_started:
+                            text_block_index = current_block_index
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": text_block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            })
+                            text_block_started = True
+                        yield format_sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": text_block_index,
+                            "delta": {"type": "text_delta", "text": summary},
+                        })
+                    break
         
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
@@ -873,7 +1163,8 @@ async def stream_with_first_token_retry_anthropic(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    web_search_continuation: Optional[WebSearchContinuation] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -896,6 +1187,7 @@ async def stream_with_first_token_retry_anthropic(
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
         request_system: Original system prompt (for fallback token counting)
+        web_search_continuation: Callback for model continuation after web search
     
     Yields:
         Strings in Anthropic SSE format
@@ -934,6 +1226,7 @@ async def stream_with_first_token_retry_anthropic(
             request_messages=request_messages,
             request_tools=request_tools,
             request_system=request_system,
+            web_search_continuation=web_search_continuation,
         ):
             yield chunk
     

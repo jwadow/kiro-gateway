@@ -859,6 +859,315 @@ class TestCollectAnthropicResponse:
 
 
 # ==================================================================================================
+# Tests for native-style WebSearch continuation
+# ==================================================================================================
+
+class TestStreamingAnthropicWebSearchContinuation:
+    """Tests for continuing Kiro generation after an intercepted web search."""
+
+    @pytest.mark.asyncio
+    async def test_streams_model_answer_after_server_search_blocks(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Continues the same SSE message with a second Kiro response.
+        Purpose: Match Anthropic server-tool UX instead of returning a raw result dump.
+        """
+        continuation_response = AsyncMock()
+        continuation_response.status_code = 200
+        continuation_response.aclose = AsyncMock()
+
+        async def mock_parse_kiro_stream(response, *args, **kwargs):
+            if response is mock_response:
+                yield KiroEvent(
+                    type="tool_use",
+                    tool_use={
+                        "id": "toolu_kiro_search",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": {"query": "example query"},
+                        },
+                    },
+                )
+                yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+            else:
+                assert response is continuation_response
+                yield KiroEvent(type="content", content="Natural synthesized answer")
+                yield KiroEvent(type="context_usage", context_usage_percentage=2.0)
+
+        results = {
+            "results": [{
+                "title": "Example",
+                "url": "https://example.com",
+                "snippet": "Synthetic result text",
+            }],
+            "totalResults": 1,
+        }
+        continuation = AsyncMock(return_value=continuation_response)
+        continuation_result = StreamResult(
+            content="Natural synthesized answer",
+            thinking_content="",
+            tool_calls=[],
+            usage=None,
+            context_usage_percentage=2.0,
+        )
+        events = []
+
+        with (
+            patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream),
+            patch(
+                "kiro.streaming_anthropic.collect_stream_to_result",
+                AsyncMock(return_value=continuation_result),
+            ),
+            patch("kiro.mcp_tools.call_kiro_mcp_api", AsyncMock(
+                return_value=("srvtoolu_test", results)
+            )),
+            patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]),
+        ):
+            async for event in stream_kiro_to_anthropic(
+                mock_response,
+                "claude-sonnet-5",
+                mock_model_cache,
+                mock_auth_manager,
+                web_search_continuation=continuation,
+            ):
+                events.append(event)
+
+        joined_events = "".join(events)
+        print("Verifying native server-tool blocks and synthesized answer...")
+        continuation.assert_awaited_once()
+        assistant_text, searches, allow_more_search = continuation.await_args.args
+        assert assistant_text == ""
+        assert searches == [{
+            "tool_use_id": "toolu_kiro_search",
+            "query": "example query",
+            "results": results,
+        }]
+        assert allow_more_search is True
+        assert "server_tool_use" in joined_events
+        assert "web_search_tool_result" in joined_events
+        assert "Natural synthesized answer" in joined_events
+        assert "<web_search>" not in joined_events
+        assert joined_events.count("event: message_start") == 1
+        assert joined_events.count("event: message_stop") == 1
+        assert '"stop_reason": "end_turn"' in joined_events
+
+    @pytest.mark.asyncio
+    async def test_allows_at_most_five_internal_search_rounds(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """Repeated searches continue internally and disable search on round five."""
+        continuation_responses = []
+        for _ in range(5):
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            continuation_responses.append(response)
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "toolu_search_1",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": {"query": "synthetic query 1"},
+                    },
+                },
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        continuation_results = [
+            StreamResult(
+                content="",
+                thinking_content="",
+                tool_calls=[{
+                    "id": f"toolu_search_{round_number + 1}",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": {"query": f"synthetic query {round_number + 1}"},
+                    },
+                }],
+                usage=None,
+                context_usage_percentage=float(round_number),
+            )
+            for round_number in range(1, 5)
+        ]
+        continuation_results.append(StreamResult(
+            content="Final answer after bounded searches.",
+            thinking_content="",
+            tool_calls=[],
+            usage=None,
+            context_usage_percentage=5.0,
+        ))
+
+        search_results = [
+            (
+                f"srvtoolu_search_{round_number}",
+                {
+                    "results": [{
+                        "title": f"Synthetic result {round_number}",
+                        "url": f"https://example.com/result-{round_number}",
+                        "snippet": f"Synthetic snippet {round_number}.",
+                    }],
+                    "totalResults": 1,
+                },
+            )
+            for round_number in range(1, 6)
+        ]
+        continuation = AsyncMock(side_effect=continuation_responses)
+        events = []
+
+        with (
+            patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream),
+            patch(
+                "kiro.streaming_anthropic.collect_stream_to_result",
+                AsyncMock(side_effect=continuation_results),
+            ),
+            patch(
+                "kiro.mcp_tools.call_kiro_mcp_api",
+                AsyncMock(side_effect=search_results),
+            ) as mcp_call,
+            patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]),
+        ):
+            async for event in stream_kiro_to_anthropic(
+                mock_response,
+                "claude-sonnet-5",
+                mock_model_cache,
+                mock_auth_manager,
+                web_search_continuation=continuation,
+                max_web_search_rounds=5,
+            ):
+                events.append(event)
+
+        joined_events = "".join(events)
+        assert continuation.await_count == 5
+        assert [call.args[2] for call in continuation.await_args_list] == [
+            True, True, True, True, False,
+        ]
+        assert mcp_call.await_count == 5
+        for response in continuation_responses:
+            response.aclose.assert_awaited_once()
+        assert joined_events.count('"type": "server_tool_use"') == 5
+        assert "Final answer after bounded searches." in joined_events
+        assert "<web_search>" not in joined_events
+        assert joined_events.count("event: message_start") == 1
+        assert joined_events.count("event: message_stop") == 1
+        assert '"stop_reason": "end_turn"' in joined_events
+
+    @pytest.mark.asyncio
+    async def test_mixed_client_tool_stops_without_internal_continuation(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Handles web search and a client tool in the same Kiro turn.
+        Purpose: Let Claude Code execute the client tool before model continuation.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "toolu_kiro_search",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": {"query": "example query"},
+                    },
+                },
+            )
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "toolu_client",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": "example.txt"},
+                    },
+                },
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        continuation = AsyncMock()
+        events = []
+        with (
+            patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream),
+            patch("kiro.mcp_tools.call_kiro_mcp_api", AsyncMock(return_value=(
+                "srvtoolu_test",
+                {"results": [], "totalResults": 0},
+            ))),
+            patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]),
+        ):
+            async for event in stream_kiro_to_anthropic(
+                mock_response,
+                "claude-sonnet-5",
+                mock_model_cache,
+                mock_auth_manager,
+                web_search_continuation=continuation,
+            ):
+                events.append(event)
+
+        joined_events = "".join(events)
+        print("Verifying mixed client tool remains client-controlled...")
+        continuation.assert_not_awaited()
+        assert "server_tool_use" in joined_events
+        assert "read_file" in joined_events
+        assert '"stop_reason": "tool_use"' in joined_events
+
+    @pytest.mark.asyncio
+    async def test_continuation_failure_falls_back_to_search_summary(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Preserves search results when the second Kiro request fails.
+        Purpose: Avoid turning a successful search into an empty assistant response.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "toolu_kiro_search",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": {"query": "example query"},
+                    },
+                },
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        continuation = AsyncMock(side_effect=RuntimeError("continuation failed"))
+        events = []
+        with (
+            patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream),
+            patch("kiro.mcp_tools.call_kiro_mcp_api", AsyncMock(return_value=(
+                "srvtoolu_test",
+                {
+                    "results": [{
+                        "title": "Example",
+                        "url": "https://example.com",
+                        "snippet": "Synthetic result text",
+                    }],
+                    "totalResults": 1,
+                },
+            ))),
+            patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]),
+        ):
+            async for event in stream_kiro_to_anthropic(
+                mock_response,
+                "claude-sonnet-5",
+                mock_model_cache,
+                mock_auth_manager,
+                web_search_continuation=continuation,
+            ):
+                events.append(event)
+
+        joined_events = "".join(events)
+        print("Verifying deterministic summary fallback...")
+        assert "<web_search>" in joined_events
+        assert "Synthetic result text" in joined_events
+        assert joined_events.count("event: message_stop") == 1
+        assert '"stop_reason": "end_turn"' in joined_events
+
+
+# ==================================================================================================
 # Tests for error handling
 # ==================================================================================================
 

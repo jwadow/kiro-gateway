@@ -26,7 +26,7 @@ Reference: https://docs.anthropic.com/en/api/messages
 """
 
 import json
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Security, Header
@@ -41,6 +41,7 @@ from kiro.models_anthropic import (
     AnthropicMessagesResponse,
     AnthropicErrorResponse,
     AnthropicErrorDetail,
+    AnthropicMessage,
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
@@ -49,12 +50,14 @@ from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
+    WebSearchContinuation,
+    WebSearchContinuationItem,
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
 from kiro.config import WEB_SEARCH_ENABLED
-from kiro.mcp_tools import handle_native_web_search
+from kiro.mcp_tools import generate_search_summary, handle_native_web_search
 
 # Import debug_logger
 try:
@@ -68,6 +71,76 @@ except ImportError:
 anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 # Also support Authorization: Bearer for compatibility
 auth_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+
+def _create_web_search_continuation(
+    request_data: AnthropicMessagesRequest,
+    http_client: KiroHttpClient,
+    url: str,
+    conversation_id: str,
+    profile_arn: str,
+) -> WebSearchContinuation:
+    """Create a stateful callback that feeds server search results back to Kiro."""
+    history = [message.model_copy(deep=True) for message in request_data.messages]
+
+    async def continue_after_web_search(
+        assistant_text: str,
+        searches: List[WebSearchContinuationItem],
+        allow_more_search: bool,
+    ) -> httpx.Response:
+        assistant_content = []
+        if assistant_text:
+            assistant_content.append({"type": "text", "text": assistant_text})
+        assistant_content.extend(
+            {
+                "type": "tool_use",
+                "id": search["tool_use_id"],
+                "name": "web_search",
+                "input": {"query": search["query"]},
+            }
+            for search in searches
+        )
+        result_content = [
+            {
+                "type": "tool_result",
+                "tool_use_id": search["tool_use_id"],
+                "content": generate_search_summary(search["query"], search["results"]),
+            }
+            for search in searches
+        ]
+
+        history.extend([
+            AnthropicMessage.model_validate({
+                "role": "assistant",
+                "content": assistant_content,
+            }),
+            AnthropicMessage.model_validate({
+                "role": "user",
+                "content": result_content,
+            }),
+        ])
+
+        continuation_request = request_data.model_copy(deep=True)
+        continuation_request.messages = list(history)
+        if not allow_more_search and continuation_request.tools:
+            continuation_request.tools = [
+                tool for tool in continuation_request.tools
+                if tool.name != "web_search"
+            ]
+
+        payload = anthropic_to_kiro(
+            continuation_request,
+            conversation_id,
+            profile_arn,
+        )
+        return await http_client.request_with_retry(
+            "POST",
+            url,
+            payload,
+            stream=True,
+        )
+
+    return continue_after_web_search
 
 
 async def verify_anthropic_api_key(
@@ -423,6 +496,14 @@ async def messages(
                 system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
             else:
                 system_for_tokenizer = request_data.system
+
+            web_search_continuation = _create_web_search_continuation(
+                request_data=request_data,
+                http_client=http_client,
+                url=url,
+                conversation_id=conversation_id,
+                profile_arn=profile_arn_for_payload,
+            )
             
             try:
                 # Make request to Kiro API
@@ -457,6 +538,7 @@ async def messages(
                                     request_messages=messages_for_tokenizer,
                                     request_tools=tools_for_tokenizer,
                                     request_system=system_for_tokenizer,
+                                    web_search_continuation=web_search_continuation,
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -738,6 +820,14 @@ async def messages(
         system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
     else:
         system_for_tokenizer = request_data.system
+
+    web_search_continuation = _create_web_search_continuation(
+        request_data=request_data,
+        http_client=http_client,
+        url=url,
+        conversation_id=conversation_id,
+        profile_arn=profile_arn_for_payload,
+    )
     
     try:
         # Make request to Kiro API (for both streaming and non-streaming modes)
@@ -815,6 +905,7 @@ async def messages(
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer,
                         request_system=system_for_tokenizer,
+                        web_search_continuation=web_search_continuation,
                     ):
                         yield chunk
                 except GeneratorExit:
