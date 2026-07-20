@@ -384,6 +384,38 @@ class TestMessagesValidation:
 
 class TestMessagesSystemPrompt:
     """Tests for system prompt handling on /v1/messages endpoint."""
+
+    def test_accepts_embedded_system_message_from_claude_code(
+        self, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Accepts Claude Code runtime instructions in messages[].
+        Purpose: Prevent request validation from returning HTTP 422 before conversion.
+        """
+        print("Action: POST /v1/messages with an embedded system message...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-5",
+                "max_tokens": 1024,
+                "system": [{"type": "text", "text": "base system"}],
+                "messages": [
+                    {"role": "user", "content": "ping"},
+                    {
+                        "role": "system",
+                        "content": [{
+                            "type": "text",
+                            "text": "runtime system",
+                            "cache_control": {"type": "ephemeral"},
+                        }],
+                    },
+                ],
+            },
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 200
     
     def test_accepts_system_as_separate_field(self, test_client, valid_proxy_api_key):
         """
