@@ -528,6 +528,95 @@ class TestAnthropicMessageWithImages:
 # Tests for AnthropicMessagesRequest with Image Content
 # ==================================================================================================
 
+class TestWebSearchHistoryContentBlocks:
+    """Tests for Anthropic server-side web search blocks replayed in history."""
+
+    def test_accepts_completed_web_search_history(self):
+        """
+        What it does: Validates a completed server-side web search assistant turn.
+        Purpose: Allow Claude Code to send gateway search output back on the next request.
+        """
+        print("Action: Validating synthetic web search history...")
+        request = AnthropicMessagesRequest.model_validate({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "search for an example"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_test",
+                            "name": "web_search",
+                            "input": {"query": "example query"},
+                        },
+                        {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": "srvtoolu_test",
+                            "content": [
+                                {
+                                    "type": "web_search_result",
+                                    "title": "Example",
+                                    "url": "https://example.com",
+                                    "encrypted_content": "Synthetic result text",
+                                    "page_age": None,
+                                }
+                            ],
+                        },
+                        {"type": "text", "text": "Synthetic search summary"},
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        })
+
+        search_call, search_result, summary = request.messages[1].content
+        print("Verifying typed blocks preserve server search metadata...")
+        assert search_call.type == "server_tool_use"
+        assert search_call.id == "srvtoolu_test"
+        assert search_call.input == {"query": "example query"}
+        assert search_result.type == "web_search_tool_result"
+        assert search_result.tool_use_id == "srvtoolu_test"
+        assert search_result.content[0].type == "web_search_result"
+        assert search_result.content[0].url == "https://example.com"
+        assert search_result.content[0].encrypted_content == "Synthetic result text"
+        assert summary.text == "Synthetic search summary"
+
+    def test_accepts_web_search_error_history(self):
+        """
+        What it does: Validates an error result from server-side web search.
+        Purpose: Keep a failed search in history without causing an unrelated HTTP 422.
+        """
+        print("Action: Validating synthetic web search error history...")
+        request = AnthropicMessagesRequest.model_validate({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": "srvtoolu_test",
+                            "content": {
+                                "type": "web_search_tool_result_error",
+                                "error_code": "unavailable",
+                            },
+                        }
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        })
+
+        error_result = request.messages[0].content[0]
+        print("Verifying typed error content is preserved...")
+        assert error_result.type == "web_search_tool_result"
+        assert error_result.content.type == "web_search_tool_result_error"
+        assert error_result.content.error_code == "unavailable"
+
+
 class TestAnthropicMessagesRequestWithImages:
     """Tests for full AnthropicMessagesRequest with image content."""
     

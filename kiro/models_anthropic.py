@@ -162,6 +162,48 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
+class ServerToolUseContentBlock(BaseModel):
+    """Anthropic server-executed tool call returned in assistant history."""
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any]
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchResultBlock(BaseModel):
+    """One result nested inside an Anthropic web-search tool result."""
+
+    type: Literal["web_search_result"] = "web_search_result"
+    title: str
+    url: str
+    encrypted_content: str
+    page_age: Optional[str] = None
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultErrorContentBlock(BaseModel):
+    """Error returned by Anthropic-compatible server-side web search."""
+
+    type: Literal["web_search_tool_result_error"] = "web_search_tool_result_error"
+    error_code: str
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultContentBlock(BaseModel):
+    """Completed Anthropic web-search result returned in assistant history."""
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Union[List[WebSearchResultBlock], WebSearchToolResultErrorContentBlock]
+
+    model_config = {"extra": "allow"}
+
+
 # Union type for all content blocks (including images and thinking)
 ContentBlock = Union[
     TextContentBlock,
@@ -170,6 +212,8 @@ ContentBlock = Union[
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
 ]
 
 

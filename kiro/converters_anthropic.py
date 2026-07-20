@@ -30,6 +30,7 @@ from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import get_model_id_for_kiro
+from kiro.mcp_tools import generate_search_summary
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessage,
@@ -162,6 +163,84 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
     return tool_results
 
 
+def extract_server_web_search_results_from_anthropic_content(
+    content: Any,
+) -> List[Dict[str, Any]]:
+    """Convert Anthropic server WebSearch result blocks to unified tool results."""
+    if not isinstance(content, list):
+        return []
+
+    search_queries: Dict[str, str] = {}
+    for block in content:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            tool_id = block.get("id")
+            tool_name = block.get("name")
+            tool_input = block.get("input", {})
+        else:
+            block_type = getattr(block, "type", None)
+            tool_id = getattr(block, "id", None)
+            tool_name = getattr(block, "name", None)
+            tool_input = getattr(block, "input", {})
+
+        if (
+            block_type == "server_tool_use"
+            and tool_name == "web_search"
+            and tool_id
+        ):
+            search_queries[tool_id] = (
+                tool_input.get("query", "") if isinstance(tool_input, dict) else ""
+            )
+
+    tool_results = []
+    for block in content:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            tool_use_id = block.get("tool_use_id")
+            result_content = block.get("content")
+        else:
+            block_type = getattr(block, "type", None)
+            tool_use_id = getattr(block, "tool_use_id", None)
+            result_content = getattr(block, "content", None)
+
+        if block_type != "web_search_tool_result" or not tool_use_id:
+            continue
+
+        if isinstance(result_content, list):
+            search_results = []
+            for item in result_content:
+                if isinstance(item, dict):
+                    search_results.append({
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "snippet": item.get("encrypted_content", ""),
+                    })
+                else:
+                    search_results.append({
+                        "title": getattr(item, "title", ""),
+                        "url": getattr(item, "url", ""),
+                        "snippet": getattr(item, "encrypted_content", ""),
+                    })
+            result_text = generate_search_summary(
+                search_queries.get(tool_use_id, ""),
+                {"results": search_results},
+            )
+        else:
+            if isinstance(result_content, dict):
+                error_code = result_content.get("error_code", "unknown")
+            else:
+                error_code = getattr(result_content, "error_code", "unknown")
+            result_text = f"Web search failed: {error_code}"
+
+        tool_results.append({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": result_text,
+        })
+
+    return tool_results
+
+
 def extract_images_from_tool_results(content: Any) -> List[Dict[str, Any]]:
     """
     Extracts images from tool_result content blocks.
@@ -238,7 +317,11 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
             tool_name = getattr(block, "name", None)
             tool_input = getattr(block, "input", {})
 
-        if block_type == "tool_use" and tool_id and tool_name:
+        if (
+            block_type in {"tool_use", "server_tool_use"}
+            and tool_id
+            and tool_name
+        ):
             tool_calls.append(
                 {
                     "id": tool_id,
@@ -277,6 +360,7 @@ def convert_anthropic_messages(
     total_tool_calls = 0
     total_tool_results = 0
     total_images = 0
+    pending_server_tool_results: List[Dict[str, Any]] = []
 
     for msg in messages:
         role = msg.role
@@ -295,10 +379,18 @@ def convert_anthropic_messages(
             tool_calls = extract_tool_uses_from_anthropic_content(content)
             if tool_calls:
                 total_tool_calls += len(tool_calls)
+            server_tool_results = (
+                extract_server_web_search_results_from_anthropic_content(content)
+            )
+            if server_tool_results:
+                pending_server_tool_results.extend(server_tool_results)
 
         elif role == "user":
             # User messages may contain tool_result blocks and images
             tool_results = extract_tool_results_from_anthropic_content(content)
+            if pending_server_tool_results:
+                tool_results = pending_server_tool_results + tool_results
+                pending_server_tool_results = []
             if tool_results:
                 total_tool_results += len(tool_results)
 
@@ -325,6 +417,14 @@ def convert_anthropic_messages(
             images=images if images else None,
         )
         unified_messages.append(unified_msg)
+
+    if pending_server_tool_results:
+        unified_messages.append(UnifiedMessage(
+            role="user",
+            content="",
+            tool_results=pending_server_tool_results,
+        ))
+        total_tool_results += len(pending_server_tool_results)
 
     # Log summary if any tool content or images were found
     if total_tool_calls > 0 or total_tool_results > 0 or total_images > 0:
