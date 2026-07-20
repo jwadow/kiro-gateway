@@ -134,9 +134,16 @@ class TestCallKiroMCPAPI:
         mock_client.__aenter__.return_value.post = mock_post
         
         print("Action: Calling call_kiro_mcp_api...")
-        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+        with (
+            patch("kiro.mcp_tools.PROFILE_ARN", "configured-fallback-must-not-win"),
+            patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client),
+        ):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
-        
+
+        sent_request = mock_post.call_args.kwargs["json"]
+        print("Verifying account profile ARN is included at JSON-RPC root...")
+        assert sent_request["profileArn"] == mock_auth_manager.profile_arn
+
         print(f"Comparing tool_use_id: Got '{tool_use_id}'")
         assert tool_use_id is not None
         assert tool_use_id.startswith("srvtoolu_")
@@ -146,6 +153,63 @@ class TestCallKiroMCPAPI:
         assert results["totalResults"] == 1
         assert results["results"][0]["title"] == "Python Tutorial"
         assert results["results"][0]["url"] == "https://python.org"
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_uses_configured_profile_arn_fallback(self, mock_auth_manager):
+        """
+        What it does: Uses configured PROFILE_ARN when account metadata has no ARN.
+        Purpose: Support Kiro CLI SQLite credentials that omit profile_arn.
+        """
+        print("Setup: Removing account ARN and configuring a fallback ARN...")
+        mock_auth_manager._profile_arn = None
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "id": "test-id",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{"type": "text", "text": '{"results": []}'}],
+                "isError": False,
+            },
+        }
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling MCP API with configured fallback...")
+        with (
+            patch("kiro.mcp_tools.PROFILE_ARN", "arn:aws:codewhisperer:us-east-1:000000000000:profile/test"),
+            patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client),
+        ):
+            tool_use_id, results = await call_kiro_mcp_api("test", mock_auth_manager)
+
+        sent_request = mock_post.call_args.kwargs["json"]
+        print("Verifying configured ARN is included at JSON-RPC root...")
+        assert sent_request["profileArn"] == "arn:aws:codewhisperer:us-east-1:000000000000:profile/test"
+        assert tool_use_id is not None
+        assert results == {"results": []}
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_without_profile_arn_fails_before_network(self, mock_auth_manager):
+        """
+        What it does: Rejects MCP search when no profile ARN is available.
+        Purpose: Avoid sending a request that Kiro will reject with an opaque HTTP 400.
+        """
+        print("Setup: Removing account and configured profile ARNs...")
+        mock_auth_manager._profile_arn = None
+        mock_client = AsyncMock()
+
+        print("Action: Calling MCP API without any profile ARN...")
+        with (
+            patch("kiro.mcp_tools.PROFILE_ARN", ""),
+            patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client),
+        ):
+            tool_use_id, results = await call_kiro_mcp_api("test", mock_auth_manager)
+
+        print("Verifying request fails locally without opening an HTTP client...")
+        assert tool_use_id is None
+        assert results is None
+        mock_client.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_mcp_api_error_response(self, mock_auth_manager):
