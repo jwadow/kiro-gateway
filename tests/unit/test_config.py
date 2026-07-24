@@ -691,6 +691,121 @@ class TestFallbackModelsIntegration:
 
 
 # ==================================================================================================
+# Tests for Claude Sonnet 5 Support
+# ==================================================================================================
+class TestClaudeSonnet5Support:
+    """Tests verifying Claude Sonnet 5 is registered as a known/fallback model."""
+
+    def test_claude_sonnet_5_in_fallback_models(self):
+        """
+        What it does: Verifies that claude-sonnet-5 is present in FALLBACK_MODELS.
+        Purpose: Ensure the newest Sonnet generation is known to the gateway even
+                 when /ListAvailableModels is unreachable (DNS failure recovery).
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+
+        model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+        print(f"Model IDs in fallback list: {model_ids}")
+
+        print("Verification: 'claude-sonnet-5' is present...")
+        assert "claude-sonnet-5" in model_ids
+
+    def test_claude_sonnet_5_normalizes_to_itself(self):
+        """
+        What it does: Verifies that normalize_model_name leaves claude-sonnet-5 unchanged.
+        Purpose: claude-sonnet-5 has no minor version segment (like claude-sonnet-4),
+                 so normalization must be a no-op pass-through.
+        """
+        print("Setup: Importing normalize_model_name...")
+        from kiro.model_resolver import normalize_model_name
+
+        cases = [
+            "claude-sonnet-5",
+            "claude-sonnet-5-20260601",  # date suffix should be stripped
+            "claude-sonnet-5-latest",     # 'latest' suffix should be stripped
+        ]
+
+        for case in cases:
+            print(f"Action: Normalizing '{case}'...")
+            result = normalize_model_name(case)
+            print(f"  Result: '{result}'")
+            print(f"  Comparing: Expected 'claude-sonnet-5', Got '{result}'")
+            assert result == "claude-sonnet-5"
+
+    @pytest.mark.asyncio
+    async def test_claude_sonnet_5_resolves_from_fallback_cache(self):
+        """
+        What it does: Verifies claude-sonnet-5 resolves via the fallback cache path,
+                      not passthrough, once FALLBACK_MODELS has been loaded into cache.
+        Purpose: Ensure /v1/messages and /v1/chat/completions treat claude-sonnet-5
+                 as a verified model (is_verified=True), matching other known models.
+        """
+        print("Setup: Importing FALLBACK_MODELS and creating cache...")
+        from kiro.config import FALLBACK_MODELS
+        from kiro.cache import ModelInfoCache
+        from kiro.model_resolver import ModelResolver
+
+        cache = ModelInfoCache()
+        await cache.update(FALLBACK_MODELS)
+
+        resolver = ModelResolver(cache=cache, hidden_models={})
+
+        print("Action: Resolving 'claude-sonnet-5'...")
+        resolution = resolver.resolve("claude-sonnet-5")
+
+        print(f"  Resolution source: {resolution.source}")
+        print(f"  Normalized: {resolution.normalized}")
+        print(f"  Internal ID: {resolution.internal_id}")
+        print(f"  Is verified: {resolution.is_verified}")
+
+        print("Comparing normalized: Expected 'claude-sonnet-5'...")
+        assert resolution.normalized == "claude-sonnet-5"
+
+        print("Comparing source: Expected 'cache'...")
+        assert resolution.source == "cache"
+
+        print("Comparing is_verified: Expected True...")
+        assert resolution.is_verified is True
+
+        print("Comparing internal_id: Expected 'claude-sonnet-5'...")
+        assert resolution.internal_id == "claude-sonnet-5"
+
+    def test_claude_sonnet_5_appears_in_model_family_suggestions(self):
+        """
+        What it does: Verifies claude-sonnet-5 is suggested for other Sonnet-family
+                      lookups, and never for Haiku/Opus lookups (family isolation).
+        Purpose: Error messages for invalid Sonnet models should list claude-sonnet-5
+                 as a valid alternative once it's in FALLBACK_MODELS.
+        """
+        print("Setup: Creating cache and resolver from FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+        from kiro.cache import ModelInfoCache
+        from kiro.model_resolver import ModelResolver
+        import asyncio
+
+        cache = ModelInfoCache()
+        asyncio.run(cache.update(FALLBACK_MODELS))
+
+        resolver = ModelResolver(cache=cache, hidden_models={})
+
+        print("Action: Getting suggestions for a bogus Sonnet model...")
+        sonnet_suggestions = resolver.get_suggestions_for_model("claude-sonnet-99")
+        print(f"  Sonnet suggestions: {sonnet_suggestions}")
+        assert "claude-sonnet-5" in sonnet_suggestions
+
+        print("Action: Getting suggestions for a bogus Opus model...")
+        opus_suggestions = resolver.get_suggestions_for_model("claude-opus-99")
+        print(f"  Opus suggestions: {opus_suggestions}")
+        assert "claude-sonnet-5" not in opus_suggestions
+
+        print("Action: Getting suggestions for a bogus Haiku model...")
+        haiku_suggestions = resolver.get_suggestions_for_model("claude-haiku-99")
+        print(f"  Haiku suggestions: {haiku_suggestions}")
+        assert "claude-sonnet-5" not in haiku_suggestions
+
+
+# ==================================================================================================
 # Tests for WebSearch Configuration
 # ==================================================================================================
 
