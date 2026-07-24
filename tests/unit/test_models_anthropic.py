@@ -389,6 +389,95 @@ class TestContentBlockUnion:
 
 
 # ==================================================================================================
+# Tests for AnthropicMessage role field (system-role message support)
+# ==================================================================================================
+
+class TestAnthropicMessageRole:
+    """
+    Tests for AnthropicMessage.role accepting 'system' in addition to 'user'/'assistant'.
+
+    Some clients (notably Claude Code CLI 2.x) send messages with role='system'
+    inline in the `messages` array (e.g. injected <system-reminder> context),
+    rather than exclusively via the top-level `system` field. Without this,
+    the request fails with a 422 literal_error before reaching
+    normalize_message_roles(), which already exists to convert such roles
+    to 'user' downstream (see converters_core.py, fixes issue #64).
+    """
+
+    def test_user_role_still_valid(self):
+        """
+        What it does: Verifies 'user' role still validates (no regression).
+        Purpose: Ensure widening the Literal didn't break the common case.
+        """
+        print("Setup: Creating AnthropicMessage with role='user'...")
+        message = AnthropicMessage(role="user", content="Hello")
+
+        print(f"Comparing role: Expected 'user', Got '{message.role}'")
+        assert message.role == "user"
+
+    def test_assistant_role_still_valid(self):
+        """
+        What it does: Verifies 'assistant' role still validates (no regression).
+        Purpose: Ensure widening the Literal didn't break the common case.
+        """
+        print("Setup: Creating AnthropicMessage with role='assistant'...")
+        message = AnthropicMessage(role="assistant", content="Hi there")
+
+        print(f"Comparing role: Expected 'assistant', Got '{message.role}'")
+        assert message.role == "assistant"
+
+    def test_system_role_is_accepted(self):
+        """
+        What it does: Verifies 'system' role validates without raising.
+        Purpose: Reproduces the Claude Code CLI 2.x request shape that
+                 previously raised a 422 literal_error on this field.
+        """
+        print("Setup: Creating AnthropicMessage with role='system'...")
+        message = AnthropicMessage(role="system", content="<system-reminder>context</system-reminder>")
+
+        print(f"Comparing role: Expected 'system', Got '{message.role}'")
+        assert message.role == "system"
+
+    def test_invalid_role_still_rejected(self):
+        """
+        What it does: Verifies an unrelated invalid role (e.g. 'tool') still raises.
+        Purpose: Ensure the fix only widens the Literal to the specific
+                 known-safe value, not arbitrary strings.
+        """
+        print("Setup: Attempting AnthropicMessage with role='tool'...")
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role="tool", content="oops")
+
+    def test_system_role_message_in_full_request_validates(self):
+        """
+        What it does: Verifies a full AnthropicMessagesRequest with a
+                      system-role message inline in `messages` validates
+                      (reproduces the exact Claude Code CLI 2.x payload shape).
+        Purpose: Regression test for the 422 error:
+                 "Input should be 'user' or 'assistant'" on messages[i].role.
+        """
+        print("Setup: Building request with inline system-role message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="system", content="<system-reminder>context</system-reminder>"),
+                AnthropicMessage(role="user", content="What model are you?"),
+            ],
+        )
+
+        print(f"Comparing messages length: Expected 2, Got {len(request.messages)}")
+        assert len(request.messages) == 2
+
+        print(f"Comparing first message role: Expected 'system', Got '{request.messages[0].role}'")
+        assert request.messages[0].role == "system"
+
+        print(f"Comparing second message role: Expected 'user', Got '{request.messages[1].role}'")
+        assert request.messages[1].role == "user"
+
+
+
+# ==================================================================================================
 # Tests for AnthropicMessage with Image Content (Issue #30 fix verification)
 # ==================================================================================================
 
