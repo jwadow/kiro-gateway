@@ -640,7 +640,9 @@ async def collect_stream_response(
     full_content = ""
     full_reasoning_content = ""
     final_usage = None
-    tool_calls = []
+    # Tool calls arrive incrementally (identity chunk, then arguments chunks), so
+    # accumulate by index the same way a streaming client would.
+    tool_calls_by_index = {}
     finish_reason = "stop"  # Default fallback
     completion_id = generate_completion_id()
     
@@ -670,7 +672,24 @@ async def collect_stream_response(
             if "reasoning_content" in delta:
                 full_reasoning_content += delta["reasoning_content"]
             if "tool_calls" in delta:
-                tool_calls.extend(delta["tool_calls"])
+                for tc in delta["tool_calls"] or []:
+                    # Fall back to positional order if a chunk omits index.
+                    idx = tc.get("index")
+                    if idx is None:
+                        idx = len(tool_calls_by_index)
+                    slot = tool_calls_by_index.setdefault(idx, {
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    if tc.get("type"):
+                        slot["type"] = tc["type"]
+                    func = tc.get("function") or {}
+                    if func.get("name"):
+                        slot["function"]["name"] = func["name"]
+                    slot["function"]["arguments"] += func.get("arguments") or ""
             
             # Extract finish_reason from chunk (streaming already calculated it correctly)
             finish_reason_from_chunk = chunk_data.get("choices", [{}])[0].get("finish_reason")
@@ -688,19 +707,19 @@ async def collect_stream_response(
     message = {"role": "assistant", "content": full_content}
     if full_reasoning_content:
         message["reasoning_content"] = full_reasoning_content
-    if tool_calls:
-        # For non-streaming response remove index field from tool_calls,
-        # as it's only required for streaming chunks
+    if tool_calls_by_index:
+        # For non-streaming response emit tool_calls in index order without the
+        # index field itself, as it's only required for streaming chunks.
         cleaned_tool_calls = []
-        for tc in tool_calls:
-            # Extract function with None protection
+        for idx in sorted(tool_calls_by_index):
+            tc = tool_calls_by_index[idx]
             func = tc.get("function") or {}
             cleaned_tc = {
                 "id": tc.get("id"),
                 "type": tc.get("type", "function"),
                 "function": {
                     "name": func.get("name", ""),
-                    "arguments": func.get("arguments", "{}")
+                    "arguments": func.get("arguments") or "{}"
                 }
             }
             cleaned_tool_calls.append(cleaned_tc)
