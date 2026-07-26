@@ -536,8 +536,16 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             response.status_code, error_reason
                         )
                         
-                        # Single account - no point in failover, break immediately
+                        # Single account - retry with delay for rate-limit-like errors
                         if len(all_accounts) == 1:
+                            if error_reason == "INVALID_MODEL_ID" and attempt < 2:
+                                import asyncio
+                                wait = 3 * (attempt + 1)  # 3s, 6s
+                                logger.info(f"INVALID_MODEL_ID on single account — retrying in {wait}s (attempt {attempt + 1}/3)")
+                                await asyncio.sleep(wait)
+                                # Allow same account to be retried
+                                tried_accounts.discard(account.id)
+                                continue  # Retry same account
                             break
                         
                         continue  # Next iteration
@@ -656,35 +664,82 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         )
         
         if response.status_code != 200:
+            # Check if this is a retryable INVALID_MODEL_ID error (AWS rate limit)
             try:
-                error_content = await response.aread()
-            except Exception:
-                error_content = b"Unknown error"
-            
-            await http_client.close()
-            error_text = error_content.decode('utf-8', errors='replace')
-            
-            # Try to parse JSON response from Kiro to extract error message
-            error_message = error_text
-            try:
-                error_json = json.loads(error_text)
-                # Enhance Kiro API errors with user-friendly messages
+                _err_content = await response.aread()
+                _err_text = _err_content.decode('utf-8', errors='replace')
+                _err_json = json.loads(_err_text)
                 from kiro.kiro_errors import enhance_kiro_error
-                error_info = enhance_kiro_error(error_json)
-                error_message = error_info.user_message
-                # Log original error for debugging
-                logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
+                _err_info = enhance_kiro_error(_err_json)
+                if _err_info.reason == "INVALID_MODEL_ID":
+                    # Retry up to 2 times with delay
+                    for _retry in range(2):
+                        import asyncio
+                        _wait = 3 * (_retry + 1)
+                        logger.info(f"INVALID_MODEL_ID — retrying in {_wait}s (attempt {_retry + 1}/2)")
+                        await asyncio.sleep(_wait)
+                        await http_client.close()
+                        if request_data.stream:
+                            http_client = KiroHttpClient(auth_manager, shared_client=None)
+                        else:
+                            http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+                        response = await http_client.request_with_retry("POST", url, kiro_payload, stream=True)
+                        if response.status_code == 200:
+                            break
+                    else:
+                        # All retries failed — fall through to error handling below
+                        pass
+                    if response.status_code == 200:
+                        # Success after retry — continue to normal processing
+                        pass
+                    else:
+                        # Still failing — read new error and fall through
+                        try:
+                            error_content = await response.aread()
+                        except Exception:
+                            error_content = _err_content
+                        await http_client.close()
+                        error_text = error_content.decode('utf-8', errors='replace')
+                        error_message = error_text
+                        try:
+                            error_json = json.loads(error_text)
+                            error_info = enhance_kiro_error(error_json)
+                            error_message = error_info.user_message
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                        logger.warning(f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}")
+                        if debug_logger:
+                            debug_logger.flush_on_error(response.status_code, error_message)
+                        return JSONResponse(
+                            status_code=response.status_code,
+                            content={"error": {"message": error_message, "type": "kiro_api_error", "code": response.status_code}}
+                        )
+                else:
+                    # Non-retryable error — use already-read content
+                    error_content = _err_content
+                    await http_client.close()
+                    error_text = _err_text
+                    error_message = _err_info.user_message
+                    logger.warning(f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}")
+                    if debug_logger:
+                        debug_logger.flush_on_error(response.status_code, error_message)
+                    return JSONResponse(
+                        status_code=response.status_code,
+                        content={"error": {"message": error_message, "type": "kiro_api_error", "code": response.status_code}}
+                    )
             except (json.JSONDecodeError, KeyError):
-                pass
-            
-            # Log access log for error (before flush, so it gets into app_logs)
-            logger.warning(
-                f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}"
-            )
-            
-            # Flush debug logs on error ("errors" mode)
-            if debug_logger:
-                debug_logger.flush_on_error(response.status_code, error_message)
+                # Can't parse error — fall through to original handling
+                error_content = _err_content if '_err_content' in dir() else b"Unknown error"
+                await http_client.close()
+                error_text = error_content.decode('utf-8', errors='replace')
+                error_message = error_text
+                logger.warning(f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}")
+                if debug_logger:
+                    debug_logger.flush_on_error(response.status_code, error_message)
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content={"error": {"message": error_message, "type": "kiro_api_error", "code": response.status_code}}
+                )
             
             # Return error in OpenAI API format
             return JSONResponse(
