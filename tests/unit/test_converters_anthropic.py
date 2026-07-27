@@ -23,6 +23,7 @@ from kiro.converters_anthropic import (
     extract_tool_uses_from_anthropic_content,
     convert_anthropic_messages,
     convert_anthropic_tools,
+    split_inline_system_messages,
     anthropic_to_kiro,
     extract_thinking_config_from_anthropic,
 )
@@ -1884,3 +1885,255 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestSplitInlineSystemMessages:
+    """
+    Tests for splitting inline system messages out of the conversation.
+
+    Claude Code and Claude Desktop place runtime context in a message with
+    role "system" (or "developer") inside the messages array. Those must be
+    merged into the system prompt, mirroring the OpenAI conversion path.
+    """
+
+    def test_extracts_system_message_from_conversation(self):
+        """
+        What it does: Verifies a system message is peeled off the conversation.
+        Purpose: Kiro only accepts user/assistant turns in history.
+        """
+        print("Setup: user, system, user...")
+        messages = [
+            AnthropicMessage(role="user", content="hello"),
+            AnthropicMessage(role="system", content="<system-reminder>ctx</system-reminder>"),
+            AnthropicMessage(role="user", content="say ok"),
+        ]
+
+        print("Action: Splitting inline system messages...")
+        system_prompt, conversation = split_inline_system_messages(messages)
+
+        print(f"Comparing system prompt: Got {system_prompt!r}")
+        assert system_prompt == "<system-reminder>ctx</system-reminder>"
+
+        print(f"Comparing remaining roles: Got {[m.role for m in conversation]}")
+        assert [m.role for m in conversation] == ["user", "user"]
+
+    def test_extracts_developer_role_message(self):
+        """
+        What it does: Verifies "developer" messages are treated as system.
+        Purpose: Some clients use the OpenAI-style developer role.
+        """
+        print("Setup: developer message...")
+        messages = [
+            AnthropicMessage(role="developer", content="dev context"),
+            AnthropicMessage(role="user", content="hi"),
+        ]
+
+        print("Action: Splitting...")
+        system_prompt, conversation = split_inline_system_messages(messages)
+
+        print(f"Comparing system prompt: Got {system_prompt!r}")
+        assert system_prompt == "dev context"
+        assert len(conversation) == 1
+
+    def test_joins_multiple_system_messages_in_order(self):
+        """
+        What it does: Verifies several system messages are joined in order.
+        Purpose: Preserve the order the client sent context in.
+        """
+        print("Setup: two system messages around a user turn...")
+        messages = [
+            AnthropicMessage(role="system", content="first"),
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role="system", content="second"),
+        ]
+
+        print("Action: Splitting...")
+        system_prompt, conversation = split_inline_system_messages(messages)
+
+        print(f"Comparing system prompt: Got {system_prompt!r}")
+        assert system_prompt == "first\nsecond"
+        assert len(conversation) == 1
+
+    def test_extracts_text_from_content_blocks(self):
+        """
+        What it does: Verifies system content in block form is extracted.
+        Purpose: Claude Code sends blocks with cache_control, not plain strings.
+        """
+        print("Setup: system message with text blocks...")
+        messages = [
+            AnthropicMessage(
+                role="system",
+                content=[
+                    TextContentBlock(text="block one "),
+                    TextContentBlock(text="block two"),
+                ],
+            ),
+            AnthropicMessage(role="user", content="hi"),
+        ]
+
+        print("Action: Splitting...")
+        system_prompt, conversation = split_inline_system_messages(messages)
+
+        print(f"Comparing system prompt: Got {system_prompt!r}")
+        assert system_prompt == "block one block two"
+
+    def test_skips_system_message_with_empty_content(self):
+        """
+        What it does: Verifies empty system messages add nothing.
+        Purpose: Avoid injecting blank lines into the system prompt.
+        """
+        print("Setup: empty system message...")
+        messages = [
+            AnthropicMessage(role="system", content=""),
+            AnthropicMessage(role="user", content="hi"),
+        ]
+
+        print("Action: Splitting...")
+        system_prompt, conversation = split_inline_system_messages(messages)
+
+        print(f"Comparing system prompt: Expected empty, Got {system_prompt!r}")
+        assert system_prompt == ""
+        assert len(conversation) == 1
+
+    def test_conversation_without_system_messages_is_unchanged(self):
+        """
+        What it does: Verifies a normal conversation passes through intact.
+        Purpose: The common case must not be altered.
+        """
+        print("Setup: user/assistant conversation...")
+        messages = [
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role="assistant", content="hello"),
+        ]
+
+        print("Action: Splitting...")
+        system_prompt, conversation = split_inline_system_messages(messages)
+
+        print(f"Comparing: system empty, conversation length {len(conversation)}")
+        assert system_prompt == ""
+        assert conversation == messages
+
+    def test_empty_message_list(self):
+        """
+        What it does: Verifies an empty list is handled.
+        Purpose: Guard the boundary before build_kiro_payload raises.
+        """
+        print("Action: Splitting an empty list...")
+        system_prompt, conversation = split_inline_system_messages([])
+
+        print(f"Comparing: Got {system_prompt!r}, {conversation}")
+        assert system_prompt == ""
+        assert conversation == []
+
+
+class TestAnthropicToKiroInlineSystem:
+    """
+    Tests for inline system messages through the full conversion.
+
+    Covers issues #190, #219 and #255: clients inlining role "system" in the
+    messages array used to fail Pydantic validation with HTTP 422.
+    """
+
+    def _payload_content(self, request):
+        """Runs anthropic_to_kiro and returns the user input content."""
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+        return payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+    def test_inline_system_message_reaches_system_prompt(self):
+        """
+        What it does: Verifies inline system text lands in the Kiro payload.
+        Purpose: The context the client sent must not be silently dropped.
+        """
+        print("Setup: request with an inline system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[
+                AnthropicMessage(role="user", content="hello"),
+                AnthropicMessage(role="system", content="INLINE_CONTEXT_MARKER"),
+                AnthropicMessage(role="user", content="say ok"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        content = self._payload_content(request)
+
+        print("Checking: inline context is present in the payload...")
+        assert "INLINE_CONTEXT_MARKER" in content
+
+    def test_top_level_system_precedes_inline_system(self):
+        """
+        What it does: Verifies top-level system comes before inline system text.
+        Purpose: The dedicated field is the primary prompt; inline context adds
+                 to it rather than preceding it.
+        """
+        print("Setup: request with both top-level and inline system...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            system="TOP_LEVEL_MARKER",
+            messages=[
+                AnthropicMessage(role="user", content="hello"),
+                AnthropicMessage(role="system", content="INLINE_MARKER"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        content = self._payload_content(request)
+
+        print("Checking: both markers present, top-level first...")
+        assert "TOP_LEVEL_MARKER" in content
+        assert "INLINE_MARKER" in content
+        assert content.index("TOP_LEVEL_MARKER") < content.index("INLINE_MARKER")
+
+    def test_inline_system_message_is_not_a_conversation_turn(self):
+        """
+        What it does: Verifies the system message is not sent as history.
+        Purpose: Kiro rejects non user/assistant roles, and a folded-to-user
+                 message would also distort the alternating turn structure.
+        """
+        print("Setup: single user turn plus an inline system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[
+                AnthropicMessage(role="system", content="ctx"),
+                AnthropicMessage(role="user", content="only user turn"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+
+        history = payload["conversationState"].get("history", [])
+        print(f"Comparing history length: Expected 0, Got {len(history)}")
+        assert len(history) == 0
+
+    def test_request_of_only_system_messages_raises(self):
+        """
+        What it does: Verifies a request with no real turns raises ValueError.
+        Purpose: routes_anthropic converts this into a clear client error
+                 instead of sending an empty conversation to Kiro.
+        """
+        print("Setup: request containing only a system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="system", content="ctx only")],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting, expecting ValueError...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with pytest.raises(ValueError, match="No messages to send"):
+                anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")

@@ -1757,3 +1757,65 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+# =============================================================================
+# Tests for non-standard message roles
+# =============================================================================
+
+class TestAnthropicMessageRoles:
+    """
+    Tests for roles accepted in the messages array.
+
+    Claude Desktop and Claude Code place reminder/memory blocks in a message
+    with role "system" (or "developer"). The Anthropic API rejects those, but
+    the gateway accepts them and folds them into the user channel via
+    normalize_message_roles() during payload building.
+    """
+
+    @pytest.mark.parametrize("role", ["user", "assistant", "system", "developer"])
+    def test_accepted_roles_validate(self, role):
+        """
+        What it does: Verifies each supported role passes validation.
+        Purpose: A "system" message inside messages must not raise a 422.
+        """
+        print(f"Setup: Creating AnthropicMessage with role={role!r}...")
+        message = AnthropicMessage(role=role, content="test")
+
+        print(f"Comparing role: Expected {role!r}, Got {message.role!r}")
+        assert message.role == role
+
+    def test_unknown_role_is_rejected(self):
+        """
+        What it does: Verifies an unrecognized role still fails validation.
+        Purpose: Keep the field constrained instead of accepting any string.
+        """
+        print("Setup: Creating AnthropicMessage with role='moderator'...")
+        with pytest.raises(ValidationError) as exc_info:
+            AnthropicMessage(role="moderator", content="test")
+
+        print(f"Checking: ValidationError mentions the role field...")
+        assert "role" in str(exc_info.value)
+
+    def test_request_with_system_role_message_validates(self):
+        """
+        What it does: Verifies a request carrying a "system" message validates.
+        Purpose: This is the shape Claude Desktop sends; it used to 422 at the
+                 FastAPI layer before the request reached the converters.
+        """
+        print("Setup: Creating request with a system reminder message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[
+                AnthropicMessage(role="user", content="hello"),
+                AnthropicMessage(role="system", content="<system-reminder>ctx</system-reminder>"),
+                AnthropicMessage(role="user", content="say ok"),
+            ],
+            max_tokens=1024,
+        )
+
+        print(f"Comparing message count: Expected 3, Got {len(request.messages)}")
+        assert len(request.messages) == 3
+
+        print(f"Comparing roles: Got {[m.role for m in request.messages]}")
+        assert [m.role for m in request.messages] == ["user", "system", "user"]

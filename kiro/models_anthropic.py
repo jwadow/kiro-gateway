@@ -185,9 +185,15 @@ class AnthropicMessage(BaseModel):
     Attributes:
         role: Message role (user or assistant)
         content: Message content (string or list of content blocks)
+
+    Note:
+        "system" and "developer" are accepted even though the Anthropic API
+        rejects them in the messages array: some clients (Claude Desktop,
+        Claude Code) put reminder/memory blocks there. They are folded into
+        the user channel by convert_anthropic_messages().
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system", "developer"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
