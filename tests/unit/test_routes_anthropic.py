@@ -337,12 +337,13 @@ class TestMessagesValidation:
         print(f"Status: {response.status_code}")
         assert response.status_code == 422
     
-    def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
+    def test_accepts_unknown_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies an unknown message role is not rejected at validation.
+        Purpose: Clients (e.g. Claude Code) inject mid-conversation 'system' messages.
+            Unknown roles are normalized to 'user' downstream, so they must not 422.
         """
-        print("Action: POST /v1/messages with invalid role...")
+        print("Action: POST /v1/messages with an unknown role...")
         response = test_client.post(
             "/v1/messages",
             headers={"x-api-key": valid_proxy_api_key},
@@ -352,10 +353,10 @@ class TestMessagesValidation:
                 "messages": [{"role": "invalid_role", "content": "Hello"}]
             }
         )
-        
+
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
+        # Must pass Pydantic validation; failures beyond that are upstream/auth concerns
+        assert response.status_code != 422
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """
