@@ -86,6 +86,38 @@ so this usually means you are calling the API directly rather than through the g
 `ANTHROPIC_AUTH_TOKEN` must be set, not `ANTHROPIC_API_KEY`. Only the former bypasses the
 interactive OAuth flow. `setup.sh` configures this correctly.
 
+### Shell helper (optional)
+
+`setup.sh` writes the Claude Code configuration to `~/.claude/settings.json`, so `claude` works
+from any terminal without exporting anything. The only recurring task is starting the gateway.
+
+Add this to `~/.zshrc` to avoid typing the path each time:
+
+```bash
+# Kiro Gateway
+kiro-gateway() {
+  local gw_dir="$HOME/repo/kiro-gateway"   # adjust to your clone location
+  local port
+  port=$(grep -m1 '^SERVER_PORT=' "$gw_dir/.env" 2>/dev/null | cut -d'"' -f2)
+  (cd "$gw_dir" && python3 main.py --port "${port:-8000}")
+}
+```
+
+Then `kiro-gateway` starts it in the foreground; stop it with Ctrl+C.
+
+> **Why no `export` lines?** Environment variables do not cross terminal sessions, so exporting
+> them in the window running the gateway would not reach the window running `claude`. Putting them
+> in `~/.claude/settings.json` avoids the problem and also reaches Claude Code's background
+> agents, which shell exports do not.
+
+If you prefer environment variables over the settings file, export these instead — but note they
+apply only to the shell you set them in:
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:8000"
+export ANTHROPIC_AUTH_TOKEN="<your PROXY_API_KEY from .env>"
+```
+
 ### Selecting a model
 
 Model discovery is enabled by `setup.sh`, so `/model` inside Claude Code lists the models your
