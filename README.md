@@ -21,6 +21,117 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 
 ---
 
+## 🍴 About This Fork
+
+> This is a **Polarity fork** of [Jwadow/kiro-gateway](https://github.com/Jwadow/kiro-gateway), maintained at
+> [polarity-dev/kiro-gateway](https://github.com/polarity-dev/kiro-gateway).
+>
+> It adds support for **Kiro IDE Enterprise accounts (AWS IAM Identity Center)**, which the upstream
+> project does not fully cover. See [Polarity Setup](#-polarity-setup-enterprise--idc) for the
+> automated installer and [Fork Changes](#-fork-changes) for what differs from upstream.
+
+---
+
+## 🚀 Polarity Setup (Enterprise / IdC)
+
+**If you authenticate through Polarity's AWS IAM Identity Center, use this path.** It replaces the
+manual [Configuration](#%EF%B8%8F-configuration) steps below.
+
+```bash
+git clone https://github.com/polarity-dev/kiro-gateway.git
+cd kiro-gateway
+./setup.sh
+python3 main.py
+```
+
+Then run `claude` from any terminal. No environment exports needed.
+
+### What setup.sh does
+
+Enterprise accounts need two values that cannot be discovered automatically by the upstream code.
+The installer resolves both:
+
+| Value | How it is obtained | Why it is needed |
+|-------|--------------------|------------------|
+| `PROFILE_ARN` | Read from Kiro IDE logs at `~/Library/Application Support/Kiro/logs/*/exthost/kiro.kiroAgent/q-client.log` | The AWS SSO OIDC refresh flow never returns it, and `ListAvailableProfiles` returns an empty list for Enterprise accounts. The profile ID is an opaque string that cannot be derived from your AWS account settings. |
+| `KIRO_API_REGION` | Parsed from the region field of the discovered ARN | Your SSO region (where you log in) and your subscription's API region are usually different. DNS probing is unreliable because several `runtime.*.kiro.dev` hosts resolve regardless of where your subscription lives. |
+
+It also generates a random `PROXY_API_KEY`, writes `.env`, and configures
+`~/.claude/settings.json` for Claude Code while preserving any existing settings.
+
+The script is safe to re-run: it backs up `.env` to `.env.bak` and prompts before
+overwriting anything.
+
+### Requirements
+
+- macOS with [Kiro IDE](https://kiro.dev/) installed and logged in to your Polarity account
+- Python 3.10+
+- At least one message sent in Kiro IDE, so the `profileArn` appears in its logs
+
+### Troubleshooting
+
+**`Could not find profileArn in Kiro IDE logs`**
+Send a message in Kiro IDE, then re-run `./setup.sh`. Kiro only writes the ARN once it has
+made an API call. You can also paste the ARN manually when prompted.
+
+**`runtime.<region>.kiro.dev does not resolve`**
+Your network is blocking the endpoint. Set `VPN_PROXY_URL` in `.env` — see
+[VPN/Proxy Support](#-vpnproxy-support).
+
+**`403 User is not authorized to make this call`**
+The Kiro API rejects requests without a recognised `User-Agent`. The gateway sends a valid one,
+so this usually means you are calling the API directly rather than through the gateway.
+
+**Claude Code opens a browser login page**
+`ANTHROPIC_AUTH_TOKEN` must be set, not `ANTHROPIC_API_KEY`. Only the former bypasses the
+interactive OAuth flow. `setup.sh` configures this correctly.
+
+### Selecting a model
+
+Model discovery is enabled by `setup.sh`, so `/model` inside Claude Code lists the models your
+subscription grants, labelled `From gateway`. To inspect them directly:
+
+```bash
+curl -s localhost:8000/v1/models -H "Authorization: Bearer $PROXY_API_KEY" \
+  | python3 -c "import sys,json; print('\n'.join(m['id'] for m in json.load(sys.stdin)['data']))"
+```
+
+To pin a default, set `ANTHROPIC_MODEL` in the `env` block of `~/.claude/settings.json`.
+
+---
+
+## 🔧 Fork Changes
+
+Changes in this fork that are not yet in upstream:
+
+**`setup.sh`** — Automated installer for Enterprise / IdC accounts, described above.
+
+**Support for `role: "system"` in the Anthropic endpoint** — Claude Code sends the system prompt
+as a message inside the `messages` array, while the Anthropic API specifies it as a separate
+top-level `system` field. Upstream rejects these requests with an HTTP 422 validation error.
+This fork accepts them:
+
+- `kiro/models_anthropic.py` — `AnthropicMessage.role` accepts `"system"` alongside
+  `"user"` and `"assistant"`
+- `kiro/converters_anthropic.py` — `build_kiro_payload_anthropic()` filters system messages out
+  of the array and merges their text into the system prompt before building the Kiro payload
+
+> **Note:** this change currently covers the Anthropic endpoint only. Upstream's contribution
+> guidelines require feature parity across both the OpenAI and Anthropic surfaces plus test
+> coverage for streaming and non-streaming paths, so it is not yet suitable for a pull request.
+
+### Syncing with upstream
+
+```bash
+git fetch upstream
+git merge upstream/main
+```
+
+Expect conflicts in `kiro/models_anthropic.py` and `kiro/converters_anthropic.py`, since both
+carry fork-specific changes.
+
+---
+
 ## 🤖 Available Models (Free List)
 
 > ⚠️ **Important:** Model availability depends on your Kiro tier (free/paid). The gateway provides access to whatever models are available in your IDE or CLI based on your subscription. The list below shows models commonly available on the **free tier**.
