@@ -40,6 +40,16 @@ def event_loop():
 # Environment Fixtures
 # =============================================================================
 
+@pytest.fixture(autouse=True)
+def disable_upstream_request_pacing():
+    """Keep unit tests independent of production pacing settings and state."""
+    from kiro.request_pacer import upstream_request_pacer
+
+    upstream_request_pacer.configure_for_tests(0.0, 0.0, 0.0)
+    yield
+    upstream_request_pacer.configure_for_tests(0.0, 0.0, 0.0)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def setup_test_environment(tmp_path_factory):
     """

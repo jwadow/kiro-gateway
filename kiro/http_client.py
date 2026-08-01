@@ -32,7 +32,7 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
-from typing import Optional
+from typing import Mapping, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -42,6 +42,22 @@ from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, 
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+from kiro.request_pacer import upstream_request_pacer
+
+
+def _parse_retry_after(headers: object) -> Optional[float]:
+    """Return a numeric Retry-After value when the upstream provides one."""
+    if not isinstance(headers, Mapping):
+        return None
+
+    value = headers.get("Retry-After")
+    if value is None:
+        return None
+
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 class KiroHttpClient:
@@ -211,6 +227,10 @@ class KiroHttpClient:
         
         for attempt in range(max_retries):
             try:
+                # All KiroHttpClient instances share this pacer. Subagents still
+                # run concurrently, but their model-turn requests start gradually.
+                await upstream_request_pacer.wait_for_slot()
+
                 # Get current token
                 token = await self.auth_manager.get_access_token()
                 headers = get_kiro_headers(self.auth_manager, token)
@@ -258,7 +278,9 @@ class KiroHttpClient:
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
                     last_response = response  # Сохраняем для возврата после exhaustion
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    retry_after = _parse_retry_after(response.headers)
+                    shared_cooldown = await upstream_request_pacer.register_rate_limit(retry_after)
+                    delay = max(BASE_RETRY_DELAY * (2 ** attempt), shared_cooldown)
                     logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue

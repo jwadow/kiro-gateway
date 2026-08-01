@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from kiro.http_client import KiroHttpClient
 from kiro.auth import KiroAuthManager
 from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.request_pacer import UpstreamRequestPacer
 
 
 @pytest.fixture
@@ -557,6 +558,56 @@ class TestKiroHttpClientExponentialBackoff:
         assert len(sleep_delays) == 2
         assert sleep_delays[0] == BASE_RETRY_DELAY * (2 ** 0)  # 1.0
         assert sleep_delays[1] == BASE_RETRY_DELAY * (2 ** 1)  # 2.0
+
+
+class TestUpstreamRequestPacer:
+    """Tests for process-wide request pacing and 429 coordination."""
+
+    @pytest.mark.asyncio
+    async def test_retry_sleep_patch_does_not_replace_pacer_sleep(self):
+        """HTTP retry tests can mock backoff without disabling pacer timing."""
+        pacer = UpstreamRequestPacer(min_interval=0.001, cooldown=0.0, jitter=0.0)
+        await pacer.wait_for_slot()
+
+        with patch("kiro.http_client.asyncio.sleep", side_effect=RuntimeError("retry sleep only")):
+            await pacer.wait_for_slot()
+
+    @pytest.mark.asyncio
+    async def test_request_starts_are_spaced_across_callers(self):
+        """A second caller waits for the configured minimum start interval."""
+        pacer = UpstreamRequestPacer(min_interval=0.01, cooldown=0.0, jitter=0.0)
+        loop = asyncio.get_running_loop()
+
+        await pacer.wait_for_slot()
+        first = loop.time()
+        await pacer.wait_for_slot()
+        second = loop.time()
+
+        assert second - first >= 0.009
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_uses_retry_after_and_jitter(self):
+        """A 429 creates one shared cooldown using the strongest delay signal."""
+        pacer = UpstreamRequestPacer(min_interval=0.0, cooldown=5.0, jitter=2.0)
+
+        with patch("kiro.request_pacer.random.uniform", return_value=1.25):
+            delay = await pacer.register_rate_limit(retry_after=8.0)
+
+        assert 9.0 <= delay <= 9.25
+
+    @pytest.mark.asyncio
+    async def test_waiting_caller_observes_new_rate_limit(self):
+        """A cooldown reported while another caller waits delays that caller."""
+        pacer = UpstreamRequestPacer(min_interval=0.03, cooldown=0.05, jitter=0.0)
+        await pacer.wait_for_slot()
+
+        waiter = asyncio.create_task(pacer.wait_for_slot())
+        await asyncio.sleep(0.005)
+        await pacer.register_rate_limit()
+
+        started = asyncio.get_running_loop().time()
+        await waiter
+        assert asyncio.get_running_loop().time() - started >= 0.04
 
 
 class TestKiroHttpClientStreamingTimeout:
