@@ -6,6 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: kiro-gateway
+    user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "8000:8000"
     environment:
