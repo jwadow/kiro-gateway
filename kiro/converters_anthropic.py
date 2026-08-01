@@ -134,15 +134,18 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
         block_type = None
         tool_use_id = None
         result_content = ""
+        is_error = False
 
         if isinstance(block, dict):
             block_type = block.get("type")
             tool_use_id = block.get("tool_use_id")
             result_content = block.get("content", "")
+            is_error = bool(block.get("is_error", False))
         elif hasattr(block, "type"):
             block_type = block.type
             tool_use_id = getattr(block, "tool_use_id", None)
             result_content = getattr(block, "content", "")
+            is_error = bool(getattr(block, "is_error", False))
 
         if block_type == "tool_result" and tool_use_id:
             # Convert content to text if it's a list
@@ -156,6 +159,7 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
                     "content": result_content or "(empty result)",
+                    "is_error": is_error,
                 }
             )
 

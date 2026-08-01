@@ -18,6 +18,7 @@ import pytest
 from kiro.truncation_recovery import (
     should_inject_recovery,
     generate_truncation_tool_result,
+    generate_tool_protocol_failure_message,
     generate_truncation_user_message
 )
 
@@ -108,19 +109,13 @@ class TestToolTruncationMessage:
         assert isinstance(content, str), "Content should be string"
         assert len(content) > 0, "Content should not be empty"
         
-        # Assert - Key phrases present
-        assert "[API Limitation]" in content, "Should contain [API Limitation] marker"
-        assert "truncated" in content.lower(), "Should mention truncation"
-        assert "upstream api" in content.lower(), "Should mention upstream API"
-        assert "output size limits" in content.lower(), "Should mention size limits"
-        
-        # Assert - Universal formulation (conditional language)
-        assert "if" in content.lower() or "likely" in content.lower(), "Should use conditional language"
-        assert "consequence" in content.lower(), "Should explain error is consequence"
-        
-        # Assert - Warning about repetition
-        assert "repeating" in content.lower(), "Should warn about repeating"
-        assert "adapt" in content.lower(), "Should suggest adaptation"
+        # Large truncations are size pressure and require splitting the operation.
+        assert "[API Limitation]" in content
+        assert "truncated" in content.lower()
+        assert "upstream api" in content.lower()
+        assert "due to its size" in content.lower()
+        assert "repeating" in content.lower()
+        assert "split" in content.lower() or "smaller" in content.lower()
         
         print("✅ Test passed: Tool truncation message format correct")
     
@@ -152,7 +147,8 @@ class TestToolTruncationMessage:
             
             assert result["type"] == "tool_result", f"Should work for {tool_name}"
             assert result["tool_use_id"] == tool_id, f"Should preserve tool_id for {tool_name}"
-            assert "[API Limitation]" in result["content"], f"Should have marker for {tool_name}"
+            assert "[Upstream Glitch]" in result["content"], f"Should mark small cutoff for {tool_name}"
+            assert "retry" in result["content"].lower()
         
         print("✅ Test passed: Works for all tool types")
     
@@ -188,10 +184,52 @@ class TestToolTruncationMessage:
         for phrase in forbidden_phrases:
             assert phrase not in content, f"Should NOT contain specific instruction: '{phrase}'"
         
-        # Assert - Should contain general guidance
-        assert "adapt" in content or "consider" in content, "Should suggest general adaptation"
+        # Large write-like failures should recommend splitting without leaking data.
+        assert "split" in content or "smaller" in content
+        assert "repeating" in content
         
         print("✅ Test passed: No specific instructions (universal formulation)")
+
+
+class TestToolProtocolFailureMessage:
+    def test_malformed_message_is_redacted_and_non_executable(self):
+        raw_arguments = '{"secret": "sensitive", nope}'
+        tool_call = {
+            "id": "call_bad",
+            "function": {"name": "Write", "arguments": raw_arguments},
+            "_protocol_failure": {
+                "classification": "malformed",
+                "reason": "malformed JSON",
+                "size_bytes": len(raw_arguments),
+            },
+            "_executable": False,
+        }
+
+        message = generate_tool_protocol_failure_message(tool_call)
+
+        assert "[Tool Protocol Error]" in message
+        assert "No tool was executed" in message
+        assert "valid JSON" in message
+        assert raw_arguments not in message
+        assert "sensitive" not in message
+
+    def test_truncated_message_preserves_retry_guidance(self):
+        tool_call = {
+            "id": "call_cut",
+            "function": {"name": "Agent", "arguments": '{"prompt": "cut'},
+            "_protocol_failure": {
+                "classification": "truncated",
+                "reason": "unclosed string literal",
+                "size_bytes": 15,
+            },
+            "_executable": False,
+        }
+
+        message = generate_tool_protocol_failure_message(tool_call)
+
+        assert "[Upstream Glitch]" in message
+        assert "retry" in message.lower()
+        assert "No tool was executed" in message
 
 
 class TestContentTruncationMessage:

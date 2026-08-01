@@ -36,7 +36,7 @@ import io
 import json
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 from loguru import logger
 
 from kiro.config import DEBUG_MODE, DEBUG_DIR
@@ -74,6 +74,11 @@ class DebugLogger:
         # Buffer for application logs (loguru)
         self._app_logs_buffer: io.StringIO = io.StringIO()
         self._loguru_sink_id: Optional[int] = None
+
+        # Accumulated protocol anomalies for the current request. Persisted
+        # immediately (metadata-only) and independently of the error-flush
+        # lifecycle, since anomalies can occur on otherwise-successful responses.
+        self._anomaly_buffer: list = []
     
     def _is_enabled(self) -> bool:
         """Checks if logging is enabled."""
@@ -89,6 +94,7 @@ class DebugLogger:
         self._kiro_request_body_buffer = None
         self._raw_chunks_buffer.clear()
         self._modified_chunks_buffer.clear()
+        self._anomaly_buffer = []
         self._clear_app_logs_buffer()
     
     def _clear_app_logs_buffer(self):
@@ -217,6 +223,36 @@ class DebugLogger:
             # "errors" mode - buffer
             self._modified_chunks_buffer.extend(chunk)
     
+    def record_anomaly(self, category: str, metadata: Optional[Dict[str, Any]] = None):
+        """
+        Records a protocol anomaly for the current request (metadata-only).
+
+        Unlike request/response buffers, anomalies are persisted on BOTH the
+        success and error paths, because an anomaly on an HTTP 200 response
+        (e.g. a malformed tool call in an otherwise-successful stream) is
+        precisely the case worth capturing.
+
+        No raw payloads, prompts, or stream bytes are captured here — only a
+        bounded category plus caller-supplied scalar metadata.
+
+        Args:
+            category: Short anomaly signature (e.g. "tool_protocol_failure").
+            metadata: Optional flat dict of JSON-serializable scalars.
+        """
+        if not self._is_enabled():
+            return
+
+        entry: Dict[str, Any] = {"category": str(category)}
+        if metadata:
+            # Keep only scalar metadata to guarantee no payload leakage.
+            for key, value in metadata.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    entry[str(key)] = value
+                else:
+                    entry[str(key)] = repr(value)[:200]
+
+        self._anomaly_buffer.append(entry)
+
     def log_error_info(self, status_code: int, error_message: str = ""):
         """
         Writes error information to file.
@@ -265,16 +301,19 @@ class DebugLogger:
         # In "all" mode data is already written, add error_info and app logs
         if self._is_immediate_write():
             self.log_error_info(status_code, error_message)
+            self._write_anomalies_to_file()
             self._write_app_logs_to_file()
             self._clear_app_logs_buffer()
+            self._anomaly_buffer = []
             return
-        
+
         # Check if there's anything to flush
         if not any([
             self._request_body_buffer,
             self._kiro_request_body_buffer,
             self._raw_chunks_buffer,
-            self._modified_chunks_buffer
+            self._modified_chunks_buffer,
+            self._anomaly_buffer,
         ]):
             return
         
@@ -303,10 +342,13 @@ class DebugLogger:
             
             # Save error information
             self.log_error_info(status_code, error_message)
-            
+
+            # Save protocol anomalies (metadata-only)
+            self._write_anomalies_to_file()
+
             # Save application logs
             self._write_app_logs_to_file()
-            
+
             logger.info(f"[DebugLogger] Error logs flushed to {self.debug_dir} (status={status_code})")
             
         except Exception as e:
@@ -323,11 +365,17 @@ class DebugLogger:
         Also called in "all" mode to save logs of successful request.
         """
         if DEBUG_MODE == "errors":
+            # Anomalies are persisted even on success, since a protocol anomaly
+            # on an HTTP 200 response is exactly what we want to capture.
+            # Everything else (prompts, requests, raw streams) is discarded.
+            self._write_anomalies_to_file()
             self._clear_buffers()
         elif DEBUG_MODE == "all":
             # In "all" mode save logs even for successful requests
+            self._write_anomalies_to_file()
             self._write_app_logs_to_file()
             self._clear_app_logs_buffer()
+            self._anomaly_buffer = []
     
     # ==================== Private file writing methods ====================
     
@@ -377,6 +425,26 @@ class DebugLogger:
         except Exception:
             pass
     
+    def _write_anomalies_to_file(self):
+        """Writes accumulated protocol anomalies to anomaly_info.json (metadata-only)."""
+        if not self._anomaly_buffer:
+            return
+        try:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
+            file_path = self.debug_dir / "anomaly_info.json"
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"anomalies": self._anomaly_buffer},
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            logger.debug(
+                f"[DebugLogger] Recorded {len(self._anomaly_buffer)} anomaly event(s)"
+            )
+        except Exception as e:
+            logger.error(f"[DebugLogger] Error writing anomaly_info: {e}")
+
     def _write_app_logs_to_file(self):
         """Writes captured application logs to file."""
         try:

@@ -325,6 +325,25 @@ class TestDeduplicateToolCalls:
         print("Verifying that tool call with longer arguments was kept...")
         assert "limit" in result[0]["function"]["arguments"]
     
+    def test_deduplicates_by_id_prefers_valid_candidate_over_protocol_failure(self):
+        invalid = {
+            "id": "call_same",
+            "function": {"name": "write_file", "arguments": "{malformed}"},
+            "_protocol_failure": {
+                "classification": "malformed",
+                "reason": "malformed JSON",
+                "size_bytes": 11,
+            },
+            "_executable": False,
+        }
+        valid = {
+            "id": "call_same",
+            "function": {"name": "write_file", "arguments": "{}"},
+        }
+
+        assert deduplicate_tool_calls([invalid, valid]) == [valid]
+        assert deduplicate_tool_calls([valid, invalid]) == [valid]
+
     def test_deduplicates_empty_arguments_replaced_by_non_empty(self):
         """
         What it does: Tests replacement of empty arguments with non-empty.
@@ -765,25 +784,56 @@ class TestAwsEventStreamParserFinalizeToolCall:
     
     def test_finalize_with_invalid_json_arguments(self, aws_event_parser):
         """
-        What it does: Tests finalization of tool call with invalid JSON.
-        Goal: Ensure invalid JSON is replaced with "{}".
+        What it does: Marks malformed JSON as a non-executable protocol failure.
+        Goal: Never normalize invalid arguments to an executable empty object.
         """
-        print("Setup: Tool call with invalid JSON...")
+        raw_arguments = '{"required": nope}'
         aws_event_parser.current_tool_call = {
             "id": "call_5",
             "type": "function",
             "function": {
                 "name": "test_func",
-                "arguments": "not valid json {"
+                "arguments": raw_arguments
             }
         }
-        
-        print("Action: Finalizing tool call...")
+
         aws_event_parser._finalize_tool_call()
-        
-        print(f"Result: {aws_event_parser.tool_calls}")
-        assert len(aws_event_parser.tool_calls) == 1
-        assert aws_event_parser.tool_calls[0]["function"]["arguments"] == "{}"
+
+        tool_call = aws_event_parser.tool_calls[0]
+        assert tool_call["function"]["arguments"] == raw_arguments
+        assert tool_call["_executable"] is False
+        assert tool_call["_protocol_failure"]["classification"] == "malformed"
+        assert tool_call.get("_truncation_detected") is None
+
+    def test_finalize_with_truncated_json_is_non_executable(self, aws_event_parser):
+        raw_arguments = '{"path": "file.txt", "content": "unfinished'
+        aws_event_parser.current_tool_call = {
+            "id": "call_truncated",
+            "type": "function",
+            "function": {"name": "Write", "arguments": raw_arguments},
+        }
+
+        aws_event_parser._finalize_tool_call()
+
+        tool_call = aws_event_parser.tool_calls[0]
+        assert tool_call["function"]["arguments"] == raw_arguments
+        assert tool_call["_executable"] is False
+        assert tool_call["_protocol_failure"]["classification"] == "truncated"
+        assert tool_call["_truncation_detected"] is True
+
+    def test_finalize_with_valid_empty_object_remains_executable(self, aws_event_parser):
+        aws_event_parser.current_tool_call = {
+            "id": "call_empty",
+            "type": "function",
+            "function": {"name": "list_items", "arguments": "{}"},
+        }
+
+        aws_event_parser._finalize_tool_call()
+
+        tool_call = aws_event_parser.tool_calls[0]
+        assert tool_call["function"]["arguments"] == "{}"
+        assert "_protocol_failure" not in tool_call
+        assert tool_call.get("_executable", True) is True
     
     def test_finalize_with_none_current_tool_call(self, aws_event_parser):
         """

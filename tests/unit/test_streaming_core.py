@@ -22,6 +22,7 @@ from kiro.streaming_core import (
     KiroEvent,
     StreamResult,
     FirstTokenTimeoutError,
+    EmptyUpstreamStreamError,
     parse_kiro_stream,
     collect_stream_to_result,
     calculate_tokens_from_context_usage,
@@ -467,33 +468,24 @@ class TestParseKiroStream:
         print("✓ FirstTokenTimeoutError raised on timeout")
     
     @pytest.mark.asyncio
-    async def test_handles_empty_response(self, mock_response):
+    async def test_raises_retryable_error_for_empty_response(self, mock_response):
         """
-        What it does: Handles empty response gracefully.
-        Goal: Verify no events yielded for empty response.
+        What it does: Classifies immediate upstream EOF as retryable.
+        Goal: Prevent an empty stream from becoming a successful assistant turn.
         """
-        print("Setup: Mock empty response...")
-        
         async def mock_aiter_bytes():
             return
-            yield  # Make it a generator
-        
-        mock_response.aiter_bytes = mock_aiter_bytes
-        
-        # Mock wait_for to raise StopAsyncIteration (empty response)
+            yield  # Make it an async generator
+
         async def mock_wait_for_empty(*args, **kwargs):
             raise StopAsyncIteration()
-        
-        print("Action: Parsing empty stream...")
-        events = []
-        
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
         with patch('kiro.streaming_core.asyncio.wait_for', side_effect=mock_wait_for_empty):
-            async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
-                events.append(event)
-        
-        print(f"Received {len(events)} events")
-        assert len(events) == 0
-        print("✓ Empty response handled correctly")
+            with pytest.raises(EmptyUpstreamStreamError, match="before sending any bytes"):
+                async for _ in parse_kiro_stream(mock_response, first_token_timeout=30):
+                    pass
     
     @pytest.mark.asyncio
     async def test_handles_generator_exit(self, mock_response, mock_parser):

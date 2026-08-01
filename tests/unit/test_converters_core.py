@@ -3051,24 +3051,58 @@ class TestConvertToolResultsToKiroFormat:
         assert result[0]["content"][0]["text"] == long_content
         assert len(result[0]["content"][0]["text"]) == 10000
     
-    def test_all_results_have_success_status(self):
+    def test_maps_is_error_to_kiro_status(self):
         """
-        What it does: Verifies all results have status="success".
-        Purpose: Ensure Kiro API receives correct status field.
+        What it does: Maps explicit tool failures to Kiro error status.
+        Purpose: Preserve success, error, omitted, and empty-result semantics.
         """
-        print("Setup: Multiple tool results...")
         tool_results = [
-            {"type": "tool_result", "tool_use_id": "call_1", "content": "Result 1"},
-            {"type": "tool_result", "tool_use_id": "call_2", "content": "Result 2"}
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_error",
+                "content": "failed",
+                "is_error": True,
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_false",
+                "content": "done",
+                "is_error": False,
+            },
+            {"type": "tool_result", "tool_use_id": "call_omitted", "content": "done"},
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_empty_error",
+                "content": "",
+                "is_error": True,
+            },
         ]
-        
-        print("Action: Converting to Kiro format...")
+
         result = convert_tool_results_to_kiro_format(tool_results)
-        
-        print("Checking all statuses...")
-        for i, r in enumerate(result):
-            print(f"Result {i}: status = {r['status']}")
-            assert r["status"] == "success"
+
+        assert [item["status"] for item in result] == [
+            "error",
+            "success",
+            "success",
+            "error",
+        ]
+        assert result[3]["content"][0]["text"] == "(empty result)"
+
+    def test_direct_content_extraction_maps_error_status(self):
+        result = extract_tool_results_from_content([
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_error",
+                "content": [{"type": "text", "text": "failed"}],
+                "is_error": True,
+            }
+        ])
+
+        assert result == [{
+            "content": [{"text": "failed"}],
+            "status": "error",
+            "toolUseId": "call_error",
+        }]
     
     def test_handles_unicode_content(self):
         """

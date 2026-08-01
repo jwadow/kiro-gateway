@@ -307,6 +307,74 @@ class TestDebugLoggerModeErrors:
             assert error_info["error_message"] == "Bad Request"
 
 
+class TestDebugLoggerAnomalies:
+    """Tests for metadata-only protocol anomaly recording."""
+
+    def _make_logger(self, tmp_path):
+        from kiro.debug_logger import DebugLogger
+        logger = DebugLogger.__new__(DebugLogger)
+        logger._initialized = False
+        logger.__init__()
+        logger.debug_dir = tmp_path / "debug_logs"
+        return logger
+
+    def test_anomaly_persisted_on_success_in_errors_mode(self, tmp_path):
+        """Anomaly on a successful (discard) request is still written in errors mode."""
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            logger = self._make_logger(tmp_path)
+            logger.record_anomaly("tool_protocol_failure", {"tool": "Read", "size_bytes": 12})
+
+            # Success path clears buffers but must persist anomalies.
+            logger.discard_buffers()
+
+            anomaly_file = tmp_path / "debug_logs" / "anomaly_info.json"
+            assert anomaly_file.exists()
+            data = json.loads(anomaly_file.read_text())
+            assert data["anomalies"][0]["category"] == "tool_protocol_failure"
+            assert data["anomalies"][0]["tool"] == "Read"
+            # Buffer cleared after write.
+            assert logger._anomaly_buffer == []
+
+    def test_no_anomaly_file_when_none_recorded(self, tmp_path):
+        """A clean successful request writes no anomaly file and no directory."""
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            logger = self._make_logger(tmp_path)
+            logger.discard_buffers()
+            assert not (tmp_path / "debug_logs").exists()
+
+    def test_anomaly_survives_error_flush_rmtree(self, tmp_path):
+        """Anomalies recorded before an error flush survive the directory wipe."""
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            logger = self._make_logger(tmp_path)
+            logger.record_anomaly("protocol_text_leak", {"signature": "raw_transport_envelope"})
+            logger.log_raw_chunk(b'partial')
+
+            logger.flush_on_error(500, "boom")
+
+            anomaly_file = tmp_path / "debug_logs" / "anomaly_info.json"
+            assert anomaly_file.exists()
+            data = json.loads(anomaly_file.read_text())
+            assert data["anomalies"][0]["signature"] == "raw_transport_envelope"
+
+    def test_record_anomaly_does_nothing_in_off_mode(self, tmp_path):
+        """No anomaly capture when logging is disabled."""
+        with patch('kiro.debug_logger.DEBUG_MODE', 'off'):
+            logger = self._make_logger(tmp_path)
+            logger.record_anomaly("tool_protocol_failure", {"tool": "Read"})
+            logger.discard_buffers()
+            assert not (tmp_path / "debug_logs").exists()
+            assert logger._anomaly_buffer == []
+
+    def test_non_scalar_metadata_is_stringified(self, tmp_path):
+        """Non-scalar metadata is repr-truncated so no raw payload objects leak."""
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            logger = self._make_logger(tmp_path)
+            logger.record_anomaly("tool_protocol_failure", {"payload": {"a": [1, 2, 3]}})
+            entry = logger._anomaly_buffer[0]
+            assert isinstance(entry["payload"], str)
+            assert len(entry["payload"]) <= 200
+
+
 class TestDebugLoggerLogErrorInfo:
     """Тесты для метода log_error_info()."""
     

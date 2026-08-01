@@ -106,9 +106,16 @@ class StreamResult:
     context_usage_percentage: Optional[float] = None
 
 
-class FirstTokenTimeoutError(Exception):
-    """Exception raised when first token timeout occurs."""
-    pass
+class RetryableStreamError(Exception):
+    """Base exception for upstream failures that are safe to retry before commit."""
+
+
+class FirstTokenTimeoutError(RetryableStreamError):
+    """Exception raised when the upstream stream does not produce its first byte in time."""
+
+
+class EmptyUpstreamStreamError(RetryableStreamError):
+    """Exception raised when an upstream stream ends without an actionable assistant event."""
 
 
 # ==================================================================================================
@@ -162,9 +169,8 @@ async def parse_kiro_stream(
             logger.warning(f"[FirstTokenTimeout] Model did not respond within {first_token_timeout}s")
             raise FirstTokenTimeoutError(f"No response within {first_token_timeout} seconds")
         except StopAsyncIteration:
-            # Empty response - this is normal, just finish
-            logger.debug("Empty response from Kiro API")
-            return
+            logger.warning("[EmptyUpstreamStream] Kiro API closed the stream before sending any bytes")
+            raise EmptyUpstreamStreamError("Upstream stream ended before sending any bytes")
         
         # Process first chunk
         if debug_logger:
@@ -215,7 +221,7 @@ async def parse_kiro_stream(
         for tc in all_tool_calls:
             yield KiroEvent(type="tool_use", tool_use=tc)
             
-    except FirstTokenTimeoutError:
+    except RetryableStreamError:
         raise
     except GeneratorExit:
         logger.debug("Client disconnected (GeneratorExit)")
@@ -326,8 +332,41 @@ async def collect_stream_to_result(
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
-    
+
+    # Warning-only detection of raw transport-text leakage into content. This
+    # never mutates the response — the Stop hook remains the recovery mechanism.
+    _check_protocol_text_leak(result.content)
+
     return result
+
+
+def _check_protocol_text_leak(content: str) -> None:
+    """
+    Detects high-confidence transport-text leakage in assistant content.
+
+    Warning-only: logs and records a metadata-only anomaly, but never mutates
+    the response. Best-effort — diagnostics must never break streaming.
+    """
+    try:
+        from kiro.protocol_anomalies import classify_protocol_text
+
+        signature = classify_protocol_text(content)
+        if not signature:
+            return
+
+        logger.warning(
+            f"[ProtocolAnomaly] Detected transport-text leak in content: "
+            f"signature={signature}"
+        )
+
+        if debug_logger is not None:
+            debug_logger.record_anomaly(
+                "protocol_text_leak",
+                {"signature": signature},
+            )
+    except Exception:
+        # Diagnostics must never interfere with response handling.
+        pass
 
 
 # ==================================================================================================
@@ -418,9 +457,11 @@ async def stream_with_first_token_retry(
         ...     print(chunk)
     """
     last_error: Optional[Exception] = None
-    
+
     for attempt in range(max_retries):
         response: Optional[httpx.Response] = None
+        stream: Optional[AsyncGenerator[str, None]] = None
+        committed = False
         try:
             # Make request
             if attempt > 0:
@@ -453,27 +494,52 @@ async def stream_with_first_token_retry(
                 else:
                     raise Exception(f"Upstream API error ({response.status_code}): {error_text}")
             
-            # Try to stream with first token timeout
-            async for chunk in stream_processor(response):
+            # Prefetch one formatted chunk before committing the response. This is
+            # the retry boundary: failed attempts must send zero bytes to the client.
+            stream = stream_processor(response)
+            try:
+                first_chunk = await stream.__anext__()
+            except StopAsyncIteration:
+                raise EmptyUpstreamStreamError(
+                    "Upstream stream ended before producing a client-visible event"
+                )
+
+            committed = True
+            yield first_chunk
+
+            async for chunk in stream:
                 yield chunk
-            
+
             # Successfully completed - exit
             return
-            
-        except FirstTokenTimeoutError as e:
+
+        except RetryableStreamError as e:
             last_error = e
+            if committed:
+                logger.error(
+                    "Retryable stream failure occurred after response commit; "
+                    "propagating without retry to avoid duplicate output"
+                )
+                raise
+
             logger.warning(
-                f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} failed - "
-                f"model did not respond within {first_token_timeout}s"
+                f"[StreamRetry] Attempt {attempt + 1}/{max_retries} failed before commit: "
+                f"{type(e).__name__}: {e}"
             )
-            
+
+            if stream is not None:
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
+
             # Close current response if open
             if response:
                 try:
                     await response.aclose()
                 except Exception:
                     pass
-            
+
             # Continue to next attempt
             continue
             

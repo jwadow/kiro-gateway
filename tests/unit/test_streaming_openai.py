@@ -221,7 +221,42 @@ class TestStreamKiroToOpenai:
         assert len(tool_chunks) >= 1
         assert "get_weather" in tool_chunks[0]
         print("✓ Tool calls chunk yielded")
-    
+
+    @pytest.mark.asyncio
+    async def test_malformed_tool_is_corrective_text_not_tool_call(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        raw_arguments = '{"path": nope}'
+        malformed_tool = {
+            "id": "call_bad",
+            "function": {"name": "Write", "arguments": raw_arguments},
+            "_protocol_failure": {
+                "classification": "malformed",
+                "reason": "malformed JSON",
+                "size_bytes": len(raw_arguments),
+            },
+            "_executable": False,
+        }
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=malformed_tool)
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        output = "".join(chunks)
+        assert "Tool Protocol Error" in output
+        assert "No tool was executed" in output
+        assert '"tool_calls"' not in output
+        assert '"finish_reason": "stop"' in output
+        assert raw_arguments not in output
+
     @pytest.mark.asyncio
     async def test_tool_calls_have_index(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
         """
@@ -389,6 +424,177 @@ class TestStreamKiroToOpenai:
 
 
 # ==================================================================================================
+# Tests for tool_call streaming lifecycle (OpenAI incremental protocol)
+# ==================================================================================================
+
+def _parse_deltas(chunks):
+    """Extract the delta dict from every SSE chunk, in order."""
+    deltas = []
+    for chunk in chunks:
+        if not chunk.startswith("data: "):
+            continue
+        payload = chunk[len("data: "):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        data = json.loads(payload)
+        choices = data.get("choices") or []
+        if choices:
+            deltas.append(choices[0].get("delta", {}))
+    return deltas
+
+
+def _accumulate_tool_calls(chunks):
+    """
+    Reassemble streamed tool_call deltas the way an OpenAI client would:
+    accumulate by index, taking identity from the opening chunk and
+    concatenating argument fragments.
+
+    Returns a list of tool calls ordered by index.
+    """
+    acc = {}
+    for delta in _parse_deltas(chunks):
+        for tc in delta.get("tool_calls") or []:
+            slot = acc.setdefault(tc["index"], {
+                "id": None,
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            })
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            if tc.get("type"):
+                slot["type"] = tc["type"]
+            func = tc.get("function") or {}
+            if func.get("name"):
+                slot["function"]["name"] = func["name"]
+            slot["function"]["arguments"] += func.get("arguments") or ""
+    return [acc[i] for i in sorted(acc)]
+
+
+class TestToolCallStreamingLifecycle:
+    """
+    Tool-call-only turns must still open the assistant message and must emit
+    tool calls incrementally (open with id+name, then append arguments).
+
+    Regression: a tool-call-only turn previously emitted a single chunk with no
+    role and a fully-populated arguments string, which left OpenCode waiting
+    forever for argument deltas that never arrived.
+    """
+
+    @pytest.mark.asyncio
+    async def test_new_tool_call_carries_id_and_name(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: The first delta for a tool call index carries both id and
+                      function.name.
+        Goal: The Vercel AI SDK's StreamingToolCallTracker.processNewToolCall
+              throws InvalidResponseDataError if either is missing on the first
+              delta for an index. Sending them together with the arguments is an
+              explicitly supported path.
+        """
+        args_json = '{"path": "a.txt"}'
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use={
+                "id": "call_1", "type": "function",
+                "function": {"name": "Read", "arguments": args_json}
+            })
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        tc_deltas = [d for d in _parse_deltas(chunks) if "tool_calls" in d]
+        assert tc_deltas, "expected a tool_calls delta"
+        opening = tc_deltas[0]["tool_calls"][0]
+        assert opening["index"] == 0
+        assert opening["id"] == "call_1"
+        assert opening["type"] == "function"
+        assert opening["function"]["name"] == "Read"
+        assert opening["function"]["arguments"] == args_json
+
+    @pytest.mark.asyncio
+    async def test_multiple_tool_calls_keep_distinct_indices(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Each tool call gets its own index, preserved across
+                      its opening and arguments chunks.
+        Goal: Verify parallel tool calls stay separable by index.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use={
+                "id": "call_1", "type": "function",
+                "function": {"name": "func1", "arguments": '{"a": 1}'}
+            })
+            yield KiroEvent(type="tool_use", tool_use={
+                "id": "call_2", "type": "function",
+                "function": {"name": "func2", "arguments": '{"b": 2}'}
+            })
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        tc_deltas = [d for d in _parse_deltas(chunks) if "tool_calls" in d]
+        # Reassemble the way a client would: accumulate by index.
+        acc = {}
+        for delta in tc_deltas:
+            for tc in delta["tool_calls"]:
+                slot = acc.setdefault(tc["index"], {"id": None, "name": "", "arguments": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                func = tc.get("function") or {}
+                if func.get("name"):
+                    slot["name"] = func["name"]
+                slot["arguments"] += func.get("arguments") or ""
+
+        assert set(acc) == {0, 1}
+        assert acc[0] == {"id": "call_1", "name": "func1", "arguments": '{"a": 1}'}
+        assert acc[1] == {"id": "call_2", "name": "func2", "arguments": '{"b": 2}'}
+
+    @pytest.mark.asyncio
+    async def test_collect_stream_response_still_assembles_tool_calls(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Non-streaming collection reassembles the split chunks into
+                      one complete tool call.
+        Goal: Verify the incremental split did not break the non-streaming path.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use={
+                "id": "call_1", "type": "function",
+                "function": {"name": "Read", "arguments": '{"path": "a.txt"}'}
+            })
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                result = await collect_stream_response(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                )
+
+        message = result["choices"][0]["message"]
+        assert result["choices"][0]["finish_reason"] == "tool_calls"
+        assert len(message["tool_calls"]) == 1
+        tc = message["tool_calls"][0]
+        assert tc["id"] == "call_1"
+        assert tc["function"]["name"] == "Read"
+        assert tc["function"]["arguments"] == '{"path": "a.txt"}'
+
+
+# ==================================================================================================
 # Tests for thinking content handling
 # ==================================================================================================
 
@@ -497,18 +703,9 @@ class TestStreamingOpenaiNoneProtection:
         tool_chunks = [c for c in chunks if '"tool_calls"' in c]
         assert len(tool_chunks) >= 1
         
-        # Parse and verify name is empty string
-        for chunk in tool_chunks:
-            if chunk.startswith("data: "):
-                json_str = chunk[6:].strip()
-                if json_str != "[DONE]":
-                    data = json.loads(json_str)
-                    if "choices" in data and data["choices"]:
-                        delta = data["choices"][0].get("delta", {})
-                        if "tool_calls" in delta:
-                            for tc in delta["tool_calls"]:
-                                assert tc["function"]["name"] == ""
-        
+        # Tool calls stream incrementally, so assert on the reassembled call.
+        assert _accumulate_tool_calls(chunks)[0]["function"]["name"] == ""
+
         print("✓ None function name handled")
     
     @pytest.mark.asyncio
@@ -542,18 +739,9 @@ class TestStreamingOpenaiNoneProtection:
         tool_chunks = [c for c in chunks if '"tool_calls"' in c]
         assert len(tool_chunks) >= 1
         
-        # Parse and verify arguments is "{}"
-        for chunk in tool_chunks:
-            if chunk.startswith("data: "):
-                json_str = chunk[6:].strip()
-                if json_str != "[DONE]":
-                    data = json.loads(json_str)
-                    if "choices" in data and data["choices"]:
-                        delta = data["choices"][0].get("delta", {})
-                        if "tool_calls" in delta:
-                            for tc in delta["tool_calls"]:
-                                assert tc["function"]["arguments"] == "{}"
-        
+        # Tool calls stream incrementally, so assert on the reassembled call.
+        assert _accumulate_tool_calls(chunks)[0]["function"]["arguments"] == "{}"
+
         print("✓ None function arguments handled")
     
     @pytest.mark.asyncio

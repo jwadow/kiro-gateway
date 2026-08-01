@@ -24,7 +24,7 @@ from kiro.streaming_anthropic import (
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
 )
-from kiro.streaming_core import KiroEvent, StreamResult
+from kiro.streaming_core import EmptyUpstreamStreamError, KiroEvent, StreamResult
 
 
 # ==================================================================================================
@@ -222,32 +222,26 @@ class TestStreamKiroToAnthropic:
     """Tests for stream_kiro_to_anthropic() generator."""
     
     @pytest.mark.asyncio
-    async def test_yields_message_start_event(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_withholds_message_start_for_empty_stream(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
         """
-        What it does: Yields message_start event at beginning.
-        Goal: Verify Anthropic streaming protocol.
+        What it does: Rejects a stream with no actionable assistant event.
+        Goal: Ensure no Anthropic lifecycle bytes are emitted before validation.
         """
-        print("Setup: Mock empty stream...")
-        
         async def mock_parse_kiro_stream(*args, **kwargs):
             return
-            yield  # Make it a generator
-        
-        print("Action: Streaming to Anthropic format...")
+            yield  # Make it an async generator
+
         events = []
-        
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
-            async for event in stream_kiro_to_anthropic(
-                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
-            ):
-                events.append(event)
-        
-        print(f"Received {len(events)} events")
-        
-        # First event should be message_start
-        assert len(events) > 0
-        assert "event: message_start" in events[0]
-        print("✓ message_start event yielded first")
+            with pytest.raises(EmptyUpstreamStreamError):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        assert events == []
     
     @pytest.mark.asyncio
     async def test_yields_content_block_start_on_first_content(self, mock_response, mock_model_cache, mock_auth_manager):
@@ -349,7 +343,41 @@ class TestStreamKiroToAnthropic:
         assert len(tool_use_events) >= 1
         assert "get_weather" in tool_use_events[0]
         print("✓ tool_use block yielded for tool calls")
-    
+
+    @pytest.mark.asyncio
+    async def test_malformed_tool_is_corrective_text_not_tool_use(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        raw_arguments = '{"path": nope}'
+        malformed_tool = {
+            "id": "toolu_bad",
+            "function": {"name": "Write", "arguments": raw_arguments},
+            "_protocol_failure": {
+                "classification": "malformed",
+                "reason": "malformed JSON",
+                "size_bytes": len(raw_arguments),
+            },
+            "_executable": False,
+        }
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=malformed_tool)
+
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        output = "".join(events)
+        assert "Tool Protocol Error" in output
+        assert "No tool was executed" in output
+        assert '"type": "tool_use"' not in output
+        assert '"stop_reason": "end_turn"' in output
+        assert raw_arguments not in output
+
     @pytest.mark.asyncio
     async def test_yields_message_delta_with_stop_reason(self, mock_response, mock_model_cache, mock_auth_manager):
         """
@@ -1369,7 +1397,128 @@ class TestStreamWithFirstTokenRetryAnthropic:
         assert call_count == 2  # First timeout, second success
         assert len(chunks) > 0
         print("✓ Retry on timeout works correctly")
-    
+
+    @pytest.mark.asyncio
+    async def test_empty_first_attempt_retries_with_one_text_lifecycle(
+        self, mock_model_cache, mock_auth_manager
+    ):
+        responses = []
+
+        async def mock_make_request():
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            response.attempt = len(responses) + 1
+            responses.append(response)
+            return response
+
+        async def mock_parse_kiro_stream(response, *args, **kwargs):
+            if response.attempt == 1:
+                return
+            yield KiroEvent(type="content", content="Recovered")
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_with_first_token_retry_anthropic(
+                    make_request=mock_make_request,
+                    model="claude-sonnet-4",
+                    model_cache=mock_model_cache,
+                    auth_manager=mock_auth_manager,
+                    max_retries=2,
+                    first_token_timeout=30,
+                ):
+                    chunks.append(chunk)
+
+        output = "".join(chunks)
+        assert len(responses) == 2
+        assert output.count("event: message_start") == 1
+        assert output.count("event: message_delta") == 1
+        assert output.count("event: message_stop") == 1
+        assert output.count("Recovered") == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_first_attempt_retries_with_tool_only_response(
+        self, mock_model_cache, mock_auth_manager
+    ):
+        responses = []
+
+        async def mock_make_request():
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            response.attempt = len(responses) + 1
+            responses.append(response)
+            return response
+
+        async def mock_parse_kiro_stream(response, *args, **kwargs):
+            if response.attempt == 1:
+                return
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "toolu_recovered",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                },
+            )
+
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_with_first_token_retry_anthropic(
+                    make_request=mock_make_request,
+                    model="claude-sonnet-4",
+                    model_cache=mock_model_cache,
+                    auth_manager=mock_auth_manager,
+                    max_retries=2,
+                    first_token_timeout=30,
+                ):
+                    chunks.append(chunk)
+
+        output = "".join(chunks)
+        assert len(responses) == 2
+        assert output.count("event: message_start") == 1
+        assert output.count('"id": "toolu_recovered"') == 1
+        assert '"stop_reason": "tool_use"' in output
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_attempts_never_emit_successful_lifecycle(
+        self, mock_model_cache, mock_auth_manager
+    ):
+        attempts = 0
+
+        async def mock_make_request():
+            nonlocal attempts
+            attempts += 1
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="usage", usage={"credits": 0.001})
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with pytest.raises(Exception) as exc_info:
+                async for chunk in stream_with_first_token_retry_anthropic(
+                    make_request=mock_make_request,
+                    model="claude-sonnet-4",
+                    model_cache=mock_model_cache,
+                    auth_manager=mock_auth_manager,
+                    max_retries=2,
+                    first_token_timeout=30,
+                ):
+                    chunks.append(chunk)
+
+        error_json = json.loads(str(exc_info.value))
+        assert attempts == 2
+        assert chunks == []
+        assert error_json["type"] == "error"
+        assert "message_start" not in str(exc_info.value)
+
     @pytest.mark.asyncio
     async def test_raises_anthropic_error_after_all_retries(self, mock_model_cache, mock_auth_manager):
         """

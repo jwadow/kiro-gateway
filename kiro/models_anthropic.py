@@ -35,6 +35,56 @@ from pydantic import BaseModel, Field, model_validator
 # Content Block Models
 # ==================================================================================================
 
+# Content block "type" values this gateway actually models (see the ContentBlock
+# union below). Blocks whose type is NOT in this set are downgraded to text
+# blocks before Pydantic validation (see AnthropicMessage.sanitize_unknown_
+# content_blocks) so unknown / forward-compatible block kinds never cause a 422.
+#
+# NOTE: intentionally narrower than upstream PR #196's set. That PR also adds
+# Pydantic models + converter handling for document / redacted_thinking /
+# server_tool_use / web_search_tool_result. We did NOT pull those models in, so
+# listing them as "known" here would let them skip the downgrade and then fail
+# validation against the union — the exact 422 we're trying to prevent. If a
+# model is ever added to ContentBlock, add its type here too.
+KNOWN_CONTENT_BLOCK_TYPES = {
+    "text",
+    "thinking",
+    "image",
+    "tool_use",
+    "tool_result",
+    "tool_reference",
+}
+
+# Content block "type" values valid inside a tool_result's content array,
+# matching ToolResultContentBlock.content's accepted inner models.
+KNOWN_TOOL_RESULT_INNER_TYPES = {
+    "text",
+    "image",
+    "tool_reference",
+}
+
+
+def _downgrade_unknown_block(block: Any, known_types: set) -> Any:
+    """
+    Downgrade an unknown content block to a text block.
+
+    Args:
+        block: A single content block (a dict, or any other value).
+        known_types: Set of block ``type`` values to pass through untouched.
+
+    Returns:
+        The original block when its type is known (or it is not a dict),
+        otherwise a text block preserving any identifying info (text / tool name).
+    """
+    if not isinstance(block, dict) or block.get("type") in known_types:
+        return block
+    block_type = block.get("type", "unknown")
+    text = block.get("text") or block.get("tool_name") or block.get("name") or ""
+    return {
+        "type": "text",
+        "text": f"[{block_type}: {text}]" if text else f"[{block_type}]",
+    }
+
 
 class TextContentBlock(BaseModel):
     """
@@ -108,6 +158,28 @@ class ToolResultContentBlock(BaseModel):
     is_error: Optional[bool] = None
 
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_unknown_inner_blocks(cls, data: Any) -> Any:
+        """
+        Downgrade unknown content block types inside a tool_result's content
+        list to text blocks before validation.
+
+        Tool results may carry inner blocks whose type is not part of the
+        accepted set (e.g. a future block kind). Converting them to text keeps
+        the tool result usable instead of failing the whole request with a 422.
+        A string ``content`` (the common case) is passed through untouched.
+        """
+        if not isinstance(data, dict):
+            return data
+        content = data.get("content")
+        if not isinstance(content, list):
+            return data
+        data["content"] = [
+            _downgrade_unknown_block(block, KNOWN_TOOL_RESULT_INNER_TYPES) for block in content
+        ]
+        return data
 
 
 # ==================================================================================================
@@ -183,14 +255,39 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Normally "user" or "assistant", but accepted as a
+            free-form string because some clients (e.g. Claude Code) send other
+            roles such as "system" inside the messages array. Unknown roles are
+            normalized to "user" downstream by normalize_message_roles().
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: str
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_unknown_content_blocks(cls, data: Any) -> Any:
+        """
+        Convert unknown content block types to text blocks before validation.
+
+        Some clients (notably newer Claude Code + new model ids) emit content
+        blocks whose ``type`` is not part of the set this gateway models. Rather
+        than rejecting the whole request with a 422, we downgrade unknown blocks
+        to a text block that preserves any useful identifying info. Known types
+        listed in ``KNOWN_CONTENT_BLOCK_TYPES`` are passed through untouched.
+        """
+        if not isinstance(data, dict):
+            return data
+        content = data.get("content")
+        if not isinstance(content, list):
+            return data
+        data["content"] = [
+            _downgrade_unknown_block(block, KNOWN_CONTENT_BLOCK_TYPES) for block in content
+        ]
+        return data
 
 
 # ==================================================================================================

@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from kiro.http_client import KiroHttpClient
 from kiro.auth import KiroAuthManager
 from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.request_pacer import UpstreamRequestPacer
 
 
 @pytest.fixture
@@ -557,6 +558,148 @@ class TestKiroHttpClientExponentialBackoff:
         assert len(sleep_delays) == 2
         assert sleep_delays[0] == BASE_RETRY_DELAY * (2 ** 0)  # 1.0
         assert sleep_delays[1] == BASE_RETRY_DELAY * (2 ** 1)  # 2.0
+
+
+class TestUpstreamRequestPacer:
+    """Tests for process-wide request pacing and 429 coordination."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_wait_for_release(self):
+        """The in-flight limit blocks new upstream work until a slot is released."""
+        pacer = UpstreamRequestPacer(
+            min_interval=0.0,
+            cooldown=0.0,
+            jitter=0.0,
+            max_concurrent=1,
+        )
+        await pacer.acquire()
+
+        waiter = asyncio.create_task(pacer.acquire())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+
+        await pacer.release()
+        await asyncio.wait_for(waiter, timeout=0.1)
+        await pacer.release()
+
+    @pytest.mark.asyncio
+    async def test_close_releases_request_permit(self, mock_auth_manager_for_http):
+        """Closing a request client admits the next queued upstream request."""
+        pacer = UpstreamRequestPacer(
+            min_interval=0.0,
+            cooldown=0.0,
+            jitter=0.0,
+            max_concurrent=1,
+        )
+        first = KiroHttpClient(mock_auth_manager_for_http, request_pacer=pacer)
+        second = KiroHttpClient(mock_auth_manager_for_http, request_pacer=pacer)
+
+        first_response = AsyncMock(status_code=200)
+        second_response = AsyncMock(status_code=200)
+        first_client = AsyncMock(is_closed=False)
+        second_client = AsyncMock(is_closed=False)
+        first_client.request = AsyncMock(return_value=first_response)
+        second_client.request = AsyncMock(return_value=second_response)
+
+        with patch.object(first, "_get_client", return_value=first_client), \
+             patch.object(second, "_get_client", return_value=second_client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}):
+            await first.request_with_retry("POST", "https://api.example.com/first")
+            waiter = asyncio.create_task(
+                second.request_with_retry("POST", "https://api.example.com/second")
+            )
+            await asyncio.sleep(0)
+            assert not waiter.done()
+
+            await first.close()
+            assert await asyncio.wait_for(waiter, timeout=0.1) is second_response
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_request_releases_request_permit(self, mock_auth_manager_for_http):
+        """Cancellation while sending cannot strand an in-flight slot."""
+        pacer = UpstreamRequestPacer(
+            min_interval=0.0,
+            cooldown=0.0,
+            jitter=0.0,
+            max_concurrent=1,
+        )
+        cancelled = KiroHttpClient(mock_auth_manager_for_http, request_pacer=pacer)
+        follower = KiroHttpClient(mock_auth_manager_for_http, request_pacer=pacer)
+        send_started = asyncio.Event()
+
+        async def block_request(*args, **kwargs):
+            send_started.set()
+            await asyncio.Event().wait()
+
+        cancelled_client = AsyncMock(is_closed=False)
+        cancelled_client.request = AsyncMock(side_effect=block_request)
+        follower_response = AsyncMock(status_code=200)
+        follower_client = AsyncMock(is_closed=False)
+        follower_client.request = AsyncMock(return_value=follower_response)
+
+        with patch.object(cancelled, "_get_client", return_value=cancelled_client), \
+             patch.object(follower, "_get_client", return_value=follower_client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}):
+            task = asyncio.create_task(
+                cancelled.request_with_retry("POST", "https://api.example.com/cancel")
+            )
+            await send_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert await asyncio.wait_for(
+                follower.request_with_retry("POST", "https://api.example.com/follower"),
+                timeout=0.1,
+            ) is follower_response
+            await follower.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_sleep_patch_does_not_replace_pacer_sleep(self):
+        """HTTP retry tests can mock backoff without disabling pacer timing."""
+        pacer = UpstreamRequestPacer(min_interval=0.001, cooldown=0.0, jitter=0.0)
+        await pacer.wait_for_slot()
+
+        with patch("kiro.http_client.asyncio.sleep", side_effect=RuntimeError("retry sleep only")):
+            await pacer.wait_for_slot()
+
+    @pytest.mark.asyncio
+    async def test_request_starts_are_spaced_across_callers(self):
+        """A second caller waits for the configured minimum start interval."""
+        pacer = UpstreamRequestPacer(min_interval=0.01, cooldown=0.0, jitter=0.0)
+        loop = asyncio.get_running_loop()
+
+        await pacer.wait_for_slot()
+        first = loop.time()
+        await pacer.wait_for_slot()
+        second = loop.time()
+
+        assert second - first >= 0.009
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_uses_retry_after_and_jitter(self):
+        """A 429 creates one shared cooldown using the strongest delay signal."""
+        pacer = UpstreamRequestPacer(min_interval=0.0, cooldown=5.0, jitter=2.0)
+
+        with patch("kiro.request_pacer.random.uniform", return_value=1.25):
+            delay = await pacer.register_rate_limit(retry_after=8.0)
+
+        assert 9.0 <= delay <= 9.25
+
+    @pytest.mark.asyncio
+    async def test_waiting_caller_observes_new_rate_limit(self):
+        """A cooldown reported while another caller waits delays that caller."""
+        pacer = UpstreamRequestPacer(min_interval=0.03, cooldown=0.05, jitter=0.0)
+        await pacer.wait_for_slot()
+
+        waiter = asyncio.create_task(pacer.wait_for_slot())
+        await asyncio.sleep(0.005)
+        await pacer.register_rate_limit()
+
+        started = asyncio.get_running_loop().time()
+        await waiter
+        assert asyncio.get_running_loop().time() - started >= 0.04
 
 
 class TestKiroHttpClientStreamingTimeout:

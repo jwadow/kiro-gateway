@@ -125,6 +125,7 @@ async def stream_kiro_to_openai_internal(
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    protocol_failures = []
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
@@ -186,7 +187,11 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "tool_use" and event.tool_use:
                 tool = event.tool_use
-                
+
+                if tool.get("_protocol_failure"):
+                    protocol_failures.append(tool)
+                    continue
+
                 # Extract tool name safely (handle None/missing fields)
                 tool_name = ""
                 if tool:
@@ -277,12 +282,35 @@ async def stream_kiro_to_openai_internal(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
+
+        if protocol_failures:
+            from kiro.truncation_recovery import generate_tool_protocol_failure_message
+
+            correction = "\n\n".join(
+                generate_tool_protocol_failure_message(tool)
+                for tool in protocol_failures
+            )
+            full_content += correction
+            delta = {"content": correction}
+            if first_chunk:
+                delta["role"] = "assistant"
+                first_chunk = False
+
+            correction_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(correction_chunk, ensure_ascii=False)}\n\n"
         
         # Detect content truncation (missing completion signals)
         content_was_truncated = (
             not stream_completed_normally and
             len(full_content) > 0 and
-            not all_tool_calls  # Don't confuse with tool call truncation
+            not all_tool_calls and
+            not protocol_failures
         )
         
         if content_was_truncated:
@@ -412,7 +440,16 @@ async def stream_kiro_to_openai_internal(
             f"completion_tokens={completion_tokens} (tiktoken), "
             f"total_tokens={total_tokens} ({total_source})"
         )
-        
+
+        # Persist usage to JSONL for the dashboard
+        from kiro.usage_logger import log_usage
+        log_usage(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+
         yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
         
@@ -603,7 +640,9 @@ async def collect_stream_response(
     full_content = ""
     full_reasoning_content = ""
     final_usage = None
-    tool_calls = []
+    # Tool calls arrive incrementally (identity chunk, then arguments chunks), so
+    # accumulate by index the same way a streaming client would.
+    tool_calls_by_index = {}
     finish_reason = "stop"  # Default fallback
     completion_id = generate_completion_id()
     
@@ -633,7 +672,24 @@ async def collect_stream_response(
             if "reasoning_content" in delta:
                 full_reasoning_content += delta["reasoning_content"]
             if "tool_calls" in delta:
-                tool_calls.extend(delta["tool_calls"])
+                for tc in delta["tool_calls"] or []:
+                    # Fall back to positional order if a chunk omits index.
+                    idx = tc.get("index")
+                    if idx is None:
+                        idx = len(tool_calls_by_index)
+                    slot = tool_calls_by_index.setdefault(idx, {
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    if tc.get("type"):
+                        slot["type"] = tc["type"]
+                    func = tc.get("function") or {}
+                    if func.get("name"):
+                        slot["function"]["name"] = func["name"]
+                    slot["function"]["arguments"] += func.get("arguments") or ""
             
             # Extract finish_reason from chunk (streaming already calculated it correctly)
             finish_reason_from_chunk = chunk_data.get("choices", [{}])[0].get("finish_reason")
@@ -651,19 +707,19 @@ async def collect_stream_response(
     message = {"role": "assistant", "content": full_content}
     if full_reasoning_content:
         message["reasoning_content"] = full_reasoning_content
-    if tool_calls:
-        # For non-streaming response remove index field from tool_calls,
-        # as it's only required for streaming chunks
+    if tool_calls_by_index:
+        # For non-streaming response emit tool_calls in index order without the
+        # index field itself, as it's only required for streaming chunks.
         cleaned_tool_calls = []
-        for tc in tool_calls:
-            # Extract function with None protection
+        for idx in sorted(tool_calls_by_index):
+            tc = tool_calls_by_index[idx]
             func = tc.get("function") or {}
             cleaned_tc = {
                 "id": tc.get("id"),
                 "type": tc.get("type", "function"),
                 "function": {
                     "name": func.get("name", ""),
-                    "arguments": func.get("arguments", "{}")
+                    "arguments": func.get("arguments") or "{}"
                 }
             }
             cleaned_tool_calls.append(cleaned_tc)

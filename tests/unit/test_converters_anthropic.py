@@ -349,41 +349,77 @@ class TestExtractToolResultsFromAnthropicContent:
     def test_extracts_tool_result_from_dict(self):
         """
         What it does: Verifies extraction of tool result from dict content block.
-        Purpose: Ensure tool_result blocks are extracted correctly.
+        Purpose: Ensure tool_result blocks preserve explicit failure status.
         """
-        print("Setup: Content with tool_result block...")
         content = [
-            {"type": "tool_result", "tool_use_id": "call_123", "content": "Result text"}
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_123",
+                "content": "Result text",
+                "is_error": True,
+            }
         ]
 
-        print("Action: Extracting tool results...")
         result = extract_tool_results_from_anthropic_content(content)
 
-        print(f"Result: {result}")
         assert len(result) == 1
         assert result[0]["type"] == "tool_result"
         assert result[0]["tool_use_id"] == "call_123"
         assert result[0]["content"] == "Result text"
+        assert result[0]["is_error"] is True
 
     def test_extracts_tool_result_from_pydantic_model(self):
         """
         What it does: Verifies extraction from Pydantic ToolResultContentBlock.
-        Purpose: Ensure Pydantic models are handled correctly.
+        Purpose: Ensure Pydantic failures preserve is_error.
         """
-        print("Setup: Content with Pydantic ToolResultContentBlock...")
         content = [
             ToolResultContentBlock(
-                type="tool_result", tool_use_id="call_456", content="Pydantic result"
+                type="tool_result",
+                tool_use_id="call_456",
+                content="Pydantic result",
+                is_error=True,
             )
         ]
 
-        print("Action: Extracting tool results...")
         result = extract_tool_results_from_anthropic_content(content)
 
-        print(f"Result: {result}")
         assert len(result) == 1
         assert result[0]["tool_use_id"] == "call_456"
         assert result[0]["content"] == "Pydantic result"
+        assert result[0]["is_error"] is True
+
+    def test_omitted_is_error_defaults_to_false(self):
+        content = [
+            {"type": "tool_result", "tool_use_id": "call_ok", "content": "done"}
+        ]
+
+        result = extract_tool_results_from_anthropic_content(content)
+
+        assert result[0]["is_error"] is False
+
+    def test_error_with_text_array_and_empty_error_preserve_status(self):
+        content = [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_text",
+                "content": [{"type": "text", "text": "failed details"}],
+                "is_error": True,
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_empty",
+                "content": "",
+                "is_error": True,
+            },
+        ]
+
+        result = extract_tool_results_from_anthropic_content(content)
+
+        assert result[0]["content"] == "failed details"
+        assert result[0]["is_error"] is True
+        assert result[1]["content"] == "(empty result)"
+        assert result[1]["is_error"] is True
 
     def test_extracts_multiple_tool_results(self):
         """
@@ -1636,6 +1672,54 @@ class TestAnthropicToKiro:
         tool_results = context.get("toolResults", [])
         print(f"Tool results: {tool_results}")
         assert len(tool_results) == 1
+        assert tool_results[0]["status"] == "success"
+
+    def test_failed_tool_result_reaches_kiro_payload_as_error(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                AnthropicMessage(role="user", content="Run the tool"),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[{
+                        "type": "tool_use",
+                        "id": "call_failed",
+                        "name": "run_task",
+                        "input": {},
+                    }],
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[{
+                        "type": "tool_result",
+                        "tool_use_id": "call_failed",
+                        "content": "permission denied",
+                        "is_error": True,
+                    }],
+                ),
+            ],
+            max_tokens=1024,
+            tools=[
+                AnthropicTool(
+                    name="run_task",
+                    description="Run a task",
+                    input_schema={"type": "object"},
+                )
+            ],
+        )
+
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        current = result["conversationState"]["currentMessage"]["userInputMessage"]
+        tool_result = current["userInputMessageContext"]["toolResults"][0]
+        assert tool_result["status"] == "error"
+        assert tool_result["toolUseId"] == "call_failed"
+        assert tool_result["content"] == [{"text": "permission denied"}]
 
     def test_raises_for_empty_messages(self):
         """

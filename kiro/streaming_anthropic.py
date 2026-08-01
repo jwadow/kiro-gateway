@@ -42,7 +42,8 @@ from loguru import logger
 from kiro.streaming_core import (
     parse_kiro_stream,
     collect_stream_to_result,
-    FirstTokenTimeoutError,
+    RetryableStreamError,
+    EmptyUpstreamStreamError,
     KiroEvent,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
@@ -198,11 +199,33 @@ async def stream_kiro_to_anthropic(
     context_usage_percentage: Optional[float] = None
     upstream_cache_usage: Dict[str, int] = {}
     
-    # Track truncated tool calls for recovery
+    # Track tool protocol failures separately from executable tool blocks.
     truncated_tools: List[Dict[str, Any]] = []
+    protocol_failure_count = 0
     
     try:
-        # Send message_start event
+        # Do not commit the Anthropic lifecycle until Kiro produces an actionable
+        # assistant event. Metadata-only and empty streams must remain retryable.
+        event_stream = parse_kiro_stream(response, first_token_timeout)
+        prelude_events: List[KiroEvent] = []
+        first_actionable_event: Optional[KiroEvent] = None
+
+        async for event in event_stream:
+            is_actionable = (
+                (event.type == "content" and bool(event.content))
+                or (event.type == "thinking" and bool(event.thinking_content))
+                or (event.type == "tool_use" and bool(event.tool_use))
+            )
+            if is_actionable:
+                first_actionable_event = event
+                break
+            prelude_events.append(event)
+
+        if first_actionable_event is None:
+            raise EmptyUpstreamStreamError(
+                "Upstream stream ended before producing an actionable assistant event"
+            )
+
         yield format_sse_event("message_start", {
             "type": "message_start",
             "message": {
@@ -219,8 +242,15 @@ async def stream_kiro_to_anthropic(
                 }
             }
         })
-        
-        async for event in parse_kiro_stream(response, first_token_timeout):
+
+        async def committed_events() -> AsyncGenerator[KiroEvent, None]:
+            for prelude_event in prelude_events:
+                yield prelude_event
+            yield first_actionable_event
+            async for remaining_event in event_stream:
+                yield remaining_event
+
+        async for event in committed_events():
             if event.type == "content":
                 content = event.content or ""
                 full_content += content
@@ -324,6 +354,39 @@ async def stream_kiro_to_anthropic(
                 # For "strip" mode, we just skip the thinking content
             
             elif event.type == "tool_use" and event.tool_use:
+                tool = event.tool_use
+
+                if tool.get("_protocol_failure"):
+                    from kiro.truncation_recovery import generate_tool_protocol_failure_message
+
+                    protocol_failure_count += 1
+                    correction = generate_tool_protocol_failure_message(tool)
+                    full_content += correction
+
+                    if thinking_block_started and thinking_block_index is not None:
+                        yield format_sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": thinking_block_index
+                        })
+                        thinking_block_started = False
+                        current_block_index += 1
+
+                    if not text_block_started:
+                        text_block_index = current_block_index
+                        yield format_sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": text_block_index,
+                            "content_block": {"type": "text", "text": ""}
+                        })
+                        text_block_started = True
+
+                    yield format_sse_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": text_block_index,
+                        "delta": {"type": "text_delta", "text": correction}
+                    })
+                    continue
+
                 # Close thinking block if open
                 if thinking_block_started and thinking_block_index is not None:
                     yield format_sse_event("content_block_stop", {
@@ -332,7 +395,7 @@ async def stream_kiro_to_anthropic(
                     })
                     thinking_block_started = False
                     current_block_index += 1
-                
+
                 # Close text block if open
                 if text_block_started and text_block_index is not None:
                     yield format_sse_event("content_block_stop", {
@@ -341,8 +404,7 @@ async def stream_kiro_to_anthropic(
                     })
                     text_block_started = False
                     current_block_index += 1
-                
-                tool = event.tool_use
+
                 tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
                 tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
                 tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
@@ -610,7 +672,8 @@ async def stream_kiro_to_anthropic(
         content_was_truncated = (
             not stream_completed_normally and
             len(full_content) > 0 and
-            not tool_blocks  # Don't confuse with tool call truncation
+            not tool_blocks and
+            protocol_failure_count == 0
         )
         
         if content_was_truncated:
@@ -661,7 +724,16 @@ async def stream_kiro_to_anthropic(
         yield format_sse_event("message_stop", {
             "type": "message_stop"
         })
-        
+
+        # Persist usage to JSONL for the dashboard
+        from kiro.usage_logger import log_usage
+        log_usage(
+            model=model,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        )
+
         # Save truncation info for recovery (tracked by stable identifiers)
         from kiro.truncation_recovery import should_inject_recovery
         from kiro.truncation_state import save_tool_truncation, save_content_truncation
@@ -692,7 +764,7 @@ async def stream_kiro_to_anthropic(
             f"tool_blocks={len(tool_blocks)}, stop_reason={stop_reason}"
         )
         
-    except FirstTokenTimeoutError:
+    except RetryableStreamError:
         raise
     except GeneratorExit:
         logger.debug("Client disconnected (GeneratorExit)")
@@ -784,8 +856,20 @@ async def collect_anthropic_response(
             "text": text_content
         })
     
-    # Add tool use blocks
+    # Add executable tool use blocks. Protocol failures become corrective text
+    # so clients can never execute malformed arguments.
+    executable_tool_calls = []
     for tc in result.tool_calls:
+        if tc.get("_protocol_failure"):
+            from kiro.truncation_recovery import generate_tool_protocol_failure_message
+
+            content_blocks.append({
+                "type": "text",
+                "text": generate_tool_protocol_failure_message(tc),
+            })
+            continue
+        executable_tool_calls.append(tc)
+
         tool_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
         tool_name = tc.get("function", {}).get("name", "") or tc.get("name", "")
         tool_input = tc.get("function", {}).get("arguments", {}) or tc.get("input", {})
@@ -820,7 +904,7 @@ async def collect_anthropic_response(
     content_was_truncated = (
         not stream_completed_normally and
         len(result.content) > 0 and
-        not result.tool_calls  # Don't confuse with tool call truncation
+        not result.tool_calls
     )
     
     if content_was_truncated:
@@ -834,7 +918,7 @@ async def collect_anthropic_response(
     # Determine stop reason (truncation has highest priority)
     if content_was_truncated:
         stop_reason = "max_tokens"
-    elif result.tool_calls:
+    elif executable_tool_calls:
         stop_reason = "tool_use"
     else:
         stop_reason = "end_turn"
@@ -842,9 +926,18 @@ async def collect_anthropic_response(
     logger.debug(
         f"[Anthropic Non-Streaming] Completed: "
         f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
-        f"tool_calls={len(result.tool_calls)}, stop_reason={stop_reason}"
+        f"tool_calls={len(executable_tool_calls)}, stop_reason={stop_reason}"
     )
-    
+
+    # Persist usage to JSONL for the dashboard
+    from kiro.usage_logger import log_usage
+    log_usage(
+        model=model,
+        prompt_tokens=input_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+    )
+
     usage_payload: Dict[str, Any] = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens

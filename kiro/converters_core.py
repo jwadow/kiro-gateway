@@ -735,7 +735,7 @@ def convert_tool_results_to_kiro_format(tool_results: List[Dict[str, Any]]) -> L
         
         kiro_results.append({
             "content": [{"text": content_text}],
-            "status": "success",
+            "status": "error" if tr.get("is_error") is True else "success",
             "toolUseId": tr.get("tool_use_id", "")
         })
     
@@ -762,7 +762,7 @@ def extract_tool_results_from_content(content: Any) -> List[Dict[str, Any]]:
             if isinstance(item, dict) and item.get("type") == "tool_result":
                 tool_results.append({
                     "content": [{"text": extract_text_content(item.get("content", "")) or "(empty result)"}],
-                    "status": "success",
+                    "status": "error" if item.get("is_error") is True else "success",
                     "toolUseId": item.get("tool_use_id", "")
                 })
     

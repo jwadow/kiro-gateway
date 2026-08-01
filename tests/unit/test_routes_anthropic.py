@@ -339,8 +339,9 @@ class TestMessagesValidation:
     
     def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies an unknown message role is accepted (not rejected).
+        Purpose: Unknown roles are normalized to "user" downstream rather than
+        rejected, so the request must pass validation.
         """
         print("Action: POST /v1/messages with invalid role...")
         response = test_client.post(
@@ -354,8 +355,10 @@ class TestMessagesValidation:
         )
         
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
+        # Unknown roles are intentionally accepted and normalized to "user"
+        # downstream by normalize_message_roles() (Kiro supports only
+        # user/assistant), so validation must NOT reject them with 422.
+        assert response.status_code != 422
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """
@@ -1472,7 +1475,8 @@ class TestTruncationRecoveryMessageModification:
         print("Checking: Content modified in new object...")
         modified_content = self._get_block_value(modified_msg.content[0], "content")
         assert modified_content != original_content
-        assert "[API Limitation]" in modified_content
+        # Small truncations (<=1024B) use the "[Upstream Glitch]" lead.
+        assert "[Upstream Glitch]" in modified_content or "[API Limitation]" in modified_content
 
 
 # =============================================================================

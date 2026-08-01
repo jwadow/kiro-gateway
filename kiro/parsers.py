@@ -36,6 +36,42 @@ from loguru import logger
 from kiro.utils import generate_tool_call_id
 
 
+def _record_tool_protocol_anomaly(
+    tool_name: str,
+    classification: str,
+    reason: str,
+    size_bytes: int,
+) -> None:
+    """
+    Records a tool-call protocol failure as a metadata-only anomaly.
+
+    Best-effort and non-fatal: parsing must never break because diagnostics
+    are unavailable. Captures only the bounded scalar fields already emitted
+    to the logs — never the raw arguments payload.
+    """
+    try:
+        from kiro.debug_logger import debug_logger
+    except Exception:
+        return
+
+    if debug_logger is None:
+        return
+
+    try:
+        debug_logger.record_anomaly(
+            "tool_protocol_failure",
+            {
+                "tool": tool_name,
+                "classification": classification,
+                "reason": reason,
+                "size_bytes": size_bytes,
+            },
+        )
+    except Exception:
+        # Diagnostics must never interfere with response parsing.
+        pass
+
+
 def find_matching_brace(text: str, start_pos: int) -> int:
     """
     Finds the position of the closing brace considering nesting and strings.
@@ -175,13 +211,26 @@ def deduplicate_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, A
         if existing is None:
             by_id[tc_id] = tc
         else:
-            # Duplicate by id exists - keep the one with more arguments
+            # Duplicate by id exists. A valid candidate always wins over a
+            # protocol failure, regardless of argument length.
+            existing_invalid = bool(existing.get("_protocol_failure"))
+            current_invalid = bool(tc.get("_protocol_failure"))
             existing_args = existing.get("function", {}).get("arguments", "{}")
             current_args = tc.get("function", {}).get("arguments", "{}")
-            
-            # Prefer non-empty arguments
-            if current_args != "{}" and (existing_args == "{}" or len(current_args) > len(existing_args)):
-                logger.debug(f"Replacing tool call {tc_id} with better arguments: {len(existing_args)} -> {len(current_args)}")
+
+            should_replace = existing_invalid and not current_invalid
+            if existing_invalid == current_invalid:
+                should_replace = (
+                    current_args != "{}"
+                    and (existing_args == "{}" or len(current_args) > len(existing_args))
+                )
+
+            if should_replace:
+                logger.debug(
+                    f"Replacing tool call {tc_id} with better candidate: "
+                    f"invalid={existing_invalid}->{current_invalid}, "
+                    f"args={len(existing_args)}->{len(current_args)}"
+                )
                 by_id[tc_id] = tc
     
     # Collect tool calls: first those with id, then without id
@@ -418,32 +467,39 @@ class AwsEventStreamParser:
                     # Ensure result is a JSON string
                     self.current_tool_call['function']['arguments'] = json.dumps(parsed)
                     logger.debug(f"Tool '{tool_name}' arguments parsed successfully: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
-                except json.JSONDecodeError as e:
-                    # Analyze the failure to provide better diagnostics
-                    truncation_info = self._diagnose_json_truncation(args)
-                    
-                    if truncation_info["is_truncated"]:
-                        # Mark for recovery system
+                except json.JSONDecodeError:
+                    diagnostic = self._diagnose_json_truncation(args)
+                    classification = "truncated" if diagnostic["is_truncated"] else "malformed"
+                    tool_id = self.current_tool_call.get('id', 'unknown')
+
+                    # Preserve the raw value for diagnostics, but explicitly mark
+                    # the call non-executable. Consumers must never normalize this
+                    # failure to an executable empty object.
+                    self.current_tool_call['_protocol_failure'] = {
+                        "classification": classification,
+                        "reason": diagnostic["reason"],
+                        "size_bytes": diagnostic["size_bytes"],
+                    }
+                    self.current_tool_call['_executable'] = False
+
+                    if diagnostic["is_truncated"]:
+                        # Keep legacy metadata while recovery consumers migrate to
+                        # the broader protocol-failure classification.
                         self.current_tool_call['_truncation_detected'] = True
-                        self.current_tool_call['_truncation_info'] = truncation_info
-                        
-                        # Check if recovery is enabled
-                        from kiro.config import TRUNCATION_RECOVERY
-                        tool_id = self.current_tool_call.get('id', 'unknown')
-                        
-                        # Clear error message: this is Kiro API's fault, not ours
-                        logger.error(
-                            f"Tool call truncated by Kiro API: "
-                            f"tool='{tool_name}', id={tool_id}, size={truncation_info['size_bytes']} bytes, "
-                            f"reason={truncation_info['reason']}. "
-                            f"This is a Kiro API limitation. "
-                            f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
-                        )
-                    else:
-                        # Regular JSON parse error
-                        logger.warning(f"Failed to parse tool '{tool_name}' arguments: {e}. Raw: {args[:200]}")
-                    
-                    self.current_tool_call['function']['arguments'] = "{}"
+                        self.current_tool_call['_truncation_info'] = diagnostic
+
+                    logger.error(
+                        f"Tool call protocol failure: tool='{tool_name}', id={tool_id}, "
+                        f"size={diagnostic['size_bytes']} bytes, classification={classification}, "
+                        f"reason={diagnostic['reason']}"
+                    )
+
+                    _record_tool_protocol_anomaly(
+                        tool_name=tool_name,
+                        classification=classification,
+                        reason=diagnostic["reason"],
+                        size_bytes=diagnostic["size_bytes"],
+                    )
             else:
                 # Empty string - use empty object
                 # This is normal behavior for duplicate tool calls from Kiro
@@ -454,9 +510,25 @@ class AwsEventStreamParser:
             self.current_tool_call['function']['arguments'] = json.dumps(args)
             logger.debug(f"Tool '{tool_name}' arguments already dict with keys: {list(args.keys())}")
         else:
-            # Unknown type - empty object
-            logger.warning(f"Tool '{tool_name}' has unexpected arguments type: {type(args)}")
-            self.current_tool_call['function']['arguments'] = "{}"
+            tool_id = self.current_tool_call.get('id', 'unknown')
+            self.current_tool_call['_protocol_failure'] = {
+                "classification": "malformed",
+                "reason": f"unexpected arguments type: {type(args).__name__}",
+                "size_bytes": 0,
+            }
+            self.current_tool_call['_executable'] = False
+            logger.error(
+                f"Tool call protocol failure: tool='{tool_name}', id={tool_id}, "
+                f"size=0 bytes, classification=malformed, "
+                f"reason=unexpected arguments type {type(args).__name__}"
+            )
+
+            _record_tool_protocol_anomaly(
+                tool_name=tool_name,
+                classification="malformed",
+                reason=f"unexpected arguments type: {type(args).__name__}",
+                size_bytes=0,
+            )
         
         self.tool_calls.append(self.current_tool_call)
         self.current_tool_call = None

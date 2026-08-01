@@ -623,6 +623,210 @@ class TestAnthropicMessagesRequestWithImages:
 
 
 # ==================================================================================================
+# Tests for inline non-standard message roles (Issue #190)
+# ==================================================================================================
+
+class TestAnthropicMessageInlineRoles:
+    """
+    Tests for AnthropicMessage with inline non-standard roles.
+
+    These tests verify the fix for Issue #190 - 422 Validation Error
+    when newer Claude Code clients inline a message with role "system"
+    inside the messages array.
+
+    The role field is intentionally a free-form str: unknown roles such
+    as "system" and "developer" are normalized to "user" downstream by
+    converters_core.normalize_message_roles().
+    """
+
+    def test_message_with_system_role_validates(self):
+        """
+        What it does: Verifies AnthropicMessage accepts role "system".
+        Purpose: This is the PRIMARY test for Issue #190 fix.
+
+        Before the fix, this raised a ValidationError because role was
+        declared as Literal["user", "assistant"].
+        """
+        print("Setup: Creating AnthropicMessage with role 'system'...")
+        message = AnthropicMessage(
+            role="system",
+            content="<system-reminder>context blob</system-reminder>"
+        )
+
+        print(f"Comparing role: Expected 'system', Got '{message.role}'")
+        assert message.role == "system"
+        assert message.content == "<system-reminder>context blob</system-reminder>"
+
+    def test_message_with_developer_role_validates(self):
+        """
+        What it does: Verifies other non-standard roles also validate.
+        Purpose: Ensure the field is leniently typed, not just patched
+        for the single "system" value.
+        """
+        print("Setup: Creating AnthropicMessage with role 'developer'...")
+        message = AnthropicMessage(role="developer", content="some context")
+
+        print(f"Comparing role: Expected 'developer', Got '{message.role}'")
+        assert message.role == "developer"
+
+    def test_standard_roles_still_validate(self):
+        """
+        What it does: Verifies user/assistant roles are unaffected.
+        Purpose: Guard against regressions in the common path.
+        """
+        assert AnthropicMessage(role="user", content="hi").role == "user"
+        assert AnthropicMessage(role="assistant", content="hello").role == "assistant"
+
+    def test_request_with_inline_system_message_validates(self):
+        """
+        What it does: Verifies the exact Issue #190 request validates.
+        Purpose: End-to-end validation for the failing Claude Code payload
+        that carries an inline role "system" message at index 1.
+        """
+        print("Setup: Creating request with inline 'system' role message...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=16,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "<system-reminder>...</system-reminder>"},
+            ],
+        )
+
+        print(f"Comparing roles: Got {[m.role for m in request.messages]}")
+        assert [m.role for m in request.messages] == ["user", "system"]
+
+
+class TestAnthropicMessageUnknownContentBlocks:
+    """
+    Tests for AnthropicMessage downgrading unknown content block types.
+
+    Verifies the fix for 422 Validation Errors when a client (newer Claude
+    Code + new model ids) emits a content block whose ``type`` is not part of
+    the set this gateway models. Such blocks are downgraded to a text block
+    before validation instead of failing the whole request. Known block types
+    listed in KNOWN_CONTENT_BLOCK_TYPES pass through untouched.
+    """
+
+    def test_unknown_top_level_block_downgrades_to_text(self):
+        """
+        What it does: Verifies an unknown top-level block becomes a text block.
+        Purpose: PRIMARY test — before the fix this raised a ValidationError
+        because the block type was not in the ContentBlock union.
+        """
+        print("Setup: Creating message with an unknown 'redacted_thinking' block...")
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"type": "text", "text": "before"},
+                {"type": "redacted_thinking", "data": "opaque-encrypted-payload"},
+            ],
+        )
+
+        print(f"Comparing block types: Got {[b.type for b in message.content]}")
+        assert [b.type for b in message.content] == ["text", "text"]
+        # Identifying info is preserved in the downgraded placeholder
+        assert message.content[1].text == "[redacted_thinking]"
+
+    def test_unknown_block_preserves_name(self):
+        """
+        What it does: Verifies the downgrade preserves a block's name/text.
+        Purpose: A downgraded server_tool_use block should remain traceable
+        rather than collapsing to an opaque placeholder.
+        """
+        print("Setup: Creating message with an unknown 'server_tool_use' block...")
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {}},
+            ],
+        )
+
+        print(f"Comparing downgraded text: Got '{message.content[0].text}'")
+        assert message.content[0].type == "text"
+        assert message.content[0].text == "[server_tool_use: web_search]"
+
+    def test_known_blocks_pass_through_untouched(self):
+        """
+        What it does: Verifies text/tool_use blocks are unaffected.
+        Purpose: Guard against the sanitizer mangling the common path.
+        """
+        print("Setup: Creating message with known text + tool_use blocks...")
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"type": "text", "text": "hello"},
+                {"type": "tool_use", "id": "t1", "name": "calc", "input": {"x": 1}},
+            ],
+        )
+
+        assert message.content[0].type == "text"
+        assert message.content[0].text == "hello"
+        assert message.content[1].type == "tool_use"
+        assert message.content[1].name == "calc"
+
+    def test_string_content_unaffected(self):
+        """
+        What it does: Verifies plain string content is passed through.
+        Purpose: The sanitizer must only touch list content, not strings.
+        """
+        message = AnthropicMessage(role="user", content="just a string")
+        assert message.content == "just a string"
+
+    def test_unknown_inner_tool_result_block_downgrades(self):
+        """
+        What it does: Verifies unknown blocks inside a tool_result downgrade.
+        Purpose: tool_result content arrays can carry future inner block kinds;
+        they must convert to text instead of 422ing the whole request.
+        """
+        print("Setup: Creating tool_result with an unknown inner block...")
+        message = AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_123",
+                    "content": [
+                        {"type": "text", "text": "ok"},
+                        {"type": "weird_inner", "text": "payload"},
+                    ],
+                }
+            ],
+        )
+
+        tool_result = message.content[0]
+        print(f"Comparing inner types: Got {[b.type for b in tool_result.content]}")
+        assert tool_result.type == "tool_result"
+        assert [b.type for b in tool_result.content] == ["text", "text"]
+        assert tool_result.content[1].text == "[weird_inner: payload]"
+
+    def test_request_with_unknown_block_validates(self):
+        """
+        What it does: Verifies a full request with an unknown block validates.
+        Purpose: End-to-end guard that the 422 is gone for the realistic
+        Claude Code payload carrying a novel content block.
+        """
+        print("Setup: Creating request with an unknown content block...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=16,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "some_future_block", "foo": "bar"},
+                    ],
+                },
+            ],
+        )
+
+        block_types = [b.type for b in request.messages[0].content]
+        print(f"Comparing block types: Got {block_types}")
+        assert block_types == ["text", "text"]
+
+
+# ==================================================================================================
 # Tests for TextContentBlock
 # ==================================================================================================
 

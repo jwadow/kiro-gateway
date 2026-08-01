@@ -32,16 +32,32 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
-from typing import Optional
+from typing import Mapping, Optional
 
 import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, FIRST_TOKEN_TIMEOUT, STREAMING_READ_TIMEOUT
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+from kiro.request_pacer import UpstreamRequestPacer, upstream_request_pacer
+
+
+def _parse_retry_after(headers: object) -> Optional[float]:
+    """Return a numeric Retry-After value when the upstream provides one."""
+    if not isinstance(headers, Mapping):
+        return None
+
+    value = headers.get("Retry-After")
+    if value is None:
+        return None
+
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 class KiroHttpClient:
@@ -79,7 +95,8 @@ class KiroHttpClient:
     def __init__(
         self,
         auth_manager: KiroAuthManager,
-        shared_client: Optional[httpx.AsyncClient] = None
+        shared_client: Optional[httpx.AsyncClient] = None,
+        request_pacer: UpstreamRequestPacer = upstream_request_pacer,
     ):
         """
         Initializes the HTTP client.
@@ -94,6 +111,15 @@ class KiroHttpClient:
         self._shared_client = shared_client
         self._owns_client = shared_client is None
         self.client: Optional[httpx.AsyncClient] = shared_client
+        self._request_pacer = request_pacer
+        self._request_permit_acquired = False
+
+    async def _acquire_request_permit(self) -> None:
+        """Hold one in-flight slot for this client's upstream request lifetime."""
+        if self._request_permit_acquired:
+            return
+        await self._request_pacer.acquire()
+        self._request_permit_acquired = True
     
     async def _get_client(self, stream: bool = False) -> httpx.AsyncClient:
         """
@@ -155,17 +181,17 @@ class KiroHttpClient:
         Uses graceful exception handling to prevent errors during cleanup
         from masking the original exception in finally blocks.
         """
-        # Don't close shared clients - they're managed by the application
-        if not self._owns_client:
-            return
-        
-        if self.client and not self.client.is_closed:
-            try:
+        try:
+            if self._owns_client and self.client and not self.client.is_closed:
                 await self.client.aclose()
-            except Exception as e:
-                # Log but don't propagate - we're in cleanup code
-                # Propagating here could mask the original exception
-                logger.warning(f"Error closing HTTP client: {e}")
+        except Exception as e:
+            # Log but don't propagate - we're in cleanup code
+            # Propagating here could mask the original exception
+            logger.warning(f"Error closing HTTP client: {e}")
+        finally:
+            if self._request_permit_acquired:
+                self._request_permit_acquired = False
+                await self._request_pacer.release()
     
     async def request_with_retry(
         self,
@@ -204,13 +230,22 @@ class KiroHttpClient:
         # FIRST_TOKEN_TIMEOUT is used in streaming_openai.py, not here
         max_retries = FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES
         
-        client = await self._get_client(stream=stream)
+        await self._acquire_request_permit()
+        try:
+            client = await self._get_client(stream=stream)
+        except BaseException:
+            await self.close()
+            raise
         last_error = None
         last_error_info: Optional[NetworkErrorInfo] = None
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
         
         for attempt in range(max_retries):
             try:
+                # All KiroHttpClient instances share this pacer. Subagents still
+                # run concurrently, but their model-turn requests start gradually.
+                await self._request_pacer.wait_for_slot()
+
                 # Get current token
                 token = await self.auth_manager.get_access_token()
                 headers = get_kiro_headers(self.auth_manager, token)
@@ -229,7 +264,18 @@ class KiroHttpClient:
                     headers["Connection"] = "close"
                     req = client.build_request(method, url, **request_kwargs)
                     logger.debug("Sending request to Kiro API...")
-                    response = await client.send(req, stream=True)
+                    # Bound the time-to-response-headers with FIRST_TOKEN_TIMEOUT.
+                    # Without this, a stalled upstream (Amazon risk-control on bursty
+                    # agentic/subagent traffic) leaves us blocked in client.send() until
+                    # the 300s STREAMING_READ_TIMEOUT, with no retry — the request hangs
+                    # indefinitely from the client's perspective. The per-chunk first-token
+                    # timeout in parse_kiro_stream only guards AFTER headers arrive, so the
+                    # header-wait phase needs its own bound. On timeout we fall through to
+                    # the same retryable path as other timeouts below.
+                    response = await asyncio.wait_for(
+                        client.send(req, stream=True),
+                        timeout=FIRST_TOKEN_TIMEOUT
+                    )
                 else:
                     logger.debug("Sending request to Kiro API...")
                     response = await client.request(method, url, **request_kwargs)
@@ -247,7 +293,9 @@ class KiroHttpClient:
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
                     last_response = response  # Сохраняем для возврата после exhaustion
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    retry_after = _parse_retry_after(response.headers)
+                    shared_cooldown = await upstream_request_pacer.register_rate_limit(retry_after)
+                    delay = max(BASE_RETRY_DELAY * (2 ** attempt), shared_cooldown)
                     logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
@@ -262,6 +310,27 @@ class KiroHttpClient:
                 
                 # Other errors - return as is
                 return response
+                
+            except asyncio.CancelledError:
+                await self.close()
+                raise
+
+            except asyncio.TimeoutError as e:
+                # Streaming header-wait exceeded FIRST_TOKEN_TIMEOUT (see client.send above).
+                # Treat exactly like a retryable network timeout: back off and retry, so a
+                # stalled upstream fails fast instead of hanging until STREAMING_READ_TIMEOUT.
+                last_error = e
+                error_info = classify_network_error(
+                    httpx.ReadTimeout(f"No response headers within {FIRST_TOKEN_TIMEOUT}s")
+                )
+                last_error_info = error_info
+                short_msg = f"Slow upstream: no response headers within {FIRST_TOKEN_TIMEOUT}s"
+                if attempt < max_retries - 1:
+                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(f"{short_msg} - waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"{short_msg} - no more retries (attempt {attempt + 1}/{max_retries})")
                 
             except httpx.TimeoutException as e:
                 last_error = e

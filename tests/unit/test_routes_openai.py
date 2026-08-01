@@ -1117,7 +1117,11 @@ class TestTruncationRecoveryMessageModification:
         
         print("Checking: Content modified in new object...")
         assert modified_msg.content != original_msg.content
-        assert "[API Limitation]" in modified_msg.content
+        # Small truncations (<=1024B) use the "[Upstream Glitch]" lead.
+        assert (
+            "[Upstream Glitch]" in modified_msg.content
+            or "[API Limitation]" in modified_msg.content
+        )
 
 
 # =============================================================================
@@ -1203,8 +1207,11 @@ class TestTruncationRecoveryEdgeCases:
         assert len(modified_messages) == 1
         
         print("Checking: Truncation notice still prepended...")
-        assert "[API Limitation]" in modified_messages[0].content
-        
+        # Recovery lead depends on truncation size: small/transient (<=1024B)
+        # yields "[Upstream Glitch]", larger yields "[API Limitation]".
+        content = modified_messages[0].content
+        assert "[Upstream Glitch]" in content or "[API Limitation]" in content
+
         print("Checking: Empty original content preserved...")
         assert "Original tool result:\n" in modified_messages[0].content
     
