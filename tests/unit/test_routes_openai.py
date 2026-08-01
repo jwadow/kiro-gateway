@@ -980,6 +980,223 @@ class TestHTTPClientSelection:
 
 
 # =============================================================================
+# Tests for streaming errors raised after the response has started
+# =============================================================================
+
+class TestBuildSseErrorChunk:
+    """
+    Tests for build_sse_error_chunk() - in-band reporting of streaming failures.
+    """
+
+    def test_http_exception_preserves_status_and_detail(self):
+        """
+        What it does: Verifies HTTPException status_code and detail end up in the chunk.
+        Purpose: Ensure the client learns why the stream failed (e.g. 504 first-token timeout).
+        """
+        print("Setup: HTTPException(504)...")
+        from kiro.routes_openai import build_sse_error_chunk
+
+        chunk = build_sse_error_chunk(
+            HTTPException(status_code=504, detail="Model did not respond within 15.0s")
+        )
+
+        print(f"Chunk: {chunk!r}")
+        assert chunk.startswith("data: ")
+        assert chunk.endswith("\n\n")
+        payload = json.loads(chunk[len("data: "):])
+        assert payload["error"]["code"] == 504
+        assert payload["error"]["message"] == "Model did not respond within 15.0s"
+        assert payload["error"]["type"] == "kiro_api_error"
+        print("✅ Status and detail preserved")
+
+    def test_generic_exception_reported_as_500(self):
+        """
+        What it does: Verifies a non-HTTP exception is reported with code 500.
+        Purpose: Ensure unexpected failures still produce a valid error chunk.
+        """
+        print("Setup: RuntimeError...")
+        from kiro.routes_openai import build_sse_error_chunk
+
+        chunk = build_sse_error_chunk(RuntimeError("connection dropped"))
+
+        payload = json.loads(chunk[len("data: "):])
+        print(f"Payload: {payload}")
+        assert payload["error"]["code"] == 500
+        assert payload["error"]["message"] == "connection dropped"
+        print("✅ Generic exception reported as 500")
+
+    def test_exception_without_message_is_still_valid_json(self):
+        """
+        What it does: Verifies an exception with an empty message produces valid JSON.
+        Purpose: Edge case - clients must never receive a malformed SSE chunk.
+        """
+        print("Setup: Exception with empty message...")
+        from kiro.routes_openai import build_sse_error_chunk
+
+        chunk = build_sse_error_chunk(RuntimeError())
+
+        payload = json.loads(chunk[len("data: "):])
+        print(f"Payload: {payload}")
+        assert payload["error"]["code"] == 500
+        assert isinstance(payload["error"]["message"], str)
+        print("✅ Empty message handled")
+
+
+class TestStreamingErrorAfterResponseStart:
+    """
+    Tests that a streaming failure is reported in-band as an SSE error chunk.
+
+    Once StreamingResponse has sent its headers, raising from the generator makes
+    Starlette fail with "Caught handled exception, but response already started."
+    and the client receives a stream with no error information at all.
+    """
+
+    @patch('kiro.routes_openai.stream_with_first_token_retry')
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_first_token_timeout_is_sent_as_sse_error_chunk(
+        self,
+        mock_kiro_http_client_class,
+        mock_stream_with_retry,
+        test_client,
+        valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a 504 from the streaming pipeline becomes an SSE error chunk.
+        Purpose: Ensure clients see the reason instead of an empty stream + server traceback.
+        """
+        print("Setup: Mocking upstream 200 response and failing stream...")
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        mock_client_instance = AsyncMock()
+        mock_client_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_client_instance.close = AsyncMock()
+        mock_client_instance.client = MagicMock()
+        mock_kiro_http_client_class.return_value = mock_client_instance
+
+        async def failing_stream(*args, **kwargs):
+            raise HTTPException(
+                status_code=504,
+                detail="Model did not respond within 15.0s after 3 attempts. Please try again."
+            )
+            yield ""  # pragma: no cover - makes this an async generator
+
+        mock_stream_with_retry.side_effect = failing_stream
+
+        print("Action: POST /v1/chat/completions with stream=true...")
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print(f"Checking: status={response.status_code}, body={response.text[:200]}")
+        assert response.status_code == 200, "Headers are already sent, status stays 200"
+        assert '"code": 504' in response.text, "Error chunk must carry the upstream status"
+        assert "Model did not respond" in response.text, "Error chunk must carry the detail"
+        assert response.text.rstrip().endswith("data: [DONE]"), "Stream must be terminated"
+        print("✅ Streaming error delivered in-band without raising")
+
+    @patch('kiro.routes_openai.stream_with_first_token_retry')
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_mid_stream_error_keeps_already_sent_chunks(
+        self,
+        mock_kiro_http_client_class,
+        mock_stream_with_retry,
+        test_client,
+        valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a failure after some chunks were sent appends an error chunk.
+        Purpose: Mid-stream upstream drops (e.g. RemoteProtocolError) must not truncate silently.
+        """
+        print("Setup: Mocking stream that fails after one chunk...")
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        mock_client_instance = AsyncMock()
+        mock_client_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_client_instance.close = AsyncMock()
+        mock_client_instance.client = MagicMock()
+        mock_kiro_http_client_class.return_value = mock_client_instance
+
+        async def failing_stream(*args, **kwargs):
+            yield 'data: {"choices": [{"delta": {"content": "Hi"}}]}\n\n'
+            raise RuntimeError("peer closed connection without sending complete message body")
+
+        mock_stream_with_retry.side_effect = failing_stream
+
+        print("Action: POST /v1/chat/completions with stream=true...")
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print(f"Checking: body={response.text[:300]}")
+        assert response.status_code == 200
+        assert '"content": "Hi"' in response.text, "Chunks sent before the error are preserved"
+        assert '"code": 500' in response.text, "Unexpected failures are reported as 500"
+        assert "peer closed connection" in response.text
+        assert response.text.rstrip().endswith("data: [DONE]")
+        print("✅ Mid-stream error reported after already sent chunks")
+
+    @patch('kiro.routes_openai.stream_with_first_token_retry')
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_successful_stream_has_no_error_chunk(
+        self,
+        mock_kiro_http_client_class,
+        mock_stream_with_retry,
+        test_client,
+        valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a healthy stream is passed through unchanged.
+        Purpose: Ensure the error path does not affect the happy path.
+        """
+        print("Setup: Mocking successful stream...")
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        mock_client_instance = AsyncMock()
+        mock_client_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_client_instance.close = AsyncMock()
+        mock_client_instance.client = MagicMock()
+        mock_kiro_http_client_class.return_value = mock_client_instance
+
+        async def ok_stream(*args, **kwargs):
+            yield 'data: {"choices": [{"delta": {"content": "Hi"}}]}\n\n'
+            yield "data: [DONE]\n\n"
+
+        mock_stream_with_retry.side_effect = ok_stream
+
+        print("Action: POST /v1/chat/completions with stream=true...")
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print(f"Checking: body={response.text[:200]}")
+        assert response.status_code == 200
+        assert "kiro_api_error" not in response.text, "No error chunk on the happy path"
+        assert response.text.count("data: [DONE]") == 1, "[DONE] must not be duplicated"
+        print("✅ Happy path unchanged")
+
+
+# =============================================================================
 # Tests for Truncation Recovery message modification (Issue #56)
 # =============================================================================
 

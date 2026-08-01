@@ -86,6 +86,32 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
     return True
 
 
+def build_sse_error_chunk(exc: Exception) -> str:
+    """
+    Build an SSE data chunk describing a streaming failure.
+    
+    Once StreamingResponse has sent its headers, the HTTP status code can no
+    longer be changed: re-raising makes Starlette abort with "Caught handled
+    exception, but response already started" and the client receives a stream
+    with no error information at all. Reporting the error in-band keeps the
+    reason visible to the client (same approach as /v1/messages).
+    
+    Args:
+        exc: Exception raised while streaming. HTTPException status_code and
+             detail are preserved, any other exception is reported as 500.
+    
+    Returns:
+        SSE chunk in OpenAI error format, ready to be yielded
+    """
+    return "data: " + json.dumps({
+        "error": {
+            "message": str(getattr(exc, "detail", None) or exc),
+            "type": "kiro_api_error",
+            "code": getattr(exc, "status_code", 500),
+        }
+    }) + "\n\n"
+
+
 # --- Router ---
 router = APIRouter()
 
@@ -397,11 +423,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                             except Exception as e:
                                 streaming_error = e
+                                # Response headers are already sent: report the error
+                                # in-band instead of raising (see build_sse_error_chunk)
                                 try:
+                                    yield build_sse_error_chunk(e)
                                     yield "data: [DONE]\n\n"
                                 except Exception:
-                                    pass
-                                raise
+                                    pass  # Client already disconnected
                             finally:
                                 await http_client.close()
                                 if streaming_error:
@@ -694,13 +722,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                 except Exception as e:
                     streaming_error = e
-                    # Try to send [DONE] to client before finishing
-                    # so client doesn't "hang" waiting for data
+                    # Response headers are already sent: report the error
+                    # in-band instead of raising (see build_sse_error_chunk)
                     try:
+                        yield build_sse_error_chunk(e)
                         yield "data: [DONE]\n\n"
                     except Exception:
                         pass  # Client already disconnected
-                    raise
                 finally:
                     await http_client.close()
                     # Log access log for streaming (success or error)
