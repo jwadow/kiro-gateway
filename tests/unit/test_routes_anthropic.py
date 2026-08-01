@@ -2519,3 +2519,68 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+
+# =============================================================================
+# Tests for streaming errors raised after the response has started
+# =============================================================================
+
+class TestStreamingErrorAfterResponseStart:
+    """
+    Tests that a streaming failure on /v1/messages is reported in-band.
+
+    Once StreamingResponse has sent its headers, raising from the generator makes
+    Starlette fail with "Caught handled exception, but response already started."
+    This is the Anthropic counterpart of the same test in test_routes_openai.py -
+    both APIs must report streaming failures as SSE events instead of raising.
+    """
+
+    @patch('kiro.routes_anthropic.stream_with_first_token_retry_anthropic')
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_first_token_timeout_is_sent_as_sse_error_event(
+        self,
+        mock_kiro_http_client_class,
+        mock_stream_with_retry,
+        test_client,
+        valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a 504 from the streaming pipeline becomes an SSE error event.
+        Purpose: Ensure clients see the reason instead of an empty stream + server traceback.
+        """
+        print("Setup: Mocking upstream 200 response and failing stream...")
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        mock_client_instance = AsyncMock()
+        mock_client_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_client_instance.close = AsyncMock()
+        mock_client_instance.client = MagicMock()
+        mock_kiro_http_client_class.return_value = mock_client_instance
+
+        async def failing_stream(*args, **kwargs):
+            raise HTTPException(
+                status_code=504,
+                detail="Model did not respond within 15.0s after 3 attempts. Please try again."
+            )
+            yield ""  # pragma: no cover - makes this an async generator
+
+        mock_stream_with_retry.side_effect = failing_stream
+
+        print("Action: POST /v1/messages with stream=true...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print(f"Checking: status={response.status_code}, body={response.text[:200]}")
+        assert response.status_code == 200, "Headers are already sent, status stays 200"
+        assert "event: error" in response.text, "Error must be reported as an SSE event"
+        assert "Model did not respond" in response.text, "Error event must carry the reason"
+        print("✅ Streaming error delivered in-band without raising")
