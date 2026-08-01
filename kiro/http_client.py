@@ -42,7 +42,7 @@ from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, 
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
-from kiro.request_pacer import upstream_request_pacer
+from kiro.request_pacer import UpstreamRequestPacer, upstream_request_pacer
 
 
 def _parse_retry_after(headers: object) -> Optional[float]:
@@ -95,7 +95,8 @@ class KiroHttpClient:
     def __init__(
         self,
         auth_manager: KiroAuthManager,
-        shared_client: Optional[httpx.AsyncClient] = None
+        shared_client: Optional[httpx.AsyncClient] = None,
+        request_pacer: UpstreamRequestPacer = upstream_request_pacer,
     ):
         """
         Initializes the HTTP client.
@@ -110,6 +111,15 @@ class KiroHttpClient:
         self._shared_client = shared_client
         self._owns_client = shared_client is None
         self.client: Optional[httpx.AsyncClient] = shared_client
+        self._request_pacer = request_pacer
+        self._request_permit_acquired = False
+
+    async def _acquire_request_permit(self) -> None:
+        """Hold one in-flight slot for this client's upstream request lifetime."""
+        if self._request_permit_acquired:
+            return
+        await self._request_pacer.acquire()
+        self._request_permit_acquired = True
     
     async def _get_client(self, stream: bool = False) -> httpx.AsyncClient:
         """
@@ -171,17 +181,17 @@ class KiroHttpClient:
         Uses graceful exception handling to prevent errors during cleanup
         from masking the original exception in finally blocks.
         """
-        # Don't close shared clients - they're managed by the application
-        if not self._owns_client:
-            return
-        
-        if self.client and not self.client.is_closed:
-            try:
+        try:
+            if self._owns_client and self.client and not self.client.is_closed:
                 await self.client.aclose()
-            except Exception as e:
-                # Log but don't propagate - we're in cleanup code
-                # Propagating here could mask the original exception
-                logger.warning(f"Error closing HTTP client: {e}")
+        except Exception as e:
+            # Log but don't propagate - we're in cleanup code
+            # Propagating here could mask the original exception
+            logger.warning(f"Error closing HTTP client: {e}")
+        finally:
+            if self._request_permit_acquired:
+                self._request_permit_acquired = False
+                await self._request_pacer.release()
     
     async def request_with_retry(
         self,
@@ -220,7 +230,12 @@ class KiroHttpClient:
         # FIRST_TOKEN_TIMEOUT is used in streaming_openai.py, not here
         max_retries = FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES
         
-        client = await self._get_client(stream=stream)
+        await self._acquire_request_permit()
+        try:
+            client = await self._get_client(stream=stream)
+        except BaseException:
+            await self.close()
+            raise
         last_error = None
         last_error_info: Optional[NetworkErrorInfo] = None
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
@@ -229,7 +244,7 @@ class KiroHttpClient:
             try:
                 # All KiroHttpClient instances share this pacer. Subagents still
                 # run concurrently, but their model-turn requests start gradually.
-                await upstream_request_pacer.wait_for_slot()
+                await self._request_pacer.wait_for_slot()
 
                 # Get current token
                 token = await self.auth_manager.get_access_token()
@@ -296,6 +311,10 @@ class KiroHttpClient:
                 # Other errors - return as is
                 return response
                 
+            except asyncio.CancelledError:
+                await self.close()
+                raise
+
             except asyncio.TimeoutError as e:
                 # Streaming header-wait exceeded FIRST_TOKEN_TIMEOUT (see client.send above).
                 # Treat exactly like a retryable network timeout: back off and retry, so a

@@ -208,6 +208,10 @@ BASE_RETRY_DELAY: float = 1.0
 # Set to 0 to disable pacing (default preserves transparent proxy behavior).
 KIRO_REQUEST_MIN_INTERVAL_SECONDS: float = float(os.getenv("KIRO_REQUEST_MIN_INTERVAL_SECONDS", "0"))
 
+# Maximum number of requests that may remain active against the Kiro runtime.
+# Set to 0 to disable the in-flight limit.
+KIRO_MAX_CONCURRENT_REQUESTS: int = int(os.getenv("KIRO_MAX_CONCURRENT_REQUESTS", "0"))
+
 # Process-wide cooldown after an upstream 429. Concurrent requests observe the
 # same deadline instead of retrying independently and creating another burst.
 KIRO_429_COOLDOWN_SECONDS: float = float(os.getenv("KIRO_429_COOLDOWN_SECONDS", "0"))

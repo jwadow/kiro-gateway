@@ -564,6 +564,98 @@ class TestUpstreamRequestPacer:
     """Tests for process-wide request pacing and 429 coordination."""
 
     @pytest.mark.asyncio
+    async def test_concurrent_requests_wait_for_release(self):
+        """The in-flight limit blocks new upstream work until a slot is released."""
+        pacer = UpstreamRequestPacer(
+            min_interval=0.0,
+            cooldown=0.0,
+            jitter=0.0,
+            max_concurrent=1,
+        )
+        await pacer.acquire()
+
+        waiter = asyncio.create_task(pacer.acquire())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+
+        await pacer.release()
+        await asyncio.wait_for(waiter, timeout=0.1)
+        await pacer.release()
+
+    @pytest.mark.asyncio
+    async def test_close_releases_request_permit(self, mock_auth_manager_for_http):
+        """Closing a request client admits the next queued upstream request."""
+        pacer = UpstreamRequestPacer(
+            min_interval=0.0,
+            cooldown=0.0,
+            jitter=0.0,
+            max_concurrent=1,
+        )
+        first = KiroHttpClient(mock_auth_manager_for_http, request_pacer=pacer)
+        second = KiroHttpClient(mock_auth_manager_for_http, request_pacer=pacer)
+
+        first_response = AsyncMock(status_code=200)
+        second_response = AsyncMock(status_code=200)
+        first_client = AsyncMock(is_closed=False)
+        second_client = AsyncMock(is_closed=False)
+        first_client.request = AsyncMock(return_value=first_response)
+        second_client.request = AsyncMock(return_value=second_response)
+
+        with patch.object(first, "_get_client", return_value=first_client), \
+             patch.object(second, "_get_client", return_value=second_client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}):
+            await first.request_with_retry("POST", "https://api.example.com/first")
+            waiter = asyncio.create_task(
+                second.request_with_retry("POST", "https://api.example.com/second")
+            )
+            await asyncio.sleep(0)
+            assert not waiter.done()
+
+            await first.close()
+            assert await asyncio.wait_for(waiter, timeout=0.1) is second_response
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_request_releases_request_permit(self, mock_auth_manager_for_http):
+        """Cancellation while sending cannot strand an in-flight slot."""
+        pacer = UpstreamRequestPacer(
+            min_interval=0.0,
+            cooldown=0.0,
+            jitter=0.0,
+            max_concurrent=1,
+        )
+        cancelled = KiroHttpClient(mock_auth_manager_for_http, request_pacer=pacer)
+        follower = KiroHttpClient(mock_auth_manager_for_http, request_pacer=pacer)
+        send_started = asyncio.Event()
+
+        async def block_request(*args, **kwargs):
+            send_started.set()
+            await asyncio.Event().wait()
+
+        cancelled_client = AsyncMock(is_closed=False)
+        cancelled_client.request = AsyncMock(side_effect=block_request)
+        follower_response = AsyncMock(status_code=200)
+        follower_client = AsyncMock(is_closed=False)
+        follower_client.request = AsyncMock(return_value=follower_response)
+
+        with patch.object(cancelled, "_get_client", return_value=cancelled_client), \
+             patch.object(follower, "_get_client", return_value=follower_client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}):
+            task = asyncio.create_task(
+                cancelled.request_with_retry("POST", "https://api.example.com/cancel")
+            )
+            await send_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert await asyncio.wait_for(
+                follower.request_with_retry("POST", "https://api.example.com/follower"),
+                timeout=0.1,
+            ) is follower_response
+            await follower.close()
+
+    @pytest.mark.asyncio
     async def test_retry_sleep_patch_does_not_replace_pacer_sleep(self):
         """HTTP retry tests can mock backoff without disabling pacer timing."""
         pacer = UpstreamRequestPacer(min_interval=0.001, cooldown=0.0, jitter=0.0)
