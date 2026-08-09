@@ -1,4 +1,4 @@
-Branch: `fix/anthropic-system-message-compatibility`
+Branch: `main`
 Title: `Fix: Kiro Gateway Anthropic system message compatibility`
 
 # Description
