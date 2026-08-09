@@ -22,6 +22,7 @@ from kiro.converters_anthropic import (
     extract_images_from_tool_results,
     extract_tool_uses_from_anthropic_content,
     convert_anthropic_messages,
+    split_anthropic_system_messages,
     convert_anthropic_tools,
     anthropic_to_kiro,
     extract_thinking_config_from_anthropic,
@@ -980,6 +981,41 @@ class TestConvertAnthropicMessages:
         assert result[0].role == "assistant"
         assert result[0].content == "Hi there!"
 
+    def test_skips_inline_system_messages(self):
+        """
+        What it does: Verifies inline system messages are excluded from history.
+        Purpose: Prevent Claude Code compatibility system prompts from becoming user messages.
+        """
+        messages = [
+            AnthropicMessage(role="system", content="Follow the project rules."),
+            AnthropicMessage(role="user", content="Hello!"),
+        ]
+
+        result = convert_anthropic_messages(messages)
+
+        assert [message.role for message in result] == ["user"]
+        assert result[0].content == "Hello!"
+
+
+class TestSplitAnthropicSystemMessages:
+    """Tests for promoting inline system messages to the system prompt."""
+
+    def test_extracts_and_preserves_conversation_order(self):
+        messages = [
+            AnthropicMessage(role="user", content="Hello"),
+            AnthropicMessage(role="system", content="Be concise."),
+            AnthropicMessage(role="assistant", content="Hi"),
+            AnthropicMessage(
+                role="system",
+                content=[{"type": "text", "text": "Use Traditional Chinese."}],
+            ),
+        ]
+
+        system_prompt, conversation_messages = split_anthropic_system_messages(messages)
+
+        assert system_prompt == "Be concise.\n\nUse Traditional Chinese."
+        assert [message.role for message in conversation_messages] == ["user", "assistant"]
+
     def test_converts_user_message_with_content_blocks(self):
         """
         What it does: Verifies conversion of user message with content blocks.
@@ -1498,6 +1534,33 @@ class TestAnthropicToKiro:
         ]["content"]
         print(f"Current content: {current_content}")
         assert "You are a helpful assistant." in current_content
+
+    def test_promotes_inline_system_message_into_payload(self):
+        """
+        What it does: Verifies the Claude Code inline system-message shape.
+        Purpose: Regression coverage for the reported 422 validation error.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-5",
+            messages=[
+                AnthropicMessage(role="user", content="Hello!"),
+                AnthropicMessage(role="system", content="Follow these instructions."),
+            ],
+            max_tokens=1024,
+        )
+
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        assert "Follow these instructions." in current_content
+        assert "Hello!" in current_content
 
     def test_includes_tools(self):
         """
