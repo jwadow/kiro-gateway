@@ -507,6 +507,23 @@ async def lifespan(app: FastAPI):
         app.state.account_manager.save_state_periodically()
     )
     
+    # Start background task for proactive token refresh (keep sessions alive)
+    async def _token_keepalive():
+        """Refresh tokens every 30 min to prevent session expiry."""
+        while True:
+            await asyncio.sleep(30 * 60)  # 30 minutes
+            for account_id, account in app.state.account_manager._accounts.items():
+                am = account.get("auth_manager")
+                if am and am._refresh_token:
+                    try:
+                        await am._refresh_token_request()
+                        logger.info(f"[keepalive] Token refreshed for account {account_id}, "
+                                    f"expires: {am._expires_at.isoformat() if am._expires_at else '?'}")
+                    except Exception as e:
+                        logger.error(f"[keepalive] Token refresh FAILED for {account_id}: {e}")
+    
+    keepalive_task = asyncio.create_task(_token_keepalive())
+    
     logger.info("Account system initialized successfully")
     
     yield
@@ -514,10 +531,15 @@ async def lifespan(app: FastAPI):
     # Graceful shutdown
     logger.info("Shutting down application...")
     
-    # Cancel background task
+    # Cancel background tasks
     save_task.cancel()
+    keepalive_task.cancel()
     try:
         await save_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await keepalive_task
     except asyncio.CancelledError:
         pass
     
