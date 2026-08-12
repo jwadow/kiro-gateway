@@ -128,6 +128,12 @@ async def health(request: Request):
                 account = accounts[0]
                 if account.auth_manager:
                     am = account.auth_manager
+                    # Reload from SQLite so health check reflects latest kiro-cli login
+                    if hasattr(am, "_sqlite_db") and am._sqlite_db:
+                        try:
+                            am._load_credentials_from_sqlite(am._sqlite_db)
+                        except Exception:
+                            pass
                     if am.is_token_expired():
                         auth_status = "expired"
                         status = "unhealthy"
