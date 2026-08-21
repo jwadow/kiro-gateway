@@ -1471,6 +1471,20 @@ class TestAnthropicToKiro:
         assert "userInputMessage" in result["conversationState"]["currentMessage"]
         assert result["profileArn"] == "arn:aws:test"
 
+    def test_resolves_configured_model_alias(self):
+        """Configured aliases are resolved in the Anthropic converter path."""
+        request = AnthropicMessagesRequest(
+            model="custom:Kiro-Claude-Opus-4.6-2",
+            messages=[AnthropicMessage(role="user", content="Hello!")],
+            max_tokens=1024,
+        )
+
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            result = anthropic_to_kiro(request, "conv-123", "")
+
+        model_id = result["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+        assert model_id == "claude-opus-4.6"
+
     def test_includes_system_prompt(self):
         """
         What it does: Verifies that system prompt is included.

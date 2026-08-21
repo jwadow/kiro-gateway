@@ -816,6 +816,18 @@ class TestBuildKiroPayload:
         # claude-sonnet-4-5 should normalize to claude-sonnet-4.5 (dashes→dots)
         print(f"Comparing model_id: Expected 'claude-sonnet-4.5', Got '{model_id}'")
         assert model_id == "claude-sonnet-4.5"
+
+    def test_resolves_configured_model_alias(self):
+        """Configured aliases are resolved in the OpenAI converter path."""
+        request = ChatCompletionRequest(
+            model="custom:Kiro-Claude-Opus-4.6-2",
+            messages=[ChatMessage(role="user", content="Hello")],
+        )
+
+        result = build_kiro_payload(request, "conv-123", "")
+
+        model_id = result["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+        assert model_id == "claude-opus-4.6"
     
     def test_includes_tools_in_context(self):
         """

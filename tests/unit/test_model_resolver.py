@@ -629,6 +629,42 @@ class TestGetModelIdForKiro:
         print(f"Comparing result: Expected 'claude-unknown-model' (pass-through), Got '{result}'")
         assert result == "claude-unknown-model"
 
+    def test_resolves_alias_before_normalization(self):
+        """Aliases are resolved before model-name normalization."""
+        aliases = {"my-haiku": "claude-haiku-4-5"}
+
+        result = get_model_id_for_kiro("my-haiku", {}, aliases)
+
+        assert result == "claude-haiku-4.5"
+
+    def test_resolves_alias_chain(self):
+        """Alias chains resolve to their final model ID."""
+        aliases = {
+            "team-default": "my-opus",
+            "my-opus": "claude-opus-4.6",
+        }
+
+        result = get_model_id_for_kiro("team-default", {}, aliases)
+
+        assert result == "claude-opus-4.6"
+
+    def test_alias_resolves_to_hidden_model(self):
+        """Alias resolution still applies the hidden-model lookup."""
+        aliases = {"legacy": "claude-3.7-sonnet"}
+        hidden = {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_INTERNAL"}
+
+        result = get_model_id_for_kiro("legacy", hidden, aliases)
+
+        assert result == "CLAUDE_3_7_SONNET_INTERNAL"
+
+    def test_alias_cycle_falls_back_to_original_name(self):
+        """Cyclic aliases cannot recurse indefinitely."""
+        aliases = {"model-a": "model-b", "model-b": "model-a"}
+
+        result = get_model_id_for_kiro("model-a", {}, aliases)
+
+        assert result == "model-a"
+
 
 # =============================================================================
 # TestModelResolver - Tests for ModelResolver class

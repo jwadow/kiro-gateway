@@ -248,6 +248,13 @@ HIDDEN_MODELS: Dict[str, str] = {
 # Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
 MODEL_ALIASES: Dict[str, str] = {
     "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
+    "custom:Kiro-Claude-Sonnet-4.5-0": "claude-sonnet-4.5",
+    "custom:Kiro-Claude-Opus-4.5-1": "claude-opus-4.5",
+    "custom:Kiro-Claude-Opus-4.6-2": "claude-opus-4.6",
+    "custom:Kiro-Claude-Sonnet-4.6-3": "claude-sonnet-4.6",
+    "custom:Kiro-Claude-Haiku-4.5-4": "claude-haiku-4.5",
+    "custom:Kiro-Minimax-M2.5-5": "minimax-m2.5",
+    "custom:Kiro-Qwen3-Coder-Next-6": "qwen3-coder-next",
 }
 
 # Models to hide from /v1/models endpoint.
@@ -578,4 +585,3 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
-
