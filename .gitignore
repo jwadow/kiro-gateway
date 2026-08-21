@@ -3,11 +3,13 @@
 .env.local
 credentials.json
 state.json
+/kiro-credentials/
 
 # IDE
 .vscode/
 .idea/
 .shard/
+.DS_Store
 
 # Python
 __pycache__/
