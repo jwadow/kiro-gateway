@@ -184,6 +184,11 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
+# Optional: override the complete API host (bypasses the template).
+# Useful when the default runtime.*.kiro.dev domain is blocked by a corporate proxy.
+# Example: KIRO_API_HOST="https://codewhisperer.us-east-1.amazonaws.com"
+KIRO_API_HOST_OVERRIDE: str = os.getenv("KIRO_API_HOST", "")
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================

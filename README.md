@@ -53,6 +53,7 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 |---------|-------------|
 | 🔌 **OpenAI-compatible API** | Works with any OpenAI-compatible tool |
 | 🔌 **Anthropic-compatible API** | Native `/v1/messages` endpoint |
+| 🔌 **OpenAI Responses API** | Native `/v1/responses` endpoint for OpenAI Codex CLI |
 | 🔀 **Multi-Account Support** | Intelligent failover between multiple accounts |
 | 🌐 **VPN/Proxy Support** | HTTP/SOCKS5 proxy for restricted networks |
 | 🧠 **Extended Thinking** | Reasoning is exclusive to our project |
@@ -64,6 +65,16 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 | 🔄 **Retry Logic** | Automatic retries on errors (403, 429, 5xx) |
 | 📋 **Extended model list** | Including versioned models |
 | 🔐 **Smart token management** | Automatic refresh before expiration |
+
+---
+
+## 🆕 What's New in This Fork
+
+> This is a maintained fork with additional fixes and features on top of the upstream project.
+
+- **OpenAI Responses API support (`/v1/responses`)** — Native endpoint for the OpenAI **Codex CLI**, with streaming (SSE), tool calling, and reasoning. Server-side reasoning items (`rs_...`) sent back by Codex are safely ignored, so stateless (`store: false`) multi-turn sessions work without `Item with id rs_... not found` errors.
+- **Fix: Claude Code 422 errors from `system` role messages** — The Anthropic endpoint rejected requests where Claude Code included a `role: "system"` message inside the `messages` array (the `role` field was a strict `Literal["user", "assistant"]`, failing Pydantic validation). Such messages are now accepted.
+- **Fix: 422 errors from server-side tool content blocks** — Content blocks for `web_search` and other server-side tools were not recognized during validation and triggered a 422. They are now supported.
 
 ---
 
@@ -517,6 +528,7 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/v1/responses` | POST | OpenAI Responses API (Codex CLI) |
 
 ---
 
@@ -722,6 +734,48 @@ with client.messages.stream(
     for text in stream.text_stream:
         print(text, end="", flush=True)
 ```
+
+</details>
+
+### OpenAI Responses API (Codex CLI)
+
+The `/v1/responses` endpoint implements the OpenAI **Responses API** protocol used by [OpenAI Codex CLI](https://github.com/openai/codex). It supports text, streaming (SSE), tool calling, and reasoning.
+
+<details>
+<summary>🔹 Simple cURL Request</summary>
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "You are a helpful coding agent.",
+    "input": "List the files in the current directory.",
+    "stream": true
+  }'
+```
+
+</details>
+
+<details>
+<summary>🤖 Point Codex CLI at the gateway</summary>
+
+Configure Codex to use the gateway as an OpenAI-compatible provider (in `~/.codex/config.toml`):
+
+```toml
+model = "claude-sonnet-4-5"
+model_provider = "kiro-gateway"
+
+[model_providers.kiro-gateway]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"
+```
+
+Set your `PROXY_API_KEY` as the API key Codex sends (e.g. via `OPENAI_API_KEY` or the provider's `env_key`).
+
+> **Note on reasoning:** Kiro produces plaintext thinking, not OpenAI's encrypted reasoning items. The gateway surfaces reasoning as `reasoning` summary items and safely **ignores** any `rs_...` reasoning items Codex sends back in a follow-up turn, so stateless (`store: false`) multi-turn sessions work without `Item with id rs_... not found` errors.
 
 </details>
 

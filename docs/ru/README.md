@@ -53,6 +53,7 @@
 |-------------|----------|
 | 🔌 **API, совместимый с OpenAI** | Работает с любым инструментом, совместимым с OpenAI |
 | 🔌 **API, совместимый с Anthropic** | Нативный эндпоинт `/v1/messages` |
+| 🔌 **OpenAI Responses API** | Нативный эндпоинт `/v1/responses` для OpenAI Codex CLI |
 | 🔀 **Поддержка нескольких аккаунтов** | Интеллектуальный переход между несколькими аккаунтами |
 | 🌐 **Поддержка VPN/Proxy** | HTTP/SOCKS5 прокси для ограниченных сетей |
 | 🧠 **Расширенное мышление** | Режим рассуждений — эксклюзив нашего проекта |
@@ -64,6 +65,16 @@
 | 🔄 **Логика повторных попыток** | Автоматические повторы при ошибках (403, 429, 5xx) |
 | 📋 **Расширенный список моделей** | Включая версионные модели |
 | 🔐 **Умное управление токенами** | Автоматическое обновление до истечения срока |
+
+---
+
+## 🆕 Что нового в этом форке
+
+> Это поддерживаемый форк с дополнительными исправлениями и возможностями поверх исходного проекта.
+
+- **Поддержка OpenAI Responses API (`/v1/responses`)** — Нативный эндпоинт для OpenAI **Codex CLI** со стримингом (SSE), вызовом инструментов и рассуждениями. Серверные элементы рассуждений (`rs_...`), которые Codex отправляет обратно, безопасно игнорируются, поэтому многошаговые сессии без сохранения состояния (`store: false`) работают без ошибок `Item with id rs_... not found`.
+- **Исправление: ошибки 422 в Claude Code из-за сообщений с ролью `system`** — Эндпоинт Anthropic отклонял запросы, в которых Claude Code включал сообщение `role: "system"` внутри массива `messages` (поле `role` было строгим `Literal["user", "assistant"]`, что приводило к сбою валидации Pydantic). Теперь такие сообщения принимаются.
+- **Исправление: ошибки 422 из-за блоков контента серверных инструментов** — Блоки контента для `web_search` и других серверных инструментов не распознавались при валидации и вызывали ошибку 422. Теперь они поддерживаются.
 
 ---
 
@@ -517,6 +528,7 @@ VPN_PROXY_URL=192.168.1.100:8080
 | `/v1/models` | GET | Список доступных моделей |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/v1/responses` | POST | OpenAI Responses API (Codex CLI) |
 
 ---
 
@@ -722,6 +734,48 @@ with client.messages.stream(
     for text in stream.text_stream:
         print(text, end="", flush=True)
 ```
+
+</details>
+
+### OpenAI Responses API (Codex CLI)
+
+Эндпоинт `/v1/responses` реализует протокол OpenAI **Responses API**, используемый [OpenAI Codex CLI](https://github.com/openai/codex). Он поддерживает текст, стриминг (SSE), вызов инструментов и рассуждения.
+
+<details>
+<summary>🔹 Простой cURL-запрос</summary>
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "You are a helpful coding agent.",
+    "input": "List the files in the current directory.",
+    "stream": true
+  }'
+```
+
+</details>
+
+<details>
+<summary>🤖 Настройка Codex CLI на использование шлюза</summary>
+
+Настройте Codex на использование шлюза как провайдера, совместимого с OpenAI (в файле `~/.codex/config.toml`):
+
+```toml
+model = "claude-sonnet-4-5"
+model_provider = "kiro-gateway"
+
+[model_providers.kiro-gateway]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"
+```
+
+Укажите ваш `PROXY_API_KEY` в качестве API-ключа, который отправляет Codex (например, через `OPENAI_API_KEY` или `env_key` провайдера).
+
+> **Примечание о рассуждениях:** Kiro генерирует рассуждения в виде обычного текста, а не зашифрованных элементов рассуждений OpenAI. Шлюз представляет рассуждения как сводные элементы `reasoning` и безопасно **игнорирует** любые элементы рассуждений `rs_...`, которые Codex отправляет обратно в следующем ходе, поэтому многошаговые сессии без сохранения состояния (`store: false`) работают без ошибок `Item with id rs_... not found`.
 
 </details>
 

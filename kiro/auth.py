@@ -43,6 +43,7 @@ from loguru import logger
 from kiro.config import (
     TOKEN_REFRESH_THRESHOLD,
     SQLITE_READONLY,
+    KIRO_API_HOST_OVERRIDE,
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
@@ -219,8 +220,13 @@ class KiroAuthManager:
         # - API/Q hosts: use determined API region (for Q Developer API calls)
         sso_region_for_oidc = self._sso_region or region
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
-        self._api_host = get_kiro_api_host(final_api_region)
-        self._q_host = get_kiro_q_host(final_api_region)
+        if KIRO_API_HOST_OVERRIDE:
+            self._api_host = KIRO_API_HOST_OVERRIDE.rstrip("/")
+            self._q_host = KIRO_API_HOST_OVERRIDE.rstrip("/")
+            logger.info(f"API host overridden by KIRO_API_HOST: {self._api_host}")
+        else:
+            self._api_host = get_kiro_api_host(final_api_region)
+            self._q_host = get_kiro_q_host(final_api_region)
         
         # Log initialized endpoints for diagnostics (helps with DNS issues like #58, #132, #133)
         logger.info(
@@ -702,7 +708,7 @@ class KiroAuthManager:
         payload = {'refreshToken': self._refresh_token}
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": f"KiroIDE-0.7.45-{self._fingerprint}",
+            "User-Agent": f"KiroIDE-1.0.337-{self._fingerprint}",
         }
         
         async with httpx.AsyncClient(timeout=30) as client:

@@ -53,6 +53,7 @@
 |------|------|
 | 🔌 **兼容 OpenAI 的 API** | 与任何兼容 OpenAI 的工具配合使用 |
 | 🔌 **兼容 Anthropic 的 API** | 原生 `/v1/messages` 端点 |
+| 🔌 **OpenAI Responses API** | 面向 OpenAI Codex CLI 的原生 `/v1/responses` 端点 |
 | 🔀 **多账户支持** | 多个账户之间的智能故障转移 |
 | 🌐 **VPN/代理支持** | 用于受限网络的 HTTP/SOCKS5 代理 |
 | 🧠 **扩展思维** | 推理功能是我们项目的独家特性 |
@@ -64,6 +65,16 @@
 | 🔄 **重试逻辑** | 错误时自动重试（403、429、5xx） |
 | 📋 **扩展模型列表** | 包括版本化模型 |
 | 🔐 **智能令牌管理** | 到期前自动刷新 |
+
+---
+
+## 🆕 本 Fork 的新特性
+
+> 这是一个持续维护的 fork,在上游项目的基础上增加了额外的修复和功能。
+
+- **OpenAI Responses API 支持 (`/v1/responses`)** — 面向 OpenAI **Codex CLI** 的原生端点,支持流式传输 (SSE)、工具调用和推理。Codex 回传的服务端推理项 (`rs_...`) 会被安全忽略,因此无状态 (`store: false`) 的多轮会话可以正常工作,不会出现 `Item with id rs_... not found` 错误。
+- **修复:Claude Code 因 `system` 角色消息导致的 422 错误** — 当 Claude Code 在 `messages` 数组中包含 `role: "system"` 的消息时,Anthropic 端点会拒绝该请求(`role` 字段原本是严格的 `Literal["user", "assistant"]`,导致 Pydantic 校验失败)。现在此类消息可以被正常接受。
+- **修复:服务端工具内容块导致的 422 错误** — `web_search` 及其他服务端工具的内容块在校验时未被识别,从而触发 422。现在已支持这些内容块。
 
 ---
 
@@ -517,6 +528,7 @@ VPN_PROXY_URL=192.168.1.100:8080
 | `/v1/models` | GET | 列出可用模型 |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/v1/responses` | POST | OpenAI Responses API (Codex CLI) |
 
 ---
 
@@ -722,6 +734,48 @@ with client.messages.stream(
     for text in stream.text_stream:
         print(text, end="", flush=True)
 ```
+
+</details>
+
+### OpenAI Responses API (Codex CLI)
+
+`/v1/responses` 端点实现了 [OpenAI Codex CLI](https://github.com/openai/codex) 所使用的 OpenAI **Responses API** 协议。它支持文本、流式传输 (SSE)、工具调用和推理。
+
+<details>
+<summary>🔹 简单 cURL 请求</summary>
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "You are a helpful coding agent.",
+    "input": "List the files in the current directory.",
+    "stream": true
+  }'
+```
+
+</details>
+
+<details>
+<summary>🤖 让 Codex CLI 指向该网关</summary>
+
+将 Codex 配置为使用该网关作为兼容 OpenAI 的提供方(在 `~/.codex/config.toml` 中):
+
+```toml
+model = "claude-sonnet-4-5"
+model_provider = "kiro-gateway"
+
+[model_providers.kiro-gateway]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"
+```
+
+将您的 `PROXY_API_KEY` 设置为 Codex 发送的 API 密钥(例如通过 `OPENAI_API_KEY` 或该提供方的 `env_key`)。
+
+> **关于推理的注意事项:** Kiro 产生的是纯文本思考内容,而不是 OpenAI 的加密推理项。网关会将推理内容以 `reasoning` 摘要项的形式呈现,并会安全地**忽略** Codex 在后续轮次中回传的任何 `rs_...` 推理项,因此无状态 (`store: false`) 的多轮会话可以正常工作,不会出现 `Item with id rs_... not found` 错误。
 
 </details>
 
