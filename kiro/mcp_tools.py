@@ -41,6 +41,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import get_external_idp_headers
 
 # Import debug_logger
 try:
@@ -153,6 +154,7 @@ async def call_kiro_mcp_api(
             "x-amzn-codewhisperer-optout": "false",
             "Content-Type": "application/json"
         }
+        headers.update(get_external_idp_headers(auth_manager))
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")

@@ -454,9 +454,14 @@ prompt_tokens = total_tokens - completion_tokens             (subtraction)
 
 ### 3.14. Kiro API Endpoints
 
-All URLs are dynamically formed based on the region:
+Runtime URLs are dynamically formed based on the region. Token refresh is
+selected from the credential type:
 
-*   **Token Refresh:** `POST https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
+*   **Kiro Desktop Refresh:** `POST https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
+*   **AWS SSO OIDC Refresh:** `POST https://oidc.{region}.amazonaws.com/token`
+*   **External IdP Refresh:** `POST` to the validated HTTPS `tokenEndpoint`
+    stored by Kiro IDE. Uses a public-client refresh grant and adds
+    `TokenType: EXTERNAL_IDP` to subsequent Kiro requests.
 *   **List Models:** `GET https://q.{region}.amazonaws.com/ListAvailableModels`
 *   **Generate Response:** `POST https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse`
 
@@ -651,6 +656,12 @@ TOOL_DESCRIPTION_MAX_LENGTH="10000"
   "region": "us-east-1"
 }
 ```
+
+Enterprise Kiro IDE credentials can additionally contain `authMethod`,
+`provider`, `clientId`, `issuerUrl`, `tokenEndpoint`, and `scopes`. When
+`authMethod` is `external_idp`, the selected CodeWhisperer profile ARN is read
+from Kiro IDE extension global storage because it is not part of the token
+cache.
 
 ## 7. API Endpoints
 

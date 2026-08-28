@@ -28,6 +28,40 @@ from kiro.mcp_tools import (
 )
 
 
+class TestExternalIdpMCPHeaders:
+    """Tests External IdP authentication headers on the separate MCP path."""
+
+    @pytest.mark.asyncio
+    async def test_mcp_request_includes_external_token_type(self) -> None:
+        """
+        What it does: Calls MCP with an External IdP authentication manager.
+        Purpose: Ensure web search receives Kiro's required token-type header.
+        """
+        auth_manager = Mock()
+        auth_manager.get_access_token = AsyncMock(return_value="external_access")
+        auth_manager.q_host = "https://q.us-east-1.api.aws"
+        auth_manager.token_type = "EXTERNAL_IDP"
+        mcp_response = {
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{"type": "text", "text": json.dumps({"results": []})}],
+                "isError": False,
+            },
+        }
+        response = Mock(status_code=200)
+        response.json.return_value = mcp_response
+        post = AsyncMock(return_value=response)
+        client = AsyncMock()
+        client.__aenter__.return_value.post = post
+
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=client):
+            await call_kiro_mcp_api("test", auth_manager)
+
+        headers = post.await_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer external_access"
+        assert headers["TokenType"] == "EXTERNAL_IDP"
+
+
 # ==================================================================================================
 # Tests for ID Generation
 # ==================================================================================================

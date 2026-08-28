@@ -407,7 +407,13 @@ class TestServerPortConfig:
         """
         print("Setup: Removing SERVER_PORT from environment...")
         
-        with patch.dict(os.environ, {}, clear=False):
+        # Prevent the project .env from re-populating SERVER_PORT during the
+        # module reload. The test is specifically validating the no-config
+        # default and must remain isolated from a developer's local settings.
+        with patch.dict(os.environ, {}, clear=False), patch(
+            "dotenv.load_dotenv",
+            return_value=False,
+        ):
             if "SERVER_PORT" in os.environ:
                 del os.environ["SERVER_PORT"]
             

@@ -143,6 +143,14 @@ PROXY_API_KEY="my-super-secret-password-123"
 
 > **Note:** If you have two JSON files in `~/.aws/sso/cache/` (e.g., `kiro-auth-token.json` and a file with a hash name), use `kiro-auth-token.json` in `KIRO_CREDS_FILE`. The gateway will automatically load the other file.
 
+Current Kiro IDE versions may use a direct enterprise OIDC provider such as
+Microsoft Entra ID. Those files are detected from `authMethod: "external_idp"`
+and include `clientId`, `issuerUrl`, `tokenEndpoint`, and `scopes`. The gateway
+refreshes the token directly with that provider and automatically reads the
+selected `profileArn` from Kiro IDE's extension storage. Keep Kiro IDE signed
+in and point `KIRO_CREDS_FILE` at the file it manages; no client secret or
+manual `PROFILE_ARN` is required.
+
 </details>
 
 ### Option 2: Environment Variables (.env file)
@@ -201,6 +209,12 @@ AWS SSO credentials files (from `~/.aws/sso/cache/`) contain:
 <summary>🔍 How it works</summary>
 
 The gateway automatically detects the authentication type based on the credentials file:
+
+- **External IdP (Entra ID, Okta, compatible OIDC)**: Used when Kiro marks the
+  credentials with `authMethod: "external_idp"` or `provider: "ExternalIdp"`
+  - Endpoint: The HTTPS `tokenEndpoint` recorded by Kiro IDE
+  - Request: OAuth public-client refresh grant (no client secret)
+  - Kiro API requests include `TokenType: EXTERNAL_IDP`
 
 - **Kiro Desktop Auth** (default): Used when `clientId` and `clientSecret` are NOT present
   - Endpoint: `https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
