@@ -26,8 +26,12 @@ and other common utilities.
 
 import hashlib
 import json
+import os
+import re
+import sys
 import uuid
-from typing import TYPE_CHECKING, List, Dict, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from loguru import logger
 
@@ -58,7 +62,27 @@ def get_machine_fingerprint() -> str:
         return hashlib.sha256(b"default-kiro-gateway").hexdigest()
 
 
-def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
+def get_external_idp_headers(auth_manager: "KiroAuthManager") -> Dict[str, str]:
+    """
+    Builds request headers that are specific to External IdP authentication.
+
+    Kiro marks tokens issued by a configured enterprise identity provider with
+    ``TokenType: EXTERNAL_IDP``. The header is required for both the Q runtime
+    and MCP endpoints; without it, a valid Entra ID token is rejected.
+
+    Args:
+        auth_manager: Authentication manager describing the active auth type.
+
+    Returns:
+        External IdP headers, or an empty dictionary for other auth types.
+    """
+    token_type = getattr(auth_manager, "token_type", None)
+    if token_type == "EXTERNAL_IDP":
+        return {"TokenType": token_type}
+    return {}
+
+
+def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> Dict[str, str]:
     """
     Builds headers for Kiro API requests.
     
@@ -76,7 +100,7 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
     """
     fingerprint = auth_manager.fingerprint
     
-    return {
+    headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/x-amz-json-1.0",
         "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
@@ -87,6 +111,139 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
         "amz-sdk-invocation-id": str(uuid.uuid4()),
         "amz-sdk-request": "attempt=1; max=3",
     }
+    headers.update(get_external_idp_headers(auth_manager))
+    return headers
+
+
+def get_kiro_agent_profile_roots() -> List[Path]:
+    """
+    Returns platform-specific Kiro Agent global-storage directories.
+
+    Returns:
+        Candidate directories containing Kiro's ``profile.json`` file.
+    """
+    if sys.platform == "darwin":
+        return [
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "Kiro"
+            / "User"
+            / "globalStorage"
+            / "kiro.kiroagent"
+        ]
+
+    if os.name == "nt":
+        app_data = os.getenv("APPDATA")
+        if not app_data:
+            return []
+        return [
+            Path(app_data)
+            / "Kiro"
+            / "User"
+            / "globalStorage"
+            / "kiro.kiroagent"
+        ]
+
+    config_home = Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    return [
+        config_home
+        / "Kiro"
+        / "User"
+        / "globalStorage"
+        / "kiro.kiroagent"
+    ]
+
+
+def _is_valid_profile_arn(profile_arn: Any) -> bool:
+    """
+    Validates a Kiro/CodeWhisperer profile ARN.
+
+    Args:
+        profile_arn: Candidate value read from Kiro state.
+
+    Returns:
+        True when the value has the expected profile ARN structure.
+    """
+    if not isinstance(profile_arn, str):
+        return False
+    return bool(
+        re.fullmatch(
+            r"arn:[^:]+:codewhisperer:[a-z0-9-]+:[^:]*:profile/.+",
+            profile_arn,
+        )
+    )
+
+
+def detect_kiro_agent_profile_arn(
+    search_roots: Optional[List[Path]] = None,
+) -> Optional[str]:
+    """
+    Detects the active CodeWhisperer profile ARN stored by Kiro IDE.
+
+    The External IdP credential cache does not contain ``profileArn``. Kiro
+    stores the selected profile separately in its extension global storage, so
+    the gateway reads that file when External IdP auth is active.
+
+    Args:
+        search_roots: Optional directories to search instead of platform
+            defaults. This is primarily useful for tests.
+
+    Returns:
+        The first valid profile ARN found, otherwise None.
+    """
+    roots = search_roots if search_roots is not None else get_kiro_agent_profile_roots()
+
+    for root in roots:
+        candidates = [root / "profile.json"]
+        if root.exists():
+            try:
+                candidates.extend(
+                    path for path in sorted(root.rglob("profile.json"))
+                    if path not in candidates
+                )
+            except OSError as error:
+                logger.debug(f"Unable to search Kiro profile directory {root}: {error}")
+
+        for profile_path in candidates:
+            try:
+                with open(profile_path, "r", encoding="utf-8") as profile_file:
+                    profile_data = json.load(profile_file)
+            except FileNotFoundError:
+                continue
+            except (OSError, json.JSONDecodeError, TypeError) as error:
+                logger.debug(f"Unable to read Kiro profile file {profile_path}: {error}")
+                continue
+
+            if not isinstance(profile_data, dict):
+                continue
+
+            profile_arn = profile_data.get("arn") or profile_data.get("profileArn")
+            if _is_valid_profile_arn(profile_arn):
+                logger.info(f"Profile ARN auto-detected from Kiro IDE: {profile_path}")
+                return profile_arn
+
+            logger.debug(f"Ignoring invalid profile ARN in {profile_path}")
+
+    return None
+
+
+def extract_region_from_profile_arn(profile_arn: str) -> Optional[str]:
+    """
+    Extracts the AWS region from a validated CodeWhisperer profile ARN.
+
+    Args:
+        profile_arn: CodeWhisperer profile ARN.
+
+    Returns:
+        AWS region from the ARN, otherwise None.
+    """
+    if not _is_valid_profile_arn(profile_arn):
+        return None
+    region = profile_arn.split(":", 5)[3]
+    if re.fullmatch(r"[a-z]+(?:-[a-z0-9]+)+-\d+", region):
+        return region
+    return None
 
 
 def generate_completion_id() -> str:

@@ -384,6 +384,41 @@ class TestMessagesValidation:
 
 class TestMessagesSystemPrompt:
     """Tests for system prompt handling on /v1/messages endpoint."""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_accepts_claude_code_inline_system_message(
+        self, test_client, valid_proxy_api_key, stream
+    ):
+        """
+        What it does: Sends Claude Code's system-role message shape in both response modes.
+        Purpose: Prevent 422 validation failures for streaming and non-streaming requests.
+        """
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "hello"}],
+                    },
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "<system-reminder>Use the current date.</system-reminder>",
+                            }
+                        ],
+                    },
+                ],
+                "stream": stream,
+            },
+        )
+
+        assert response.status_code != 422
     
     def test_accepts_system_as_separate_field(self, test_client, valid_proxy_api_key):
         """
@@ -2148,6 +2183,33 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print(f"✅ Token count: {data['input_tokens']} tokens")
+
+    def test_count_tokens_accepts_inline_system_message(
+        self, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Counts a Claude Code request containing an inline system message.
+        Purpose: Keep Claude Code's compaction preflight compatible with message generation.
+        """
+        response = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-5",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "Runtime system reminder"}
+                        ],
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["input_tokens"] > 0
     
     def test_count_tokens_with_tools(self, test_client, valid_proxy_api_key):
         """

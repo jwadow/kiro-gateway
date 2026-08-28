@@ -7,13 +7,75 @@ Tests token management logic for Kiro without real network requests.
 
 import asyncio
 import json
+import sqlite3
 import pytest
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from kiro.auth import KiroAuthManager, AuthType
-from kiro.config import TOKEN_REFRESH_THRESHOLD, get_aws_sso_oidc_url
+from kiro.config import MAX_RETRIES, TOKEN_REFRESH_THRESHOLD, get_aws_sso_oidc_url
+from kiro.utils import detect_kiro_agent_profile_arn, get_kiro_headers
+
+
+@pytest.fixture
+def temp_external_idp_creds_file(tmp_path: Path) -> str:
+    """
+    Creates a Kiro IDE External IdP credential cache for isolated tests.
+
+    Returns:
+        Path to the temporary JSON credential file.
+    """
+    credentials = {
+        "authMethod": "external_idp",
+        "provider": "ExternalIdp",
+        "accessToken": "expired_external_access_token",
+        "refreshToken": "external_refresh_token",
+        "expiresAt": "2020-01-01T00:00:00.000Z",
+        "clientId": "external_public_client_id",
+        "issuerUrl": "https://login.microsoftonline.com/test-tenant/v2.0",
+        "tokenEndpoint": (
+            "https://login.microsoftonline.com/test-tenant/oauth2/v2.0/token"
+        ),
+        "scopes": "openid profile offline_access codewhisperer:completions",
+    }
+    credentials_path = tmp_path / "external-idp.json"
+    credentials_path.write_text(json.dumps(credentials), encoding="utf-8")
+    return str(credentials_path)
+
+
+@pytest.fixture
+def external_idp_manager(temp_external_idp_creds_file: str) -> KiroAuthManager:
+    """
+    Creates an External IdP manager without reading workstation profile state.
+
+    Returns:
+        Initialized External IdP authentication manager.
+    """
+    with patch("kiro.auth.detect_kiro_agent_profile_arn", return_value=None):
+        return KiroAuthManager(creds_file=temp_external_idp_creds_file)
+
+
+def make_external_idp_response(
+    status_code: int = 200,
+    payload: dict | None = None,
+) -> httpx.Response:
+    """
+    Builds an HTTP response associated with a provider token request.
+
+    Args:
+        status_code: HTTP response status.
+        payload: JSON response body.
+
+    Returns:
+        HTTPX response suitable for refresh tests.
+    """
+    request = httpx.Request(
+        "POST",
+        "https://login.microsoftonline.com/test-tenant/oauth2/v2.0/token",
+    )
+    return httpx.Response(status_code, json=payload or {}, request=request)
 
 
 class TestKiroAuthManagerInitialization:
@@ -511,16 +573,19 @@ class TestAuthTypeEnum:
     def test_auth_type_enum_values(self):
         """
         What it does: Verifies AuthType enum values.
-        Purpose: Ensure enum contains KIRO_DESKTOP and AWS_SSO_OIDC.
+        Purpose: Ensure enum contains all supported authentication mechanisms.
         """
         print("Verification: AuthType contains KIRO_DESKTOP...")
         assert AuthType.KIRO_DESKTOP.value == "kiro_desktop"
         
         print("Verification: AuthType contains AWS_SSO_OIDC...")
         assert AuthType.AWS_SSO_OIDC.value == "aws_sso_oidc"
+
+        print("Verification: AuthType contains EXTERNAL_IDP...")
+        assert AuthType.EXTERNAL_IDP.value == "external_idp"
         
-        print(f"Comparing value count: Expected 2, Got {len(AuthType)}")
-        assert len(AuthType) == 2
+        print(f"Comparing value count: Expected 3, Got {len(AuthType)}")
+        assert len(AuthType) == 3
 
 
 # =============================================================================
@@ -4251,3 +4316,491 @@ class TestAPIRegionPriorityHierarchy:
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
 
+
+# =============================================================================
+# Tests for Kiro IDE External IdP authentication
+# =============================================================================
+
+
+class TestExternalIdpCredentialLoading:
+    """Tests External IdP detection, loading, and Kiro profile discovery."""
+
+    def test_loads_current_kiro_external_idp_schema(
+        self,
+        external_idp_manager: KiroAuthManager,
+    ) -> None:
+        """
+        What it does: Loads the External IdP fields written by Kiro IDE.
+        Purpose: Prevent Entra credentials from falling back to desktop auth.
+        """
+        assert external_idp_manager.auth_type == AuthType.EXTERNAL_IDP
+        assert external_idp_manager._client_id == "external_public_client_id"
+        assert external_idp_manager._provider == "ExternalIdp"
+        assert external_idp_manager._token_endpoint.endswith("/oauth2/v2.0/token")
+        assert "offline_access" in external_idp_manager._external_scopes
+        assert external_idp_manager.token_type == "EXTERNAL_IDP"
+
+    def test_external_marker_takes_priority_over_client_secret(
+        self,
+        temp_external_idp_creds_file: str,
+    ) -> None:
+        """
+        What it does: Detects explicit External IdP metadata before AWS SSO.
+        Purpose: Ensure extra cache fields cannot route Entra tokens to AWS OIDC.
+        """
+        credentials_path = Path(temp_external_idp_creds_file)
+        credentials = json.loads(credentials_path.read_text(encoding="utf-8"))
+        credentials["clientSecret"] = "unexpected_secret"
+        credentials_path.write_text(json.dumps(credentials), encoding="utf-8")
+
+        with patch("kiro.auth.detect_kiro_agent_profile_arn", return_value=None):
+            manager = KiroAuthManager(creds_file=temp_external_idp_creds_file)
+
+        assert manager.auth_type == AuthType.EXTERNAL_IDP
+
+    def test_auto_detects_profile_and_region_from_kiro_ide(
+        self,
+        temp_external_idp_creds_file: str,
+    ) -> None:
+        """
+        What it does: Reads Kiro's separately stored active enterprise profile.
+        Purpose: Supply runtime profileArn without manual .env configuration.
+        """
+        profile_arn = (
+            "arn:aws:codewhisperer:eu-central-1:123456789012:profile/test-profile"
+        )
+        with patch(
+            "kiro.auth.detect_kiro_agent_profile_arn",
+            return_value=profile_arn,
+        ):
+            manager = KiroAuthManager(creds_file=temp_external_idp_creds_file)
+
+        assert manager.profile_arn == profile_arn
+        assert "runtime.eu-central-1.kiro.dev" in manager.api_host
+
+    def test_derives_region_from_profile_persisted_after_refresh(
+        self,
+        temp_external_idp_creds_file: str,
+    ) -> None:
+        """
+        What it does: Restarts from an External IdP cache containing profileArn.
+        Purpose: Preserve automatic region selection after the first refresh.
+        """
+        credentials_path = Path(temp_external_idp_creds_file)
+        credentials = json.loads(credentials_path.read_text(encoding="utf-8"))
+        credentials["profileArn"] = (
+            "arn:aws:codewhisperer:eu-west-1:123456789012:profile/test-profile"
+        )
+        credentials_path.write_text(json.dumps(credentials), encoding="utf-8")
+
+        with patch("kiro.auth.detect_kiro_agent_profile_arn") as detect_mock:
+            manager = KiroAuthManager(creds_file=temp_external_idp_creds_file)
+
+        detect_mock.assert_not_called()
+        assert manager.profile_arn == credentials["profileArn"]
+        assert "runtime.eu-west-1.kiro.dev" in manager.api_host
+
+    @pytest.mark.parametrize("profile_key", ["arn", "profileArn"])
+    def test_profile_discovery_supports_known_key_names(
+        self,
+        tmp_path: Path,
+        profile_key: str,
+    ) -> None:
+        """
+        What it does: Parses both Kiro profile-file key variants.
+        Purpose: Preserve compatibility across Kiro IDE releases.
+        """
+        profile_arn = (
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/test-profile"
+        )
+        profile_root = tmp_path / "kiro.kiroagent"
+        profile_root.mkdir()
+        (profile_root / "profile.json").write_text(
+            json.dumps({profile_key: profile_arn}),
+            encoding="utf-8",
+        )
+
+        assert detect_kiro_agent_profile_arn([profile_root]) == profile_arn
+
+    @pytest.mark.parametrize(
+        "profile_contents",
+        ["not-json", json.dumps({"arn": "https://example.com/not-an-arn"}), "[]"],
+    )
+    def test_profile_discovery_ignores_malformed_state(
+        self,
+        tmp_path: Path,
+        profile_contents: str,
+    ) -> None:
+        """
+        What it does: Rejects malformed profile files and invalid ARN values.
+        Purpose: Avoid sending corrupt local state to the Kiro runtime.
+        """
+        profile_root = tmp_path / "kiro.kiroagent"
+        profile_root.mkdir()
+        (profile_root / "profile.json").write_text(profile_contents, encoding="utf-8")
+
+        assert detect_kiro_agent_profile_arn([profile_root]) is None
+
+
+class TestExternalIdpValidation:
+    """Tests required fields and SSRF-resistant endpoint validation."""
+
+    @pytest.mark.parametrize(
+        ("token_endpoint", "issuer_url", "expected_message"),
+        [
+            (
+                "http://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+                "https://login.microsoftonline.com/tenant/v2.0",
+                "tokenEndpoint must be an HTTPS URL",
+            ),
+            (
+                "https://user:password@login.microsoftonline.com/tenant/token",
+                "https://login.microsoftonline.com/tenant/v2.0",
+                "without embedded credentials",
+            ),
+            (
+                "https://tokens.example.com/oauth/token",
+                "https://issuer.example.com/",
+                "host must match issuerUrl host",
+            ),
+        ],
+    )
+    def test_rejects_unsafe_or_inconsistent_provider_urls(
+        self,
+        external_idp_manager: KiroAuthManager,
+        token_endpoint: str,
+        issuer_url: str,
+        expected_message: str,
+    ) -> None:
+        """
+        What it does: Validates provider-controlled refresh destinations.
+        Purpose: Prevent credential disclosure to unsafe endpoints.
+        """
+        external_idp_manager._token_endpoint = token_endpoint
+        external_idp_manager._issuer_url = issuer_url
+
+        with pytest.raises(ValueError, match=expected_message):
+            external_idp_manager._validate_external_idp_configuration()
+
+    @pytest.mark.parametrize(
+        ("missing_field", "expected_message"),
+        [
+            ("_refresh_token", "refresh token is missing"),
+            ("_client_id", "clientId is missing"),
+            ("_token_endpoint", "tokenEndpoint is missing"),
+        ],
+    )
+    def test_reports_actionable_missing_credential_fields(
+        self,
+        external_idp_manager: KiroAuthManager,
+        missing_field: str,
+        expected_message: str,
+    ) -> None:
+        """
+        What it does: Fails before network I/O when required data is absent.
+        Purpose: Direct users back to Kiro login instead of legacy endpoints.
+        """
+        setattr(external_idp_manager, missing_field, None)
+
+        with pytest.raises(ValueError, match=expected_message):
+            external_idp_manager._validate_external_idp_configuration()
+
+
+class TestExternalIdpRefresh:
+    """Tests OAuth refresh behavior, rotation persistence, and retry handling."""
+
+    @pytest.mark.asyncio
+    async def test_refresh_uses_public_client_form_grant_and_persists_rotation(
+        self,
+        external_idp_manager: KiroAuthManager,
+        temp_external_idp_creds_file: str,
+    ) -> None:
+        """
+        What it does: Refreshes Entra tokens using Kiro's public-client flow.
+        Purpose: Match the working Kiro IDE request without a client secret.
+        """
+        response = make_external_idp_response(
+            payload={
+                "access_token": "new_external_access_token",
+                "refresh_token": "rotated_external_refresh_token",
+                "expires_in": 3600,
+            }
+        )
+        post = AsyncMock(return_value=response)
+        client = AsyncMock()
+        client.__aenter__.return_value.post = post
+
+        with patch("kiro.auth.httpx.AsyncClient", return_value=client):
+            await external_idp_manager._refresh_token_request()
+
+        post.assert_awaited_once()
+        call = post.await_args
+        assert call.args[0] == external_idp_manager._token_endpoint
+        assert call.kwargs["data"] == {
+            "grant_type": "refresh_token",
+            "client_id": "external_public_client_id",
+            "refresh_token": "external_refresh_token",
+            "scope": "openid profile offline_access codewhisperer:completions",
+        }
+        assert "client_secret" not in call.kwargs["data"]
+        assert call.kwargs["headers"]["Content-Type"] == (
+            "application/x-www-form-urlencoded"
+        )
+        assert external_idp_manager._access_token == "new_external_access_token"
+        assert external_idp_manager._refresh_token == "rotated_external_refresh_token"
+
+        saved = json.loads(Path(temp_external_idp_creds_file).read_text(encoding="utf-8"))
+        assert saved["accessToken"] == "new_external_access_token"
+        assert saved["refreshToken"] == "rotated_external_refresh_token"
+        assert saved["tokenEndpoint"] == external_idp_manager._token_endpoint
+        assert saved["clientId"] == "external_public_client_id"
+
+    @pytest.mark.asyncio
+    async def test_refresh_reloads_rotated_credentials_once_after_unauthorized(
+        self,
+        external_idp_manager: KiroAuthManager,
+    ) -> None:
+        """
+        What it does: Retries an auth rejection after reloading Kiro state.
+        Purpose: Cooperate safely with refresh-token rotation by Kiro IDE.
+        """
+        responses = [
+            make_external_idp_response(401, {"error": "invalid_grant"}),
+            make_external_idp_response(
+                payload={"access_token": "fresh_access", "expires_in": 3600}
+            ),
+        ]
+        post = AsyncMock(side_effect=responses)
+        client = AsyncMock()
+        client.__aenter__.return_value.post = post
+
+        def reload_credentials() -> None:
+            external_idp_manager._refresh_token = "rotated_by_kiro"
+
+        with (
+            patch("kiro.auth.httpx.AsyncClient", return_value=client),
+            patch.object(
+                external_idp_manager,
+                "_reload_external_idp_credentials",
+                side_effect=reload_credentials,
+            ) as reload_mock,
+        ):
+            await external_idp_manager._refresh_token_external_idp()
+
+        reload_mock.assert_called_once()
+        assert post.await_count == 2
+        assert post.await_args_list[1].kwargs["data"]["refresh_token"] == "rotated_by_kiro"
+
+    @pytest.mark.asyncio
+    async def test_refresh_retries_transient_http_failure(
+        self,
+        external_idp_manager: KiroAuthManager,
+    ) -> None:
+        """
+        What it does: Retries provider throttling and server failures.
+        Purpose: Avoid surfacing short-lived IdP outages to API clients.
+        """
+        responses = [
+            make_external_idp_response(500, {"error": "temporarily_unavailable"}),
+            make_external_idp_response(
+                payload={"access_token": "fresh_access", "expires_in": 3600}
+            ),
+        ]
+        post = AsyncMock(side_effect=responses)
+        client = AsyncMock()
+        client.__aenter__.return_value.post = post
+
+        with (
+            patch("kiro.auth.httpx.AsyncClient", return_value=client),
+            patch("kiro.auth.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+        ):
+            await external_idp_manager._refresh_token_external_idp()
+
+        assert post.await_count == 2
+        sleep_mock.assert_awaited_once_with(1.0)
+
+    @pytest.mark.asyncio
+    async def test_refresh_retries_timeout_then_succeeds(
+        self,
+        external_idp_manager: KiroAuthManager,
+    ) -> None:
+        """
+        What it does: Retries a provider read timeout.
+        Purpose: Cover transient network errors independently from HTTP status.
+        """
+        request = httpx.Request("POST", external_idp_manager._token_endpoint)
+        post = AsyncMock(
+            side_effect=[
+                httpx.ReadTimeout("provider timeout", request=request),
+                make_external_idp_response(
+                    payload={"access_token": "fresh_access", "expires_in": 3600}
+                ),
+            ]
+        )
+        client = AsyncMock()
+        client.__aenter__.return_value.post = post
+
+        with (
+            patch("kiro.auth.httpx.AsyncClient", return_value=client),
+            patch("kiro.auth.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+        ):
+            await external_idp_manager._refresh_token_external_idp()
+
+        assert post.await_count == 2
+        sleep_mock.assert_awaited_once_with(1.0)
+
+    @pytest.mark.asyncio
+    async def test_refresh_stops_after_bounded_transient_retries(
+        self,
+        external_idp_manager: KiroAuthManager,
+    ) -> None:
+        """
+        What it does: Exhausts the configured transient retry budget.
+        Purpose: Ensure an unavailable IdP cannot hang gateway requests forever.
+        """
+        response = make_external_idp_response(
+            503,
+            {"error": "temporarily_unavailable"},
+        )
+        post = AsyncMock(return_value=response)
+        client = AsyncMock()
+        client.__aenter__.return_value.post = post
+
+        with (
+            patch("kiro.auth.httpx.AsyncClient", return_value=client),
+            patch("kiro.auth.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            await external_idp_manager._refresh_token_external_idp()
+
+        assert post.await_count == MAX_RETRIES + 1
+        assert sleep_mock.await_count == MAX_RETRIES
+
+    @pytest.mark.asyncio
+    async def test_get_access_token_uses_fresh_token_written_by_kiro(
+        self,
+        external_idp_manager: KiroAuthManager,
+        temp_external_idp_creds_file: str,
+    ) -> None:
+        """
+        What it does: Reloads the IDE cache before issuing a refresh grant.
+        Purpose: Avoid unnecessary rotation when Kiro already refreshed a token.
+        """
+        credentials_path = Path(temp_external_idp_creds_file)
+        credentials = json.loads(credentials_path.read_text(encoding="utf-8"))
+        credentials["accessToken"] = "fresh_token_from_kiro"
+        credentials["expiresAt"] = "2099-01-01T00:00:00.000Z"
+        credentials_path.write_text(json.dumps(credentials), encoding="utf-8")
+
+        with patch.object(
+            external_idp_manager,
+            "_refresh_token_request",
+            new_callable=AsyncMock,
+        ) as refresh_mock:
+            token = await external_idp_manager.get_access_token()
+
+        assert token == "fresh_token_from_kiro"
+        refresh_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_token_response_without_access_token(
+        self,
+        external_idp_manager: KiroAuthManager,
+    ) -> None:
+        """
+        What it does: Rejects a syntactically valid but incomplete response.
+        Purpose: Never replace working state with a missing access token.
+        """
+        response = make_external_idp_response(payload={"expires_in": 3600})
+        post = AsyncMock(return_value=response)
+        client = AsyncMock()
+        client.__aenter__.return_value.post = post
+
+        with (
+            patch("kiro.auth.httpx.AsyncClient", return_value=client),
+            pytest.raises(ValueError, match="did not contain access_token"),
+        ):
+            await external_idp_manager._do_external_idp_refresh()
+
+
+class TestExternalIdpSqlitePersistence:
+    """Tests complete External IdP metadata round-tripping in kiro-cli SQLite."""
+
+    def test_loads_and_preserves_external_idp_metadata(self, tmp_path: Path) -> None:
+        """
+        What it does: Loads and saves the External IdP SQLite record.
+        Purpose: Avoid losing refresh-critical metadata during token rotation.
+        """
+        database_path = tmp_path / "data.sqlite3"
+        token_data = {
+            "auth_method": "external_idp",
+            "provider": "ExternalIdp",
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "expires_at": "2020-01-01T00:00:00Z",
+            "client_id": "sqlite_public_client",
+            "issuer_url": "https://login.microsoftonline.com/tenant/v2.0",
+            "token_endpoint": (
+                "https://login.microsoftonline.com/tenant/oauth2/v2.0/token"
+            ),
+            "scopes": ["openid", "offline_access"],
+            "future_field": "preserve-me",
+        }
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+            connection.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT)")
+            connection.execute(
+                "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+                ("kirocli:external-idp:token", json.dumps(token_data)),
+            )
+
+        with patch("kiro.auth.detect_kiro_agent_profile_arn", return_value=None):
+            manager = KiroAuthManager(sqlite_db=str(database_path))
+        assert manager.auth_type == AuthType.EXTERNAL_IDP
+        assert manager._client_id == "sqlite_public_client"
+        assert manager._external_scopes == "openid offline_access"
+
+        manager._access_token = "new_access"
+        manager._refresh_token = "new_refresh"
+        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        manager._save_credentials_to_sqlite()
+
+        with sqlite3.connect(database_path) as connection:
+            saved_json = connection.execute(
+                "SELECT value FROM auth_kv WHERE key = ?",
+                ("kirocli:external-idp:token",),
+            ).fetchone()[0]
+        saved = json.loads(saved_json)
+        assert saved["access_token"] == "new_access"
+        assert saved["refresh_token"] == "new_refresh"
+        assert saved["token_endpoint"] == token_data["token_endpoint"]
+        assert saved["issuer_url"] == token_data["issuer_url"]
+        assert saved["client_id"] == "sqlite_public_client"
+        assert saved["scopes"] == "openid offline_access"
+        assert saved["future_field"] == "preserve-me"
+
+
+class TestExternalIdpRequestHeaders:
+    """Tests shared Kiro request headers for External IdP access tokens."""
+
+    def test_runtime_headers_include_external_token_type(
+        self,
+        external_idp_manager: KiroAuthManager,
+    ) -> None:
+        """
+        What it does: Builds shared runtime headers for External IdP auth.
+        Purpose: Cover OpenAI/Anthropic streaming and non-streaming paths.
+        """
+        headers = get_kiro_headers(external_idp_manager, "external_access_token")
+
+        assert headers["Authorization"] == "Bearer external_access_token"
+        assert headers["TokenType"] == "EXTERNAL_IDP"
+
+    def test_non_external_runtime_headers_do_not_include_token_type(self) -> None:
+        """
+        What it does: Builds legacy desktop headers after the shared change.
+        Purpose: Prevent regressions for existing authentication methods.
+        """
+        manager = KiroAuthManager(refresh_token="desktop_refresh")
+
+        assert "TokenType" not in get_kiro_headers(manager, "desktop_access")
