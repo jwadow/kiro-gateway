@@ -589,6 +589,25 @@ class TestFallbackModelsConfig:
         print("Verification: Contains at least one Claude model...")
         has_claude = any("claude" in mid.lower() for mid in model_ids)
         assert has_claude, "No Claude models in fallback list"
+
+    def test_fallback_models_include_current_kiro_ide_models(self) -> None:
+        """
+        What it does: Verifies that newly advertised Kiro IDE models are present.
+        Purpose: Ensure list-only clients can select every requested current model.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        expected_models = {
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4.8",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        }
+        advertised_models = {model["modelId"] for model in FALLBACK_MODELS}
+
+        assert expected_models <= advertised_models
     
     def test_fallback_models_use_dot_format(self):
         """
@@ -694,6 +713,34 @@ class TestFallbackModelsIntegration:
         
         print(f"Comparing sets: Expected {fallback_ids}, Got {available_set}")
         assert fallback_ids == available_set
+
+    @pytest.mark.asyncio
+    async def test_current_kiro_ide_models_resolve_without_rewriting(self) -> None:
+        """
+        What it does: Resolves each newly advertised model through the cache.
+        Purpose: Ensure selecting a listed model sends its exact Kiro model ID.
+        """
+        from kiro.cache import ModelInfoCache
+        from kiro.config import FALLBACK_MODELS
+        from kiro.model_resolver import ModelResolver
+
+        expected_models = {
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4.8",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        }
+        cache = ModelInfoCache()
+        await cache.update(FALLBACK_MODELS)
+        resolver = ModelResolver(cache=cache, hidden_models={})
+
+        for model_id in expected_models:
+            resolution = resolver.resolve(model_id)
+            assert resolution.source == "cache"
+            assert resolution.is_verified is True
+            assert resolution.internal_id == model_id
 
 
 # ==================================================================================================
