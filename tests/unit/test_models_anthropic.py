@@ -389,6 +389,33 @@ class TestContentBlockUnion:
 
 
 # ==================================================================================================
+# Tests for AnthropicMessage roles
+# ==================================================================================================
+
+
+class TestAnthropicMessageRoles:
+    """Tests for roles accepted by AnthropicMessage."""
+
+    @pytest.mark.parametrize("role", ["user", "assistant", "system"])
+    def test_accepts_supported_roles(self, role):
+        """
+        What it does: Verifies all gateway-supported Anthropic roles validate.
+        Purpose: Support Claude Code inline system messages without weakening role validation.
+        """
+        message = AnthropicMessage(role=role, content="Test content")
+
+        assert message.role == role
+
+    def test_rejects_unknown_role(self):
+        """
+        What it does: Verifies arbitrary message roles remain invalid.
+        Purpose: Ensure Claude Code compatibility does not allow malformed roles.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role="developer", content="Test content")
+
+
+# ==================================================================================================
 # Tests for AnthropicMessage with Image Content (Issue #30 fix verification)
 # ==================================================================================================
 

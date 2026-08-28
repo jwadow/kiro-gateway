@@ -686,7 +686,8 @@ curl http://localhost:8000/v1/messages \
   }'
 ```
 
-> **Note:** In Anthropic API, `system` is a separate field, not a message.
+> **Note:** Standard Anthropic requests use a separate `system` field. For Claude Code compatibility,
+> the gateway also accepts `system` entries inside `messages` and promotes them to the Kiro system prompt.
 
 </details>
 

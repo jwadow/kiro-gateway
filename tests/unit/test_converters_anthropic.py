@@ -18,6 +18,7 @@ from unittest.mock import patch, MagicMock
 from kiro.converters_anthropic import (
     convert_anthropic_content_to_text,
     extract_system_prompt,
+    extract_inline_system_messages,
     extract_tool_results_from_anthropic_content,
     extract_images_from_tool_results,
     extract_tool_uses_from_anthropic_content,
@@ -939,6 +940,76 @@ class TestExtractToolUsesFromAnthropicContent:
 
 
 # ==================================================================================================
+# Tests for extract_inline_system_messages
+# ==================================================================================================
+
+
+class TestExtractInlineSystemMessages:
+    """Tests for Claude Code inline system-message extraction."""
+
+    def test_extracts_inline_system_message_and_preserves_user_turn(self):
+        """
+        What it does: Extracts a system message that follows a user message.
+        Purpose: Ensure Claude Code's actual user turn remains the active Kiro message.
+        """
+        messages = [
+            AnthropicMessage(role="user", content="hello"),
+            AnthropicMessage(
+                role="system",
+                content=[{"type": "text", "text": "Runtime reminder"}],
+            ),
+        ]
+
+        system_prompt, conversational_messages = extract_inline_system_messages(messages)
+
+        assert system_prompt == "Runtime reminder"
+        assert [message.role for message in conversational_messages] == ["user"]
+        assert conversational_messages[0].content == "hello"
+
+    def test_combines_multiple_system_messages_in_source_order(self):
+        """
+        What it does: Extracts multiple interleaved system messages.
+        Purpose: Preserve every instruction and its order while retaining conversation order.
+        """
+        messages = [
+            AnthropicMessage(role="system", content="First instruction"),
+            AnthropicMessage(role="user", content="Question"),
+            AnthropicMessage(role="assistant", content="Answer"),
+            AnthropicMessage(role="system", content="Second instruction"),
+            AnthropicMessage(role="user", content="Follow-up"),
+        ]
+
+        system_prompt, conversational_messages = extract_inline_system_messages(messages)
+
+        assert system_prompt == "First instruction\n\nSecond instruction"
+        assert [message.role for message in conversational_messages] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert [message.content for message in conversational_messages] == [
+            "Question",
+            "Answer",
+            "Follow-up",
+        ]
+
+    def test_ignores_empty_system_text_without_dropping_conversation(self):
+        """
+        What it does: Handles an empty inline system message.
+        Purpose: Avoid adding meaningless separators or changing conversational messages.
+        """
+        messages = [
+            AnthropicMessage(role="user", content="Question"),
+            AnthropicMessage(role="system", content=[]),
+        ]
+
+        system_prompt, conversational_messages = extract_inline_system_messages(messages)
+
+        assert system_prompt == ""
+        assert conversational_messages == [messages[0]]
+
+
+# ==================================================================================================
 # Tests for convert_anthropic_messages
 # ==================================================================================================
 
@@ -1498,6 +1569,95 @@ class TestAnthropicToKiro:
         ]["content"]
         print(f"Current content: {current_content}")
         assert "You are a helpful assistant." in current_content
+
+    def test_promotes_inline_system_message_without_replacing_current_user_turn(self):
+        """
+        What it does: Converts the inline system-message shape emitted by Claude Code.
+        Purpose: Keep the user's prompt current while preserving the system reminder.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-5",
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[{"type": "text", "text": "hello"}],
+                ),
+                AnthropicMessage(
+                    role="system",
+                    content=[
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>Use the current date.</system-reminder>",
+                        }
+                    ],
+                ),
+            ],
+            max_tokens=1024,
+        )
+
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        conversation_state = result["conversationState"]
+        current_content = conversation_state["currentMessage"]["userInputMessage"][
+            "content"
+        ]
+        assert "<system-reminder>Use the current date.</system-reminder>" in current_content
+        assert current_content.endswith("hello")
+        assert "history" not in conversation_state
+
+    def test_combines_top_level_and_inline_system_prompts(self):
+        """
+        What it does: Converts requests containing both supported system prompt forms.
+        Purpose: Preserve top-level and Claude Code inline instructions together.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-5",
+            system="Top-level instruction",
+            messages=[
+                AnthropicMessage(role="system", content="Inline instruction"),
+                AnthropicMessage(role="user", content="Question"),
+            ],
+            max_tokens=1024,
+        )
+
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        assert current_content.startswith(
+            "Top-level instruction\n\nInline instruction\n\n"
+        )
+        assert current_content.endswith("Question")
+
+    def test_rejects_request_with_only_inline_system_messages(self):
+        """
+        What it does: Converts a request with no conversational user or assistant turn.
+        Purpose: Return the existing actionable error instead of manufacturing user content.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-5",
+            messages=[AnthropicMessage(role="system", content="Instruction only")],
+            max_tokens=1024,
+        )
+
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                with pytest.raises(ValueError, match="No messages to send"):
+                    anthropic_to_kiro(request, "conv-123", "arn:aws:test")
 
     def test_includes_tools(self):
         """
