@@ -64,6 +64,17 @@ SQLITE_REGISTRATION_KEYS = [
     "codewhisperer:odic:device-registration",
 ]
 
+# Profile ARN region: arn:aws:codewhisperer:REGION:account:profile/id
+_API_REGION_FROM_ARN = re.compile(r"^[a-z]+-[a-z]+-\d+$")
+
+
+def _api_region_from_profile_arn(arn: str) -> Optional[str]:
+    """Return the API region encoded in a CodeWhisperer profile ARN, if valid."""
+    parts = arn.split(":")
+    if len(parts) >= 4 and parts[3] and _API_REGION_FROM_ARN.match(parts[3]):
+        return parts[3]
+    return None
+
 
 class AuthType(Enum):
     """
@@ -140,7 +151,7 @@ class KiroAuthManager:
             sqlite_db: Path to kiro-cli SQLite database (optional)
                        Default location: ~/.local/share/kiro-cli/data.sqlite3
             api_region: Q API region override (optional, per-account)
-                       If not specified, uses auto-detection or falls back to region
+                       If not specified, uses a verified profile ARN or falls back to region
         """
         self._refresh_token = refresh_token
         self._profile_arn = profile_arn
@@ -188,9 +199,11 @@ class KiroAuthManager:
         # Determine final API region with priority hierarchy:
         # 1. Explicit api_region parameter (per-account) - HIGHEST
         # 2. KIRO_API_REGION env var (global override)
-        # 3. Auto-detected from credentials (SQLite ARN or JSON region)
-        # 4. SSO region (fallback)
-        # 5. Default region parameter (us-east-1)
+        # 3. Auto-detected from a verified profile ARN
+        # 4. Default region parameter (us-east-1)
+        #
+        # JSON/SQLite `region` is the auth/SSO region used for OIDC refresh.
+        # It is not a verified API region and must not drive api_host (issue #81).
         api_region_override = os.getenv("KIRO_API_REGION")
         
         if api_region:
@@ -202,13 +215,9 @@ class KiroAuthManager:
             final_api_region = api_region_override
             logger.info(f"API region: {final_api_region} (from KIRO_API_REGION env var)")
         elif self._detected_api_region:
-            # Auto-detected from credentials (SQLite profile ARN or JSON region field)
+            # Auto-detected from a verified profile ARN
             final_api_region = self._detected_api_region
             logger.info(f"API region: {final_api_region} (auto-detected from credentials)")
-        elif self._sso_region:
-            # Fallback to SSO region
-            final_api_region = self._sso_region
-            logger.info(f"API region: {final_api_region} (using SSO region as fallback)")
         else:
             # Final fallback to default region
             final_api_region = region
@@ -355,15 +364,12 @@ class KiroAuthManager:
                             self._profile_arn = arn
                             logger.debug(f"Profile ARN from state table: {self._profile_arn}")
                         # ARN format: arn:aws:codewhisperer:REGION:account:profile/id
-                        # Extract region from 4th component (index 3)
-                        parts = arn.split(":")
-                        if len(parts) >= 4 and parts[3]:
-                            # Validate region format (e.g., us-east-1, eu-central-1)
-                            if re.match(r'^[a-z]+-[a-z]+-\d+$', parts[3]):
-                                self._detected_api_region = parts[3]
-                                logger.info(f"API region auto-detected from profile ARN: {parts[3]}")
-                            else:
-                                logger.debug(f"Invalid region format in ARN: {parts[3]}")
+                        detected = _api_region_from_profile_arn(arn)
+                        if detected:
+                            self._detected_api_region = detected
+                            logger.info(f"API region auto-detected from profile ARN: {detected}")
+                        else:
+                            logger.debug(f"Invalid region format in ARN: {arn}")
             except sqlite3.Error as e:
                 logger.debug(f"Failed to read state table from SQLite: {e}")
             except json.JSONDecodeError as e:
@@ -420,12 +426,15 @@ class KiroAuthManager:
                 self._access_token = data['accessToken']
             if 'profileArn' in data:
                 self._profile_arn = data['profileArn']
+                detected = _api_region_from_profile_arn(data['profileArn'])
+                if detected:
+                    self._detected_api_region = detected
+                    logger.info(f"API region auto-detected from profile ARN: {detected}")
             if 'region' in data:
-                # Store as SSO region for OIDC token refresh
+                # JSON `region` is the auth/SSO region for OIDC refresh, not the API host
+                # (issue #81). API region comes from profileArn, KIRO_API_REGION, or default.
                 self._sso_region = data['region']
-                # Also use as detected API region (can be overridden by KIRO_API_REGION env var)
-                self._detected_api_region = data['region']
-                logger.debug(f"Region from JSON credentials: {data['region']}")
+                logger.debug(f"SSO region from JSON credentials: {data['region']}")
             
             # Load clientIdHash and device registration for Enterprise Kiro IDE
             if 'clientIdHash' in data:
