@@ -245,9 +245,11 @@ HIDDEN_MODELS: Dict[str, str] = {
 #       "gpt-5": "claude-sonnet-4.5"
 #   }
 #
-# Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
+# Default: {"auto-kiro": "auto", "claude-auto": "auto"} to avoid Cursor IDE conflict
+# and Claude Desktop's rejection of model names without an Anthropic-y term.
 MODEL_ALIASES: Dict[str, str] = {
     "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
+    "claude-auto": "auto",  # Alias with "claude" prefix so Claude Desktop accepts it
 }
 
 # Models to hide from /v1/models endpoint.
