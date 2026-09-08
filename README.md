@@ -27,6 +27,8 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 
 > 🔒 **Claude Opus 4.5** was removed from the free tier on January 17, 2026. It may be available on paid tiers — check your IDE/CLI model list.
 
+> 🆕 **Claude Opus 5** is now available (`claude-opus-5`). Availability depends on your Kiro tier — check your IDE/CLI model list.
+
 🚀 **Claude Sonnet 4.5** — Balanced performance. Great for coding, writing, and general-purpose tasks.
 
 ⚡ **Claude Haiku 4.5** — Lightning fast. Perfect for quick responses, simple tasks, and chat.
