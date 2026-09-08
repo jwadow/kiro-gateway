@@ -604,6 +604,22 @@ class TestFallbackModelsConfig:
                     print(f"  WARNING: {model_id} uses dash format instead of dot")
                     # This is acceptable but not ideal
                     pass
+    
+    def test_fallback_models_contain_claude_opus_5(self):
+        """
+        What it does: Verifies that claude-opus-5 is present in the fallback list.
+        Purpose: Ensure the newly released Opus 5 model is discoverable via
+                 /v1/models without requiring a dynamic ListAvailableModels
+                 call (which runtime.kiro.dev does not support).
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+        
+        model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+        print(f"Model IDs in fallback list: {model_ids}")
+        
+        print("Verification: claude-opus-5 is present...")
+        assert "claude-opus-5" in model_ids
 
 
 class TestFallbackModelsIntegration:
