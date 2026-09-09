@@ -479,7 +479,24 @@ class AccountManager:
             
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
-            
+
+            # Kiro API now requires profileArn for all requests.
+            # If not loaded from credentials, force a token refresh to obtain it.
+            if not auth_manager.profile_arn:
+                logger.info(f"Account {account_id}: profileArn not in credentials, forcing token refresh to obtain it...")
+                try:
+                    await auth_manager.force_refresh()
+                    if auth_manager.profile_arn:
+                        logger.info(f"Account {account_id}: profileArn obtained via token refresh")
+                    else:
+                        logger.warning(
+                            f"Account {account_id}: profileArn still unavailable after token refresh. "
+                            "API calls will fail with 400 'profileArn is required'. "
+                            "Set PROFILE_ARN in .env as a workaround."
+                        )
+                except Exception as e:
+                    logger.warning(f"Account {account_id}: failed to obtain profileArn via force refresh: {e}")
+
             # Determine if we should fetch models or use static list
             if _is_runtime_endpoint(auth_manager):
                 models_list = []
@@ -489,12 +506,12 @@ class AccountManager:
                 params = {"origin": "AI_EDITOR"}
                 if auth_manager.profile_arn:
                     params["profileArn"] = auth_manager.profile_arn
-                
+
                 list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
-                
+
                 # Use KiroHttpClient for retry logic (3 attempts with exponential backoff)
                 http_client = KiroHttpClient(auth_manager, shared_client=None)
-                
+
                 try:
                     response = await http_client.request_with_retry(
                         method="GET",
@@ -503,18 +520,22 @@ class AccountManager:
                         params=params,
                         stream=False
                     )
-                    
+
                     if response.status_code == 200:
                         data = response.json()
                         models_list = data.get("models", [])
+                        # Capture profileArn if returned in response and not already set
+                        if not auth_manager.profile_arn and data.get("profileArn"):
+                            auth_manager._profile_arn = data["profileArn"]
+                            logger.info(f"Account {account_id}: profileArn obtained from ListAvailableModels response")
                     else:
                         # Shouldn't happen (retry handles non-200), but keep for safety
                         raise Exception(f"HTTP {response.status_code}")
-                
+
                 except Exception as e:
                     logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
                     models_list = []
-                
+
                 finally:
                     await http_client.close()
             
@@ -596,9 +617,13 @@ class AccountManager:
             if response.status_code == 200:
                 data = response.json()
                 models_list = data.get("models", [])
+                # Capture profileArn if returned and not already set
+                if not account.auth_manager.profile_arn and data.get("profileArn"):
+                    account.auth_manager._profile_arn = data["profileArn"]
+                    logger.info(f"Account {account_id}: profileArn obtained from ListAvailableModels response (refresh)")
                 await account.model_cache.update(models_list)
                 account.models_cached_at = time.time()
-                
+
                 # Update model_to_accounts mapping (new models may have appeared)
                 available_models = account.model_resolver.get_available_models()
                 for model in available_models:
