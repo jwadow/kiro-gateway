@@ -197,7 +197,12 @@ async def stream_kiro_to_anthropic(
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
     upstream_cache_usage: Dict[str, int] = {}
-    
+
+    # Billing credits. Must accumulate: one downstream request can trigger
+    # several upstream calls (tool use), each emitting its own metering event.
+    credits_used = 0.0
+    upstream_calls = 0
+
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
     
@@ -522,7 +527,17 @@ async def stream_kiro_to_anthropic(
                 context_usage_percentage = event.context_usage_percentage
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
-        
+            elif event.type == "metering" and event.credits:
+                credits_used += event.credits
+                upstream_calls += 1
+
+        # Credits actually billed upstream. req= is the dedup key for log-based
+        # reconciliation, so keep it in the line.
+        logger.info(
+            f"[Credit] req={message_id} model={model} "
+            f"credits={credits_used:.12f} calls={upstream_calls}"
+        )
+
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
         
@@ -760,7 +775,13 @@ async def collect_anthropic_response(
     # Collect stream result
     result = await collect_stream_to_result(response)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
-    
+
+    # Same line format as the streaming path so both can be parsed alike
+    logger.info(
+        f"[Credit] req={message_id} model={model} "
+        f"credits={result.credits:.12f} calls={result.upstream_calls}"
+    )
+
     # Build content blocks
     content_blocks = []
     

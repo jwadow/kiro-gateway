@@ -1324,35 +1324,88 @@ class TestStreamingOpenaiBracketToolCalls:
 class TestStreamingOpenaiMeteringData:
     """Tests for metering data handling."""
     
-    @pytest.mark.asyncio
-    async def test_includes_credits_used_in_usage(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
-        """
-        What it does: Includes credits_used in usage when metering data present.
-        Goal: Verify metering data is included.
-        """
-        print("Setup: Mock stream with metering data...")
-        
+    async def _final_chunk(self, events, http_client, response, model_cache, auth_manager):
+        """Runs the stream and returns the parsed final chunk (the one before [DONE])."""
         async def mock_parse_kiro_stream(*args, **kwargs):
-            yield KiroEvent(type="content", content="Hello")
-            yield KiroEvent(type="usage", usage={"credits": 0.001})
-        
-        print("Action: Streaming to OpenAI format...")
+            for event in events:
+                yield event
+
         chunks = []
-        
         with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
                 async for chunk in stream_kiro_to_openai(
-                    mock_http_client, mock_response, "claude-sonnet-4",
-                    mock_model_cache, mock_auth_manager
+                    http_client, response, "claude-sonnet-4",
+                    model_cache, auth_manager
                 ):
                     chunks.append(chunk)
-        
-        print(f"Received {len(chunks)} chunks")
-        
-        # Final chunk should have credits_used
-        final_chunk = chunks[-2]  # Before [DONE]
-        assert '"credits_used"' in final_chunk
-        print("✓ credits_used included in usage")
+
+        return json.loads(chunks[-2][len("data:"):].strip())
+
+    @pytest.mark.asyncio
+    async def test_credits_used_hidden_by_default(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Keeps credits_used out of the payload while EXPOSE_CREDITS_USED is off.
+        Goal: Verify the fix does not silently change the OpenAI response contract.
+        """
+        print("Setup: Mock stream with a metering event, flag off (default)...")
+        events = [
+            KiroEvent(type="content", content="Hello"),
+            KiroEvent(type="metering", credits=0.0273),
+        ]
+
+        print("Action: Streaming to OpenAI format...")
+        final_chunk = await self._final_chunk(
+            events, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+        )
+
+        print(f"Result usage: {final_chunk['usage']}")
+        assert "credits_used" not in final_chunk["usage"]
+        print("✓ credits_used absent by default")
+
+    @pytest.mark.asyncio
+    async def test_includes_credits_used_when_enabled(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Includes summed credits_used when EXPOSE_CREDITS_USED is on.
+        Goal: Verify metering events reach the payload and are accumulated, not overwritten.
+        """
+        print("Setup: Mock stream with two metering events (tool call scenario)...")
+        events = [
+            KiroEvent(type="content", content="Hello"),
+            KiroEvent(type="metering", credits=0.0930),
+            KiroEvent(type="metering", credits=0.5290),
+        ]
+
+        print("Action: Streaming with EXPOSE_CREDITS_USED enabled...")
+        with patch('kiro.streaming_openai.EXPOSE_CREDITS_USED', True):
+            final_chunk = await self._final_chunk(
+                events, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+            )
+
+        print(f"Result usage: {final_chunk['usage']}")
+        assert final_chunk["usage"]["credits_used"] == pytest.approx(0.6220)
+        print("✓ credits_used summed across metering events")
+
+    @pytest.mark.asyncio
+    async def test_cache_usage_event_is_not_reported_as_credits(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Keeps the cache-token usage event out of credits_used.
+        Goal: credits_used is a float from metering events, never the usage dict.
+        """
+        print("Setup: Mock stream with a cache usage event only...")
+        events = [
+            KiroEvent(type="content", content="Hello"),
+            KiroEvent(type="usage", usage={"cacheReadInputTokens": 12}),
+        ]
+
+        print("Action: Streaming with EXPOSE_CREDITS_USED enabled...")
+        with patch('kiro.streaming_openai.EXPOSE_CREDITS_USED', True):
+            final_chunk = await self._final_chunk(
+                events, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+            )
+
+        print(f"Result usage: {final_chunk['usage']}")
+        assert "credits_used" not in final_chunk["usage"]
+        print("✓ cache usage dict not leaked into credits_used")
 
 
 # ==================================================================================================

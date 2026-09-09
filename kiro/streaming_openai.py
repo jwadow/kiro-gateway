@@ -42,6 +42,7 @@ from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
     FAKE_REASONING_HANDLING,
+    EXPOSE_CREDITS_USED,
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
 
@@ -119,6 +120,10 @@ async def stream_kiro_to_openai_internal(
     first_chunk = True
     
     metering_data = None
+    # Billing credits. Kept apart from metering_data (the cache-token dict) on
+    # purpose: the two events carry different types and would overwrite each other.
+    credits_used = 0.0
+    upstream_calls = 0
     context_usage_percentage = None
     full_content = ""
     full_thinking_content = ""  # Accumulated thinking content for non-streaming
@@ -264,12 +269,24 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "usage" and event.usage:
                 metering_data = event.usage
-            
+
+            elif event.type == "metering" and event.credits:
+                # Accumulate - tool calls trigger several upstream calls per request
+                credits_used += event.credits
+                upstream_calls += 1
+
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
         
+        # Credits actually billed upstream. req= is the dedup key for log-based
+        # reconciliation, so keep it in the line.
+        logger.info(
+            f"[Credit] req={completion_id} model={model} "
+            f"credits={credits_used:.12f} calls={upstream_calls}"
+        )
+
         # Track completion signals for truncation detection
-        received_usage = metering_data is not None
+        received_usage = metering_data is not None or upstream_calls > 0
         received_context_usage = context_usage_percentage is not None
         stream_completed_normally = received_usage or received_context_usage
         
@@ -402,8 +419,9 @@ async def stream_kiro_to_openai_internal(
             }
         }
         
-        if metering_data:
-            final_chunk["usage"]["credits_used"] = metering_data
+        # Opt-in: adding credits_used changes the response contract for clients
+        if EXPOSE_CREDITS_USED and upstream_calls > 0:
+            final_chunk["usage"]["credits_used"] = credits_used
         
         # Log final token values being sent to client
         logger.debug(

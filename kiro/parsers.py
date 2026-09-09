@@ -220,7 +220,8 @@ class AwsEventStreamParser:
     - tool_start: Start of tool call (name, toolUseId)
     - tool_input: Continuation of input for tool call
     - tool_stop: End of tool call
-    - usage: Credit consumption information
+    - usage: Cache token usage (dict, sent by some upstream versions)
+    - metering: Credits billed for the request (float, MeteringEvent)
     - context_usage: Context usage percentage
     
     Attributes:
@@ -245,6 +246,7 @@ class AwsEventStreamParser:
         ('{"stop":', 'tool_stop'),
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
+        ('{"unit":', 'metering'),
         ('{"contextUsagePercentage":', 'context_usage'),
     ]
     
@@ -326,11 +328,38 @@ class AwsEventStreamParser:
             return self._process_tool_stop_event(data)
         elif event_type == 'usage':
             return {"type": "usage", "data": data.get('usage', 0)}
+        elif event_type == 'metering':
+            return self._process_metering_event(data)
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
         
         return None
     
+    def _process_metering_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """
+        Processes upstream billing event.
+
+        Wire format: {"unit":"credit","unitPlural":"credits","usage":<float>}
+        (the `MeteringEvent` of the AWS CodeWhisperer streaming client).
+
+        Note the pattern matches on `{"unit":` and the unit value is validated
+        here instead: matching on `{"unit":"credit"` would silently break on a
+        single extra space in the upstream JSON.
+        """
+        # Only 'credit' is known. A different unit means upstream changed how it
+        # bills, so warn instead of silently dropping part of the charge.
+        unit = data.get('unit')
+        if unit != 'credit':
+            logger.warning(f"Unknown metering unit from upstream: {unit!r}, event ignored")
+            return None
+
+        usage = data.get('usage')
+        if not isinstance(usage, (int, float)) or isinstance(usage, bool):
+            logger.warning(f"Metering event with non-numeric usage: {usage!r}, event ignored")
+            return None
+
+        return {"type": "metering", "data": float(usage)}
+
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""
         content = data.get('content', '')

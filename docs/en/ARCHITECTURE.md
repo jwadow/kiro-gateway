@@ -329,7 +329,8 @@ Advanced AWS SSE format parser with support for:
 | `tool_start` | Start of tool call (name, toolUseId) |
 | `tool_input` | Continuation of input for tool call |
 | `tool_stop` | End of tool call |
-| `usage` | Credit consumption information |
+| `usage` | Cache token usage (dict; not sent by current upstream versions) |
+| `metering` | Credits billed for the request (`{"unit":"credit",...,"usage":<float>}`) |
 | `context_usage` | Context usage percentage |
 
 #### Helper Functions

@@ -480,6 +480,102 @@ class TestAwsEventStreamParserFeed:
         assert events[0]["type"] == "usage"
         assert events[0]["data"] == 1.5
     
+    def test_parses_metering_event(self, aws_event_parser):
+        """
+        What it does: Tests parsing of the upstream billing (metering) event.
+        Goal: Ensure the credits actually charged by Kiro are extracted.
+        """
+        print("Setup: Chunk with metering event...")
+        chunk = b'{"unit":"credit","unitPlural":"credits","usage":0.02730794364842454}'
+
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+
+        print(f"Result: {events}")
+        assert len(events) == 1
+        assert events[0]["type"] == "metering"
+        assert events[0]["data"] == 0.02730794364842454
+
+    def test_parses_multiple_metering_events(self, aws_event_parser):
+        """
+        What it does: Tests a tool-call stream carrying two metering events.
+        Goal: Both must surface - a single request can trigger several upstream calls.
+        """
+        print("Setup: Chunk with two metering events...")
+        chunk = (
+            b'{"unit":"credit","unitPlural":"credits","usage":0.0930}'
+            b'{"content":"text"}'
+            b'{"unit":"credit","unitPlural":"credits","usage":0.5290}'
+        )
+
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+
+        print(f"Result: {events}")
+        metering = [e["data"] for e in events if e["type"] == "metering"]
+        assert metering == [0.0930, 0.5290]
+
+    def test_metering_event_split_across_chunks(self, aws_event_parser):
+        """
+        What it does: Splits a metering event across two chunks.
+        Goal: Ensure the buffer reassembles it instead of dropping or duplicating it.
+        """
+        print("Setup: Metering event cut in half...")
+        events1 = aws_event_parser.feed(b'{"unit":"credit","unitPlur')
+        events2 = aws_event_parser.feed(b'al":"credits","usage":0.5}')
+
+        print(f"Result: {events1} / {events2}")
+        assert events1 == []
+        assert len(events2) == 1
+        assert events2[0]["type"] == "metering"
+        assert events2[0]["data"] == 0.5
+
+    def test_ignores_unknown_metering_unit(self, aws_event_parser):
+        """
+        What it does: Feeds a metering event with an unknown unit.
+        Goal: Event is dropped, but the content event after it must survive.
+        """
+        print("Setup: Metering event with unit=token followed by content...")
+        chunk = b'{"unit":"token","unitPlural":"tokens","usage":1234}{"content":"after"}'
+
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+
+        print(f"Result: {events}")
+        assert len(events) == 1
+        assert events[0]["type"] == "content"
+        assert events[0]["data"] == "after"
+
+    def test_does_not_match_unit_inside_content(self, aws_event_parser):
+        """
+        What it does: Model output that itself contains {"unit": ... } as JSON text.
+        Goal: The escaped quotes inside content must not be parsed as a metering event.
+        """
+        print("Setup: Content event whose text contains an escaped unit object...")
+        chunk = b'{"content":"example: {\\"unit\\":\\"kg\\"}"}'
+
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+
+        print(f"Result: {events}")
+        assert len(events) == 1
+        assert events[0]["type"] == "content"
+        assert events[0]["data"] == 'example: {"unit":"kg"}'
+
+    def test_ignores_metering_event_with_non_numeric_usage(self, aws_event_parser):
+        """
+        What it does: Feeds a metering event whose usage is not a number.
+        Goal: Dropped rather than propagated as a bogus credit value.
+        """
+        print("Setup: Metering event with usage as string...")
+        chunk = b'{"unit":"credit","unitPlural":"credits","usage":"n/a"}'
+
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+
+        print(f"Result: {events}")
+        assert events == []
+
     def test_parses_context_usage_event(self, aws_event_parser):
         """
         What it does: Tests parsing of context_usage event.

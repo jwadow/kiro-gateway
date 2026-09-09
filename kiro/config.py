@@ -333,6 +333,18 @@ TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", 
 TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in ("true", "1", "yes")
 
 # ==================================================================================================
+# Billing Settings
+# ==================================================================================================
+
+# Expose the credits billed by Kiro as `usage.credits_used` on the OpenAI endpoint.
+# Credits are always written to the log as `[Credit] req=... credits=... calls=...`;
+# this flag only controls whether they are also added to the response payload.
+# Off by default because it adds a non-standard field to the OpenAI response contract.
+# Note: credits are NOT dollars - do not rename this field to `cost`, downstream
+# proxies (e.g. LiteLLM) treat `cost` as a real charge and would mis-bill.
+EXPOSE_CREDITS_USED: bool = os.getenv("EXPOSE_CREDITS_USED", "false").lower() in ("true", "1", "yes")
+
+# ==================================================================================================
 # Logging Settings
 # ==================================================================================================
 

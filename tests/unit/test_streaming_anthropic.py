@@ -1184,7 +1184,7 @@ class TestStreamingAnthropicContextUsage:
         What it does: Passes through upstream cache usage fields when available.
         Goal: Ensure no fake values, only real upstream usage keys.
         """
-        mock_result = MagicMock(
+        mock_result = StreamResult(
             content="done",
             thinking_content="",
             tool_calls=[],
