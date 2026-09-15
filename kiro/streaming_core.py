@@ -274,7 +274,21 @@ async def _process_chunk(
             else:
                 # No thinking parser - pass through as-is
                 yield KiroEvent(type="content", content=content)
-        
+
+        elif event["type"] == "reasoning":
+            # Native model reasoning from runtime.kiro.dev (reasoningContentEvent).
+            # It is already pure thinking content, so we bypass the ThinkingParser's
+            # tag-detection FSM and route straight to the thinking channel. When a
+            # parser exists we still call process_for_output() to honor the handling
+            # mode (e.g. "remove" suppresses thinking output entirely).
+            reasoning_text = event["data"]
+            if thinking_parser:
+                processed = thinking_parser.process_for_output(reasoning_text, False, False)
+                if processed:
+                    yield KiroEvent(type="thinking", thinking_content=processed)
+            else:
+                yield KiroEvent(type="thinking", thinking_content=reasoning_text)
+
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])
         

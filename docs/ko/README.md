@@ -53,6 +53,7 @@
 |------|------|
 | 🔌 **OpenAI 호환 API** | OpenAI 호환 도구와 함께 작동 |
 | 🔌 **Anthropic 호환 API** | 네이티브 `/v1/messages` 엔드포인트 |
+| 🔌 **OpenAI Responses API** | OpenAI Codex CLI를 위한 네이티브 `/v1/responses` 엔드포인트 |
 | 🔀 **다중 계정 지원** | 여러 계정 간의 지능형 페일오버 |
 | 🌐 **VPN/프록시 지원** | 제한된 네트워크용 HTTP/SOCKS5 프록시 |
 | 🧠 **확장 사고** | 추론 기능은 우리 프로젝트만의 독점 기능 |
@@ -64,6 +65,16 @@
 | 🔄 **재시도 로직** | 오류 시 자동 재시도 (403, 429, 5xx) |
 | 📋 **확장 모델 목록** | 버전 모델 포함 |
 | 🔐 **스마트 토큰 관리** | 만료 전 자동 갱신 |
+
+---
+
+## 🆕 이 포크의 새로운 기능
+
+> 이것은 상위(upstream) 프로젝트에 추가 수정 사항과 기능을 더해 유지 관리되는 포크입니다.
+
+- **OpenAI Responses API 지원 (`/v1/responses`)** — 스트리밍(SSE), 도구 호출, 추론을 지원하는 OpenAI **Codex CLI**용 네이티브 엔드포인트. Codex가 반환하는 서버 측 추론 항목(`rs_...`)은 안전하게 무시되므로, 상태 비저장(`store: false`) 멀티턴 세션이 `Item with id rs_... not found` 오류 없이 작동합니다.
+- **수정: `system` 역할 메시지로 인한 Claude Code 422 오류** — Anthropic 엔드포인트는 Claude Code가 `messages` 배열 안에 `role: "system"` 메시지를 포함한 요청을 거부했습니다 (`role` 필드가 엄격한 `Literal["user", "assistant"]`로 정의되어 Pydantic 검증에 실패). 이제 이러한 메시지가 허용됩니다.
+- **수정: 서버 측 도구 콘텐츠 블록으로 인한 422 오류** — `web_search` 및 기타 서버 측 도구의 콘텐츠 블록이 검증 과정에서 인식되지 않아 422를 유발했습니다. 이제 지원됩니다.
 
 ---
 
@@ -517,6 +528,7 @@ VPN_PROXY_URL=192.168.1.100:8080
 | `/v1/models` | GET | 사용 가능한 모델 목록 |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/v1/responses` | POST | OpenAI Responses API (Codex CLI) |
 
 ---
 
@@ -722,6 +734,48 @@ with client.messages.stream(
     for text in stream.text_stream:
         print(text, end="", flush=True)
 ```
+
+</details>
+
+### OpenAI Responses API (Codex CLI)
+
+`/v1/responses` 엔드포인트는 [OpenAI Codex CLI](https://github.com/openai/codex)가 사용하는 OpenAI **Responses API** 프로토콜을 구현합니다. 텍스트, 스트리밍(SSE), 도구 호출, 추론을 지원합니다.
+
+<details>
+<summary>🔹 간단한 cURL 요청</summary>
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "You are a helpful coding agent.",
+    "input": "List the files in the current directory.",
+    "stream": true
+  }'
+```
+
+</details>
+
+<details>
+<summary>🤖 Codex CLI를 게이트웨이로 연결</summary>
+
+Codex가 게이트웨이를 OpenAI 호환 공급자로 사용하도록 설정하세요 (`~/.codex/config.toml`에서):
+
+```toml
+model = "claude-sonnet-4-5"
+model_provider = "kiro-gateway"
+
+[model_providers.kiro-gateway]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"
+```
+
+Codex가 전송하는 API 키로 `PROXY_API_KEY`를 설정하세요 (예: `OPENAI_API_KEY` 또는 공급자의 `env_key`를 통해).
+
+> **추론에 대한 참고:** Kiro는 OpenAI의 암호화된 추론 항목이 아닌 일반 텍스트 사고를 생성합니다. 게이트웨이는 추론을 `reasoning` 요약 항목으로 노출하며, Codex가 후속 턴에서 반환하는 모든 `rs_...` 추론 항목을 안전하게 **무시**하므로, 상태 비저장(`store: false`) 멀티턴 세션이 `Item with id rs_... not found` 오류 없이 작동합니다.
 
 </details>
 

@@ -184,6 +184,11 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
+# Optional: override the complete API host (bypasses the template).
+# Useful when the default runtime.*.kiro.dev domain is blocked by a corporate proxy.
+# Example: KIRO_API_HOST="https://codewhisperer.us-east-1.amazonaws.com"
+KIRO_API_HOST_OVERRIDE: str = os.getenv("KIRO_API_HOST", "")
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
@@ -275,11 +280,11 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Update gateway regularly to get the latest model list
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
-    {"modelId": "claude-sonnet-4"},
+    {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-sonnet-4.5"},
     {"modelId": "claude-sonnet-4.6"},
     {"modelId": "claude-haiku-4.5"},
-    {"modelId": "claude-opus-4.5"},
+    {"modelId": "claude-opus-5"},
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-4.7"},
     {"modelId": "deepseek-3.2"},

@@ -463,7 +463,55 @@ class TestAwsEventStreamParserFeed:
         print(f"Second result: {events2}")
         assert len(events1) == 1
         assert len(events2) == 0  # Duplicate filtered out
-    
+
+    def test_parses_reasoning_event(self, aws_event_parser):
+        """
+        What it does: reasoningContentEvent payload {"text":...} -> reasoning event.
+        Goal: native model reasoning from runtime.kiro.dev is no longer dropped.
+        """
+        events = aws_event_parser.feed(b'{"text":"Looking at"}')
+        assert len(events) == 1
+        assert events[0]["type"] == "reasoning"
+        assert events[0]["data"] == "Looking at"
+
+    def test_reasoning_events_are_not_deduplicated(self, aws_event_parser):
+        """
+        What it does: identical consecutive reasoning tokens are BOTH kept.
+        Goal: reasoning streams token-by-token; repeated words ("the the") are
+        legitimate, unlike content which is deduplicated.
+        """
+        e1 = aws_event_parser.feed(b'{"text":" the"}')
+        e2 = aws_event_parser.feed(b'{"text":" the"}')
+        assert len(e1) == 1
+        assert len(e2) == 1  # NOT filtered out
+
+    def test_signature_event_is_skipped(self, aws_event_parser):
+        """
+        What it does: the {"signature":...} reasoning terminator yields no event.
+        Goal: we mint our own thinking signature; the upstream one is ignored.
+        """
+        events = aws_event_parser.feed(b'{"signature":"ErADCmMIDxAB"}')
+        assert len(events) == 0
+
+    def test_reasoning_then_content_sequence(self, aws_event_parser):
+        """
+        What it does: a realistic reasoning->signature->content sequence.
+        Goal: reasoning and content are separated into distinct event types,
+        mirroring the runtime.kiro.dev stream (reasoningContentEvent followed by
+        assistantResponseEvent).
+        """
+        chunk = (
+            b'{"text":"I think"}'
+            b'{"signature":"abc123"}'
+            b'{"content":"Hello"}'
+        )
+        events = aws_event_parser.feed(chunk)
+        assert len(events) == 2
+        assert events[0]["type"] == "reasoning"
+        assert events[0]["data"] == "I think"
+        assert events[1]["type"] == "content"
+        assert events[1]["data"] == "Hello"
+
     def test_parses_usage_event(self, aws_event_parser):
         """
         What it does: Tests parsing of usage event.

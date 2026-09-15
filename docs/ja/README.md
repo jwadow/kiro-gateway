@@ -53,6 +53,7 @@
 |------|------|
 | 🔌 **OpenAI 互換 API** | OpenAI 互換のあらゆるツールで動作 |
 | 🔌 **Anthropic 互換 API** | ネイティブ `/v1/messages` エンドポイント |
+| 🔌 **OpenAI Responses API** | OpenAI Codex CLI 向けのネイティブ `/v1/responses` エンドポイント |
 | 🔀 **マルチアカウントサポート** | 複数アカウント間のインテリジェントなフェイルオーバー |
 | 🌐 **VPN/プロキシサポート** | 制限されたネットワーク向けの HTTP/SOCKS5 プロキシ |
 | 🧠 **拡張思考** | 推論機能は本プロジェクト独自の機能 |
@@ -64,6 +65,16 @@
 | 🔄 **リトライロジック** | エラー時の自動リトライ（403、429、5xx） |
 | 📋 **拡張モデルリスト** | バージョン付きモデルを含む |
 | 🔐 **スマートトークン管理** | 有効期限前に自動更新 |
+
+---
+
+## 🆕 このフォークの新機能
+
+> これは、上流プロジェクトに追加の修正と機能を加えたメンテナンス版フォークです。
+
+- **OpenAI Responses API サポート (`/v1/responses`)** — OpenAI **Codex CLI** 向けのネイティブエンドポイントで、ストリーミング (SSE)、ツール呼び出し、推論に対応。Codex が返送するサーバーサイドの推論アイテム (`rs_...`) は安全に無視されるため、ステートレス (`store: false`) なマルチターンセッションでも `Item with id rs_... not found` エラーなしで動作します。
+- **修正：`system` ロールメッセージによる Claude Code の 422 エラー** — Anthropic エンドポイントは、Claude Code が `messages` 配列内に `role: "system"` メッセージを含めたリクエストを拒否していました（`role` フィールドが厳格な `Literal["user", "assistant"]` だったため Pydantic 検証に失敗）。このようなメッセージが受け入れられるようになりました。
+- **修正：サーバーサイドツールコンテンツブロックによる 422 エラー** — `web_search` やその他のサーバーサイドツールのコンテンツブロックが検証時に認識されず、422 が発生していました。これらがサポートされるようになりました。
 
 ---
 
@@ -517,6 +528,7 @@ VPN_PROXY_URL=192.168.1.100:8080
 | `/v1/models` | GET | 利用可能なモデル一覧 |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/v1/responses` | POST | OpenAI Responses API (Codex CLI) |
 
 ---
 
@@ -722,6 +734,48 @@ with client.messages.stream(
     for text in stream.text_stream:
         print(text, end="", flush=True)
 ```
+
+</details>
+
+### OpenAI Responses API (Codex CLI)
+
+`/v1/responses` エンドポイントは、[OpenAI Codex CLI](https://github.com/openai/codex) が使用する OpenAI **Responses API** プロトコルを実装しています。テキスト、ストリーミング (SSE)、ツール呼び出し、推論に対応しています。
+
+<details>
+<summary>🔹 シンプルな cURL リクエスト</summary>
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "You are a helpful coding agent.",
+    "input": "List the files in the current directory.",
+    "stream": true
+  }'
+```
+
+</details>
+
+<details>
+<summary>🤖 Codex CLI をゲートウェイに向ける</summary>
+
+Codex を OpenAI 互換プロバイダーとしてゲートウェイを使用するように設定します（`~/.codex/config.toml` 内）：
+
+```toml
+model = "claude-sonnet-4-5"
+model_provider = "kiro-gateway"
+
+[model_providers.kiro-gateway]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"
+```
+
+Codex が送信する API キーとして `PROXY_API_KEY` を設定します（例：`OPENAI_API_KEY` 経由、またはプロバイダーの `env_key` 経由）。
+
+> **推論に関する注意：** Kiro は OpenAI の暗号化された推論アイテムではなく、プレーンテキストの思考を生成します。ゲートウェイは推論を `reasoning` サマリーアイテムとして表示し、Codex が後続のターンで返送する `rs_...` 推論アイテムを安全に**無視**します。そのため、ステートレス (`store: false`) なマルチターンセッションでも `Item with id rs_... not found` エラーなしで動作します。
 
 </details>
 

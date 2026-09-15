@@ -53,6 +53,7 @@ Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 |----------------|-------------|
 | 🔌 **API compatible con OpenAI** | Funciona con cualquier herramienta compatible con OpenAI |
 | 🔌 **API compatible con Anthropic** | Endpoint nativo `/v1/messages` |
+| 🔌 **OpenAI Responses API** | Endpoint nativo `/v1/responses` para OpenAI Codex CLI |
 | 🔀 **Soporte de Múltiples Cuentas** | Conmutación inteligente entre múltiples cuentas |
 | 🌐 **Soporte de VPN/Proxy** | Proxy HTTP/SOCKS5 para redes restringidas |
 | 🧠 **Pensamiento Extendido** | El razonamiento es exclusivo de nuestro proyecto |
@@ -64,6 +65,16 @@ Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 | 🔄 **Lógica de Reintentos** | Reintentos automáticos en errores (403, 429, 5xx) |
 | 📋 **Lista extendida de modelos** | Incluyendo modelos versionados |
 | 🔐 **Gestión inteligente de tokens** | Actualización automática antes de la expiración |
+
+---
+
+## 🆕 Novedades en Este Fork
+
+> Este es un fork mantenido con correcciones y funciones adicionales sobre el proyecto original.
+
+- **Soporte de OpenAI Responses API (`/v1/responses`)** — Endpoint nativo para el **Codex CLI** de OpenAI, con streaming (SSE), llamada de herramientas y razonamiento. Los elementos de razonamiento del lado del servidor (`rs_...`) que Codex reenvía se ignoran de forma segura, por lo que las sesiones multi-turno sin estado (`store: false`) funcionan sin errores `Item with id rs_... not found`.
+- **Corrección: errores 422 de Claude Code por mensajes con rol `system`** — El endpoint de Anthropic rechazaba las solicitudes en las que Claude Code incluía un mensaje `role: "system"` dentro del arreglo `messages` (el campo `role` era un estricto `Literal["user", "assistant"]`, fallando la validación de Pydantic). Estos mensajes ahora se aceptan.
+- **Corrección: errores 422 por bloques de contenido de herramientas del lado del servidor** — Los bloques de contenido para `web_search` y otras herramientas del lado del servidor no se reconocían durante la validación y provocaban un 422. Ahora son compatibles.
 
 ---
 
@@ -517,6 +528,7 @@ Deja `VPN_PROXY_URL` vacío (por defecto) si no necesitas soporte proxy.
 | `/v1/models` | GET | Lista modelos disponibles |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/v1/responses` | POST | OpenAI Responses API (Codex CLI) |
 
 ---
 
@@ -722,6 +734,48 @@ with client.messages.stream(
     for text in stream.text_stream:
         print(text, end="", flush=True)
 ```
+
+</details>
+
+### OpenAI Responses API (Codex CLI)
+
+El endpoint `/v1/responses` implementa el protocolo **Responses API** de OpenAI que usa el [Codex CLI de OpenAI](https://github.com/openai/codex). Soporta texto, streaming (SSE), llamada de herramientas y razonamiento.
+
+<details>
+<summary>🔹 Solicitud cURL Simple</summary>
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "You are a helpful coding agent.",
+    "input": "List the files in the current directory.",
+    "stream": true
+  }'
+```
+
+</details>
+
+<details>
+<summary>🤖 Apunta el Codex CLI al gateway</summary>
+
+Configura Codex para usar el gateway como un proveedor compatible con OpenAI (en `~/.codex/config.toml`):
+
+```toml
+model = "claude-sonnet-4-5"
+model_provider = "kiro-gateway"
+
+[model_providers.kiro-gateway]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"
+```
+
+Establece tu `PROXY_API_KEY` como la API key que Codex envía (por ejemplo, mediante `OPENAI_API_KEY` o el `env_key` del proveedor).
+
+> **Nota sobre el razonamiento:** Kiro produce pensamiento en texto plano, no los elementos de razonamiento cifrados de OpenAI. El gateway expone el razonamiento como elementos de resumen `reasoning` e **ignora** de forma segura cualquier elemento de razonamiento `rs_...` que Codex reenvíe en un turno posterior, por lo que las sesiones multi-turno sin estado (`store: false`) funcionan sin errores `Item with id rs_... not found`.
 
 </details>
 

@@ -53,6 +53,7 @@ Feito com ❤️ por [@Jwadow](https://github.com/jwadow)
 |---------|-----------|
 | 🔌 **API compatível com OpenAI** | Funciona com qualquer ferramenta compatível com OpenAI |
 | 🔌 **API compatível com Anthropic** | Endpoint nativo `/v1/messages` |
+| 🔌 **OpenAI Responses API** | Endpoint nativo `/v1/responses` para o OpenAI Codex CLI |
 | 🔀 **Suporte a Múltiplas Contas** | Alternância inteligente entre múltiplas contas |
 | 🌐 **Suporte a VPN/Proxy** | Proxy HTTP/SOCKS5 para redes restritas |
 | 🧠 **Pensamento Estendido** | Raciocínio é exclusivo do nosso projeto |
@@ -64,6 +65,16 @@ Feito com ❤️ por [@Jwadow](https://github.com/jwadow)
 | 🔄 **Lógica de Retry** | Retentativas automáticas em erros (403, 429, 5xx) |
 | 📋 **Lista estendida de modelos** | Incluindo modelos versionados |
 | 🔐 **Gerenciamento inteligente de tokens** | Atualização automática antes da expiração |
+
+---
+
+## 🆕 Novidades Neste Fork
+
+> Este é um fork mantido com correções e recursos adicionais em cima do projeto original.
+
+- **Suporte à OpenAI Responses API (`/v1/responses`)** — Endpoint nativo para o OpenAI **Codex CLI**, com streaming (SSE), chamada de ferramentas e raciocínio. Itens de raciocínio do lado do servidor (`rs_...`) enviados de volta pelo Codex são ignorados com segurança, então sessões multiturno sem estado (`store: false`) funcionam sem erros `Item with id rs_... not found`.
+- **Correção: erros 422 do Claude Code causados por mensagens com role `system`** — O endpoint Anthropic rejeitava requisições em que o Claude Code incluía uma mensagem `role: "system"` dentro do array `messages` (o campo `role` era um `Literal["user", "assistant"]` estrito, falhando na validação Pydantic). Essas mensagens agora são aceitas.
+- **Correção: erros 422 causados por blocos de conteúdo de ferramentas do lado do servidor** — Blocos de conteúdo para `web_search` e outras ferramentas do lado do servidor não eram reconhecidos durante a validação e geravam um 422. Agora são suportados.
 
 ---
 
@@ -517,6 +528,7 @@ Deixe `VPN_PROXY_URL` vazio (padrão) se você não precisar de suporte a proxy.
 | `/v1/models` | GET | Lista modelos disponíveis |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/v1/responses` | POST | OpenAI Responses API (Codex CLI) |
 
 ---
 
@@ -722,6 +734,48 @@ with client.messages.stream(
     for text in stream.text_stream:
         print(text, end="", flush=True)
 ```
+
+</details>
+
+### OpenAI Responses API (Codex CLI)
+
+O endpoint `/v1/responses` implementa o protocolo da OpenAI **Responses API** usado pelo [OpenAI Codex CLI](https://github.com/openai/codex). Ele suporta texto, streaming (SSE), chamada de ferramentas e raciocínio.
+
+<details>
+<summary>🔹 Requisição cURL Simples</summary>
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "You are a helpful coding agent.",
+    "input": "List the files in the current directory.",
+    "stream": true
+  }'
+```
+
+</details>
+
+<details>
+<summary>🤖 Aponte o Codex CLI para o gateway</summary>
+
+Configure o Codex para usar o gateway como um provedor compatível com OpenAI (em `~/.codex/config.toml`):
+
+```toml
+model = "claude-sonnet-4-5"
+model_provider = "kiro-gateway"
+
+[model_providers.kiro-gateway]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"
+```
+
+Defina seu `PROXY_API_KEY` como a chave de API que o Codex envia (por exemplo, via `OPENAI_API_KEY` ou o `env_key` do provedor).
+
+> **Nota sobre raciocínio:** O Kiro produz pensamento em texto puro, não os itens de raciocínio criptografados da OpenAI. O gateway expõe o raciocínio como itens de resumo `reasoning` e **ignora** com segurança quaisquer itens de raciocínio `rs_...` que o Codex envia de volta em um turno seguinte, então sessões multiturno sem estado (`store: false`) funcionam sem erros `Item with id rs_... not found`.
 
 </details>
 

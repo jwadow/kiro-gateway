@@ -22,6 +22,9 @@ from kiro.models_anthropic import (
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
+    UnknownContentBlock,
     # Image models
     Base64ImageSource,
     URLImageSource,
@@ -1052,6 +1055,109 @@ class TestToolReferenceContentBlock:
 
         print(f"Comparing type: Expected 'tool_reference', Got '{block.type}'")
         assert block.type == "tool_reference"
+
+
+# ==================================================================================================
+# Tests for server-side tool content blocks (web_search etc.)
+# ==================================================================================================
+
+class TestServerToolContentBlocks:
+    """Tests for server-side tool blocks sent by Claude Code (web_search)."""
+
+    def test_server_tool_use_block(self):
+        """
+        What it does: Verifies ServerToolUseContentBlock accepts a web_search call.
+        Purpose: Ensure server_tool_use blocks no longer trigger 422 validation.
+        """
+        print("Setup: Creating ServerToolUseContentBlock...")
+        block = ServerToolUseContentBlock(
+            id="srvtoolu_abc",
+            name="web_search",
+            input={"query": "Cursor rules directory"},
+        )
+
+        print(f"Comparing type: Expected 'server_tool_use', Got '{block.type}'")
+        assert block.type == "server_tool_use"
+        assert block.name == "web_search"
+        assert block.input["query"] == "Cursor rules directory"
+
+    def test_web_search_tool_result_block(self):
+        """
+        What it does: Verifies WebSearchToolResultContentBlock accepts search results.
+        Purpose: Ensure web_search_tool_result blocks validate with list content.
+        """
+        print("Setup: Creating WebSearchToolResultContentBlock...")
+        block = WebSearchToolResultContentBlock(
+            tool_use_id="srvtoolu_abc",
+            content=[
+                {
+                    "type": "web_search_result",
+                    "title": "Cursor - Rules",
+                    "url": "https://docs.cursor.com/context/rules",
+                    "encrypted_content": "stored in .cursor/rules",
+                    "page_age": None,
+                }
+            ],
+        )
+
+        print(f"Comparing type: Expected 'web_search_tool_result', Got '{block.type}'")
+        assert block.type == "web_search_tool_result"
+        assert block.tool_use_id == "srvtoolu_abc"
+
+    def test_unknown_block_falls_back(self):
+        """
+        What it does: Verifies UnknownContentBlock accepts an unrecognized type.
+        Purpose: Ensure future server tools degrade gracefully instead of 422.
+        """
+        print("Setup: Creating UnknownContentBlock from a future server tool...")
+        block = UnknownContentBlock(
+            type="code_execution_tool_result",
+            tool_use_id="z",
+            content={"stdout": "hi"},
+        )
+
+        print(f"Comparing type: Got '{block.type}'")
+        assert block.type == "code_execution_tool_result"
+
+    def test_message_with_web_search_history(self):
+        """
+        What it does: Verifies an assistant message with a full web_search exchange validates.
+        Purpose: Reproduce the exact 422 payload shape and confirm correct block resolution.
+        """
+        print("Setup: Building assistant message mirroring the 422 payload...")
+        msg = AnthropicMessage(
+            role="assistant",
+            content=[
+                {
+                    "id": "srvtoolu_abc",
+                    "type": "server_tool_use",
+                    "name": "web_search",
+                    "input": {"query": "foo"},
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_abc",
+                    "content": [
+                        {
+                            "type": "web_search_result",
+                            "title": "T",
+                            "url": "https://x",
+                            "encrypted_content": "c",
+                            "page_age": None,
+                        }
+                    ],
+                },
+                {"type": "text", "text": "<web_search>results</web_search>"},
+            ],
+        )
+
+        resolved = [type(b).__name__ for b in msg.content]
+        print(f"Resolved block types: {resolved}")
+        assert resolved == [
+            "ServerToolUseContentBlock",
+            "WebSearchToolResultContentBlock",
+            "TextContentBlock",
+        ]
 
 
 # ==================================================================================================

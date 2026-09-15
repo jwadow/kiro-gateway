@@ -67,30 +67,13 @@ from kiro.http_client import KiroHttpClient
 def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
     """
     Check if auth manager uses runtime endpoint that doesn't provide /ListAvailableModels.
-    
+
     Runtime endpoint pattern: https://runtime.{region}.kiro.dev
     Old endpoint pattern: https://q.{region}.amazonaws.com
-    
-    Runtime endpoint does not provide /ListAvailableModels API (AWS limitation).
-    
-    Args:
-        auth_manager: KiroAuthManager instance
-    
-    Returns:
-        True if using runtime endpoint, False otherwise
-    
-    Examples:
-        >>> auth_manager.api_host = "https://runtime.us-east-1.kiro.dev"
-        >>> _is_runtime_endpoint(auth_manager)
-        True
-        >>> auth_manager.api_host = "https://runtime.eu-central-1.kiro.dev"
-        >>> _is_runtime_endpoint(auth_manager)
-        True
-        >>> auth_manager.api_host = "https://q.us-east-1.amazonaws.com"
-        >>> _is_runtime_endpoint(auth_manager)
-        False
+
+    NOTE: runtime.kiro.dev DOES support /ListAvailableModels, always attempt dynamic fetch.
     """
-    return "://runtime." in auth_manager.api_host
+    return False
 
 
 def _format_duration(seconds: float) -> str:
@@ -496,25 +479,39 @@ class AccountManager:
             
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
-            
+
+            # Kiro API now requires profileArn for all requests.
+            # If not loaded from credentials, force a token refresh to obtain it.
+            if not auth_manager.profile_arn:
+                logger.info(f"Account {account_id}: profileArn not in credentials, forcing token refresh to obtain it...")
+                try:
+                    await auth_manager.force_refresh()
+                    if auth_manager.profile_arn:
+                        logger.info(f"Account {account_id}: profileArn obtained via token refresh")
+                    else:
+                        logger.warning(
+                            f"Account {account_id}: profileArn still unavailable after token refresh. "
+                            "API calls will fail with 400 'profileArn is required'. "
+                            "Set PROFILE_ARN in .env as a workaround."
+                        )
+                except Exception as e:
+                    logger.warning(f"Account {account_id}: failed to obtain profileArn via force refresh: {e}")
+
             # Determine if we should fetch models or use static list
             if _is_runtime_endpoint(auth_manager):
-                # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
-                # Use static list without attempting request
-                logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
-                models_list = FALLBACK_MODELS
+                models_list = []
             else:
                 # Old endpoint - attempt to fetch dynamic model list
                 # Fetch models list with retry + fallback
                 params = {"origin": "AI_EDITOR"}
-                if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+                if auth_manager.profile_arn:
                     params["profileArn"] = auth_manager.profile_arn
-                
+
                 list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
-                
+
                 # Use KiroHttpClient for retry logic (3 attempts with exponential backoff)
                 http_client = KiroHttpClient(auth_manager, shared_client=None)
-                
+
                 try:
                     response = await http_client.request_with_retry(
                         method="GET",
@@ -523,20 +520,22 @@ class AccountManager:
                         params=params,
                         stream=False
                     )
-                    
+
                     if response.status_code == 200:
                         data = response.json()
                         models_list = data.get("models", [])
+                        # Capture profileArn if returned in response and not already set
+                        if not auth_manager.profile_arn and data.get("profileArn"):
+                            auth_manager._profile_arn = data["profileArn"]
+                            logger.info(f"Account {account_id}: profileArn obtained from ListAvailableModels response")
                     else:
                         # Shouldn't happen (retry handles non-200), but keep for safety
                         raise Exception(f"HTTP {response.status_code}")
-                
+
                 except Exception as e:
-                    # All retries exhausted - use fallback
                     logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
-                    logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
-                    models_list = FALLBACK_MODELS
-                
+                    models_list = []
+
                 finally:
                     await http_client.close()
             
@@ -591,10 +590,7 @@ class AccountManager:
         
         # Check if using runtime endpoint (no dynamic model list available)
         if _is_runtime_endpoint(account.auth_manager):
-            # Runtime endpoint does not provide /ListAvailableModels
-            # Use static list and update cache timestamp
-            logger.debug(f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)")
-            await account.model_cache.update(FALLBACK_MODELS)
+            await account.model_cache.update([])
             account.models_cached_at = time.time()
             self._dirty = True
             return
@@ -605,7 +601,7 @@ class AccountManager:
         
         try:
             params = {"origin": "AI_EDITOR"}
-            if account.auth_manager.auth_type == AuthType.KIRO_DESKTOP and account.auth_manager.profile_arn:
+            if account.auth_manager.profile_arn:
                 params["profileArn"] = account.auth_manager.profile_arn
             
             list_models_url = f"{account.auth_manager.q_host}/ListAvailableModels"
@@ -621,9 +617,13 @@ class AccountManager:
             if response.status_code == 200:
                 data = response.json()
                 models_list = data.get("models", [])
+                # Capture profileArn if returned and not already set
+                if not account.auth_manager.profile_arn and data.get("profileArn"):
+                    account.auth_manager._profile_arn = data["profileArn"]
+                    logger.info(f"Account {account_id}: profileArn obtained from ListAvailableModels response (refresh)")
                 await account.model_cache.update(models_list)
                 account.models_cached_at = time.time()
-                
+
                 # Update model_to_accounts mapping (new models may have appeared)
                 available_models = account.model_resolver.get_available_models()
                 for model in available_models:

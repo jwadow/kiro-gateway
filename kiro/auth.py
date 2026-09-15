@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
@@ -43,12 +44,49 @@ from loguru import logger
 from kiro.config import (
     TOKEN_REFRESH_THRESHOLD,
     SQLITE_READONLY,
+    KIRO_API_HOST_OVERRIDE,
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
     get_aws_sso_oidc_url,
 )
 from kiro.utils import get_machine_fingerprint
+
+
+def _load_kiro_ide_profile_arn() -> Optional[str]:
+    """
+    Read profile ARN from Kiro IDE's profile.json.
+
+    Kiro IDE stores the user's selected CodeWhisperer profile in:
+      macOS:   ~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/profile.json
+      Linux:   ~/.config/Kiro/User/globalStorage/kiro.kiroagent/profile.json
+      Windows: %APPDATA%/Kiro/User/globalStorage/kiro.kiroagent/profile.json
+
+    The file contains {"arn": "arn:aws:codewhisperer:...", "name": "..."}
+    """
+    try:
+        home = Path.home()
+        if sys.platform == "darwin":
+            base = home / "Library" / "Application Support"
+        elif sys.platform == "win32":
+            base = Path(os.environ.get("APPDATA", str(home / "AppData" / "Roaming")))
+        else:
+            base = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config")))
+
+        profile_path = base / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent" / "profile.json"
+        if not profile_path.exists():
+            return None
+
+        with open(profile_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        arn = data.get("arn", "")
+        if arn:
+            logger.debug(f"Profile ARN loaded from Kiro IDE profile.json: {arn}")
+            return arn
+    except Exception as e:
+        logger.debug(f"Failed to read Kiro IDE profile.json: {e}")
+    return None
 
 
 # Supported SQLite token keys (searched in priority order)
@@ -181,7 +219,15 @@ class KiroAuthManager:
         # Load credentials from JSON file if specified
         elif creds_file:
             self._load_credentials_from_file(creds_file)
-        
+
+        # If profileArn is still not set, try to read it from Kiro IDE's profile.json.
+        # Kiro now requires profileArn for all API calls; the IDE stores it separately.
+        if not self._profile_arn:
+            ide_arn = _load_kiro_ide_profile_arn()
+            if ide_arn:
+                self._profile_arn = ide_arn
+                logger.info(f"profileArn auto-loaded from Kiro IDE: {ide_arn}")
+
         # Determine auth type based on available credentials
         self._detect_auth_type()
         
@@ -219,8 +265,13 @@ class KiroAuthManager:
         # - API/Q hosts: use determined API region (for Q Developer API calls)
         sso_region_for_oidc = self._sso_region or region
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
-        self._api_host = get_kiro_api_host(final_api_region)
-        self._q_host = get_kiro_q_host(final_api_region)
+        if KIRO_API_HOST_OVERRIDE:
+            self._api_host = KIRO_API_HOST_OVERRIDE.rstrip("/")
+            self._q_host = KIRO_API_HOST_OVERRIDE.rstrip("/")
+            logger.info(f"API host overridden by KIRO_API_HOST: {self._api_host}")
+        else:
+            self._api_host = get_kiro_api_host(final_api_region)
+            self._q_host = get_kiro_q_host(final_api_region)
         
         # Log initialized endpoints for diagnostics (helps with DNS issues like #58, #132, #133)
         logger.info(
@@ -702,7 +753,7 @@ class KiroAuthManager:
         payload = {'refreshToken': self._refresh_token}
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": f"KiroIDE-0.7.45-{self._fingerprint}",
+            "User-Agent": f"KiroIDE-1.1.14-{self._fingerprint}",
         }
         
         async with httpx.AsyncClient(timeout=30) as client:
