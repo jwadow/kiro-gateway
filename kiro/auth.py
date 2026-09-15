@@ -753,7 +753,7 @@ class KiroAuthManager:
         payload = {'refreshToken': self._refresh_token}
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": f"KiroIDE-1.0.337-{self._fingerprint}",
+            "User-Agent": f"KiroIDE-1.1.14-{self._fingerprint}",
         }
         
         async with httpx.AsyncClient(timeout=30) as client:
