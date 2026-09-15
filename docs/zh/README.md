@@ -216,6 +216,12 @@ AWS SSO 凭据文件（来自 `~/.aws/sso/cache/`）包含：
 
 如果您使用 `kiro-cli` 并希望直接使用其 SQLite 数据库：
 
+```bash
+# 如果后续使用 docker compose 先执行属主修改
+chown 999:999 ~/.local/share/kiro-cli
+chown 999:999 ~/.local/share/kiro-cli/data.sqlite3
+```
+
 ```env
 KIRO_CLI_DB_FILE="~/.local/share/kiro-cli/data.sqlite3"
 
