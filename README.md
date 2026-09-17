@@ -341,6 +341,67 @@ For complete configuration examples (including per-account region settings), see
 
 ---
 
+## 🧑‍💻 macOS Menu Bar App
+
+Run the gateway as a native macOS menu bar application — no terminal window required.
+
+### Run from Source
+
+```bash
+# Install the menu bar dependency
+uv pip install rumps --python .venv/bin/python   # or: pip install rumps
+
+# Launch (adds 👻 icon to the menu bar)
+.venv/bin/python menubar.py
+```
+
+### Build a Standalone .app
+
+```bash
+.venv/bin/python setup_menubar.py py2app
+# → dist/Kiro Gateway.app (open it, or drag to /Applications)
+```
+
+### Menu Items
+
+| Item | Description |
+|------|-------------|
+| **Ghost icon** | Status at a glance: bright = Running, dim = Stopped (template icon adapts to light/dark menu bar) |
+| **Status: Running/Stopped** | Live server state (text) |
+| **Start / Stop** | Toggle the server in a background thread |
+| **Copy URL** | Copy the gateway base URL (`https://...` when TLS is configured) |
+| **Open Logs** | Open the log file |
+| **Settings…** | Open the settings window (see below) |
+| **Launch at Login** | Install/remove a LaunchAgent so the app starts on login |
+| **Quit** | Graceful server shutdown and exit |
+
+### Settings Window
+
+The **Settings…** item opens a single window with one field per editable
+`.env` key (comments and ordering preserved on save). The API key field is
+masked. Editable keys:
+
+`PROXY_API_KEY`, `SERVER_PORT`, `SERVER_HOST`, `SSL_CERTFILE`, `SSL_KEYFILE`,
+`KIRO_CREDS_FILE`, `KIRO_CLI_DB_FILE`, `KIRO_API_REGION`, `VPN_PROXY_URL`, `DEBUG_MODE`
+
+Clicking **Save** writes the values and prompts an immediate **Restart Now /
+Later** choice — `.env` values are read at process startup, so a restart is
+required for changes to take effect. "Restart to Apply" in the same submenu
+relaunches at any time.
+
+### HTTPS for the Menu Bar App
+
+Set the certificate paths in `.env` (same settings the CLI uses):
+
+```env
+SSL_CERTFILE="/path/to/fullchain.pem"
+SSL_KEYFILE="/path/to/privkey.pem"
+```
+
+They can also be passed on the command line: `python main.py --ssl-certfile ... --ssl-keyfile ...`
+
+---
+
 ## 🐳 Docker Deployment
 
 > **Docker-based deployment.** Prefer native Python? See [Quick Start](#-quick-start) above.

@@ -69,6 +69,8 @@ from kiro.config import (
     SERVER_PORT,
     DEFAULT_SERVER_HOST,
     DEFAULT_SERVER_PORT,
+    SSL_CERTFILE,
+    SSL_KEYFILE,
     STREAMING_READ_TIMEOUT,
     HIDDEN_MODELS,
     MODEL_ALIASES,
@@ -636,6 +638,22 @@ Examples:
         metavar="PORT",
         help=f"Server port (default: {DEFAULT_SERVER_PORT}, env: SERVER_PORT)"
     )
+
+    parser.add_argument(
+        "--ssl-certfile",
+        type=str,
+        default=None,  # None means "use env or default"
+        metavar="PATH",
+        help="Path to TLS certificate (PEM). Requires --ssl-keyfile. (env: SSL_CERTFILE)"
+    )
+
+    parser.add_argument(
+        "--ssl-keyfile",
+        type=str,
+        default=None,  # None means "use env or default"
+        metavar="PATH",
+        help="Path to TLS private key (PEM). Requires --ssl-certfile. (env: SSL_KEYFILE)"
+    )
     
     parser.add_argument(
         "-v", "--version",
@@ -686,17 +704,51 @@ def resolve_server_config(args: argparse.Namespace) -> tuple[str, int]:
     # Log configuration sources for transparency
     logger.debug(f"Host: {final_host} (from {host_source})")
     logger.debug(f"Port: {final_port} (from {port_source})")
-    
+
     return final_host, final_port
 
 
-def print_startup_banner(host: str, port: int) -> None:
+def resolve_tls_config(args: argparse.Namespace) -> tuple[str, str]:
+    """
+    Resolve TLS certificate/key paths using priority hierarchy.
+
+    Priority (highest to lowest):
+    1. CLI arguments (--ssl-certfile, --ssl-keyfile)
+    2. Environment variables (SSL_CERTFILE, SSL_KEYFILE)
+    3. Disabled (empty strings)
+
+    Args:
+        args: Parsed CLI arguments
+
+    Returns:
+        Tuple of (certfile, keyfile) paths, empty strings when TLS is disabled
+
+    Raises:
+        ValueError: If only one of certfile/keyfile is provided
+    """
+    certfile = args.ssl_certfile if args.ssl_certfile is not None else SSL_CERTFILE
+    keyfile = args.ssl_keyfile if args.ssl_keyfile is not None else SSL_KEYFILE
+
+    if bool(certfile) != bool(keyfile):
+        raise ValueError(
+            "TLS requires both --ssl-certfile and --ssl-keyfile "
+            "(or both SSL_CERTFILE and SSL_KEYFILE). Got only one of them."
+        )
+
+    if certfile and keyfile:
+        logger.info(f"TLS enabled: cert={certfile}, key={keyfile}")
+
+    return certfile, keyfile
+
+
+def print_startup_banner(host: str, port: int, tls_enabled: bool = False) -> None:
     """
     Print a startup banner with server information.
-    
+
     Args:
         host: Server host address
         port: Server port
+        tls_enabled: Whether HTTPS is enabled
     """
     # ANSI color codes
     GREEN = "\033[92m"
@@ -706,10 +758,11 @@ def print_startup_banner(host: str, port: int) -> None:
     BOLD = "\033[1m"
     DIM = "\033[2m"
     RESET = "\033[0m"
-    
+
     # Determine display URL
     display_host = "localhost" if host == "0.0.0.0" else host
-    url = f"http://{display_host}:{port}"
+    scheme = "https" if tls_enabled else "http"
+    url = f"{scheme}://{display_host}:{port}"
     
     print()
     print(f"  {WHITE}{BOLD}👻 {APP_TITLE} v{APP_VERSION}{RESET}")
@@ -742,16 +795,19 @@ if __name__ == "__main__":
     
     # Resolve final configuration with priority hierarchy
     final_host, final_port = resolve_server_config(args)
-    
+    ssl_certfile, ssl_keyfile = resolve_tls_config(args)
+
     # Print startup banner
-    print_startup_banner(final_host, final_port)
-    
+    print_startup_banner(final_host, final_port, tls_enabled=bool(ssl_certfile))
+
     logger.info(f"Starting Uvicorn server on {final_host}:{final_port}...")
-    
+
     # Use string reference to avoid double module import
     uvicorn.run(
         "main:app",
         host=final_host,
         port=final_port,
         log_config=UVICORN_LOG_CONFIG,
+        ssl_certfile=ssl_certfile or None,
+        ssl_keyfile=ssl_keyfile or None,
     )

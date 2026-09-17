@@ -91,6 +91,17 @@ SERVER_HOST: str = os.getenv("SERVER_HOST", DEFAULT_SERVER_HOST)
 DEFAULT_SERVER_PORT: int = 8000
 SERVER_PORT: int = int(os.getenv("SERVER_PORT", str(DEFAULT_SERVER_PORT)))
 
+# TLS/HTTPS settings (optional)
+# When both are set, the server runs with HTTPS using the provided certificate.
+#
+# Files follow the certbot live-directory convention:
+#   ~/.certbot/config/live/<domain>/fullchain.pem
+#   ~/.certbot/config/live/<domain>/privkey.pem
+#
+# Can be overridden by CLI: python main.py --ssl-certfile ... --ssl-keyfile ...
+SSL_CERTFILE: str = _get_raw_env_value("SSL_CERTFILE") or os.getenv("SSL_CERTFILE", "")
+SSL_KEYFILE: str = _get_raw_env_value("SSL_KEYFILE") or os.getenv("SSL_KEYFILE", "")
+
 # ==================================================================================================
 # Proxy Server Settings
 # ==================================================================================================
@@ -248,6 +259,9 @@ HIDDEN_MODELS: Dict[str, str] = {
 # Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
 MODEL_ALIASES: Dict[str, str] = {
     "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
+    "kiro/claude-sonnet-4-6": "claude-sonnet-4.6",  # bench cc harness model alias
+    "kiro/claude-sonnet-4-5": "claude-sonnet-4.5",  # bench cc harness model alias
+    "kiro/claude-haiku-4-5": "claude-haiku-4.5",    # bench cc harness model alias
 }
 
 # Models to hide from /v1/models endpoint.
@@ -555,7 +569,7 @@ STATE_SAVE_INTERVAL_SECONDS: int = int(os.getenv("STATE_SAVE_INTERVAL_SECONDS", 
 # Application Version
 # ==================================================================================================
 
-APP_VERSION: str = "2.4.dev.13"
+APP_VERSION: str = "2.4.1"
 APP_TITLE: str = "Kiro Gateway"
 APP_DESCRIPTION: str = "Proxy gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible. Made by @jwadow"
 

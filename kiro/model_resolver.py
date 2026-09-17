@@ -128,6 +128,10 @@ def normalize_model_name(name: str) -> str:
     if not name:
         return name
 
+    # Strip provider prefix (e.g., "kiro/claude-sonnet-4-6" → "claude-sonnet-4-6")
+    if "/" in name:
+        name = name.split("/", 1)[1]
+
     # Strip context window suffix (e.g., [1m], [200k]) — client-side indicator, not a model ID
     name = re.sub(r'\[\d+[mk]\]$', '', name, flags=re.IGNORECASE)
 

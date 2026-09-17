@@ -44,7 +44,7 @@ from kiro.config import (
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
-from kiro.payload_guards import check_payload_size, trim_payload_to_limit
+from kiro.payload_guards import check_payload_size, trim_payload_to_limit, repair_tool_use_integrity
 
 
 # ==================================================================================================
@@ -1593,5 +1593,9 @@ def build_kiro_payload(
                 f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
                 f"({stats.original_bytes} -> {stats.final_bytes} bytes)"
             )
+        else:
+            repair_tool_use_integrity(payload)
+    else:
+        repair_tool_use_integrity(payload)
 
     return KiroPayloadResult(payload=payload, tool_documentation=tool_documentation)

@@ -23,3 +23,4 @@ These contributors have made significant, sustained contributions to the project
 - [@BoosterY](https://github.com/BoosterY) — SQLite write-back field preservation (#131), regional configuration auto-detection (#132, #133)
 - [@leikaiwei](https://github.com/leikaiwei) — Anthropic token counting fix (#135)
 - [@ramaiyaKushal](https://github.com/ramaiyaKushal) — Missing import fix (#138)
+- [@leecoder](https://github.com/leecoder) — macOS menu bar app with Settings window, DMG packaging

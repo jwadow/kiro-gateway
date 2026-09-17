@@ -134,7 +134,6 @@ class TestParseCliArgs:
 
 class TestResolveServerConfig:
     """Tests for resolve_server_config() function - priority hierarchy."""
-    
     def test_cli_args_take_priority_over_env(self):
         """
         What it does: Verifies that CLI arguments have highest priority.
@@ -257,6 +256,160 @@ class TestResolveServerConfig:
         print(f"Comparing: Expected ('192.168.1.1', 5000)")
         assert host == "192.168.1.1"  # From env (different from default)
         assert port == 5000  # From CLI
+
+
+class TestResolveTlsConfig:
+    """Tests for resolve_tls_config() function - TLS priority and validation."""
+
+    def test_no_tls_by_default(self):
+        """
+        What it does: Verifies TLS is disabled when no CLI args or env vars.
+        Purpose: Ensure empty strings (TLS off) are returned by default.
+        """
+        print("Setup: Importing resolve_tls_config...")
+        from main import resolve_tls_config
+
+        print("Setup: Creating args with ssl options None...")
+        args = argparse.Namespace(ssl_certfile=None, ssl_keyfile=None)
+
+        print("Action: Calling resolve_tls_config with no env vars...")
+        with patch('main.SSL_CERTFILE', ''), patch('main.SSL_KEYFILE', ''):
+            certfile, keyfile = resolve_tls_config(args)
+
+        print(f"certfile: {certfile!r}, keyfile: {keyfile!r}")
+        assert certfile == ""
+        assert keyfile == ""
+
+    def test_env_vars_used_when_no_cli_args(self):
+        """
+        What it does: Verifies env vars are used when CLI args are None.
+        Purpose: Ensure SSL_CERTFILE/SSL_KEYFILE env vars enable TLS.
+        """
+        print("Setup: Importing resolve_tls_config...")
+        from main import resolve_tls_config
+
+        args = argparse.Namespace(ssl_certfile=None, ssl_keyfile=None)
+
+        print("Action: Calling resolve_tls_config with env vars set...")
+        with patch('main.SSL_CERTFILE', '/certs/fullchain.pem'), \
+             patch('main.SSL_KEYFILE', '/certs/privkey.pem'):
+            certfile, keyfile = resolve_tls_config(args)
+
+        print(f"certfile: {certfile}, keyfile: {keyfile}")
+        assert certfile == "/certs/fullchain.pem"
+        assert keyfile == "/certs/privkey.pem"
+
+    def test_cli_args_take_priority_over_env(self):
+        """
+        What it does: Verifies CLI args override env vars.
+        Purpose: Ensure CLI has highest priority for TLS paths.
+        """
+        print("Setup: Importing resolve_tls_config...")
+        from main import resolve_tls_config
+
+        args = argparse.Namespace(
+            ssl_certfile="/cli/cert.pem", ssl_keyfile="/cli/key.pem"
+        )
+
+        print("Action: Calling resolve_tls_config with both CLI and env set...")
+        with patch('main.SSL_CERTFILE', '/env/cert.pem'), \
+             patch('main.SSL_KEYFILE', '/env/key.pem'):
+            certfile, keyfile = resolve_tls_config(args)
+
+        print(f"certfile: {certfile}, keyfile: {keyfile}")
+        assert certfile == "/cli/cert.pem"
+        assert keyfile == "/cli/key.pem"
+
+    def test_only_certfile_raises_error(self):
+        """
+        What it does: Verifies error when only certfile is provided.
+        Purpose: Ensure partial TLS config is rejected, not silently ignored.
+        """
+        print("Setup: Importing resolve_tls_config...")
+        from main import resolve_tls_config
+
+        args = argparse.Namespace(ssl_certfile="/cert.pem", ssl_keyfile=None)
+
+        print("Action: Calling resolve_tls_config with certfile only...")
+        with patch('main.SSL_CERTFILE', ''), patch('main.SSL_KEYFILE', ''):
+            with pytest.raises(ValueError) as exc_info:
+                resolve_tls_config(args)
+
+        print(f"Error message: {exc_info.value}")
+        assert "both" in str(exc_info.value).lower()
+
+    def test_only_keyfile_raises_error(self):
+        """
+        What it does: Verifies error when only keyfile is provided.
+        Purpose: Ensure partial TLS config is rejected in both directions.
+        """
+        print("Setup: Importing resolve_tls_config...")
+        from main import resolve_tls_config
+
+        args = argparse.Namespace(ssl_certfile=None, ssl_keyfile="/key.pem")
+
+        print("Action: Calling resolve_tls_config with keyfile only...")
+        with patch('main.SSL_CERTFILE', ''), patch('main.SSL_KEYFILE', ''):
+            with pytest.raises(ValueError):
+                resolve_tls_config(args)
+
+    def test_empty_strings_do_not_raise(self):
+        """
+        What it does: Verifies empty strings for both paths are treated as TLS off.
+        Purpose: Ensure empty env vars do not trigger the mismatch error.
+        """
+        print("Setup: Importing resolve_tls_config...")
+        from main import resolve_tls_config
+
+        args = argparse.Namespace(ssl_certfile="", ssl_keyfile="")
+
+        print("Action: Calling resolve_tls_config with empty strings...")
+        with patch('main.SSL_CERTFILE', ''), patch('main.SSL_KEYFILE', ''):
+            certfile, keyfile = resolve_tls_config(args)
+
+        print(f"certfile: {certfile!r}, keyfile: {keyfile!r}")
+        assert certfile == ""
+        assert keyfile == ""
+
+
+class TestParseCliTlsArgs:
+    """Tests for --ssl-certfile/--ssl-keyfile CLI argument parsing."""
+
+    def test_ssl_args_parsed(self):
+        """
+        What it does: Verifies --ssl-certfile/--ssl-keyfile are parsed.
+        Purpose: Ensure TLS can be enabled via CLI.
+        """
+        print("Setup: Importing parse_cli_args...")
+        from main import parse_cli_args
+
+        print("Action: Calling parse_cli_args with ssl args...")
+        with patch.object(sys, 'argv', [
+            'main.py',
+            '--ssl-certfile', '/certs/fullchain.pem',
+            '--ssl-keyfile', '/certs/privkey.pem',
+        ]):
+            args = parse_cli_args()
+
+        print(f"ssl_certfile: {args.ssl_certfile}, ssl_keyfile: {args.ssl_keyfile}")
+        assert args.ssl_certfile == "/certs/fullchain.pem"
+        assert args.ssl_keyfile == "/certs/privkey.pem"
+
+    def test_ssl_args_default_none(self):
+        """
+        What it does: Verifies ssl args default to None.
+        Purpose: Ensure None means "use env or default" like host/port.
+        """
+        print("Setup: Importing parse_cli_args...")
+        from main import parse_cli_args
+
+        print("Action: Calling parse_cli_args without ssl args...")
+        with patch.object(sys, 'argv', ['main.py']):
+            args = parse_cli_args()
+
+        print(f"ssl_certfile: {args.ssl_certfile}, ssl_keyfile: {args.ssl_keyfile}")
+        assert args.ssl_certfile is None
+        assert args.ssl_keyfile is None
 
 
 class TestPrintStartupBanner:

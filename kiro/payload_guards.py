@@ -63,6 +63,61 @@ def _align_to_user_message(history: list) -> list:
     return history
 
 
+def _repair_unmatched_tool_uses(history: list, current_message: dict = None) -> None:
+    """
+    Remove toolUses from assistant messages that have no corresponding toolResult
+    in the following user message. Bedrock rejects such payloads with a 400 error:
+    "tool_use ids were found in the assistant turn that don't have a corresponding
+    tool_result in the user turn."
+
+    This happens when parallel tool_use calls are present (e.g., CC calling Read
+    twice) but the conversation is trimmed or the tool_results are dropped, leaving
+    dangling toolUse ids that Bedrock cannot resolve.
+
+    current_message: the payload's currentMessage dict, which may contain toolResults
+    that correspond to the last assistant entry in history (i.e., the case where the
+    last history entry is an assistant message and its results live in currentMessage,
+    not in a subsequent history entry).
+    """
+    current_result_ids = set()
+    if current_message:
+        um = current_message.get("userInputMessage", {})
+        ctx = um.get("userInputMessageContext", {})
+        for tr in ctx.get("toolResults", []):
+            tool_use_id = tr.get("toolUseId")
+            if tool_use_id:
+                current_result_ids.add(tool_use_id)
+
+    for i, entry in enumerate(history):
+        assistant = entry.get("assistantResponseMessage")
+        if not assistant or "toolUses" not in assistant:
+            continue
+
+        tool_uses = assistant.get("toolUses", [])
+        if not tool_uses:
+            continue
+
+        # Collect toolUseIds present in the following user message
+        result_ids = set()
+        if i + 1 < len(history):
+            next_user = history[i + 1].get("userInputMessage", {})
+            ctx = next_user.get("userInputMessageContext", {})
+            for tr in ctx.get("toolResults", []):
+                tool_use_id = tr.get("toolUseId")
+                if tool_use_id:
+                    result_ids.add(tool_use_id)
+        elif i == len(history) - 1:
+            result_ids = current_result_ids
+
+        kept = [tu for tu in tool_uses if tu.get("toolUseId") in result_ids]
+        dropped = len(tool_uses) - len(kept)
+        if dropped:
+            if kept:
+                assistant["toolUses"] = kept
+            else:
+                del assistant["toolUses"]
+
+
 def _repair_orphaned_tool_results(history: list) -> None:
     """
     Remove orphaned toolResults that reference toolUseIds not present
@@ -118,6 +173,16 @@ def _repair_orphaned_tool_results(history: list) -> None:
                 user_msg["content"] = current_content + marker
 
 
+def repair_tool_use_integrity(payload: Dict[str, Any]) -> None:
+    cs = payload.get("conversationState", {})
+    history = cs.get("history")
+    if not history:
+        return
+    current_message = cs.get("currentMessage")
+    _repair_unmatched_tool_uses(history, current_message)
+    _repair_orphaned_tool_results(history)
+
+
 def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTrimStats:
     """
     Trim oldest history entries so the serialized payload fits under max_bytes.
@@ -151,7 +216,8 @@ def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTri
     # Align to userInputMessage boundary
     _align_to_user_message(history)
 
-    # Repair orphaned tool results after trimming
+    current_message = payload.get("conversationState", {}).get("currentMessage")
+    _repair_unmatched_tool_uses(history, current_message)
     _repair_orphaned_tool_results(history)
 
     final_bytes = check_payload_size(payload)

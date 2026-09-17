@@ -28,6 +28,7 @@ Contains all API endpoints:
 
 import json
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -53,6 +54,7 @@ from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
+from kiro.multi_user import multi_user_manager
 
 # Import debug_logger
 try:
@@ -63,6 +65,7 @@ except ImportError:
 
 # --- Security scheme ---
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+models_x_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 
 async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
@@ -84,6 +87,15 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
         logger.warning("Access attempt with invalid API key.")
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return True
+
+
+async def verify_models_api_key(
+    x_api_key: Optional[str] = Security(models_x_api_key_header),
+    auth_header: Optional[str] = Security(api_key_header),
+) -> bool:
+    if x_api_key and x_api_key == PROXY_API_KEY:
+        return True
+    return await verify_api_key(auth_header or "")
 
 
 # --- Router ---
@@ -119,7 +131,7 @@ async def health():
         "version": APP_VERSION
     }
 
-@router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
+@router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_models_api_key)])
 async def get_models(request: Request):
     """
     Return list of available models.
@@ -559,13 +571,32 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         # ==============================================================================
         # LEGACY MODE: Single Account (no failover)
         # ==============================================================================
-        account = request.app.state.account_manager.get_first_account()
-        if not account.auth_manager:
-            logger.error("No initialized accounts available (legacy mode)")
-            raise HTTPException(503, "No initialized accounts available")
-        auth_manager = account.auth_manager
-        model_cache = account.model_cache
-        model_resolver = account.model_resolver
+        
+        # Multi-user: check for X-Kiro-* headers
+        kiro_refresh = request.headers.get("x-kiro-refresh-token")
+        kiro_access = request.headers.get("x-kiro-access-token")
+        
+        if kiro_refresh:
+            auth_manager = multi_user_manager.get_or_create(
+                refresh_token=kiro_refresh,
+                access_token=kiro_access,
+                auth_method=request.headers.get("x-kiro-auth-method"),
+                profile_arn=request.headers.get("x-kiro-profile-arn"),
+                region=request.headers.get("x-kiro-region"),
+                client_id=request.headers.get("x-kiro-client-id"),
+                client_secret=request.headers.get("x-kiro-client-secret"),
+                client_id_hash=request.headers.get("x-kiro-client-id-hash"),
+            )
+            model_cache = ModelInfoCache()
+            model_resolver = None
+        else:
+            account = request.app.state.account_manager.get_first_account()
+            if not account.auth_manager:
+                logger.error("No initialized accounts available (legacy mode)")
+                raise HTTPException(503, "No initialized accounts available")
+            auth_manager = account.auth_manager
+            model_cache = account.model_cache
+            model_resolver = account.model_resolver
     
     # Generate conversation ID for Kiro API (random UUID, not used for tracking)
     conversation_id = generate_conversation_id()

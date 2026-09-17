@@ -289,6 +289,27 @@ class TestModelsEndpoint:
         
         print(f"Status: {response.status_code}")
         assert response.status_code == 401
+
+    def test_models_accepts_x_api_key(self, test_client, valid_proxy_api_key):
+        print("Action: GET /v1/models with valid x-api-key...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"x-api-key": valid_proxy_api_key}
+        )
+
+        print(f"Result: {response.json()}")
+        assert response.status_code == 200
+        assert response.json()["object"] == "list"
+
+    def test_models_rejects_invalid_x_api_key(self, test_client, invalid_proxy_api_key):
+        print("Action: GET /v1/models with invalid x-api-key...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"x-api-key": invalid_proxy_api_key}
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 401
     
     def test_models_returns_list_object(self, test_client, valid_proxy_api_key):
         """
@@ -420,6 +441,20 @@ class TestChatCompletionsAuthentication:
             }
         )
         
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 401
+
+    def test_chat_completions_rejects_x_api_key(self, test_client, valid_proxy_api_key):
+        print("Action: POST /v1/chat/completions with valid x-api-key...")
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
         print(f"Status: {response.status_code}")
         assert response.status_code == 401
 
