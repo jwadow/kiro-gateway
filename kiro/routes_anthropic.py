@@ -44,6 +44,7 @@ from kiro.models_anthropic import (
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
+from kiro.model_resolver import normalize_model_name
 from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
@@ -792,6 +793,13 @@ async def messages(
                     }
                 }
             )
+
+        # Self-discovery (legacy mode): surface working-but-unadvertised models
+        # in /v1/models. Account-system mode already does this via
+        # account_manager.report_success.
+        normalized_model_name = normalize_model_name(request_data.model)
+        if not model_cache.is_valid_model(normalized_model_name):
+            model_cache.add_discovered_model(normalized_model_name)
         
         if request_data.stream:
             # Streaming mode with first token retry

@@ -125,6 +125,30 @@ class ModelInfoCache:
                 "_is_hidden": True,  # Mark as hidden model
             }
             logger.debug(f"Added hidden model: {display_name} → {internal_id}")
+
+    def add_discovered_model(self, model_id: str) -> None:
+        """
+        Register a model discovered through a successful request.
+
+        The runtime endpoint does not provide /ListAvailableModels, so the
+        advertised list comes from the static FALLBACK_MODELS. Models released
+        after that list was written work when requested directly but stay
+        invisible in /v1/models. This method surfaces them: once a request
+        with an unknown model ID succeeds, the model is added to the cache
+        and appears in /v1/models from then on (until restart).
+
+        Args:
+            model_id: Model ID as requested by the client
+        """
+        if model_id not in self._cache:
+            self._cache[model_id] = {
+                "modelId": model_id,
+                "modelName": model_id,
+                "description": "Discovered via successful request",
+                "tokenLimits": {"maxInputTokens": DEFAULT_MAX_INPUT_TOKENS},
+                "_discovered": True,
+            }
+            logger.info(f"Discovered new model via successful request: {model_id}")
     
     def get_max_input_tokens(self, model_id: str) -> int:
         """

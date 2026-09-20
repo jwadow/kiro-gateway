@@ -46,7 +46,7 @@ from kiro.models_openai import (
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
-from kiro.model_resolver import ModelResolver
+from kiro.model_resolver import ModelResolver, normalize_model_name
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
@@ -658,6 +658,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     }
                 }
             )
+
+        # Self-discovery (legacy mode): surface working-but-unadvertised models
+        # in /v1/models. Account-system mode already does this via
+        # account_manager.report_success.
+        normalized_model_name = normalize_model_name(request_data.model)
+        if not model_cache.is_valid_model(normalized_model_name):
+            model_cache.add_discovered_model(normalized_model_name)
         
         # Prepare data for fallback token counting
         # Convert Pydantic models to dicts for tokenizer

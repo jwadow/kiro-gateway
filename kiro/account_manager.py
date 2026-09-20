@@ -795,6 +795,12 @@ class AccountManager:
                 self._model_to_accounts[normalized_model].accounts.append(account_id)
                 logger.debug(f"Dynamic learning: model '{normalized_model}' works on account {account_id}")
                 self._dirty = True
+
+            # Self-discovery: also surface the model in /v1/models. Without this,
+            # dynamically learned models stay usable but invisible to clients
+            # that rely on /v1/models for model discovery.
+            if account.model_cache is not None and not account.model_cache.is_valid_model(normalized_model):
+                account.model_cache.add_discovered_model(normalized_model)
             
             # GLOBAL STICKY: Update global current_account_index
             all_account_ids = list(self._accounts.keys())

@@ -939,6 +939,62 @@ class TestAccountManagerReportSuccess:
         # Assert
         print(f"Failures after success: {manager._accounts[account_id].failures}")
         assert manager._accounts[account_id].failures == 0
+
+    @pytest.mark.asyncio
+    async def test_report_success_discovers_new_model(self, tmp_path, mock_list_models_response):
+        """
+        Test that report_success with an unadvertised model surfaces it in /v1/models.
+
+        What it does: Reports success with a model not in FALLBACK_MODELS/cache
+        Purpose: Self-discovery — working-but-unlisted models become visible
+        """
+        print("\n=== Test: report_success discovers new model ===")
+
+        # Arrange (same setup as reset_failures test)
+        test_json = tmp_path / "test.json"
+        test_json.write_text(json.dumps({
+            "refreshToken": "test_token",
+            "accessToken": "test_access",
+            "expiresAt": "2099-01-01T00:00:00.000Z"
+        }))
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": str(test_json), "enabled": True}
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+
+        await manager.load_credentials()
+        account_id = str(test_json.resolve())
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = AsyncMock()
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = mock_list_models_response
+            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+
+            await manager._initialize_account(account_id)
+
+        # Pre-condition: model is unknown
+        new_model = "claude-sonnet-5"
+        assert new_model not in manager.get_all_available_models()
+
+        # Act
+        await manager.report_success(account_id, new_model)
+
+        # Assert: model is now advertised
+        assert new_model in manager.get_all_available_models()
+        assert manager._accounts[account_id].model_cache.is_valid_model(new_model)
+        # Idempotent: a second success must not duplicate anything
+        await manager.report_success(account_id, new_model)
+        assert manager.get_all_available_models().count(new_model) == 1
     
     @pytest.mark.asyncio
     async def test_report_success_update_stats(self, tmp_path, mock_list_models_response):
