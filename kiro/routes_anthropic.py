@@ -44,6 +44,7 @@ from kiro.models_anthropic import (
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
+from kiro.model_resolver import normalize_model_name
 from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
@@ -459,6 +460,7 @@ async def messages(
                                     request_system=system_for_tokenizer,
                                 ):
                                     yield chunk
+                                model_cache.add_discovered_model(normalize_model_name(request_data.model))
                             except GeneratorExit:
                                 client_disconnected = True
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -506,6 +508,7 @@ async def messages(
                             request_tools=tools_for_tokenizer,
                             request_system=system_for_tokenizer,
                         )
+                        model_cache.add_discovered_model(normalize_model_name(request_data.model))
                         
                         await http_client.close()
                         logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
@@ -792,7 +795,7 @@ async def messages(
                     }
                 }
             )
-        
+
         if request_data.stream:
             # Streaming mode with first token retry
             async def stream_wrapper():
@@ -817,6 +820,7 @@ async def messages(
                         request_system=system_for_tokenizer,
                     ):
                         yield chunk
+                    model_cache.add_discovered_model(normalize_model_name(request_data.model))
                 except GeneratorExit:
                     client_disconnected = True
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -865,6 +869,7 @@ async def messages(
                 request_tools=tools_for_tokenizer,
                 request_system=system_for_tokenizer,
             )
+            model_cache.add_discovered_model(normalize_model_name(request_data.model))
             
             await http_client.close()
             

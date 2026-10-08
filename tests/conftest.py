@@ -1852,3 +1852,72 @@ def temp_account_credentials_files(tmp_path):
     files["account3"] = str(account3)
     
     return files
+
+
+@pytest.fixture
+def model_discovery_route_context(monkeypatch, mock_account):
+    """Exercise real routes with isolated upstream I/O and real account caches."""
+    import importlib
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from kiro.cache import ModelInfoCache
+    from kiro.models_openai import ChatCompletionRequest
+    from kiro.models_anthropic import AnthropicMessagesRequest
+
+    def create(api, account_system, stream, *, status_code=200, fail_body=False):
+        module = importlib.import_module(f"kiro.routes_{api}")
+        other_cache = ModelInfoCache()
+        manager = Mock()
+        manager._accounts = {mock_account.id: mock_account, "other": SimpleNamespace(model_cache=other_cache)}
+        manager.get_first_account.return_value = mock_account
+        manager.get_next_account = AsyncMock(side_effect=[mock_account, None])
+        manager.report_success = AsyncMock()
+        manager.report_failure = AsyncMock()
+        manager.get_all_available_models.side_effect = lambda: (
+            mock_account.model_cache.get_all_model_ids() + other_cache.get_all_model_ids()
+        )
+        upstream = Mock(status_code=status_code)
+        upstream.aread = AsyncMock(return_value=b'{"message": "rejected"}')
+        client = Mock(client=Mock())
+        client.request_with_retry = AsyncMock(return_value=upstream)
+        client.close = AsyncMock()
+        monkeypatch.setattr(module, "KiroHttpClient", Mock(return_value=client))
+        monkeypatch.setattr(module, "debug_logger", None)
+        monkeypatch.setattr(module, "WEB_SEARCH_ENABLED", False)
+
+        async def body_stream(**kwargs):
+            yield "data: first output\n\n"
+            if fail_body:
+                raise RuntimeError("upstream body failed")
+            yield "data: completed\n\n"
+
+        collector = AsyncMock(return_value={"id": "test-response"})
+        if fail_body:
+            collector.side_effect = RuntimeError("upstream body failed")
+        if api == "openai":
+            route = module.chat_completions
+            request_type = ChatCompletionRequest
+            builder_name = "build_kiro_payload"
+            monkeypatch.setattr(module, "collect_stream_response", collector)
+            monkeypatch.setattr(module, "stream_with_first_token_retry", body_stream)
+        else:
+            route = module.messages
+            request_type = AnthropicMessagesRequest
+            builder_name = "anthropic_to_kiro"
+            monkeypatch.setattr(module, "collect_anthropic_response", collector)
+            monkeypatch.setattr(module, "stream_with_first_token_retry_anthropic", body_stream)
+        builder = Mock(return_value={"test": "payload"})
+        monkeypatch.setattr(module, builder_name, builder)
+        data = request_type(
+            model="claude-sonnet-5", stream=stream, max_tokens=64,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        state = SimpleNamespace(account_system=account_system, account_manager=manager, http_client=Mock())
+        request = Request({"type": "http", "app": SimpleNamespace(state=state)})
+        return SimpleNamespace(
+            invoke=lambda: route(request, data), request=request, data=data,
+            cache=mock_account.model_cache, other_cache=other_cache,
+            client=client, manager=manager, builder=builder,
+        )
+
+    return create

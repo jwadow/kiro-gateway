@@ -26,7 +26,7 @@ with TTL and lazy loading support.
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from loguru import logger
 
@@ -58,6 +58,7 @@ class ModelInfoCache:
             cache_ttl: Cache time-to-live in seconds (default from config)
         """
         self._cache: Dict[str, Dict[str, Any]] = {}
+        self._discovered_model_ids: Set[str] = set()
         self._lock = asyncio.Lock()
         self._last_update: Optional[float] = None
         self._cache_ttl = cache_ttl
@@ -66,7 +67,7 @@ class ModelInfoCache:
         """
         Updates the model cache.
         
-        Thread-safely replaces cache contents with new data.
+        Replaces advertised metadata while retaining models confirmed by requests.
         
         Args:
             models_data: List of dictionaries with model information.
@@ -74,7 +75,14 @@ class ModelInfoCache:
         """
         async with self._lock:
             logger.info(f"Updating model cache. Found {len(models_data)} models.")
-            self._cache = {model["modelId"]: model for model in models_data}
+            discovered = {
+                model_id: model for model_id, model in self._cache.items()
+                if model_id in self._discovered_model_ids
+            }
+            self._cache = {
+                **discovered,
+                **{model["modelId"]: model for model in models_data},
+            }
             self._last_update = time.time()
     
     def get(self, model_id: str) -> Optional[Dict[str, Any]]:
@@ -125,6 +133,31 @@ class ModelInfoCache:
                 "_is_hidden": True,  # Mark as hidden model
             }
             logger.debug(f"Added hidden model: {display_name} → {internal_id}")
+
+    def add_discovered_model(self, model_id: str) -> None:
+        """
+        Register a model discovered through a successful request.
+
+        The runtime endpoint does not provide /ListAvailableModels, so the
+        advertised list comes from the static FALLBACK_MODELS. Models released
+        after that list was written work when requested directly but stay
+        invisible in /v1/models. This method surfaces them: once a request
+        with an unknown model ID succeeds, the model is added to the cache
+        and appears in /v1/models from then on (until restart).
+
+        Args:
+            model_id: Model ID as requested by the client
+        """
+        if model_id not in self._cache:
+            self._cache[model_id] = {
+                "modelId": model_id,
+                "modelName": model_id,
+                "description": "Discovered via successful request",
+                "tokenLimits": {"maxInputTokens": DEFAULT_MAX_INPUT_TOKENS},
+                "_discovered": True,
+            }
+            self._discovered_model_ids.add(model_id)
+            logger.info(f"Discovered new model via successful request: {model_id}")
     
     def get_max_input_tokens(self, model_id: str) -> int:
         """
