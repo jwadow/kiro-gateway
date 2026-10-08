@@ -460,6 +460,7 @@ async def messages(
                                     request_system=system_for_tokenizer,
                                 ):
                                     yield chunk
+                                model_cache.add_discovered_model(normalize_model_name(request_data.model))
                             except GeneratorExit:
                                 client_disconnected = True
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -507,6 +508,7 @@ async def messages(
                             request_tools=tools_for_tokenizer,
                             request_system=system_for_tokenizer,
                         )
+                        model_cache.add_discovered_model(normalize_model_name(request_data.model))
                         
                         await http_client.close()
                         logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
@@ -794,13 +796,6 @@ async def messages(
                 }
             )
 
-        # Self-discovery (legacy mode): surface working-but-unadvertised models
-        # in /v1/models. Account-system mode already does this via
-        # account_manager.report_success.
-        normalized_model_name = normalize_model_name(request_data.model)
-        if not model_cache.is_valid_model(normalized_model_name):
-            model_cache.add_discovered_model(normalized_model_name)
-        
         if request_data.stream:
             # Streaming mode with first token retry
             async def stream_wrapper():
@@ -825,6 +820,7 @@ async def messages(
                         request_system=system_for_tokenizer,
                     ):
                         yield chunk
+                    model_cache.add_discovered_model(normalize_model_name(request_data.model))
                 except GeneratorExit:
                     client_disconnected = True
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -873,6 +869,7 @@ async def messages(
                 request_tools=tools_for_tokenizer,
                 request_system=system_for_tokenizer,
             )
+            model_cache.add_discovered_model(normalize_model_name(request_data.model))
             
             await http_client.close()
             

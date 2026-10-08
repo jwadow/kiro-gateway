@@ -435,3 +435,43 @@ class TestModelInfoCacheThreadSafety:
         print("Проверка: Все чтения вернули одинаковый результат...")
         assert all(r is not None for r in results)
         assert all(r["modelId"] == "claude-sonnet-4" for r in results)
+
+class TestDiscoveredModels:
+    """Confirmed models survive refresh without overriding upstream metadata."""
+
+    @pytest.mark.asyncio
+    async def test_discovery_survives_refresh_and_is_idempotent(self):
+        cache = ModelInfoCache()
+        cache.add_discovered_model("claude-sonnet-5")
+        original = cache.get("claude-sonnet-5")
+        cache.add_discovered_model("claude-sonnet-5")
+        assert cache.get("claude-sonnet-5") is original
+        await cache.update([{"modelId": "advertised"}])
+        await cache.update([])
+        assert cache.get("claude-sonnet-5") is original
+        assert cache.get_all_model_ids() == ["claude-sonnet-5"]
+
+    @pytest.mark.asyncio
+    async def test_upstream_metadata_replaces_discovered_defaults(self):
+        cache = ModelInfoCache()
+        cache.add_discovered_model("claude-sonnet-5")
+        upstream = {"modelId": "claude-sonnet-5", "tokenLimits": {"maxInputTokens": 250000}}
+        await cache.update([upstream])
+        cache.add_discovered_model("claude-sonnet-5")
+        assert cache.get("claude-sonnet-5") == upstream
+        assert cache.get_max_input_tokens("claude-sonnet-5") == 250000
+        assert "_discovered" not in cache.get("claude-sonnet-5")
+        await cache.update([])
+        assert cache.get("claude-sonnet-5") == upstream
+
+    @pytest.mark.asyncio
+    async def test_refresh_drops_stale_advertised_models_and_keeps_accounts_isolated(self):
+        selected = ModelInfoCache()
+        other = ModelInfoCache()
+        await selected.update([{"modelId": "stale"}])
+        selected.add_discovered_model("claude-sonnet-5")
+        await selected.update([])
+        await other.update([])
+        assert not selected.is_valid_model("stale")
+        assert selected.is_valid_model("claude-sonnet-5")
+        assert not other.is_valid_model("claude-sonnet-5")

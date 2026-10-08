@@ -2519,3 +2519,71 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+class TestSuccessfulModelDiscovery:
+    """Only fully successful responses advertise models in the selected account."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("account_system", [False, True])
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_completed_response_is_advertised(self, model_discovery_route_context, account_system, stream):
+        context = model_discovery_route_context('anthropic', account_system, stream)
+        response = await context.invoke()
+        assert response.status_code == 200
+        if stream:
+            assert not context.cache.is_valid_model(context.data.model)
+            chunks = [chunk async for chunk in response.body_iterator]
+            assert len(chunks) == 2
+        assert context.cache.is_valid_model(context.data.model)
+        assert not context.other_cache.is_valid_model(context.data.model)
+        assert context.builder.call_args.args[0].model == context.data.model
+        assert context.builder.call_args.args[0].messages[0].content == "hello"
+        context.client.close.assert_awaited_once()
+        if account_system:
+            context.manager.report_success.assert_awaited_once()
+        from kiro.routes_openai import get_models
+        advertised = await get_models(context.request)
+        assert context.data.model in [model.id for model in advertised.data]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("account_system", [False, True])
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_failed_body_is_not_advertised(self, model_discovery_route_context, account_system, stream):
+        context = model_discovery_route_context('anthropic', account_system, stream, fail_body=True)
+        try:
+            response = await context.invoke()
+            if stream:
+                async for _ in response.body_iterator:
+                    pass
+            else:
+                assert response.status_code == 500
+        except (HTTPException, RuntimeError) as error:
+            if isinstance(error, HTTPException):
+                assert error.status_code == 500
+            else:
+                assert str(error) == "upstream body failed"
+        assert not context.cache.is_valid_model(context.data.model)
+        assert not context.other_cache.is_valid_model(context.data.model)
+        context.client.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("account_system", [False, True])
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_rejected_request_is_not_advertised(self, model_discovery_route_context, account_system, stream):
+        context = model_discovery_route_context('anthropic', account_system, stream, status_code=400)
+        try:
+            response = await context.invoke()
+            assert response.status_code >= 400
+        except HTTPException as error:
+            assert error.status_code >= 400
+        assert not context.cache.is_valid_model(context.data.model)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("account_system", [False, True])
+    async def test_disconnected_stream_is_not_advertised(self, model_discovery_route_context, account_system):
+        context = model_discovery_route_context('anthropic', account_system, True)
+        response = await context.invoke()
+        await anext(response.body_iterator)
+        await response.body_iterator.aclose()
+        assert not context.cache.is_valid_model(context.data.model)
+        context.client.close.assert_awaited_once()

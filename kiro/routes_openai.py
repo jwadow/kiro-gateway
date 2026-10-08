@@ -392,6 +392,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     request_tools=tools_for_tokenizer
                                 ):
                                     yield chunk
+                                model_cache.add_discovered_model(normalize_model_name(request_data.model))
                             except GeneratorExit:
                                 client_disconnected = True
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -431,6 +432,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             request_messages=messages_for_tokenizer,
                             request_tools=tools_for_tokenizer
                         )
+                        model_cache.add_discovered_model(normalize_model_name(request_data.model))
                         
                         await http_client.close()
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
@@ -659,13 +661,6 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 }
             )
 
-        # Self-discovery (legacy mode): surface working-but-unadvertised models
-        # in /v1/models. Account-system mode already does this via
-        # account_manager.report_success.
-        normalized_model_name = normalize_model_name(request_data.model)
-        if not model_cache.is_valid_model(normalized_model_name):
-            model_cache.add_discovered_model(normalized_model_name)
-        
         # Prepare data for fallback token counting
         # Convert Pydantic models to dicts for tokenizer
         messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
@@ -695,6 +690,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         request_tools=tools_for_tokenizer
                     ):
                         yield chunk
+                    model_cache.add_discovered_model(normalize_model_name(request_data.model))
                 except GeneratorExit:
                     # Client disconnected - this is normal
                     client_disconnected = True
@@ -740,6 +736,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 request_messages=messages_for_tokenizer,
                 request_tools=tools_for_tokenizer
             )
+            model_cache.add_discovered_model(normalize_model_name(request_data.model))
             
             await http_client.close()
             
