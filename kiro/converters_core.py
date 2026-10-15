@@ -1089,6 +1089,7 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
     merge_counts = {"user": 0, "assistant": 0}
     total_tool_calls_merged = 0
     total_tool_results_merged = 0
+    total_images_merged = 0
     
     for msg in messages:
         if not merged:
@@ -1123,6 +1124,13 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 last.tool_results = list(last.tool_results) + list(msg.tool_results)
                 total_tool_results_merged += len(msg.tool_results)
             
+            # Merge images for user messages
+            if msg.role == "user" and msg.images:
+                if last.images is None:
+                    last.images = []
+                last.images = list(last.images) + list(msg.images)
+                total_images_merged += len(msg.images)
+
             # Count merges by role
             if msg.role in merge_counts:
                 merge_counts[msg.role] += 1
@@ -1143,6 +1151,8 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
             extras.append(f"{total_tool_calls_merged} tool_calls")
         if total_tool_results_merged > 0:
             extras.append(f"{total_tool_results_merged} tool_results")
+        if total_images_merged > 0:
+            extras.append(f"{total_images_merged} images")
         
         if extras:
             logger.debug(f"Merged {total_merges} adjacent messages ({merge_summary}), including {', '.join(extras)}")

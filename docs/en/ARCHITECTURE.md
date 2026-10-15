@@ -268,9 +268,19 @@ OpenAI messages are transformed into Kiro conversationState:
 
 1. **System prompt** — added to the first user message
 2. **Message history** — fully passed in `history` array
-3. **Adjacent message merging** — messages with the same role are merged
+3. **Adjacent message merging** — messages with the same role are merged, combining text, assistant `tool_calls`, user `tool_results`, and user `images`
 4. **Tool calls** — OpenAI tools format support
 5. **Tool results** — correct transmission of tool call results
+6. **Multi-modal image support** — user images from messages and tool responses are preserved directly in `userInputMessage.images`
+
+#### Multi-modal Image Support and Tool Result Merging
+
+When clients (such as OpenAI-compatible desktop agents) execute a tool call and emit a tool result followed immediately by a user message containing image attachments (via standard `image_url` data URLs), the converter pipeline accumulates tool results and user messages as consecutive `user` role entries in `UnifiedMessage`.
+
+`merge_adjacent_messages()` combines these consecutive user messages into a single unified entry:
+- Message text content is concatenated with newlines
+- `tool_results` are combined in `userInputMessageContext.toolResults`
+- `images` are preserved and merged into `userInputMessage.images` directly in Kiro native format (`{"format": ..., "source": {"bytes": ...}}`) without mutating caller input lists
 
 #### Long Tool Description Handling
 
@@ -289,9 +299,10 @@ OpenAI messages are transformed into Kiro conversationState:
 | Function | Description |
 |----------|-------------|
 | `extract_text_content(content)` | Extract text from various formats |
-| `merge_adjacent_messages(messages)` | Merge adjacent messages with same role |
+| `merge_adjacent_messages(messages)` | Merge adjacent messages with same role (content, tool_calls, tool_results, images) |
 | `build_kiro_history(messages, model_id)` | Build history array for Kiro |
 | `build_kiro_payload(request_data, conversation_id, profile_arn)` | Full payload for request |
+
 
 #### Model Mapping
 

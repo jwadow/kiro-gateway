@@ -268,9 +268,19 @@ OpenAI messages преобразуются в Kiro conversationState:
 
 1. **System prompt** — добавляется к первому user сообщению
 2. **История сообщений** — полностью передаётся в `history` array
-3. **Объединение соседних сообщений** — сообщения с одинаковой ролью мерджатся
+3. **Объединение соседних сообщений** — сообщения с одинаковой ролью мерджатся (текст, `tool_calls`, `tool_results` и `images`)
 4. **Tool calls** — поддержка OpenAI tools формата
 5. **Tool results** — корректная передача результатов вызова инструментов
+6. **Мультимодальные изображения** — изображения пользователя сохраняются напрямую в `userInputMessage.images`
+
+#### Мультимодальные изображения и объединение с результатами инструментов
+
+Когда клиент возвращает результат выполнения инструмента, за которым сразу следует сообщение пользователя с изображением (через data URL `image_url`), конвертер накапливает результат инструмента и сообщение пользователя как последовательные сообщения с ролью `user` в `UnifiedMessage`.
+
+`merge_adjacent_messages()` объединяет такие соседние сообщения:
+- Текстовое содержимое объединяется через перевод строки
+- `tool_results` объединяются в `userInputMessageContext.toolResults`
+- `images` сохраняются и объединяются в `userInputMessage.images` напрямую в нативном формате Kiro (`{"format": ..., "source": {"bytes": ...}}`) без мутации исходных списков
 
 #### Обработка длинных описаний Tools
 
@@ -289,7 +299,7 @@ OpenAI messages преобразуются в Kiro conversationState:
 | Функция | Описание |
 |---------|----------|
 | `extract_text_content(content)` | Извлечение текста из различных форматов |
-| `merge_adjacent_messages(messages)` | Объединение соседних сообщений с одной ролью |
+| `merge_adjacent_messages(messages)` | Объединение соседних сообщений с одной ролью (текст, tool_calls, tool_results, images) |
 | `build_kiro_history(messages, model_id)` | Построение массива history для Kiro |
 | `build_kiro_payload(request_data, conversation_id, profile_arn)` | Полный payload для запроса |
 

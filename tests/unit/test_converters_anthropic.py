@@ -1637,6 +1637,82 @@ class TestAnthropicToKiro:
         print(f"Tool results: {tool_results}")
         assert len(tool_results) == 1
 
+    def test_consecutive_user_messages_with_tool_result_and_image(self):
+        """
+        What it does: Verifies Anthropic request with consecutive user messages (tool result then image).
+        Purpose: Ensure toolResults and images are both preserved when consecutive user messages are merged.
+        """
+        print("Setup: Anthropic request with tool result followed by user message with image...")
+        test_image_base64 = "anthropic_test_image_bytes"
+        request = AnthropicMessagesRequest(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=1000,
+            messages=[
+                AnthropicMessage(role="user", content="Take screenshot"),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseContentBlock(
+                            type="tool_use",
+                            id="call_snap",
+                            name="screenshot_tool",
+                            input={}
+                        )
+                    ]
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ToolResultContentBlock(
+                            type="tool_result",
+                            tool_use_id="call_snap",
+                            content="Screenshot taken"
+                        )
+                    ]
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "Analyze this screenshot"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": test_image_base64
+                            }
+                        }
+                    ]
+                )
+            ],
+            tools=[
+                AnthropicTool(
+                    name="screenshot_tool",
+                    description="Take a screenshot",
+                    input_schema={"type": "object", "properties": {}}
+                )
+            ]
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4.5"):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        current_msg = result["conversationState"]["currentMessage"]["userInputMessage"]
+        context = current_msg.get("userInputMessageContext", {})
+
+        # Verify toolResults retained
+        tool_results = context.get("toolResults", [])
+        assert len(tool_results) == 1
+        assert tool_results[0]["toolUseId"] == "call_snap"
+
+        # Verify images retained directly in userInputMessage
+        assert "images" in current_msg
+        assert len(current_msg["images"]) == 1
+        assert current_msg["images"][0]["format"] == "png"
+        assert current_msg["images"][0]["source"]["bytes"] == test_image_base64
+
     def test_raises_for_empty_messages(self):
         """
         What it does: Verifies that empty messages raise Pydantic ValidationError.
