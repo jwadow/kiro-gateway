@@ -1288,6 +1288,151 @@ class TestMergeAdjacentMessages:
         assert result[0].tool_results is not None
         assert len(result[0].tool_results) == 2
 
+    def test_merges_user_messages_with_images(self):
+        """
+        What it does: Verifies merging of user messages where second message contains images.
+        Purpose: Ensure images are preserved when merging adjacent user messages (e.g. tool result + image).
+        """
+        print("Setup: First user message without images, second with images...")
+        messages = [
+            UnifiedMessage(role="user", content="Result text", tool_results=[
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "Done"}
+            ], images=None),
+            UnifiedMessage(role="user", content="Inspect this", images=[
+                {"format": "png", "source": {"bytes": "test_image_bytes"}}
+            ])
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0].images is not None
+        assert len(result[0].images) == 1
+        assert result[0].images[0]["source"]["bytes"] == "test_image_bytes"
+
+    def test_merges_user_messages_first_has_images_second_none(self):
+        """
+        What it does: Verifies merging when first user message has images and second has none.
+        Purpose: Ensure images from the first message are not lost when a subsequent message has no images.
+        """
+        print("Setup: First user message with images, second without...")
+        messages = [
+            UnifiedMessage(role="user", content="Here is an image", images=[
+                {"format": "jpeg", "source": {"bytes": "first_image_bytes"}}
+            ]),
+            UnifiedMessage(role="user", content="Follow-up question without images", images=None)
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0].images is not None
+        assert len(result[0].images) == 1
+        assert result[0].images[0]["format"] == "jpeg"
+        assert result[0].images[0]["source"]["bytes"] == "first_image_bytes"
+        assert "Here is an image" in result[0].content
+        assert "Follow-up question without images" in result[0].content
+
+    def test_merges_user_messages_both_have_images(self):
+        """
+        What it does: Verifies merging when both user messages contain images.
+        Purpose: Ensure images from all adjacent messages are concatenated in deterministic order.
+        """
+        print("Setup: Two user messages each with an image...")
+        messages = [
+            UnifiedMessage(role="user", content="Image 1", images=[
+                {"format": "png", "source": {"bytes": "img_1_bytes"}}
+            ]),
+            UnifiedMessage(role="user", content="Image 2", images=[
+                {"format": "webp", "source": {"bytes": "img_2_bytes"}}
+            ])
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0].images is not None
+        assert len(result[0].images) == 2
+        assert result[0].images[0]["format"] == "png"
+        assert result[0].images[0]["source"]["bytes"] == "img_1_bytes"
+        assert result[0].images[1]["format"] == "webp"
+        assert result[0].images[1]["source"]["bytes"] == "img_2_bytes"
+
+    def test_merges_three_user_messages_accumulates_images(self):
+        """
+        What it does: Verifies merging of three adjacent user messages with images.
+        Purpose: Ensure all images are accumulated across more than two consecutive user messages.
+        """
+        print("Setup: Three user messages with images...")
+        messages = [
+            UnifiedMessage(role="user", content="Msg 1", images=[
+                {"format": "png", "source": {"bytes": "img_1"}}
+            ]),
+            UnifiedMessage(role="user", content="Msg 2", images=None),
+            UnifiedMessage(role="user", content="Msg 3", images=[
+                {"format": "gif", "source": {"bytes": "img_3"}}
+            ])
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0].images is not None
+        assert len(result[0].images) == 2
+        assert [img["source"]["bytes"] for img in result[0].images] == ["img_1", "img_3"]
+
+    def test_merges_user_messages_aliasing_safety(self):
+        """
+        What it does: Verifies that merged images list is a new list and does not mutate input lists.
+        Purpose: Ensure immutability and prevent caller side-effects when modifying image lists.
+        """
+        print("Setup: Original image list...")
+        original_img_list = [{"format": "png", "source": {"bytes": "original"}}]
+        messages = [
+            UnifiedMessage(role="user", content="Msg 1", images=original_img_list),
+            UnifiedMessage(role="user", content="Msg 2", images=[{"format": "jpeg", "source": {"bytes": "second"}}])
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        print("Asserting aliasing safety...")
+        assert len(result[0].images) == 2
+
+        # Mutating original list should not affect merged message
+        original_img_list.append({"format": "gif", "source": {"bytes": "mutated"}})
+        assert len(result[0].images) == 2
+        assert len(original_img_list) == 2
+
+    def test_non_user_messages_do_not_merge_images(self):
+        """
+        What it does: Verifies that non-user (assistant) messages do not merge images into last.images.
+        Purpose: Ensure role boundaries are respected and images are restricted to user role as required by Kiro API.
+        """
+        print("Setup: Two assistant messages with synthetic images attribute...")
+        messages = [
+            UnifiedMessage(role="assistant", content="Response 1", images=None),
+            UnifiedMessage(role="assistant", content="Response 2", images=[{"format": "png", "source": {"bytes": "bad"}}])
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0].role == "assistant"
+        assert result[0].images is None
+
+
+
 
 # ==================================================================================================
 # Tests for ensure_first_message_is_user
@@ -5936,6 +6081,131 @@ class TestBuildKiroPayloadImages:
         print("Checking that thinking tags were injected in content...")
         content = current_msg["content"]
         assert "<thinking_mode>" in content
+
+    def test_merged_tool_result_and_user_image_in_current_message(self):
+        """
+        What it does: Verifies build_kiro_payload with separate tool_results and image messages merged at the tail.
+        Purpose: Ensure images and toolResults are both retained in currentMessage when merged from consecutive user messages.
+        """
+        print("Setup: Tool result message followed by image user message as current messages...")
+        messages = [
+            UnifiedMessage(role="user", content="Call tool"),
+            UnifiedMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "run_op", "arguments": "{}"}
+                }]
+            ),
+            UnifiedMessage(
+                role="user",
+                content="",
+                tool_results=[{
+                    "type": "tool_result",
+                    "tool_use_id": "call_abc",
+                    "content": "Operation output"
+                }]
+            ),
+            UnifiedMessage(
+                role="user",
+                content="Analyze this output",
+                images=[{"media_type": "image/png", "data": "output_graph_bytes"}]
+            )
+        ]
+        tools = [UnifiedTool(name="run_op", description="Run op", input_schema={"type": "object"})]
+
+        print("Action: Building Kiro payload...")
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=tools,
+            conversation_id="test-conv",
+            profile_arn="arn:test",
+            thinking_config=ThinkingConfig(enabled=False)
+        )
+
+        current_msg = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        context = current_msg.get("userInputMessageContext", {})
+
+        print("Checking current message has both images and toolResults...")
+        assert "images" in current_msg
+        assert len(current_msg["images"]) == 1
+        assert current_msg["images"][0]["format"] == "png"
+        assert current_msg["images"][0]["source"]["bytes"] == "output_graph_bytes"
+
+        assert "toolResults" in context
+        assert len(context["toolResults"]) == 1
+        assert context["toolResults"][0]["toolUseId"] == "call_abc"
+
+    def test_merged_tool_result_and_user_image_in_history(self):
+        """
+        What it does: Verifies build_kiro_payload with merged tool_results and image messages in conversation history.
+        Purpose: Ensure history entries retain both images and toolResults when merged from consecutive user messages.
+        """
+        print("Setup: Conversation with merged tool result and image messages in history...")
+        messages = [
+            UnifiedMessage(role="user", content="Start"),
+            UnifiedMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{
+                    "id": "call_hist",
+                    "type": "function",
+                    "function": {"name": "hist_tool", "arguments": "{}"}
+                }]
+            ),
+            UnifiedMessage(
+                role="user",
+                content="",
+                tool_results=[{
+                    "type": "tool_result",
+                    "tool_use_id": "call_hist",
+                    "content": "History result"
+                }]
+            ),
+            UnifiedMessage(
+                role="user",
+                content="History image analysis",
+                images=[{"media_type": "image/jpeg", "data": "hist_img_data"}]
+            ),
+            UnifiedMessage(role="assistant", content="I analyzed the history image."),
+            UnifiedMessage(role="user", content="Next step")
+        ]
+        tools = [UnifiedTool(name="hist_tool", description="History tool", input_schema={"type": "object"})]
+
+        print("Action: Building Kiro payload...")
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=tools,
+            conversation_id="test-conv",
+            profile_arn="arn:test",
+            thinking_config=ThinkingConfig(enabled=False)
+        )
+
+        history = result.payload["conversationState"]["history"]
+        print(f"History elements count: {len(history)}")
+
+        # Find the merged user message in history (following assistant tool_call)
+        user_history_msgs = [h["userInputMessage"] for h in history if "userInputMessage" in h]
+        print(f"User history messages: {user_history_msgs}")
+
+        # Second user message in history corresponds to the merged tool_result + image
+        merged_user_history = user_history_msgs[1]
+        assert "images" in merged_user_history
+        assert len(merged_user_history["images"]) == 1
+        assert merged_user_history["images"][0]["format"] == "jpeg"
+        assert merged_user_history["images"][0]["source"]["bytes"] == "hist_img_data"
+
+        context = merged_user_history.get("userInputMessageContext", {})
+        assert "toolResults" in context
+        assert len(context["toolResults"]) == 1
+        assert context["toolResults"][0]["toolUseId"] == "call_hist"
+
 
 
 # ==================================================================================================

@@ -1328,6 +1328,199 @@ class TestBuildKiroPayloadToolCallsIntegration:
         assert "tooluse_first" in tool_result_ids
         assert "tooluse_second" in tool_result_ids
     
+    def test_tool_result_followed_by_user_image_preserves_images_in_payload(self):
+        """
+        What it does: Verifies OpenAI tool result followed by user image preserves images in Kiro payload.
+        Purpose: Ensure images in user messages following tool responses are not dropped when merged.
+        """
+        print("Setup: Request with assistant tool call, tool result, and user image...")
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                ChatMessage(role="user", content="Take a screenshot"),
+                ChatMessage(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[{
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {"name": "take_screenshot", "arguments": "{}"}
+                    }]
+                ),
+                ChatMessage(
+                    role="tool",
+                    tool_call_id="call_123",
+                    content="Screenshot captured"
+                ),
+                ChatMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "What is shown here?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}
+                        }
+                    ]
+                )
+            ],
+            tools=[Tool(
+                type="function",
+                function=ToolFunction(
+                    name="take_screenshot",
+                    description="Takes a screenshot",
+                    parameters={}
+                )
+            )]
+        )
+
+        print("Action: Building Kiro payload...")
+        result = build_kiro_payload(request, "conv-123", "arn:aws:test")
+
+        current_msg = result["conversationState"]["currentMessage"]["userInputMessage"]
+        print(f"Current message keys: {list(current_msg.keys())}")
+
+        # Verify toolResults are present in userInputMessageContext
+        context = current_msg.get("userInputMessageContext", {})
+        tool_results = context.get("toolResults", [])
+        assert len(tool_results) == 1
+        assert tool_results[0]["toolUseId"] == "call_123"
+
+        # Verify images are present in userInputMessage
+        assert "images" in current_msg, "images key missing from userInputMessage"
+        images = current_msg["images"]
+        assert len(images) == 1
+        assert images[0]["format"] == "png"
+        assert images[0]["source"]["bytes"] == "iVBORw0KGgoAAAANSUhEUg=="
+
+    def test_multiple_tool_results_with_multiple_images_preserves_all_in_payload(self):
+        """
+        What it does: Verifies multiple tool results followed by multiple images in user message.
+        Purpose: Ensure all toolResults and all images are preserved with correct counts and formats.
+        """
+        print("Setup: Two tool calls, two tool results, and user message with two images...")
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                ChatMessage(role="user", content="Compare two tools"),
+                ChatMessage(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "fetch_a", "arguments": "{}"}
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "fetch_b", "arguments": "{}"}
+                        }
+                    ]
+                ),
+                ChatMessage(role="tool", tool_call_id="call_1", content="Result A"),
+                ChatMessage(role="tool", tool_call_id="call_2", content="Result B"),
+                ChatMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "Compare these two screenshots"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,png_bytes_data"}
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64,jpeg_bytes_data"}
+                        }
+                    ]
+                )
+            ],
+            tools=[
+                Tool(type="function", function=ToolFunction(name="fetch_a", description="Fetch A", parameters={})),
+                Tool(type="function", function=ToolFunction(name="fetch_b", description="Fetch B", parameters={}))
+            ]
+        )
+
+        print("Action: Building Kiro payload...")
+        result = build_kiro_payload(request, "conv-123", "arn:aws:test")
+
+        current_msg = result["conversationState"]["currentMessage"]["userInputMessage"]
+        context = current_msg.get("userInputMessageContext", {})
+
+        # Verify both tool results are retained
+        tool_results = context.get("toolResults", [])
+        assert len(tool_results) == 2
+        tool_ids = [tr["toolUseId"] for tr in tool_results]
+        assert "call_1" in tool_ids
+        assert "call_2" in tool_ids
+
+        # Verify both images are retained directly in userInputMessage
+        assert "images" in current_msg
+        images = current_msg["images"]
+        assert len(images) == 2
+        assert images[0]["format"] == "png"
+        assert images[0]["source"]["bytes"] == "png_bytes_data"
+        assert images[1]["format"] == "jpeg"
+        assert images[1]["source"]["bytes"] == "jpeg_bytes_data"
+
+    def test_interleaved_tool_messages_with_images_and_user_images(self):
+        """
+        What it does: Verifies tool result containing an image plus a subsequent user message with another image.
+        Purpose: Ensure images from tool messages and adjacent user messages are both preserved together.
+        """
+        print("Setup: Tool message with image plus user message with image...")
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                ChatMessage(role="user", content="Run visual check"),
+                ChatMessage(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[{
+                        "id": "call_mcp",
+                        "type": "function",
+                        "function": {"name": "mcp_screenshot", "arguments": "{}"}
+                    }]
+                ),
+                ChatMessage(
+                    role="tool",
+                    tool_call_id="call_mcp",
+                    content=[
+                        {"type": "text", "text": "Screenshot taken"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,tool_shot"}}
+                    ]
+                ),
+                ChatMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "And here is expected design"},
+                        {"type": "image_url", "image_url": {"url": "data:image/webp;base64,design_shot"}}
+                    ]
+                )
+            ],
+            tools=[
+                Tool(type="function", function=ToolFunction(name="mcp_screenshot", description="Screenshot", parameters={}))
+            ]
+        )
+
+        print("Action: Building Kiro payload...")
+        result = build_kiro_payload(request, "conv-123", "arn:aws:test")
+
+        current_msg = result["conversationState"]["currentMessage"]["userInputMessage"]
+        context = current_msg.get("userInputMessageContext", {})
+
+        # Verify tool result present
+        assert len(context.get("toolResults", [])) == 1
+
+        # Verify both images merged: tool image + user message image
+        assert "images" in current_msg
+        images = current_msg["images"]
+        assert len(images) == 2
+        assert images[0]["format"] == "png"
+        assert images[0]["source"]["bytes"] == "tool_shot"
+        assert images[1]["format"] == "webp"
+        assert images[1]["source"]["bytes"] == "design_shot"
+
     def test_long_tool_description_added_to_system_prompt(self):
         """
         What it does: Verifies integration of long tool descriptions into payload.
