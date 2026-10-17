@@ -107,6 +107,46 @@ async def root():
     }
 
 
+def _unwrap_structured_output(response: dict, structured_tool_name: str) -> dict:
+    """
+    If response contains a tool_call from our synthetic structured-output tool,
+    unwrap it back to a plain assistant message with JSON content.
+    This converts the tool-use trick back to what the client expects.
+    """
+    if not structured_tool_name:
+        return response
+    choices = response.get("choices", [])
+    if not choices:
+        return response
+    choice = choices[0]
+    tool_calls = choice.get("message", {}).get("tool_calls", [])
+    if not tool_calls:
+        return response
+    # Find our synthetic tool call
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        if func.get("name") == structured_tool_name:
+            # Unwrap: replace tool_calls with the JSON as plain content
+            import json as _json
+            args = func.get("arguments", "{}")
+            try:
+                # Validate it's valid JSON
+                _json.loads(args)
+            except Exception:
+                pass  # Return as-is if invalid
+            response = dict(response)
+            response["choices"] = list(response["choices"])
+            response["choices"][0] = dict(response["choices"][0])
+            response["choices"][0]["message"] = dict(response["choices"][0].get("message", {}))
+            response["choices"][0]["message"]["content"] = args
+            response["choices"][0]["message"].pop("tool_calls", None)
+            response["choices"][0]["finish_reason"] = "stop"
+            logger.debug(f"Unwrapped structured output tool '{structured_tool_name}' to plain message")
+            break
+    return response
+
+
+
 @router.get("/health")
 async def health(request: Request):
     """
@@ -353,7 +393,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     # Multiple accounts - generic error with context
                     detail = "No available accounts for this model."
                     if last_error_message:
-                        detail += f" Last error: {last_error_message}"
+                        detail += f" Error from last account: {last_error_message}"
                     raise HTTPException(status_code=503, detail=detail)
             
             # Mark account as tried in current failover loop
@@ -372,6 +412,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
             
             try:
+                # Track structured output tool name for response unwrapping
+                _stn = None
+                rf = getattr(request_data, "response_format", None) or {}
+                if rf.get("type") == "json_schema":
+                    _stn = (rf.get("json_schema") or {}).get("name", "structured_output")
                 kiro_payload = build_kiro_payload(
                     request_data,
                     conversation_id,
@@ -483,6 +528,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         if debug_logger:
                             debug_logger.discard_buffers()
                         
+                        # Unwrap structured output if applicable
+                        _sot_name = getattr(request_data, "_structured_tool_name", None)
+                        if _sot_name:
+                            openai_response = _unwrap_structured_output(openai_response, _sot_name)
                         return JSONResponse(content=openai_response)
                 
                 else:
@@ -605,7 +654,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             # Multiple accounts - generic error with context
             detail = "All accounts failed after full circle."
             if last_error_message:
-                detail += f" Last error: {last_error_message}"
+                detail += f" Error from last account: {last_error_message}"
             raise HTTPException(status_code=503, detail=detail)
     
     else:
@@ -628,6 +677,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
     
     try:
+        # Track structured output tool name for response unwrapping
+        _stn = None
+        rf = getattr(request_data, "response_format", None) or {}
+        if rf.get("type") == "json_schema":
+            _stn = (rf.get("json_schema") or {}).get("name", "structured_output")
         kiro_payload = build_kiro_payload(
             request_data,
             conversation_id,

@@ -1776,7 +1776,7 @@ class TestChatCompletionsFailoverLoop:
         else:
             detail = "No available accounts for this model."
             if last_error_message:
-                detail += f" Last error: {last_error_message}"
+                detail += f" Error from last account: {last_error_message}"
             error_response = {
                 "status_code": 503,
                 "detail": detail
@@ -1785,7 +1785,7 @@ class TestChatCompletionsFailoverLoop:
         print(f"Error response: {error_response}")
         assert error_response["status_code"] == 503
         assert "No available accounts" in error_response["detail"]
-        assert "Last error: Token expired" in error_response["detail"]
+        assert "Error from last account: Token expired" in error_response["detail"]
         print("✅ Multi-account correctly returns generic error with context")
     
     @pytest.mark.asyncio

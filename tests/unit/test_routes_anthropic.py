@@ -1873,7 +1873,7 @@ class TestMessagesFailoverLoop:
             # Should return generic message with context
             generic_message = "No available accounts for this model."
             if last_error_message:
-                generic_message += f" Last error: {last_error_message}"
+                generic_message += f" Error from last account: {last_error_message}"
             
             assert "No available accounts" in generic_message
             assert last_error_message in generic_message
