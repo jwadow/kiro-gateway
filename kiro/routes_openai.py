@@ -531,7 +531,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         # Unwrap structured output if applicable
                         _sot_name = getattr(request_data, "_structured_tool_name", None)
                         if _sot_name:
-                            openai_response = _unwrap_structured_output(openai_response, _sot_name)
+                            openai_response = _unwrap_structured_output(openai_response, _stn)
                         return JSONResponse(content=openai_response)
                 
                 else:
@@ -889,6 +889,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             )
             
             await http_client.close()
+            
+            if _stn:
+                openai_response = _unwrap_structured_output(openai_response, _stn)
             
             # Log access log for non-streaming success
             logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
