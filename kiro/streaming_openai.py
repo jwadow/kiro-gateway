@@ -42,6 +42,7 @@ from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
     FAKE_REASONING_HANDLING,
+    STREAM_KEEPALIVE_INTERVAL,
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
 
@@ -52,7 +53,11 @@ from kiro.streaming_core import (
     KiroEvent,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
+    with_keepalive,
 )
+
+# SSE comment line: ignored by clients per the SSE spec, but keeps bytes flowing
+OPENAI_KEEPALIVE_COMMENT = ": keepalive\n\n"
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -492,7 +497,8 @@ async def stream_with_first_token_retry(
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    keepalive_interval: float = STREAM_KEEPALIVE_INTERVAL
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout.
@@ -517,6 +523,7 @@ async def stream_with_first_token_retry(
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        keepalive_interval: Seconds of silence before sending an SSE comment (0 disables)
     
     Yields:
         Strings in SSE format
@@ -561,14 +568,18 @@ async def stream_with_first_token_retry(
         ):
             yield chunk
     
-    async for chunk in stream_with_first_token_retry_core(
-        make_request=make_request,
-        stream_processor=stream_processor,
-        initial_response=initial_response,
-        max_retries=max_retries,
-        first_token_timeout=first_token_timeout,
-        on_http_error=create_http_error,
-        on_all_retries_failed=create_timeout_error,
+    async for chunk in with_keepalive(
+        stream_with_first_token_retry_core(
+            make_request=make_request,
+            stream_processor=stream_processor,
+            initial_response=initial_response,
+            max_retries=max_retries,
+            first_token_timeout=first_token_timeout,
+            on_http_error=create_http_error,
+            on_all_retries_failed=create_timeout_error,
+        ),
+        OPENAI_KEEPALIVE_COMMENT,
+        keepalive_interval,
     ):
         yield chunk
 

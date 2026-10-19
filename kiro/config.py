@@ -365,6 +365,15 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 # Default: 3 attempts
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
 
+# Keepalive interval for streaming responses to the client (in seconds).
+# Tool calls are buffered until Kiro finishes the whole response, so a large tool input
+# (e.g. writing a big file) can leave the client without a single byte for minutes.
+# Clients with an idle-stream watchdog (e.g. Claude Code) then abort the request.
+# While the stream is silent for this long, a keepalive is sent: an Anthropic `ping`
+# event or an SSE comment line for OpenAI. Clients ignore both.
+# Default: 10 seconds. Set to 0 to disable.
+STREAM_KEEPALIVE_INTERVAL: float = float(os.getenv("STREAM_KEEPALIVE_INTERVAL", "10"))
+
 # ==================================================================================================
 # Debug Settings
 # ==================================================================================================
