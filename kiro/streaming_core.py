@@ -280,6 +280,9 @@ async def _process_chunk(
         
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
+        
+        elif event["type"] == "heartbeat":
+            yield KiroEvent(type="heartbeat")
 
 
 # ==================================================================================================

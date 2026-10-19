@@ -1,16 +1,23 @@
 # Kiro Gateway - Docker Image
-# Optimized single-stage build
+# Optimized single-stage build on Alpine for a minimal, low-CVE footprint.
 
-FROM python:3.10-slim
+FROM python:3.13-alpine
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    # Fail the build if any dependency lacks a musl (musllinux) wheel instead of
+    # silently attempting a source build. All current deps ship musl wheels, so
+    # no compiler toolchain is needed in the image.
+    PIP_ONLY_BINARY=:all:
 
-# Create non-root user for security
-RUN groupadd -r kiro && useradd -r -g kiro kiro
+# Apply available base package upgrades
+RUN apk update && apk upgrade --no-cache
+
+# Create non-root user for security (busybox adduser/addgroup)
+RUN addgroup -S kiro && adduser -S -G kiro kiro
 
 # Set working directory and give ownership to kiro user
 WORKDIR /app
@@ -18,7 +25,14 @@ RUN chown kiro:kiro /app
 
 # Install dependencies first (better layer caching)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install runtime dependencies, then remove pip and its vendored packages.
+# pip is only needed at build time; leaving it in the final image exposes its
+# vendored copies of msgpack/setuptools to CVE scanners (e.g. Trivy) even though
+# they are never imported by the gateway at runtime.
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -m pip uninstall -y pip \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip* \
+              /usr/local/bin/pip*
 
 # Copy application code
 COPY --chown=kiro:kiro . .

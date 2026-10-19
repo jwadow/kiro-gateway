@@ -1,12 +1,12 @@
 # Prod dependencies
-fastapi
-uvicorn[standard]
-httpx
-loguru
-python-dotenv
-tiktoken
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+httpx==0.28.1
+loguru==0.7.3
+python-dotenv==1.2.3
+tiktoken==0.14.0
 
 # Testing dependencies
-pytest
-pytest-asyncio
-hypothesis
+pytest==9.1.1
+pytest-asyncio==1.4.0
+hypothesis==6.168.1

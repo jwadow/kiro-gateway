@@ -31,3 +31,8 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local tools / infra
+.opencode/
+k8s/
+mitmproxy-ca-cert.pem

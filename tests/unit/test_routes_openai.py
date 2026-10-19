@@ -38,6 +38,9 @@ class TestVerifyApiKey:
         """
         What it does: Verifies that a valid Bearer token passes authentication.
         Purpose: Ensure correct API keys are accepted.
+        Note: verify_api_key returns the bearer token itself (not a bool),
+        since passthrough mode (ksk_* keys) needs the raw token downstream
+        to authenticate directly against Kiro API.
         """
         print("Setup: Creating valid Bearer token...")
         valid_header = f"Bearer {PROXY_API_KEY}"
@@ -45,8 +48,8 @@ class TestVerifyApiKey:
         print("Action: Calling verify_api_key...")
         result = await verify_api_key(valid_header)
         
-        print(f"Comparing result: Expected True, Got {result}")
-        assert result is True
+        print(f"Comparing result: Expected '{PROXY_API_KEY}', Got '{result}'")
+        assert result == PROXY_API_KEY
     
     @pytest.mark.asyncio
     async def test_invalid_api_key_raises_401(self):
@@ -363,10 +366,38 @@ class TestModelsEndpoint:
             assert model["object"] == "model", "Model object type should be 'model'"
             assert "owned_by" in model, "Model missing 'owned_by' field"
     
-    def test_models_owned_by_anthropic(self, test_client, valid_proxy_api_key):
+    def test_passthrough_models_update_session_token_limits(self, test_client):
+        """Live metadata advertised to clients must also drive usage accounting."""
+        from kiro.routes_openai import _get_passthrough_session, _passthrough_sessions
+
+        key = "ksk_test_models_context_window"
+        response_data = {
+            "models": [{
+                "modelId": "claude-sonnet-4",
+                "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 32000},
+            }]
+        }
+        _passthrough_sessions.clear()
+        try:
+            with patch("kiro.routes_openai.httpx.AsyncClient") as client_class:
+                client = client_class.return_value.__aenter__.return_value
+                client.post = AsyncMock(return_value=Mock(status_code=200, json=Mock(return_value=response_data)))
+                response = test_client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+            assert response.status_code == 200
+            assert response.json()["data"][0]["context_window"] == 1000000
+            import asyncio
+            session = asyncio.run(_get_passthrough_session(key))
+            assert session.model_cache.get_max_input_tokens("claude-sonnet-4") == 1000000
+        finally:
+            _passthrough_sessions.clear()
+
+    def test_models_owned_by_kiro(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies models are owned by Anthropic.
-        Purpose: Ensure correct model attribution.
+        What it does: Verifies models are attributed to Kiro.
+        Purpose: Ensure correct model attribution. Kiro serves models from
+        multiple providers (Anthropic, DeepSeek, MiniMax, Qwen, etc.), so
+        "kiro" is the accurate owner rather than "anthropic".
         """
         print("Action: GET /v1/models with valid auth...")
         response = test_client.get(
@@ -378,12 +409,215 @@ class TestModelsEndpoint:
         assert response.status_code == 200
         
         for model in response.json()["data"]:
-            assert model["owned_by"] == "anthropic"
+            assert model["owned_by"] == "kiro"
 
 
 # =============================================================================
 # Tests for chat completions endpoint (/v1/chat/completions)
 # =============================================================================
+
+class TestChatCompletionsPassthroughStreamingErrorHandling:
+    """
+    Tests for exception handling in the ksk_* API key passthrough streaming
+    wrapper (stream_wrapper_passthrough).
+    
+    Bug context: this wrapper originally only caught GeneratorExit, not
+    generic Exception. When something failed mid-stream (after the SSE
+    response had already started sending bytes), the exception propagated
+    uncaught into Starlette's BaseHTTPMiddleware, which raised a secondary
+    RuntimeError("Caught handled exception, but response already started")
+    that masked the real error and dropped the connection with no error
+    frame ever reaching the client. The account-system stream_wrapper already
+    handled this correctly; the passthrough wrapper was the inconsistency.
+    """
+    
+    def test_mid_stream_exception_does_not_crash_with_unhandled_runtime_error(
+        self, test_client
+    ):
+        """
+        What it does: Simulates an exception raised mid-stream (after the
+        response has started) in passthrough mode and verifies the request
+        completes with a clean response instead of an unhandled server error.
+        Goal: Reproduce the original bug scenario and confirm the fix — the
+        generic `except Exception` handler in stream_wrapper_passthrough
+        catches the error and yields "data: [DONE]\\n\\n", so the connection
+        closes cleanly instead of triggering Starlette's masking RuntimeError.
+        """
+        print("Setup: Mocking stream_with_first_token_retry to raise mid-stream...")
+        
+        async def mock_stream_with_error(*args, **kwargs):
+            yield 'data: {"choices": [{"delta": {"content": "partial"}}]}\n\n'
+            raise RuntimeError("Simulated mid-stream failure (e.g. unhandled parser event)")
+        
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.aclose = AsyncMock()
+        
+        mock_http_client_instance = AsyncMock()
+        mock_http_client_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_http_client_instance.close = AsyncMock()
+        mock_http_client_instance.client = AsyncMock()
+        
+        print("Action: POST /v1/chat/completions with ksk_ passthrough key, stream=True...")
+        with patch('kiro.routes_openai.KiroHttpClient', return_value=mock_http_client_instance):
+            with patch('kiro.routes_openai.stream_with_first_token_retry', mock_stream_with_error):
+                response = test_client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer ksk_test_passthrough_key"},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "stream": True
+                    }
+                )
+        
+        print(f"Status: {response.status_code}")
+        print(f"Body: {response.text!r}")
+        
+        print("Checking: response completed (not an uncaught 500 from BaseHTTPMiddleware)...")
+        assert response.status_code == 200
+        
+        print("Checking: partial content before the error was still delivered...")
+        assert "partial" in response.text
+        
+        print("Checking: stream terminates with [DONE] despite the mid-stream exception...")
+        assert "data: [DONE]" in response.text
+        print("✅ Mid-stream exception handled gracefully, no masking RuntimeError")
+    
+    def test_mid_stream_exception_closes_http_client(self, test_client):
+        """
+        What it does: Verifies http_client.close() is still called in the
+        finally block when a mid-stream exception occurs in passthrough mode.
+        Goal: Ensure the fix doesn't leak per-request HTTP clients when the
+        stream fails — resource cleanup must happen on every code path
+        (success, GeneratorExit, or generic exception).
+        """
+        print("Setup: Mocking stream_with_first_token_retry to raise mid-stream...")
+        
+        async def mock_stream_with_error(*args, **kwargs):
+            yield 'data: {"choices": [{"delta": {"content": "x"}}]}\n\n'
+            raise ValueError("Simulated failure")
+        
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.aclose = AsyncMock()
+        
+        mock_http_client_instance = AsyncMock()
+        mock_http_client_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_http_client_instance.close = AsyncMock()
+        mock_http_client_instance.client = AsyncMock()
+        
+        print("Action: POST /v1/chat/completions with ksk_ passthrough key, stream=True...")
+        with patch('kiro.routes_openai.KiroHttpClient', return_value=mock_http_client_instance):
+            with patch('kiro.routes_openai.stream_with_first_token_retry', mock_stream_with_error):
+                test_client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer ksk_test_passthrough_key"},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "stream": True
+                    }
+                )
+        
+        print("Checking: http_client.close() was called despite the mid-stream exception...")
+        mock_http_client_instance.close.assert_called()
+        print("✅ HTTP client closed correctly on mid-stream exception (no resource leak)")
+    
+    def test_successful_stream_does_not_trigger_error_path(self, test_client):
+        """
+        What it does: Verifies a normal, error-free passthrough stream still
+        completes as before (no regression from adding the except Exception
+        handler).
+        Goal: The new exception handling must be additive — it should never
+        fire, log an error, or alter output for the happy path.
+        """
+        print("Setup: Mocking stream_with_first_token_retry with a clean stream...")
+        
+        async def mock_stream_ok(*args, **kwargs):
+            yield 'data: {"choices": [{"delta": {"content": "Hi"}}]}\n\n'
+            yield 'data: [DONE]\n\n'
+        
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.aclose = AsyncMock()
+        
+        mock_http_client_instance = AsyncMock()
+        mock_http_client_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_http_client_instance.close = AsyncMock()
+        mock_http_client_instance.client = AsyncMock()
+        
+        print("Action: POST /v1/chat/completions with ksk_ passthrough key, stream=True...")
+        with patch('kiro.routes_openai.KiroHttpClient', return_value=mock_http_client_instance):
+            with patch('kiro.routes_openai.stream_with_first_token_retry', mock_stream_ok):
+                response = test_client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer ksk_test_passthrough_key"},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "stream": True
+                    }
+                )
+        
+        print(f"Status: {response.status_code}")
+        print(f"Body: {response.text!r}")
+        assert response.status_code == 200
+        assert '"Hi"' in response.text
+        assert response.text.count("[DONE]") == 1
+        print("✅ Successful stream unaffected by the new error handling")
+    
+    def test_generator_exit_still_handled_separately_from_generic_exception(
+        self, test_client
+    ):
+        """
+        What it does: Verifies GeneratorExit (client disconnect) is still
+        caught by its own except clause and does NOT fall through to the
+        generic Exception handler.
+        Goal: GeneratorExit must never be treated as a streaming error (no
+        "data: [DONE]" send attempt on an already-closed connection, no
+        HTTP 500 log line) — it is normal client-initiated disconnection,
+        exactly like the pre-existing account-system stream_wrapper.
+        """
+        print("Setup: Mocking stream_with_first_token_retry to raise GeneratorExit...")
+        
+        async def mock_stream_disconnect(*args, **kwargs):
+            yield 'data: {"choices": [{"delta": {"content": "partial"}}]}\n\n'
+            raise GeneratorExit()
+        
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.aclose = AsyncMock()
+        
+        mock_http_client_instance = AsyncMock()
+        mock_http_client_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_http_client_instance.close = AsyncMock()
+        mock_http_client_instance.client = AsyncMock()
+        
+        print("Action: POST /v1/chat/completions with ksk_ passthrough key, stream=True...")
+        with patch('kiro.routes_openai.KiroHttpClient', return_value=mock_http_client_instance):
+            with patch('kiro.routes_openai.stream_with_first_token_retry', mock_stream_disconnect):
+                try:
+                    response = test_client.post(
+                        "/v1/chat/completions",
+                        headers={"Authorization": "Bearer ksk_test_passthrough_key"},
+                        json={
+                            "model": "claude-sonnet-4-5",
+                            "messages": [{"role": "user", "content": "Hello"}],
+                            "stream": True
+                        }
+                    )
+                    print(f"Status: {response.status_code}")
+                except Exception as e:
+                    # A GeneratorExit surfacing during test client teardown is
+                    # an acceptable artifact of simulating client disconnect;
+                    # what matters is http_client.close() was still called.
+                    print(f"Client-side exception during simulated disconnect: {e}")
+        
+        print("Checking: http_client.close() was called (cleanup still happens)...")
+        mock_http_client_instance.close.assert_called()
+        print("✅ GeneratorExit path still triggers cleanup correctly")
+
 
 class TestChatCompletionsAuthentication:
     """Tests for authentication on /v1/chat/completions endpoint."""

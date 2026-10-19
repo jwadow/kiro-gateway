@@ -294,7 +294,59 @@ class SystemContentBlock(BaseModel):
 SystemPrompt = Union[str, List[SystemContentBlock], List[Dict[str, Any]]]
 
 
-class AnthropicMessagesRequest(BaseModel):
+class AnthropicSystemMessageRequest(BaseModel):
+    """Normalize inline system messages for Anthropic request compatibility.
+
+    OpenAI already supports system roles directly. Anthropic generation (both
+    streaming modes) and token counting instead share this pre-validation step.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_system_messages(cls, data: Any) -> Any:
+        """Move inline system content to the top-level system prompt.
+
+        Args:
+            data: Raw request data, which must not be mutated.
+
+        Returns:
+            Request data with system blocks appended in encounter order.
+
+        Raises:
+            ValueError: If inline system content is not text or text blocks.
+        """
+        if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+            return data
+
+        messages = []
+        system_blocks = []
+        for message in data["messages"]:
+            if not isinstance(message, dict) or message.get("role") != "system":
+                messages.append(message)
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                system_blocks.append(SystemContentBlock(text=content))
+            elif isinstance(content, list):
+                system_blocks.extend(SystemContentBlock.model_validate(block) for block in content)
+            else:
+                raise ValueError("System message content must be a string or a list of text blocks")
+
+        if len(messages) == len(data["messages"]):
+            return data
+
+        existing_system = data.get("system")
+        if isinstance(existing_system, str):
+            system_blocks.insert(0, SystemContentBlock(text=existing_system))
+        elif isinstance(existing_system, list):
+            system_blocks = existing_system + system_blocks
+        elif existing_system is not None:
+            raise ValueError("The system field must be a string or a list of text blocks")
+
+        return {**data, "messages": messages, "system": system_blocks}
+
+
+class AnthropicMessagesRequest(AnthropicSystemMessageRequest):
     """
     Request to Anthropic Messages API (/v1/messages).
 
@@ -340,7 +392,7 @@ class AnthropicMessagesRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
-class AnthropicCountTokensRequest(BaseModel):
+class AnthropicCountTokensRequest(AnthropicSystemMessageRequest):
     """
     Request to Anthropic Count Tokens API (/v1/messages/count_tokens).
     

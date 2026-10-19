@@ -1757,3 +1757,83 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+class TestInlineSystemMessages:
+    """Regression coverage for system-role compatibility before role validation."""
+
+    @pytest.mark.parametrize("count_tokens", [False, True])
+    @pytest.mark.parametrize("system", [None, "original", [{"type": "text", "text": "original", "cache_control": {"type": "ephemeral"}}]])
+    def test_preserves_content_order_metadata_and_input(self, count_tokens: bool, system: object) -> None:
+        """Normalize both request types without changing caller-owned data."""
+        from copy import deepcopy
+        from kiro.models_anthropic import AnthropicCountTokensRequest
+        from kiro.converters_anthropic import extract_system_prompt
+
+        request_type = AnthropicCountTokensRequest if count_tokens else AnthropicMessagesRequest
+        payload = {
+            "model": "claude-opus-5.5", "max_tokens": 100, "system": system,
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "system", "content": "first"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "system", "content": [{"type": "text", "text": "second", "cache_control": {"type": "ephemeral"}, "custom": "kept"}]},
+            ],
+        }
+        original = deepcopy(payload)
+        request = request_type.model_validate(payload)
+        assert payload == original
+        assert [message.role for message in request.messages] == ["user", "assistant"]
+        assert extract_system_prompt(request.system) == ("original\n" if system is not None else "") + "first\nsecond"
+        serialized = request.model_dump()["system"]
+        assert serialized[-1]["cache_control"] == {"type": "ephemeral"}
+        assert serialized[-1]["custom"] == "kept"
+        assert request_type.model_validate(request.model_dump()) == request
+
+    @pytest.mark.parametrize("count_tokens", [False, True])
+    @pytest.mark.parametrize("content", [None, 123, {}, [{"type": "image", "source": {}}], [{"type": "text"}]])
+    def test_rejects_invalid_system_content(self, count_tokens: bool, content: object) -> None:
+        """Invalid system content must fail instead of being silently discarded."""
+        from kiro.models_anthropic import AnthropicCountTokensRequest
+        request_type = AnthropicCountTokensRequest if count_tokens else AnthropicMessagesRequest
+        with pytest.raises(ValidationError):
+            request_type.model_validate({"model": "test", "max_tokens": 10, "messages": [
+                {"role": "user", "content": "hello"}, {"role": "system", "content": content},
+            ]})
+
+    @pytest.mark.parametrize("count_tokens", [False, True])
+    def test_requires_conversation_after_extraction(self, count_tokens: bool) -> None:
+        """A system-only request cannot bypass the nonempty conversation check."""
+        from kiro.models_anthropic import AnthropicCountTokensRequest
+        request_type = AnthropicCountTokensRequest if count_tokens else AnthropicMessagesRequest
+        with pytest.raises(ValidationError):
+            request_type.model_validate({"model": "test", "max_tokens": 10, "messages": [{"role": "system", "content": "only"}]})
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_generation_modes_and_tool_content(self, stream: bool) -> None:
+        """Both generation modes retain tool content through normalization."""
+        payload = {"model": "test", "max_tokens": 10, "stream": stream, "messages": [
+            {"role": "system", "content": "instructions"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "test", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "done"}]},
+        ]}
+        request = AnthropicMessagesRequest.model_validate(payload)
+        assert request.stream is stream
+        assert request.messages[0].content[0].id == "t1"
+        assert request.messages[1].content[0].tool_use_id == "t1"
+
+    @pytest.mark.parametrize("system", [None, "", "normal", [{"type": "text", "text": "normal"}]])
+    def test_native_requests_unchanged(self, system: object) -> None:
+        """Native Anthropic requests keep their original system representation."""
+        request = AnthropicMessagesRequest(model="test", max_tokens=10, system=system, messages=[{"role": "user", "content": "hello"}])
+        assert isinstance(request.system, type(system))
+
+    def test_unknown_roles_still_rejected(self) -> None:
+        """Normalization must not broaden accepted conversation roles."""
+        with pytest.raises(ValidationError):
+            AnthropicMessagesRequest(model="test", max_tokens=10, messages=[{"role": "developer", "content": "hello"}])
+
+    def test_invalid_top_level_system_still_rejected(self) -> None:
+        """Inline messages cannot mask an invalid top-level system value."""
+        with pytest.raises(ValidationError):
+            AnthropicMessagesRequest(model="test", max_tokens=10, system=123, messages=[{"role": "system", "content": "instructions"}, {"role": "user", "content": "hello"}])

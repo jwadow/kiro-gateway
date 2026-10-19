@@ -242,6 +242,101 @@ Ambos os formatos de chave são suportados para compatibilidade com diferentes v
 
 </details>
 
+### Opção 5: API Key do Kiro (Headless / CI)
+
+O método de autenticação mais simples. Gere uma API key nas configurações do kiro-cli e use-a diretamente — sem renovação de tokens, sem SSO, sem arquivos de credenciais.
+
+Dois modos de operação:
+
+#### Modo A: Passthrough sem estado (Multi-Tenant)
+
+Nenhuma configuração do lado do servidor necessária. O gateway inicia sem credenciais e cada usuário passa sua própria API key do Kiro como Bearer token. Múltiplos usuários podem compartilhar uma única instância do gateway.
+
+```bash
+# Iniciar gateway sem credenciais
+docker run -d -p 8000:8000 --name kiro-gateway kiro-gateway
+```
+
+Usuários se conectam com sua própria key:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer ksk_USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+Cada Bearer token `ksk_*` é encaminhado diretamente para a Kiro API. Sessões são cacheadas por key para performance.
+
+#### Modo B: API Key no servidor (Single-Tenant)
+
+Uma única API key configurada no servidor. Usuários se autenticam com a senha `PROXY_API_KEY`:
+
+```env
+KIRO_API_KEY="ksk_your_api_key_here"
+
+# Senha para proteger SEU servidor proxy
+PROXY_API_KEY="my-super-secret-password-123"
+```
+
+```bash
+docker run -d -p 8000:8000 \
+  -e KIRO_API_KEY="ksk_your_api_key_here" \
+  -e PROXY_API_KEY="my-super-secret-password-123" \
+  --name kiro-gateway \
+  kiro-gateway
+```
+
+#### Como gerar uma API key
+
+1. Instale o kiro-cli: `curl -fsSL https://cli.kiro.dev/install | bash`
+2. Faça login: `kiro-cli login`
+3. Gere a API key nas configurações (veja a [documentação Kiro CLI Headless](https://kiro.dev/docs/cli/headless/))
+
+<details>
+<summary>🔍 Como funciona</summary>
+
+A API key é passada diretamente para a Kiro API como Bearer token com um cabeçalho adicional `tokentype: API_KEY`. Não é necessária renovação de tokens. O gateway detecta automaticamente a região correta a partir da resposta `GetProfile` da Kiro API.
+
+**Modo Passthrough (A):** Qualquer Bearer token que comece com `ksk_` ignora a validação do `PROXY_API_KEY` e é encaminhado diretamente para a Kiro API. Isso habilita uso multi-tenant.
+
+**Modo servidor (B):** `KIRO_API_KEY` é armazenado no servidor e usado para todas as requisições autenticadas via `PROXY_API_KEY`.
+
+</details>
+
+### Uso de Créditos
+
+Consulte o uso de créditos, excedentes e informações de faturamento:
+
+```bash
+curl http://localhost:8000/v1/credits \
+  -H "Authorization: Bearer ksk_YOUR_API_KEY"
+```
+
+Resposta:
+
+```json
+{
+  "plan": "KIRO PRO+",
+  "email": "user@example.com",
+  "credits": {
+    "limit": 2000,
+    "used": 2920.83,
+    "overage": 920.83,
+    "overage_charges_usd": 36.83,
+    "overage_rate_usd": 0.04,
+    "overage_cap": 10000
+  },
+  "next_reset": 1782864000
+}
+```
+
+> **Nota:** Este endpoint requer uma API key `ksk_*` (modo passthrough). Não faz parte da especificação da API do OpenAI — é uma extensão do kiro-gateway.
+
 ### Obtendo Credenciais
 
 **Para usuários do Kiro IDE:**

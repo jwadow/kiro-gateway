@@ -66,3 +66,6 @@ manual_api_test.py
 # Misc
 *.log
 .crush
+
+# Agent tooling (never belongs in the runtime image)
+.opencode/

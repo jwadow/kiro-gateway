@@ -675,6 +675,88 @@ class TestProcessChunk:
         assert len(thinking_events) == 1
         assert thinking_events[0].thinking_content == "Let me think"
         print("✓ Thinking content yielded correctly")
+    
+    @pytest.mark.asyncio
+    async def test_processes_heartbeat_event(self, mock_parser):
+        """
+        What it does: Processes heartbeat event from chunk (emitted by the
+        parser for redactedContent/encrypted thinking blocks).
+        Goal: Verify a bare {"type": "heartbeat"} dict from AwsEventStreamParser
+        is converted into a KiroEvent(type="heartbeat") with no content payload,
+        so downstream streaming layers can turn it into an SSE keep-alive
+        without ever touching parser-internal data.
+        """
+        print("Setup: Mock parser with heartbeat event (from redactedContent)...")
+        mock_parser.feed.return_value = [{"type": "heartbeat", "data": None}]
+        
+        print("Action: Processing chunk...")
+        events = []
+        async for event in _process_chunk(mock_parser, b'chunk', None):
+            events.append(event)
+        
+        print(f"Received {len(events)} events")
+        assert len(events) == 1
+        assert events[0].type == "heartbeat"
+        assert events[0].content is None
+        assert events[0].thinking_content is None
+        print("✓ Heartbeat event processed correctly")
+    
+    @pytest.mark.asyncio
+    async def test_heartbeat_events_do_not_pass_through_thinking_parser(self, mock_parser):
+        """
+        What it does: Verifies heartbeat events bypass the thinking parser
+        entirely, even when one is active.
+        Goal: The thinking parser's FSM is designed for real text content
+        (looking for <thinking> tags); feeding it heartbeat markers would be
+        both wasteful and semantically wrong, since there is no content to
+        classify as thinking vs regular text.
+        """
+        print("Setup: Mock parser with heartbeat event and an active thinking parser...")
+        mock_parser.feed.return_value = [{"type": "heartbeat", "data": None}]
+        
+        mock_thinking_parser = MagicMock()
+        
+        print("Action: Processing chunk with thinking parser present...")
+        events = []
+        async for event in _process_chunk(mock_parser, b'chunk', mock_thinking_parser):
+            events.append(event)
+        
+        print(f"Received {len(events)} events")
+        assert len(events) == 1
+        assert events[0].type == "heartbeat"
+        
+        print("Checking: thinking_parser.feed() was never called for the heartbeat...")
+        mock_thinking_parser.feed.assert_not_called()
+        print("✓ Heartbeat bypasses thinking parser")
+    
+    @pytest.mark.asyncio
+    async def test_processes_heartbeat_interleaved_with_content(self, mock_parser):
+        """
+        What it does: Processes a realistic mixed batch matching the captured
+        Opus traffic: several heartbeats (redacted reasoning) followed by
+        real content.
+        Goal: Ensure ordering and event types are both preserved end-to-end
+        through _process_chunk, not just individually.
+        """
+        print("Setup: Mock parser with heartbeats then content...")
+        mock_parser.feed.return_value = [
+            {"type": "heartbeat", "data": None},
+            {"type": "heartbeat", "data": None},
+            {"type": "content", "data": "Hello"},
+        ]
+        
+        print("Action: Processing chunk...")
+        events = []
+        async for event in _process_chunk(mock_parser, b'chunk', None):
+            events.append(event)
+        
+        print(f"Received {len(events)} events: {[e.type for e in events]}")
+        assert len(events) == 3
+        assert events[0].type == "heartbeat"
+        assert events[1].type == "heartbeat"
+        assert events[2].type == "content"
+        assert events[2].content == "Hello"
+        print("✓ Heartbeat and content events processed in order")
 
 
 # ==================================================================================================

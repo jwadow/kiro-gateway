@@ -184,6 +184,18 @@ async def stream_kiro_to_openai_internal(
                 
                 yield chunk_text
             
+            elif event.type == "heartbeat":
+                # Redacted/encrypted thinking blocks (Anthropic safety-redacted
+                # reasoning, seen with Opus at high/max effort) carry no
+                # displayable content, but can arrive as hundreds of chunks
+                # over a minute or more before any visible token. An SSE
+                # comment line (": ...") is valid per spec and ignored by
+                # every compliant consumer (EventSource, OpenAI/Anthropic
+                # SDKs), but keeps bytes flowing on the wire so intermediate
+                # proxies and client-side idle-read timeouts don't kill the
+                # connection during long silent reasoning phases.
+                yield ": heartbeat\n\n"
+            
             elif event.type == "tool_use" and event.tool_use:
                 tool = event.tool_use
                 

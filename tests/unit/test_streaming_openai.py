@@ -389,6 +389,159 @@ class TestStreamKiroToOpenai:
 
 
 # ==================================================================================================
+# Tests for heartbeat event handling (redacted/encrypted thinking blocks)
+# ==================================================================================================
+
+class TestStreamingOpenaiHeartbeat:
+    """
+    Tests for heartbeat event handling in OpenAI streaming.
+    
+    Heartbeats originate from Kiro's redactedContent events (Anthropic
+    safety-redacted thinking blocks), which carry no displayable content but
+    can arrive as hundreds of chunks over 100+ seconds during long reasoning
+    phases (observed with Opus at high/max effort). Without a keep-alive
+    signal, the connection goes silent on the wire and gets killed by
+    intermediate proxies or client-side idle-read timeouts before any real
+    content is ever sent.
+    """
+    
+    @pytest.mark.asyncio
+    async def test_yields_sse_comment_for_heartbeat(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Verifies a heartbeat KiroEvent produces an SSE comment
+        line, not a data: chunk.
+        Goal: SSE comments (lines starting with ":") are part of the spec and
+        are silently ignored by every compliant consumer (EventSource,
+        OpenAI/Anthropic SDK parsers), so they cannot break existing clients
+        while still keeping bytes flowing on the wire.
+        """
+        print("Setup: Mock stream with a single heartbeat event...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="heartbeat")
+        
+        print("Action: Streaming to OpenAI format...")
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        print(f"Received chunks: {chunks}")
+        assert ": heartbeat\n\n" in chunks
+        print("✓ Heartbeat produced an SSE comment line")
+    
+    @pytest.mark.asyncio
+    async def test_heartbeat_is_not_a_data_chunk(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Verifies the heartbeat chunk does NOT start with "data: ".
+        Goal: A malformed heartbeat that used "data: " prefix would be parsed
+        as a real JSON payload by OpenAI-compatible clients and could crash
+        their JSON parser or show garbage in the UI.
+        """
+        print("Setup: Mock stream with a heartbeat event...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="heartbeat")
+        
+        print("Action: Streaming to OpenAI format...")
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        heartbeat_chunks = [c for c in chunks if "heartbeat" in c]
+        print(f"Heartbeat chunks: {heartbeat_chunks}")
+        assert len(heartbeat_chunks) >= 1
+        for chunk in heartbeat_chunks:
+            assert not chunk.startswith("data: ")
+            assert chunk.startswith(":")
+        print("✓ Heartbeat chunks are SSE comments, not data chunks")
+    
+    @pytest.mark.asyncio
+    async def test_heartbeats_interleaved_with_content_preserve_order(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Verifies heartbeats before real content don't
+        interfere with content delivery or ordering.
+        Goal: Simulates the real-world Opus capture: many silent heartbeats
+        during redacted reasoning, then the actual visible response. The
+        client must still receive the content chunk correctly, with the
+        role: assistant marker on the first REAL content delta (heartbeats
+        should not consume the "first_chunk" role-setting logic).
+        """
+        print("Setup: Mock stream with heartbeats then content...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="heartbeat")
+            yield KiroEvent(type="heartbeat")
+            yield KiroEvent(type="content", content="Hello")
+        
+        print("Action: Streaming to OpenAI format...")
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        print(f"Received {len(chunks)} chunks")
+        heartbeat_count = sum(1 for c in chunks if "heartbeat" in c)
+        content_chunks = [c for c in chunks if '"content": "Hello"' in c]
+        
+        assert heartbeat_count == 2
+        assert len(content_chunks) == 1
+        print("Checking: the real content chunk still carries role: assistant...")
+        assert '"role": "assistant"' in content_chunks[0]
+        print("✓ Heartbeats preserved order and did not disturb content delivery")
+    
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_appear_in_final_usage_chunk(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Verifies heartbeat events are not accumulated into
+        full_content and do not leak into the final usage/finish_reason chunk.
+        Goal: Heartbeats are purely a wire-level keep-alive signal; they must
+        never affect token counting, bracket tool-call detection, or the
+        final response payload sent to the client.
+        """
+        print("Setup: Mock stream with heartbeats, content, and context_usage...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="heartbeat")
+            yield KiroEvent(type="content", content="Hi")
+            yield KiroEvent(type="heartbeat")
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+        
+        print("Action: Streaming to OpenAI format...")
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        final_chunk = chunks[-2]  # Before [DONE]
+        print(f"Final chunk: {final_chunk}")
+        assert "heartbeat" not in final_chunk
+        assert '"finish_reason": "stop"' in final_chunk
+        print("✓ Heartbeats did not leak into the final usage chunk")
+
+
+# ==================================================================================================
 # Tests for thinking content handling
 # ==================================================================================================
 

@@ -614,14 +614,17 @@ class TestLifespanAccountManagerInit:
         print("✓ Full circle initialization was attempted")
     
     @pytest.mark.asyncio
-    async def test_lifespan_exit_if_no_accounts(self, tmp_path, monkeypatch):
+    async def test_lifespan_enters_stateless_mode_if_no_accounts(self, tmp_path, monkeypatch):
         """
-        Test 102: RuntimeError если нет аккаунтов в credentials.json
+        Test 102: Stateless passthrough mode when no accounts in credentials.json
         
-        What it does: Verifies application raises RuntimeError if no accounts configured
-        Purpose: Prevent startup with empty configuration
+        What it does: Verifies application starts in stateless passthrough mode
+        (instead of raising) when no accounts are configured.
+        Purpose: Support zero-config multi-tenant deployments where each user
+        supplies their own Kiro API key (ksk_*) as a Bearer token, rather than
+        requiring server-side credentials to be present at startup.
         """
-        print("\n=== Test 102: RuntimeError if no accounts configured ===")
+        print("\n=== Test 102: Stateless mode when no accounts configured ===")
         
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
@@ -646,12 +649,12 @@ class TestLifespanAccountManagerInit:
                 
                 from main import lifespan, app
                 
-                # Assert: RuntimeError is raised
-                with pytest.raises(RuntimeError, match="No accounts configured"):
-                    async with lifespan(app):
-                        pass
+                # Assert: lifespan starts successfully in stateless mode, no exception
+                async with lifespan(app):
+                    print(f"app.state.stateless_mode: {app.state.stateless_mode}")
+                    assert app.state.stateless_mode is True
                 
-                print("✓ RuntimeError was raised for empty accounts")
+                print("✓ Application started in stateless passthrough mode for empty accounts")
     
     @pytest.mark.asyncio
     async def test_lifespan_exit_if_all_failed(self, tmp_path, monkeypatch):

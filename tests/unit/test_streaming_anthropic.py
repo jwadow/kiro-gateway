@@ -527,6 +527,161 @@ class TestStreamKiroToAnthropic:
 
 
 # ==================================================================================================
+# Tests for heartbeat event handling (redacted/encrypted thinking blocks)
+# ==================================================================================================
+
+class TestStreamingAnthropicHeartbeat:
+    """
+    Tests for heartbeat event handling in Anthropic streaming.
+    
+    Heartbeats originate from Kiro's redactedContent events (Anthropic
+    safety-redacted thinking blocks), which carry no displayable content but
+    can arrive as hundreds of chunks over 100+ seconds during long reasoning
+    phases (observed with Opus at high/max effort). Without a keep-alive
+    signal, the connection goes silent on the wire and gets killed by
+    intermediate proxies or client-side idle-read timeouts before any real
+    content is ever sent. Same fix as OpenAI streaming (Complete Feature
+    Consistency principle: both API surfaces must have equal capabilities).
+    """
+    
+    @pytest.mark.asyncio
+    async def test_yields_sse_comment_for_heartbeat(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Verifies a heartbeat KiroEvent produces an SSE comment
+        line, not a named "event:" frame.
+        Goal: SSE comments (lines starting with ":") are part of the spec and
+        are silently ignored by every compliant consumer (EventSource,
+        Anthropic SDK parsers), so they cannot break existing clients while
+        still keeping bytes flowing on the wire during long redacted
+        reasoning phases.
+        """
+        print("Setup: Mock stream with a single heartbeat event...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="heartbeat")
+        
+        print("Action: Streaming to Anthropic format...")
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+        
+        print(f"Received events: {events}")
+        assert ": heartbeat\n\n" in events
+        print("✓ Heartbeat produced an SSE comment line")
+    
+    @pytest.mark.asyncio
+    async def test_heartbeat_is_not_a_named_event(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Verifies the heartbeat output does NOT use the
+        "event: <name>\\ndata: {...}" format used by real Anthropic events.
+        Goal: A malformed heartbeat using the named-event format would be
+        parsed as a real content_block_delta/message_delta by Anthropic
+        SDK clients and could corrupt the visible message or crash strict
+        JSON parsing of the "data:" payload (which would be empty/invalid).
+        """
+        print("Setup: Mock stream with a heartbeat event...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="heartbeat")
+        
+        print("Action: Streaming to Anthropic format...")
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+        
+        heartbeat_events = [e for e in events if "heartbeat" in e]
+        print(f"Heartbeat events: {heartbeat_events}")
+        assert len(heartbeat_events) >= 1
+        for event in heartbeat_events:
+            assert not event.startswith("event:")
+            assert event.startswith(":")
+        print("✓ Heartbeat events are SSE comments, not named events")
+    
+    @pytest.mark.asyncio
+    async def test_heartbeats_do_not_open_a_content_block(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Verifies heartbeats before real content don't
+        trigger content_block_start or consume a block index.
+        Goal: Simulates the real-world Opus capture: many silent heartbeats
+        during redacted reasoning, then the actual visible response. Anthropic's
+        streaming protocol requires content_block_start/stop to be paired and
+        indices to be sequential — if heartbeats accidentally opened blocks,
+        the stream would violate the protocol and could desync the client's
+        block-index bookkeeping.
+        """
+        print("Setup: Mock stream with heartbeats then content...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="heartbeat")
+            yield KiroEvent(type="heartbeat")
+            yield KiroEvent(type="content", content="Hello")
+        
+        print("Action: Streaming to Anthropic format...")
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+        
+        print(f"Received {len(events)} events")
+        content_block_start_events = [e for e in events if "content_block_start" in e]
+        
+        print("Checking: exactly one content_block_start (for the real text), not more...")
+        assert len(content_block_start_events) == 1
+        
+        print("Checking: the single content_block_start is for the text block, index 0...")
+        assert '"index": 0' in content_block_start_events[0]
+        print("✓ Heartbeats did not open spurious content blocks")
+    
+    @pytest.mark.asyncio
+    async def test_heartbeats_do_not_appear_in_message_delta(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Verifies heartbeat events are not accumulated into
+        full_content and do not leak into the final message_delta (with
+        stop_reason/usage) sent to the client.
+        Goal: Heartbeats are purely a wire-level keep-alive signal; they must
+        never affect token counting or the final response payload.
+        """
+        print("Setup: Mock stream with heartbeats, content, and context_usage...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="heartbeat")
+            yield KiroEvent(type="content", content="Hi")
+            yield KiroEvent(type="heartbeat")
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+        
+        print("Action: Streaming to Anthropic format...")
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+        
+        message_delta_events = [e for e in events if "message_delta" in e]
+        print(f"message_delta events: {message_delta_events}")
+        assert len(message_delta_events) >= 1
+        for event in message_delta_events:
+            assert "heartbeat" not in event
+        print("✓ Heartbeats did not leak into message_delta")
+
+
+# ==================================================================================================
 # Tests for collect_anthropic_response()
 # ==================================================================================================
 

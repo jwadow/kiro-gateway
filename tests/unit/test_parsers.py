@@ -855,6 +855,117 @@ class TestAwsEventStreamParserEdgeCases:
         assert events[1]["type"] == "usage"
         assert events[2]["type"] == "context_usage"
     
+    def test_parses_metering_event_with_unit_field(self, aws_event_parser):
+        """
+        What it does: Tests parsing of the runtime endpoint's metering event
+        shape, which carries a "unit" field alongside "usage" instead of a
+        bare number (e.g. {"unit":"credit","unitPlural":"credits","usage":0.02}).
+        Goal: Ensure the full dict is preserved instead of just the "usage" number,
+        so credits_used can expose unit/unitPlural downstream.
+        """
+        print("Setup: Chunk with runtime-endpoint metering event...")
+        chunk = b'{"unit":"credit","unitPlural":"credits","usage":0.0243}'
+        
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Result: {events}")
+        assert len(events) == 1
+        assert events[0]["type"] == "usage"
+        assert isinstance(events[0]["data"], dict)
+        assert events[0]["data"]["unit"] == "credit"
+        assert events[0]["data"]["usage"] == 0.0243
+    
+    def test_parses_redacted_content_event_as_heartbeat(self, aws_event_parser):
+        """
+        What it does: Tests that redactedContent events (Anthropic's
+        encrypted/safety-redacted thinking blocks, observed with Opus at
+        high/max reasoning effort) are recognized and converted to a
+        heartbeat event instead of being silently dropped.
+        Goal: Ensure the parser recognizes {"redactedContent": ...} so it is
+        consumed from the buffer and signalled downstream, rather than sitting
+        unmatched while the model reasons for 100+ seconds with zero visible
+        output — which is what caused streaming connections to appear to
+        "hang" and get killed by intermediate proxies/clients.
+        """
+        print("Setup: Chunk with redactedContent event (base64 opaque blob)...")
+        chunk = b'{"redactedContent":"LktUUn5+ZXlKbGJtTnllWEIwYVc5dVVtVm5hVzl1SWpw"}'
+        
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Result: {events}")
+        assert len(events) == 1
+        assert events[0]["type"] == "heartbeat"
+        assert events[0]["data"] is None
+    
+    def test_redacted_content_does_not_leak_encrypted_payload(self, aws_event_parser):
+        """
+        What it does: Verifies the encrypted payload of a redactedContent
+        event is never exposed in the parsed event data.
+        Goal: The blob is opaque ciphertext we cannot and should not decode or
+        display; only a content-free heartbeat signal should propagate.
+        """
+        print("Setup: Chunk with redactedContent containing a distinctive payload...")
+        secret_blob = "SECRET_ENCRYPTED_PAYLOAD_MARKER_1234567890"
+        chunk = f'{{"redactedContent":"{secret_blob}"}}'.encode()
+        
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Result: {events}")
+        assert len(events) == 1
+        print("Checking: the encrypted payload is not present anywhere in the event...")
+        assert secret_blob not in str(events[0])
+    
+    def test_multiple_redacted_content_events_all_become_heartbeats(self, aws_event_parser):
+        """
+        What it does: Tests parsing of many consecutive redactedContent
+        events in a single chunk, simulating the real-world capture where
+        Opus at effort=max emitted 1034 such frames before any visible token.
+        Goal: Ensure every frame is consumed and converted, none accumulate
+        unbounded in the internal buffer, and none are lost or merged.
+        """
+        print("Setup: Chunk with 5 consecutive redactedContent events...")
+        chunk = b''.join(
+            f'{{"redactedContent":"blob_{i}"}}'.encode() for i in range(5)
+        )
+        
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Result: {len(events)} events")
+        assert len(events) == 5
+        assert all(e["type"] == "heartbeat" for e in events)
+        
+        print("Checking: buffer is fully drained, nothing left un-matched...")
+        assert aws_event_parser.buffer == ""
+    
+    def test_redacted_content_interleaved_with_content_events(self, aws_event_parser):
+        """
+        What it does: Tests a realistic sequence where redactedContent frames
+        precede the actual visible content, matching the captured Opus
+        traffic pattern (reasoningContentEvent frames, then assistantResponseEvent).
+        Goal: Ensure heartbeats and real content are both correctly extracted
+        in order, with no cross-contamination.
+        """
+        print("Setup: redactedContent frames followed by real content...")
+        chunk = (
+            b'{"redactedContent":"blob_1"}'
+            b'{"redactedContent":"blob_2"}'
+            b'{"content":"Hello"}'
+        )
+        
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Result: {events}")
+        assert len(events) == 3
+        assert events[0]["type"] == "heartbeat"
+        assert events[1]["type"] == "heartbeat"
+        assert events[2]["type"] == "content"
+        assert events[2]["data"] == "Hello"
+    
     def test_handles_garbage_between_events(self, aws_event_parser):
         """
         What it does: Tests handling of garbage between events.

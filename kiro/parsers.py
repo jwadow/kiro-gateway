@@ -245,7 +245,18 @@ class AwsEventStreamParser:
         ('{"stop":', 'tool_stop'),
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
+        ('{"unit":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
+        # redactedContent: Anthropic's encrypted/safety-redacted thinking blocks.
+        # Emitted as reasoningContentEvent frames by extended-thinking models
+        # (observed with Opus at high/max reasoning effort) and can arrive as
+        # hundreds of chunks over a minute or more before any visible content.
+        # The payload is an opaque encrypted blob we cannot and should not
+        # decode or display; we recognize it purely so it is consumed from
+        # the buffer instead of sitting there un-matched (which silently
+        # discards it anyway once a later pattern matches, but leaves the
+        # buffer growing unbounded in the meantime).
+        ('{"redactedContent":', 'redacted_thinking'),
     ]
     
     def __init__(self):
@@ -325,9 +336,18 @@ class AwsEventStreamParser:
         elif event_type == 'tool_stop':
             return self._process_tool_stop_event(data)
         elif event_type == 'usage':
+            if 'unit' in data:
+                return {"type": "usage", "data": data}
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
+        elif event_type == 'redacted_thinking':
+            # Opaque encrypted blob, nothing to decode or display. Recognized
+            # so it is consumed rather than left un-matched in the buffer;
+            # signalled downstream as a heartbeat so the SSE connection stays
+            # alive during the (sometimes 100+ second) redacted reasoning
+            # phase instead of going silent on the wire.
+            return {"type": "heartbeat", "data": None}
         
         return None
     
