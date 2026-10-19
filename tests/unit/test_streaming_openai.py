@@ -20,6 +20,7 @@ from kiro.streaming_openai import (
     stream_kiro_to_openai,
     stream_kiro_to_openai_internal,
     stream_with_first_token_retry,
+    OPENAI_KEEPALIVE_COMMENT,
     collect_stream_response,
     FirstTokenTimeoutError,
 )
@@ -1485,3 +1486,80 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+
+# ==================================================================================================
+# Tests for client keepalive
+# ==================================================================================================
+
+class TestStreamingOpenaiKeepalive:
+    """
+    Tests for the SSE comment keepalive in stream_with_first_token_retry().
+    
+    Same problem as the Anthropic API: buffered tool calls leave the stream silent.
+    For OpenAI an SSE comment line is used, which clients ignore per the SSE spec.
+    """
+    
+    async def _collect(self, mock_http_client, mock_model_cache, mock_auth_manager, keepalive_interval):
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.aclose = AsyncMock()
+        
+        async def mock_make_request():
+            return mock_response
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Writing file")
+            await asyncio.sleep(0.3)
+            yield KiroEvent(type="tool_use", tool_use={
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": '{"path": "a.txt"}'}
+            })
+        
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_with_first_token_retry(
+                    mock_make_request,
+                    mock_http_client,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                    max_retries=1,
+                    first_token_timeout=30,
+                    keepalive_interval=keepalive_interval
+                ):
+                    chunks.append(chunk)
+        return chunks
+    
+    @pytest.mark.asyncio
+    async def test_sends_sse_comment_while_tool_call_is_buffered(self, mock_http_client, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Emits SSE comment lines while the stream is silent.
+        Goal: Verify OpenAI clients keep receiving bytes during a long tool call.
+        """
+        print("Action: Streaming with keepalive_interval=0.1...")
+        chunks = await self._collect(mock_http_client, mock_model_cache, mock_auth_manager, 0.1)
+        
+        comments = [c for c in chunks if c == OPENAI_KEEPALIVE_COMMENT]
+        print(f"Received {len(chunks)} chunks, {len(comments)} keepalive comments")
+        assert len(comments) >= 2
+        assert OPENAI_KEEPALIVE_COMMENT.startswith(":")
+        assert any("tool_calls" in c for c in chunks)
+        assert chunks[-1].strip() == "data: [DONE]"
+        print("✓ SSE comments sent during silence")
+    
+    @pytest.mark.asyncio
+    async def test_no_comment_when_disabled(self, mock_http_client, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Sends no keepalive comments when keepalive_interval is 0.
+        Goal: Verify the keepalive can be disabled.
+        """
+        print("Action: Streaming with keepalive_interval=0...")
+        chunks = await self._collect(mock_http_client, mock_model_cache, mock_auth_manager, 0)
+        
+        print(f"Received {len(chunks)} chunks")
+        assert OPENAI_KEEPALIVE_COMMENT not in chunks
+        assert any("tool_calls" in c for c in chunks)
+        print("✓ No keepalive comments when disabled")

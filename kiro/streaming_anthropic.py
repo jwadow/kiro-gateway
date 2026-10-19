@@ -46,10 +46,16 @@ from kiro.streaming_core import (
     KiroEvent,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
+    with_keepalive,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
-from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
+from kiro.config import (
+    FIRST_TOKEN_TIMEOUT,
+    FIRST_TOKEN_MAX_RETRIES,
+    FAKE_REASONING_HANDLING,
+    STREAM_KEEPALIVE_INTERVAL,
+)
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -873,7 +879,8 @@ async def stream_with_first_token_retry_anthropic(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    keepalive_interval: float = STREAM_KEEPALIVE_INTERVAL
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -896,6 +903,7 @@ async def stream_with_first_token_retry_anthropic(
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
         request_system: Original system prompt (for fallback token counting)
+        keepalive_interval: Seconds of silence before sending a `ping` event (0 disables)
     
     Yields:
         Strings in Anthropic SSE format
@@ -937,13 +945,20 @@ async def stream_with_first_token_retry_anthropic(
         ):
             yield chunk
     
-    async for chunk in stream_with_first_token_retry(
-        make_request=make_request,
-        stream_processor=stream_processor,
-        initial_response=initial_response,
-        max_retries=max_retries,
-        first_token_timeout=first_token_timeout,
-        on_http_error=create_http_error,
-        on_all_retries_failed=create_timeout_error,
+    # Anthropic's own keepalive: clients skip `ping` events
+    ping_event = format_sse_event("ping", {"type": "ping"})
+    
+    async for chunk in with_keepalive(
+        stream_with_first_token_retry(
+            make_request=make_request,
+            stream_processor=stream_processor,
+            initial_response=initial_response,
+            max_retries=max_retries,
+            first_token_timeout=first_token_timeout,
+            on_http_error=create_http_error,
+            on_all_retries_failed=create_timeout_error,
+        ),
+        ping_event,
+        keepalive_interval,
     ):
         yield chunk

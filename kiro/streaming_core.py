@@ -41,6 +41,7 @@ from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, dedupli
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
+    STREAM_KEEPALIVE_INTERVAL,
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_HANDLING,
 )
@@ -503,3 +504,72 @@ async def stream_with_first_token_retry(
             f"Model did not respond within {first_token_timeout}s after {max_retries} attempts. "
             "Please try again."
         )
+
+
+# ==================================================================================================
+# Client Keepalive
+# ==================================================================================================
+
+async def with_keepalive(
+    source: AsyncGenerator[str, None],
+    keepalive_chunk: str,
+    interval: float = STREAM_KEEPALIVE_INTERVAL,
+) -> AsyncGenerator[str, None]:
+    """
+    Pass chunks through, inserting a keepalive chunk while the source is silent.
+    
+    Tool calls are only emitted once Kiro has finished the whole response, so a large
+    tool input leaves the client without any bytes for minutes. Clients with an
+    idle-stream watchdog treat that as a dead connection and abort. This wrapper sends
+    keepalive_chunk every `interval` seconds of silence so the connection stays alive.
+    
+    Keepalives start only after the first real chunk, so error responses raised before
+    the stream starts (HTTP errors, first token timeout) are unchanged.
+    
+    Args:
+        source: Async generator of SSE strings
+        keepalive_chunk: SSE string to send during silence (must be ignored by clients)
+        interval: Seconds of silence before each keepalive. 0 or less disables keepalives.
+    
+    Yields:
+        Chunks from source, with keepalive chunks inserted during silence
+    
+    Raises:
+        Any exception raised by source
+    """
+    iterator = source.__aiter__()
+    pending: Optional[asyncio.Future] = None
+    started = False
+    
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+            
+            timeout = interval if (started and interval > 0) else None
+            done, _ = await asyncio.wait({pending}, timeout=timeout)
+            
+            if not done:
+                logger.debug(f"Stream silent for {interval}s, sending keepalive")
+                yield keepalive_chunk
+                continue
+            
+            task, pending = pending, None
+            try:
+                chunk = task.result()
+            except StopAsyncIteration:
+                return
+            
+            started = True
+            yield chunk
+    finally:
+        # Client disconnected or source finished: stop the in-flight read and close the source
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except (asyncio.CancelledError, StopAsyncIteration, Exception):
+                pass
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()

@@ -14,6 +14,7 @@ Tests for:
 import pytest
 import json
 import uuid
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kiro.streaming_anthropic import (
@@ -1667,3 +1668,84 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+# ==================================================================================================
+# Tests for client keepalive
+# ==================================================================================================
+
+class TestStreamingAnthropicKeepalive:
+    """
+    Tests for the `ping` keepalive in stream_with_first_token_retry_anthropic().
+    
+    Tool calls are emitted only after Kiro finishes, so the stream can be silent for
+    minutes. Anthropic `ping` events keep idle-stream watchdogs (e.g. Claude Code) from
+    aborting the request.
+    """
+    
+    @staticmethod
+    def _slow_tool_stream():
+        """Build a parse_kiro_stream mock that pauses before emitting a tool call."""
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Writing file")
+            await asyncio.sleep(0.3)
+            yield KiroEvent(type="tool_use", tool_use={
+                "id": "toolu_1",
+                "function": {"name": "write_file", "arguments": '{"path": "a.txt"}'}
+            })
+        return mock_parse_kiro_stream
+    
+    async def _collect(self, mock_model_cache, mock_auth_manager, keepalive_interval):
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.aclose = AsyncMock()
+        
+        async def mock_make_request():
+            return mock_response
+        
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', self._slow_tool_stream()):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_with_first_token_retry_anthropic(
+                    make_request=mock_make_request,
+                    model="claude-sonnet-4",
+                    model_cache=mock_model_cache,
+                    auth_manager=mock_auth_manager,
+                    max_retries=1,
+                    first_token_timeout=30,
+                    keepalive_interval=keepalive_interval
+                ):
+                    chunks.append(chunk)
+        return chunks
+    
+    @pytest.mark.asyncio
+    async def test_sends_ping_events_while_tool_call_is_buffered(self, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Emits `ping` events while the stream is silent.
+        Goal: Verify Anthropic clients keep receiving bytes during a long tool call.
+        """
+        print("Action: Streaming with keepalive_interval=0.1...")
+        chunks = await self._collect(mock_model_cache, mock_auth_manager, 0.1)
+        
+        pings = [c for c in chunks if c.startswith("event: ping")]
+        print(f"Received {len(chunks)} chunks, {len(pings)} pings")
+        assert len(pings) >= 2
+        assert all('"type": "ping"' in p for p in pings)
+        assert chunks[0].startswith("event: message_start")
+        assert any("tool_use" in c for c in chunks)
+        assert chunks[-1].startswith("event: message_stop")
+        print("✓ Ping events sent during silence")
+    
+    @pytest.mark.asyncio
+    async def test_no_ping_when_disabled(self, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Sends no `ping` events when keepalive_interval is 0.
+        Goal: Verify the keepalive can be disabled.
+        """
+        print("Action: Streaming with keepalive_interval=0...")
+        chunks = await self._collect(mock_model_cache, mock_auth_manager, 0)
+        
+        print(f"Received {len(chunks)} chunks")
+        assert not any(c.startswith("event: ping") for c in chunks)
+        assert any("tool_use" in c for c in chunks)
+        print("✓ No ping events when disabled")
