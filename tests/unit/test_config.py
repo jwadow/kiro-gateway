@@ -583,7 +583,104 @@ class TestFallbackModelsConfig:
         print("Verification: Contains at least one Claude model...")
         has_claude = any("claude" in mid.lower() for mid in model_ids)
         assert has_claude, "No Claude models in fallback list"
-    
+
+    def test_fallback_models_contain_claude_5_generation(self):
+        """
+        What it does: Verifies that fallback models include Claude 5 generation models.
+        Purpose: Ensure newly released models (claude-sonnet-5, claude-sonnet-5.5,
+                 claude-opus-4.8, claude-opus-5, claude-opus-5.5) are available
+                 when /ListAvailableModels is unreachable.
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+
+        model_ids = {m["modelId"] for m in FALLBACK_MODELS}
+        print(f"Model IDs in fallback list: {sorted(model_ids)}")
+
+        expected_claude_5_models = {
+            "claude-sonnet-5",
+            "claude-sonnet-5.5",
+            "claude-opus-4.8",
+            "claude-opus-5",
+            "claude-opus-5.5",
+        }
+        for model_id in expected_claude_5_models:
+            print(f"Verification: Contains '{model_id}'...")
+            assert model_id in model_ids, f"Missing expected Claude 5 generation model: {model_id}"
+
+    def test_fallback_models_contain_gpt_models(self):
+        """
+        What it does: Verifies that fallback models include GPT family models.
+        Purpose: Ensure non-Claude GPT models (gpt-5.6-sol, gpt-5.6-terra,
+                 gpt-5.6-luna) are available when /ListAvailableModels is unreachable.
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+
+        model_ids = {m["modelId"] for m in FALLBACK_MODELS}
+        print(f"Model IDs in fallback list: {sorted(model_ids)}")
+
+        expected_gpt_models = {
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        }
+        for model_id in expected_gpt_models:
+            print(f"Verification: Contains '{model_id}'...")
+            assert model_id in model_ids, f"Missing expected GPT model: {model_id}"
+
+    def test_fallback_models_excludes_deprecated_sonnet_4(self):
+        """
+        What it does: Verifies that deprecated claude-sonnet-4 is NOT in fallback list.
+        Purpose: Ensure the deprecated model was intentionally removed and does not
+                 reappear (regression guard). It was dropped in favor of
+                 claude-sonnet-4.5 and newer generations.
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+
+        model_ids = {m["modelId"] for m in FALLBACK_MODELS}
+        print(f"Model IDs in fallback list: {sorted(model_ids)}")
+
+        print("Verification: 'claude-sonnet-4' is NOT present...")
+        assert "claude-sonnet-4" not in model_ids, (
+            "Deprecated 'claude-sonnet-4' should not be in fallback list"
+        )
+
+        print("Verification: 'claude-sonnet-4.5' is still present...")
+        assert "claude-sonnet-4.5" in model_ids, (
+            "Removing claude-sonnet-4 must not remove claude-sonnet-4.5"
+        )
+
+    def test_fallback_models_no_duplicates(self):
+        """
+        What it does: Verifies that fallback models list has no duplicate model IDs.
+        Purpose: Ensure cache and /v1/models list don't show duplicated entries.
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+
+        model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+        print(f"Model IDs in fallback list: {model_ids}")
+
+        duplicates = {mid for mid in model_ids if model_ids.count(mid) > 1}
+        print(f"Comparing: Expected no duplicates, Got '{duplicates or 'none'}'")
+        assert not duplicates, f"Duplicate model IDs in fallback list: {duplicates}"
+
+    def test_fallback_models_use_lowercase_ids(self):
+        """
+        What it does: Verifies that all fallback model IDs are lowercase.
+        Purpose: Ensure IDs match normalize_model_name() output format
+                 (normalization lowercases Claude names before cache lookup).
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+
+        for model in FALLBACK_MODELS:
+            model_id = model["modelId"]
+            print(f"Checking: {model_id} is lowercase...")
+            assert model_id == model_id.lower(), f"Model ID '{model_id}' is not lowercase"
+
     def test_fallback_models_use_dot_format(self):
         """
         What it does: Verifies that model IDs use dot format (e.g., claude-4.5).
