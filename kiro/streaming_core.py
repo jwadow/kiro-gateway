@@ -45,6 +45,7 @@ from kiro.config import (
     FAKE_REASONING_HANDLING,
 )
 from kiro.thinking_parser import ThinkingParser
+from kiro.model_resolver import normalize_model_name
 
 if TYPE_CHECKING:
     from kiro.cache import ModelInfoCache
@@ -347,13 +348,21 @@ def calculate_tokens_from_context_usage(
         context_usage_percentage: Context usage percentage from Kiro API
         completion_tokens: Number of completion tokens (counted via tiktoken)
         model_cache: Model cache for getting max input tokens
-        model: Model name
+        model: Model name as sent by the client (normalized here for the cache lookup)
     
     Returns:
         Tuple of (prompt_tokens, total_tokens, prompt_source, total_source)
     """
     if context_usage_percentage is not None and context_usage_percentage > 0:
-        max_input_tokens = model_cache.get_max_input_tokens(model)
+        # Clients send any supported name format (claude-opus-4-6, claude-opus-4-6[1m]),
+        # while the cache is keyed by Kiro IDs (claude-opus-4.6). Normalize first so the
+        # model's real context window is used instead of the default.
+        normalized_model = normalize_model_name(model)
+        max_input_tokens = model_cache.get_max_input_tokens(normalized_model)
+        logger.debug(
+            f"Context usage {context_usage_percentage}% of {max_input_tokens} max input tokens "
+            f"(model: '{model}' → '{normalized_model}')"
+        )
         total_tokens = int((context_usage_percentage / 100) * max_input_tokens)
         prompt_tokens = max(0, total_tokens - completion_tokens)
         return prompt_tokens, total_tokens, "subtraction", "API Kiro"

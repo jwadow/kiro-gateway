@@ -429,6 +429,26 @@ class TestNormalizeModelNameParametrized:
         ("claude-sonnet-4-20250514", "claude-sonnet-4"),
         ("claude-haiku-4", "claude-haiku-4"),
         ("claude-opus-4", "claude-opus-4"),
+        # Without minor version + 'latest' suffix (mirrors minor-version handling)
+        ("claude-opus-5", "claude-opus-5"),
+        ("claude-opus-5-latest", "claude-opus-5"),
+        ("claude-sonnet-5-latest", "claude-sonnet-5"),
+        ("claude-haiku-5-latest", "claude-haiku-5"),
+        ("claude-sonnet-4-latest", "claude-sonnet-4"),
+        ("CLAUDE-OPUS-5-LATEST", "claude-opus-5"),
+        ("claude-opus-5-20260724", "claude-opus-5"),
+        # A bare number after the major version is the minor version, not a suffix
+        ("claude-opus-5-5", "claude-opus-5.5"),
+        ("claude-opus-5-5-latest", "claude-opus-5.5"),
+        ("claude-sonnet-5-5-20261002", "claude-sonnet-5.5"),
+        ("claude-opus-4-8", "claude-opus-4.8"),
+        # Unknown suffixes on no-minor names are left untouched (pass-through)
+        ("claude-opus-5-latest-20260724", "claude-opus-5-latest-20260724"),
+        ("claude-opus-5-latestx", "claude-opus-5-latestx"),
+        ("claude-opus-5-lat", "claude-opus-5-lat"),
+        ("claude-opus-5-1234567", "claude-opus-5-1234567"),
+        ("claude-opus-5-123456789", "claude-opus-5-123456789"),
+        ("claude-opus-5-", "claude-opus-5-"),
         # Legacy format
         ("claude-3-7-sonnet", "claude-3.7-sonnet"),
         ("claude-3-7-sonnet-20250219", "claude-3.7-sonnet"),
@@ -444,6 +464,13 @@ class TestNormalizeModelNameParametrized:
         ("gpt-4", "gpt-4"),
         ("gpt-4-turbo", "gpt-4-turbo"),
         ("unknown-model", "unknown-model"),
+        # Non-Claude Kiro models are never rewritten (including 'latest'-like suffixes)
+        ("gpt-5.6-sol", "gpt-5.6-sol"),
+        ("gpt-5.6-terra", "gpt-5.6-terra"),
+        ("gpt-5.6-luna", "gpt-5.6-luna"),
+        ("gpt-5.6-sol-latest", "gpt-5.6-sol-latest"),
+        ("kimi-k3", "kimi-k3"),
+        ("kimi-k3-latest", "kimi-k3-latest"),
     ])
     def test_normalize_model_name_all_scenarios(self, input_model, expected):
         """

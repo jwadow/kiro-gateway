@@ -1036,6 +1036,78 @@ class TestCalculateTokensFromContextUsage:
         print(f"Comparing prompt_tokens: Expected 189000, Got {prompt_tokens}")
         assert prompt_tokens == 189000
         print("✓ Large percentage calculated correctly")
+    
+    @pytest.mark.parametrize("client_model,expected_lookup", [
+        ("claude-opus-4-6", "claude-opus-4.6"),
+        ("claude-opus-4-6[1m]", "claude-opus-4.6"),
+        ("claude-sonnet-4-5-20250929", "claude-sonnet-4.5"),
+        ("claude-opus-5-latest", "claude-opus-5"),
+        ("claude-opus-4.6", "claude-opus-4.6"),
+        ("gpt-5.6-sol", "gpt-5.6-sol"),
+        ("kimi-k3", "kimi-k3"),
+    ])
+    def test_normalizes_client_model_name_before_cache_lookup(
+        self, mock_model_cache, client_model, expected_lookup
+    ):
+        """
+        What it does: Verifies the cache is queried with the normalized Kiro model ID.
+        Goal: Routes pass the client's raw model name (e.g., Claude Code sends
+              "claude-opus-4-6[1m]"), but the cache is keyed by "claude-opus-4.6".
+        """
+        print(f"Action: Calculating tokens for '{client_model}'...")
+        calculate_tokens_from_context_usage(10.0, 100, mock_model_cache, client_model)
+        
+        print(f"Verification: cache queried with '{expected_lookup}'...")
+        mock_model_cache.get_max_input_tokens.assert_called_once_with(expected_lookup)
+    
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("client_model,expected_max_input_tokens", [
+        ("claude-opus-5.5", 1000000),
+        ("claude-opus-5-5", 1000000),
+        ("claude-sonnet-4-6[1m]", 1000000),
+        ("claude-haiku-4-5-20251001", 200000),
+        ("gpt-5.6-sol", 922000),
+        ("deepseek-3.2", 164000),
+        ("model-not-in-catalog", 200000),  # DEFAULT_MAX_INPUT_TOKENS
+    ])
+    async def test_uses_real_context_window_from_fallback_catalog(
+        self, client_model, expected_max_input_tokens
+    ):
+        """
+        What it does: Calculates tokens with a real cache populated from FALLBACK_MODELS.
+        Goal: Regression test - before per-model tokenLimits, every model used 200K, so
+              usage for 1M-context models was reported 5x too low.
+        """
+        print("Setup: Populating real ModelInfoCache with FALLBACK_MODELS...")
+        from kiro.cache import ModelInfoCache
+        from kiro.config import FALLBACK_MODELS
+        
+        cache = ModelInfoCache()
+        await cache.update(FALLBACK_MODELS)
+        
+        print(f"Action: 10% context usage for '{client_model}' with 100 completion tokens...")
+        prompt_tokens, total_tokens, prompt_source, total_source = calculate_tokens_from_context_usage(
+            10.0, 100, cache, client_model
+        )
+        
+        expected_total = expected_max_input_tokens // 10
+        print(f"Comparing total_tokens: Expected {expected_total}, Got {total_tokens}")
+        assert total_tokens == expected_total
+        print(f"Comparing prompt_tokens: Expected {expected_total - 100}, Got {prompt_tokens}")
+        assert prompt_tokens == expected_total - 100
+        assert prompt_source == "subtraction"
+        assert total_source == "API Kiro"
+    
+    def test_skips_cache_lookup_without_context_usage(self, mock_model_cache):
+        """
+        What it does: Verifies the cache is not queried when Kiro sent no context usage.
+        Goal: Normalization and lookup only run when there is a percentage to convert.
+        """
+        print("Action: Calculating tokens with context usage None...")
+        calculate_tokens_from_context_usage(None, 100, mock_model_cache, "claude-opus-4-6")
+        
+        print("Verification: cache was not queried...")
+        mock_model_cache.get_max_input_tokens.assert_not_called()
 
 
 # ==================================================================================================

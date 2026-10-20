@@ -93,6 +93,7 @@ def normalize_model_name(name: str) -> str:
     2. claude-haiku-4-5-20251001 → claude-haiku-4.5 (strip date suffix)
     3. claude-haiku-4-5-latest → claude-haiku-4.5 (strip 'latest' suffix)
     4. claude-sonnet-4-20250514 → claude-sonnet-4 (strip date, no minor)
+       claude-opus-5-latest → claude-opus-5 (strip 'latest', no minor)
     5. claude-3-7-sonnet → claude-3.7-sonnet (legacy format normalization)
     6. claude-3-7-sonnet-20250219 → claude-3.7-sonnet (legacy + strip date)
     7. claude-4.5-opus-high → claude-opus-4.5 (inverted format with suffix)
@@ -114,6 +115,8 @@ def normalize_model_name(name: str) -> str:
         'claude-sonnet-4'
         >>> normalize_model_name("claude-sonnet-4-20250514")
         'claude-sonnet-4'
+        >>> normalize_model_name("claude-opus-5-latest")
+        'claude-opus-5'
         >>> normalize_model_name("claude-3-7-sonnet")
         'claude-3.7-sonnet'
         >>> normalize_model_name("claude-3-7-sonnet-20250219")
@@ -145,10 +148,12 @@ def normalize_model_name(name: str) -> str:
         minor = match.group(2)  # 5
         return f"{base}.{minor}"  # claude-haiku-4.5
     
-    # Pattern 2: Standard format without minor - claude-{family}-{major}(-{date})?
-    # Matches: claude-sonnet-4, claude-sonnet-4-20250514
-    # Groups: (claude-sonnet-4), optional date
-    no_minor_pattern = r'^(claude-(?:haiku|sonnet|opus)-\d+)(?:-\d{8})?$'
+    # Pattern 2: Standard format without minor - claude-{family}-{major}(-{date}|-latest)?
+    # Matches: claude-sonnet-4, claude-sonnet-4-20250514, claude-opus-5-latest
+    # Groups: (claude-sonnet-4), optional date or 'latest' suffix
+    # Mirrors Pattern 1 suffix handling, except bare numbers: claude-opus-5-5 is Opus 5.5
+    # (handled by Pattern 1), so only 8-digit dates and 'latest' are stripped here.
+    no_minor_pattern = r'^(claude-(?:haiku|sonnet|opus)-\d+)(?:-(?:\d{8}|latest))?$'
     match = re.match(no_minor_pattern, name_lower)
     if match:
         return match.group(1)  # claude-sonnet-4

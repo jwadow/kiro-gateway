@@ -27,7 +27,7 @@ Loads environment variables and provides typed access to them.
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -266,27 +266,49 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # Fallback Models Configuration (DNS Failure Recovery)
 # ==================================================================================================
 
-# Fallback model list - used when /ListAvailableModels API is unreachable.
-# This ensures basic functionality even with DNS/network issues.
+# Known model list (static catalog).
+# - runtime.{region}.kiro.dev has no /ListAvailableModels API, so this list is what
+#   /v1/models returns for every account on the runtime endpoint.
+# - On legacy endpoints it is the fallback when /ListAvailableModels is unreachable
+#   (DNS/network issues).
+#
+# Entries use the same shape as /ListAvailableModels responses. tokenLimits.maxInputTokens
+# is each model's context window as reported by Kiro (`kiro-cli chat --list-models
+# --format json` → context_window_tokens, checked 2026-10-20). It converts Kiro's
+# contextUsagePercentage into token counts, so a wrong value skews reported usage
+# (e.g., 1M-context models were reported 5x too low with the 200K default).
 #
 # IMPORTANT: This list represents known models at the time of this gateway version.
-# - Some models may not be available on your Kiro plan (e.g., Opus on free tier)
-# - New models released after this version won't appear here
+# - Some models may not be available on your Kiro plan or region (e.g., Opus on free tier)
+# - Models missing from this list still work when requested by name (pass-through)
 # - Update gateway regularly to get the latest model list
-FALLBACK_MODELS: List[Dict[str, str]] = [
-    {"modelId": "auto"},
-    {"modelId": "claude-sonnet-4"},
-    {"modelId": "claude-sonnet-4.5"},
-    {"modelId": "claude-sonnet-4.6"},
-    {"modelId": "claude-haiku-4.5"},
-    {"modelId": "claude-opus-4.5"},
-    {"modelId": "claude-opus-4.6"},
-    {"modelId": "claude-opus-4.7"},
-    {"modelId": "deepseek-3.2"},
-    {"modelId": "glm-5"},
-    {"modelId": "minimax-m2.1"},
-    {"modelId": "minimax-m2.5"},
-    {"modelId": "qwen3-coder-next"},
+# - Claude Sonnet 4 reached end of life in Kiro on 2026-10-14 and is no longer listed
+FALLBACK_MODELS: List[Dict[str, Any]] = [
+    # Kiro model router
+    {"modelId": "auto", "tokenLimits": {"maxInputTokens": 1000000}},
+    # Anthropic Claude
+    {"modelId": "claude-opus-5.5", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-sonnet-5.5", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-opus-5", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-sonnet-5", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-opus-4.8", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-opus-4.7", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-opus-4.6", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-sonnet-4.6", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "claude-opus-4.5", "tokenLimits": {"maxInputTokens": 200000}},
+    {"modelId": "claude-sonnet-4.5", "tokenLimits": {"maxInputTokens": 200000}},
+    {"modelId": "claude-haiku-4.5", "tokenLimits": {"maxInputTokens": 200000}},
+    # OpenAI GPT
+    {"modelId": "gpt-5.6-sol", "tokenLimits": {"maxInputTokens": 922000}},
+    {"modelId": "gpt-5.6-terra", "tokenLimits": {"maxInputTokens": 922000}},
+    {"modelId": "gpt-5.6-luna", "tokenLimits": {"maxInputTokens": 922000}},
+    # Open-weight models
+    {"modelId": "deepseek-3.2", "tokenLimits": {"maxInputTokens": 164000}},
+    {"modelId": "glm-5", "tokenLimits": {"maxInputTokens": 200000}},
+    {"modelId": "kimi-k3", "tokenLimits": {"maxInputTokens": 1000000}},
+    {"modelId": "minimax-m2.1", "tokenLimits": {"maxInputTokens": 196000}},
+    {"modelId": "minimax-m2.5", "tokenLimits": {"maxInputTokens": 196000}},
+    {"modelId": "qwen3-coder-next", "tokenLimits": {"maxInputTokens": 256000}},
 ]
 
 # ==================================================================================================

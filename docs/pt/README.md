@@ -27,11 +27,13 @@ Feito com ❤️ por [@Jwadow](https://github.com/jwadow)
 
 > 🔒 **Claude Opus 4.5** foi removido do plano gratuito em 17 de janeiro de 2026. Pode estar disponível em planos pagos — verifique a lista de modelos no seu IDE/CLI.
 
+> 💎 **Os planos pagos** adicionam modelos mais recentes como **Claude Opus 5.5**, **Claude Sonnet 5.5**, **Claude Opus 5**, **Claude Sonnet 5**, **GPT-5.6** (Sol, Terra, Luna) e **Kimi K3**, com até 1M de contexto. A disponibilidade depende do seu plano e região — verifique a lista de modelos no seu IDE/CLI.
+
+> 📅 **Claude Sonnet 4** chegou ao fim da vida útil no Kiro em 14 de outubro de 2026 e não está mais disponível.
+
 🚀 **Claude Sonnet 4.5** — Desempenho equilibrado. Ótimo para programação, escrita e tarefas de uso geral.
 
 ⚡ **Claude Haiku 4.5** — Velocidade relâmpago. Perfeito para respostas rápidas, tarefas simples e chat.
-
-📦 **Claude Sonnet 4** — Geração anterior. Ainda poderoso e confiável para a maioria dos casos de uso.
 
 💤 **GLM-5** — Modelo MoE aberto (744B parâmetros, 40B ativos). Modelo avançado para engenharia de sistemas complexos e tarefas agênticas de longo prazo.
 

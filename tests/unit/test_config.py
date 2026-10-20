@@ -604,6 +604,135 @@ class TestFallbackModelsConfig:
                     print(f"  WARNING: {model_id} uses dash format instead of dot")
                     # This is acceptable but not ideal
                     pass
+    
+    def test_fallback_models_match_current_kiro_catalog(self):
+        """
+        What it does: Verifies the exact set of model IDs in FALLBACK_MODELS.
+        Purpose: Keep /v1/models in sync with Kiro's catalog
+                 (`kiro-cli chat --list-models`, checked 2026-10-20). Any addition or
+                 removal must be a deliberate change to this snapshot.
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+        
+        expected_ids = {
+            "auto",
+            "claude-opus-5.5", "claude-sonnet-5.5",
+            "claude-opus-5", "claude-sonnet-5",
+            "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6",
+            "claude-opus-4.5", "claude-sonnet-4.5", "claude-haiku-4.5",
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+            "deepseek-3.2", "glm-5", "kimi-k3",
+            "minimax-m2.1", "minimax-m2.5", "qwen3-coder-next",
+        }
+        actual_ids = {m["modelId"] for m in FALLBACK_MODELS}
+        
+        print(f"Missing from FALLBACK_MODELS: {sorted(expected_ids - actual_ids)}")
+        print(f"Unexpected in FALLBACK_MODELS: {sorted(actual_ids - expected_ids)}")
+        assert actual_ids == expected_ids
+    
+    def test_fallback_models_exclude_end_of_life_claude_sonnet_4(self):
+        """
+        What it does: Verifies claude-sonnet-4 is no longer advertised.
+        Purpose: Claude Sonnet 4 reached end of life in Kiro on 2026-10-14 and Kiro now
+                 rejects it, so /v1/models must not offer it to clients.
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+        
+        model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+        print(f"Model IDs: {model_ids}")
+        assert "claude-sonnet-4" not in model_ids
+    
+    def test_fallback_models_have_unique_ids(self):
+        """
+        What it does: Verifies no model ID appears twice.
+        Purpose: Duplicates would silently override each other's metadata in the cache
+                 (cache.update() keys entries by modelId).
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+        
+        model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+        duplicates = sorted({mid for mid in model_ids if model_ids.count(mid) > 1})
+        print(f"Duplicates: {duplicates}")
+        assert not duplicates
+    
+    def test_fallback_model_ids_survive_normalization_unchanged(self):
+        """
+        What it does: Verifies every model ID is already in normalized Kiro format.
+        Purpose: ModelResolver normalizes the client's name before the cache lookup.
+                 An ID that normalization would rewrite (e.g., "claude-opus-5-5") could
+                 never be found in the cache.
+        """
+        print("Setup: Importing FALLBACK_MODELS and normalize_model_name...")
+        from kiro.config import FALLBACK_MODELS
+        from kiro.model_resolver import normalize_model_name
+        
+        for model in FALLBACK_MODELS:
+            model_id = model["modelId"]
+            normalized = normalize_model_name(model_id)
+            print(f"Checking: '{model_id}' → '{normalized}'")
+            assert normalized == model_id
+            assert model_id == model_id.lower(), f"{model_id} must be lowercase"
+            assert model_id.strip() == model_id and " " not in model_id
+    
+    def test_fallback_models_have_valid_token_limits(self):
+        """
+        What it does: Verifies each model declares a positive integer maxInputTokens.
+        Purpose: maxInputTokens converts Kiro's contextUsagePercentage into token counts.
+                 A missing or malformed value silently falls back to the 200K default.
+        """
+        print("Setup: Importing FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+        
+        for model in FALLBACK_MODELS:
+            print(f"Checking: {model}")
+            assert isinstance(model.get("tokenLimits"), dict), f"{model['modelId']} has no tokenLimits"
+            max_input = model["tokenLimits"].get("maxInputTokens")
+            # bool is a subclass of int - reject it explicitly
+            assert type(max_input) is int, f"{model['modelId']} maxInputTokens is not int: {max_input!r}"
+            assert max_input > 0, f"{model['modelId']} maxInputTokens must be positive"
+    
+    @pytest.mark.parametrize("model_id,expected_max_input_tokens", [
+        ("auto", 1000000),
+        ("claude-opus-5.5", 1000000),
+        ("claude-sonnet-5.5", 1000000),
+        ("claude-opus-5", 1000000),
+        ("claude-sonnet-5", 1000000),
+        ("claude-opus-4.8", 1000000),
+        ("claude-opus-4.7", 1000000),
+        ("claude-opus-4.6", 1000000),
+        ("claude-sonnet-4.6", 1000000),
+        ("claude-opus-4.5", 200000),
+        ("claude-sonnet-4.5", 200000),
+        ("claude-haiku-4.5", 200000),
+        ("gpt-5.6-sol", 922000),
+        ("gpt-5.6-terra", 922000),
+        ("gpt-5.6-luna", 922000),
+        ("deepseek-3.2", 164000),
+        ("glm-5", 200000),
+        ("kimi-k3", 1000000),
+        ("minimax-m2.1", 196000),
+        ("minimax-m2.5", 196000),
+        ("qwen3-coder-next", 256000),
+    ])
+    def test_fallback_model_context_windows_match_kiro(self, model_id, expected_max_input_tokens):
+        """
+        What it does: Verifies each model's context window matches what Kiro reports.
+        Purpose: Values come from `kiro-cli chat --list-models --format json`
+                 (context_window_tokens). Using 200K for a 1M model under-reports
+                 prompt tokens 5x.
+        """
+        print(f"Setup: Looking up '{model_id}' in FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+        
+        by_id = {m["modelId"]: m for m in FALLBACK_MODELS}
+        assert model_id in by_id, f"{model_id} missing from FALLBACK_MODELS"
+        
+        actual = by_id[model_id]["tokenLimits"]["maxInputTokens"]
+        print(f"Comparing maxInputTokens: Expected {expected_max_input_tokens}, Got {actual}")
+        assert actual == expected_max_input_tokens
 
 
 class TestFallbackModelsIntegration:
@@ -688,6 +817,133 @@ class TestFallbackModelsIntegration:
         
         print(f"Comparing sets: Expected {fallback_ids}, Got {available_set}")
         assert fallback_ids == available_set
+    
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("client_model,expected_normalized", [
+        # Claude Opus 5.5 / Sonnet 5.5 in every client format
+        ("claude-opus-5.5", "claude-opus-5.5"),
+        ("claude-opus-5-5", "claude-opus-5.5"),
+        ("claude-opus-5-5[1m]", "claude-opus-5.5"),
+        ("claude-5.5-opus-high", "claude-opus-5.5"),
+        ("claude-sonnet-5.5", "claude-sonnet-5.5"),
+        ("claude-sonnet-5-5-20261002", "claude-sonnet-5.5"),
+        # Claude Opus 5 / Sonnet 5 have no minor version
+        ("claude-opus-5", "claude-opus-5"),
+        ("claude-opus-5-latest", "claude-opus-5"),
+        ("claude-sonnet-5", "claude-sonnet-5"),
+        ("claude-sonnet-5-20260724", "claude-sonnet-5"),
+        # Claude Opus 4.8
+        ("claude-opus-4-8", "claude-opus-4.8"),
+        # Non-Claude models are matched as-is
+        ("gpt-5.6-sol", "gpt-5.6-sol"),
+        ("gpt-5.6-terra", "gpt-5.6-terra"),
+        ("gpt-5.6-luna", "gpt-5.6-luna"),
+        ("kimi-k3", "kimi-k3"),
+    ])
+    async def test_latest_models_resolve_from_cache(self, client_model, expected_normalized):
+        """
+        What it does: Verifies the newest Kiro models resolve from the fallback cache.
+        Purpose: Requests in any supported client format must be verified cache hits
+                 (source="cache"), not unverified pass-through.
+        """
+        print("Setup: Populating cache with FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+        from kiro.cache import ModelInfoCache
+        from kiro.model_resolver import ModelResolver
+        
+        cache = ModelInfoCache()
+        await cache.update(FALLBACK_MODELS)
+        resolver = ModelResolver(cache=cache, hidden_models={})
+        
+        print(f"Action: Resolving '{client_model}'...")
+        resolution = resolver.resolve(client_model)
+        
+        print(f"Resolution: {resolution}")
+        assert resolution.normalized == expected_normalized
+        assert resolution.internal_id == expected_normalized
+        assert resolution.source == "cache"
+        assert resolution.is_verified is True
+    
+    @pytest.mark.asyncio
+    async def test_end_of_life_model_is_passed_through_not_blocked(self):
+        """
+        What it does: Verifies claude-sonnet-4 still resolves (as pass-through) after removal.
+        Purpose: The gateway is not a gatekeeper. Unlisted models are forwarded so Kiro
+                 can return its own error instead of the gateway rejecting the request.
+        """
+        print("Setup: Populating cache with FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS
+        from kiro.cache import ModelInfoCache
+        from kiro.model_resolver import ModelResolver
+        
+        cache = ModelInfoCache()
+        await cache.update(FALLBACK_MODELS)
+        resolver = ModelResolver(cache=cache, hidden_models={})
+        
+        print("Action: Resolving 'claude-sonnet-4-20250514'...")
+        resolution = resolver.resolve("claude-sonnet-4-20250514")
+        
+        print(f"Resolution: {resolution}")
+        assert resolution.internal_id == "claude-sonnet-4"
+        assert resolution.source == "passthrough"
+        assert resolution.is_verified is False
+    
+    @pytest.mark.asyncio
+    async def test_v1_models_list_with_default_aliases(self):
+        """
+        What it does: Verifies the /v1/models list built from FALLBACK_MODELS and default
+                      alias settings (MODEL_ALIASES, HIDDEN_FROM_LIST).
+        Purpose: Clients see every catalog model, with "auto" replaced by "auto-kiro".
+        """
+        print("Setup: Populating cache with FALLBACK_MODELS and default alias config...")
+        from kiro.config import FALLBACK_MODELS, MODEL_ALIASES, HIDDEN_FROM_LIST
+        from kiro.cache import ModelInfoCache
+        from kiro.model_resolver import ModelResolver
+        
+        cache = ModelInfoCache()
+        await cache.update(FALLBACK_MODELS)
+        resolver = ModelResolver(
+            cache=cache,
+            hidden_models={},
+            aliases=MODEL_ALIASES,
+            hidden_from_list=HIDDEN_FROM_LIST
+        )
+        
+        print("Action: Getting available models...")
+        available = resolver.get_available_models()
+        
+        expected = sorted(
+            ({m["modelId"] for m in FALLBACK_MODELS} - set(HIDDEN_FROM_LIST)) | set(MODEL_ALIASES)
+        )
+        print(f"Comparing: Expected {expected}, Got {available}")
+        assert available == expected
+        assert "auto" not in available
+        assert "auto-kiro" in available
+        for model_id in ("claude-opus-5.5", "claude-sonnet-5.5", "gpt-5.6-sol", "kimi-k3"):
+            assert model_id in available
+    
+    @pytest.mark.asyncio
+    async def test_fallback_token_limits_reach_model_cache(self):
+        """
+        What it does: Verifies get_max_input_tokens() returns each model's own limit.
+        Purpose: Token usage reporting reads limits from the cache. Unknown models must
+                 still get DEFAULT_MAX_INPUT_TOKENS.
+        """
+        print("Setup: Populating cache with FALLBACK_MODELS...")
+        from kiro.config import FALLBACK_MODELS, DEFAULT_MAX_INPUT_TOKENS
+        from kiro.cache import ModelInfoCache
+        
+        cache = ModelInfoCache()
+        await cache.update(FALLBACK_MODELS)
+        
+        for model in FALLBACK_MODELS:
+            expected = model["tokenLimits"]["maxInputTokens"]
+            actual = cache.get_max_input_tokens(model["modelId"])
+            print(f"{model['modelId']}: Expected {expected}, Got {actual}")
+            assert actual == expected
+        
+        print("Action: Looking up a model that is not in the catalog...")
+        assert cache.get_max_input_tokens("not-a-real-model") == DEFAULT_MAX_INPUT_TOKENS
 
 
 # ==================================================================================================
