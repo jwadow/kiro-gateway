@@ -434,8 +434,13 @@ class TestNormalizeModelNameParametrized:
         ("claude-sonnet-5", "claude-sonnet-5"),
         ("claude-sonnet-5-20260101", "claude-sonnet-5"),
         ("claude-sonnet-5.5", "claude-sonnet-5.5"),
+        ("claude-sonnet-5-5", "claude-sonnet-5.5"),
+        ("claude-sonnet-5-5-20260401", "claude-sonnet-5.5"),
         ("claude-opus-5", "claude-opus-5"),
         ("claude-opus-5-20260215", "claude-opus-5"),
+        ("claude-opus-5.5", "claude-opus-5.5"),
+        ("claude-opus-5-5", "claude-opus-5.5"),
+        ("claude-opus-5-5-20260501", "claude-opus-5.5"),
         ("claude-opus-4.8", "claude-opus-4.8"),
         ("claude-opus-4-8", "claude-opus-4.8"),
         ("claude-opus-4-8-20260301", "claude-opus-4.8"),
@@ -844,8 +849,10 @@ class TestNewFallbackModelsResolution:
 
     @pytest.mark.parametrize("model_id", [
         "claude-sonnet-5",
+        "claude-sonnet-5.5",
         "claude-opus-4.8",
         "claude-opus-5",
+        "claude-opus-5.5",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -872,6 +879,9 @@ class TestNewFallbackModelsResolution:
         ("claude-sonnet-5-20260101", "claude-sonnet-5"),   # Date suffix stripped
         ("claude-opus-4-8", "claude-opus-4.8"),            # Dash → Dot
         ("claude-opus-4-8-20260301", "claude-opus-4.8"),   # Dash → Dot + date stripped
+        ("claude-sonnet-5-5", "claude-sonnet-5.5"),        # Dash → Dot (minor)
+        ("claude-opus-5-5", "claude-opus-5.5"),            # Dash → Dot (minor)
+        ("claude-opus-5-5-20260501", "claude-opus-5.5"),   # Dash → Dot + date stripped
     ])
     def test_new_fallback_model_resolves_with_variant_names(self, fallback_resolver, input_model, expected_id):
         """
@@ -900,8 +910,10 @@ class TestNewFallbackModelsResolution:
 
         for model_id in (
             "claude-sonnet-5",
+            "claude-sonnet-5.5",
             "claude-opus-4.8",
             "claude-opus-5",
+            "claude-opus-5.5",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
