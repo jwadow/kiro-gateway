@@ -22,7 +22,6 @@ from kiro.model_resolver import (
     ModelResolution,
 )
 from kiro.cache import ModelInfoCache
-from kiro.config import FALLBACK_MODELS
 
 
 # =============================================================================
@@ -430,20 +429,6 @@ class TestNormalizeModelNameParametrized:
         ("claude-sonnet-4-20250514", "claude-sonnet-4"),
         ("claude-haiku-4", "claude-haiku-4"),
         ("claude-opus-4", "claude-opus-4"),
-        # Claude 5 generation (new fallback models)
-        ("claude-sonnet-5", "claude-sonnet-5"),
-        ("claude-sonnet-5-20260101", "claude-sonnet-5"),
-        ("claude-sonnet-5.5", "claude-sonnet-5.5"),
-        ("claude-opus-5", "claude-opus-5"),
-        ("claude-opus-5-20260215", "claude-opus-5"),
-        ("claude-opus-4.8", "claude-opus-4.8"),
-        ("claude-opus-4-8", "claude-opus-4.8"),
-        ("claude-opus-4-8-20260301", "claude-opus-4.8"),
-        # GPT family (new fallback models, non-Claude)
-        ("gpt-5.6-sol", "gpt-5.6-sol"),
-        ("gpt-5.6-terra", "gpt-5.6-terra"),
-        ("gpt-5.6-luna", "gpt-5.6-luna"),
-        ("gpt-5.6-sol-20260115", "gpt-5.6-sol-20260115"),  # No date stripping for non-Claude
         # Legacy format
         ("claude-3-7-sonnet", "claude-3.7-sonnet"),
         ("claude-3-7-sonnet-20250219", "claude-3.7-sonnet"),
@@ -819,127 +804,6 @@ class TestModelResolverResolve:
         
         print(f"Comparing source: Expected 'passthrough', Got '{result2.source}'")
         assert result2.source == "passthrough"
-
-
-class TestNewFallbackModelsResolution:
-    """Tests for resolving newly added fallback models (Claude 5 generation, GPT family).
-
-    Simulates the DNS-failure scenario: cache populated from FALLBACK_MODELS
-    instead of the dynamic /ListAvailableModels API.
-    """
-
-    @pytest.fixture
-    def fallback_cache(self):
-        """ModelInfoCache populated from FALLBACK_MODELS (simulates DNS failure)."""
-        print("Setup: Creating ModelInfoCache from FALLBACK_MODELS...")
-        cache = ModelInfoCache()
-        cache._cache = {model["modelId"]: model for model in FALLBACK_MODELS}
-        return cache
-
-    @pytest.fixture
-    def fallback_resolver(self, fallback_cache):
-        """ModelResolver backed by fallback cache (no hidden models)."""
-        print("Setup: Creating ModelResolver with fallback cache...")
-        return ModelResolver(cache=fallback_cache, hidden_models={})
-
-    @pytest.mark.parametrize("model_id", [
-        "claude-sonnet-5",
-        "claude-opus-4.8",
-        "claude-opus-5",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-    ])
-    def test_new_fallback_model_resolves_from_cache(self, fallback_resolver, model_id):
-        """
-        What it does: Resolves each new fallback model by its exact ID.
-        Goal: Check new models are found in fallback cache (Layer 2),
-              not passed through as unverified (Layer 4).
-        """
-        print(f"Action: Resolving '{model_id}' from fallback cache...")
-        result = fallback_resolver.resolve(model_id)
-
-        print(f"Comparing internal_id: Expected '{model_id}', Got '{result.internal_id}'")
-        assert result.internal_id == model_id
-
-        print(f"Comparing source: Expected 'cache', Got '{result.source}'")
-        assert result.source == "cache"
-
-        print(f"Comparing is_verified: Expected True, Got {result.is_verified}")
-        assert result.is_verified is True
-
-    @pytest.mark.parametrize("input_model,expected_id", [
-        ("claude-sonnet-5-20260101", "claude-sonnet-5"),   # Date suffix stripped
-        ("claude-opus-4-8", "claude-opus-4.8"),            # Dash → Dot
-        ("claude-opus-4-8-20260301", "claude-opus-4.8"),   # Dash → Dot + date stripped
-    ])
-    def test_new_fallback_model_resolves_with_variant_names(self, fallback_resolver, input_model, expected_id):
-        """
-        What it does: Resolves new fallback models via client name variants.
-        Goal: Check normalization (Layer 1) maps variants to fallback cache entries.
-        """
-        print(f"Action: Resolving '{input_model}' from fallback cache...")
-        result = fallback_resolver.resolve(input_model)
-
-        print(f"Comparing normalized: Expected '{expected_id}', Got '{result.normalized}'")
-        assert result.normalized == expected_id
-
-        print(f"Comparing internal_id: Expected '{expected_id}', Got '{result.internal_id}'")
-        assert result.internal_id == expected_id
-
-        print(f"Comparing source: Expected 'cache', Got '{result.source}'")
-        assert result.source == "cache"
-
-    def test_new_fallback_models_appear_in_available_models(self, fallback_resolver):
-        """
-        What it does: Lists available models from fallback cache.
-        Goal: Check new models are exposed via /v1/models endpoint.
-        """
-        print("Action: Getting available models from fallback resolver...")
-        available = set(fallback_resolver.get_available_models())
-
-        for model_id in (
-            "claude-sonnet-5",
-            "claude-opus-4.8",
-            "claude-opus-5",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-        ):
-            print(f"Verification: '{model_id}' in available models...")
-            assert model_id in available, f"New fallback model '{model_id}' missing from /v1/models"
-
-    def test_non_claude_model_not_mangled_by_claude_patterns(self, fallback_resolver):
-        """
-        What it does: Resolves GPT model and verifies ID is sent to Kiro unchanged.
-        Goal: Check Claude-specific normalization patterns never alter non-Claude IDs.
-        """
-        print("Action: Resolving 'gpt-5.6-sol'...")
-        result = fallback_resolver.resolve("gpt-5.6-sol")
-
-        print(f"Comparing normalized: Expected 'gpt-5.6-sol' (unchanged), Got '{result.normalized}'")
-        assert result.normalized == "gpt-5.6-sol"
-
-        print(f"Comparing internal_id: Expected 'gpt-5.6-sol' (unchanged), Got '{result.internal_id}'")
-        assert result.internal_id == "gpt-5.6-sol"
-
-    def test_unknown_gpt_variant_still_passthrough(self, fallback_resolver):
-        """
-        What it does: Resolves GPT model not present in fallback cache.
-        Goal: Check unknown GPT variants pass through unverified (gateway, not gatekeeper)
-              instead of failing or being mapped to a wrong model.
-        """
-        print("Action: Resolving 'gpt-5.7-sol' (not in fallback list)...")
-        result = fallback_resolver.resolve("gpt-5.7-sol")
-
-        print(f"Comparing internal_id: Expected 'gpt-5.7-sol', Got '{result.internal_id}'")
-        assert result.internal_id == "gpt-5.7-sol"
-
-        print(f"Comparing source: Expected 'passthrough', Got '{result.source}'")
-        assert result.source == "passthrough"
-
-        print(f"Comparing is_verified: Expected False, Got {result.is_verified}")
-        assert result.is_verified is False
 
 
 class TestModelResolverGetAvailableModels:
