@@ -149,7 +149,7 @@ def _unwrap_structured_output(response: dict, structured_tool_name: str) -> dict
 
 
 
-@router.post("/reload")
+@router.post("/v1/reload")
 async def reload_credentials(request: Request):
     """
     Reload credentials from SQLite without restarting the gateway.
