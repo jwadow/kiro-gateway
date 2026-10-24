@@ -147,6 +147,37 @@ def _unwrap_structured_output(response: dict, structured_tool_name: str) -> dict
 
 
 
+
+
+@router.post("/reload")
+async def reload_credentials(request: Request):
+    """
+    Reload credentials from SQLite without restarting the gateway.
+    Call this after kiro-cli login to pick up fresh tokens.
+    """
+    try:
+        account_manager = getattr(request.app.state, "account_manager", None)
+        if not account_manager:
+            return JSONResponse(content={"status": "error", "message": "No account manager"}, status_code=500)
+        
+        reloaded = 0
+        for account_id, account in account_manager._accounts.items():
+            am = account.auth_manager if account else None
+            if am and hasattr(am, "_sqlite_db") and am._sqlite_db:
+                try:
+                    am._load_credentials_from_sqlite(am._sqlite_db)
+                    # Force a token refresh with the new credentials
+                    await am.get_access_token()
+                    reloaded += 1
+                    logger.info(f"Reloaded credentials for account {account_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to reload account {account_id}: {e}")
+        
+        return JSONResponse(content={"status": "ok", "accounts_reloaded": reloaded})
+    except Exception as e:
+        logger.error(f"Reload failed: {e}")
+        return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
+
 @router.get("/health")
 async def health(request: Request):
     """
