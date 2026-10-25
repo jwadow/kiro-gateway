@@ -509,18 +509,20 @@ async def lifespan(app: FastAPI):
     
     # Start background task for proactive token refresh (keep sessions alive)
     async def _token_keepalive():
-        """Refresh tokens every 30 min to prevent session expiry."""
+        """Refresh tokens proactively every 45 min to prevent session expiry.
+        Runs before the 1-hour access token expiry to ensure smooth auto-renewal."""
         while True:
-            await asyncio.sleep(30 * 60)  # 30 minutes
+            await asyncio.sleep(45 * 60)  # 45 minutes - before 1h expiry
             for account_id, account in app.state.account_manager._accounts.items():
-                am = account.get("auth_manager")
+                # Account is an Account object, use attribute access not dict.get()
+                am = getattr(account, "auth_manager", None)
                 if am and am._refresh_token:
                     try:
-                        await am._refresh_token_request()
-                        logger.info(f"[keepalive] Token refreshed for account {account_id}, "
+                        await am.get_access_token()  # triggers refresh if expiring
+                        logger.info(f"[keepalive] Token kept alive for {account_id}, "
                                     f"expires: {am._expires_at.isoformat() if am._expires_at else '?'}")
                     except Exception as e:
-                        logger.error(f"[keepalive] Token refresh FAILED for {account_id}: {e}")
+                        logger.warning(f"[keepalive] Token refresh failed for {account_id}: {e}")
     
     keepalive_task = asyncio.create_task(_token_keepalive())
     
