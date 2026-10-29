@@ -822,6 +822,220 @@ class TestAccountManagerInitializeAccount:
         assert manager._accounts[account_id].model_cache is not None
 
 
+def _write_runtime_account(tmp_path: Path) -> Path:
+    """
+    Write a JSON credentials file whose account resolves to the runtime host.
+
+    Args:
+        tmp_path: pytest temporary directory
+
+    Returns:
+        Path to the credentials.json that lists the account
+    """
+    test_json = tmp_path / "test.json"
+    test_json.write_text(json.dumps({
+        "refreshToken": "test_token",
+        "accessToken": "test_access",
+        "expiresAt": "2099-01-01T00:00:00.000Z",
+        "region": "us-east-1"
+    }))
+
+    creds_file = tmp_path / "credentials.json"
+    creds_file.write_text(json.dumps([
+        {"type": "json", "path": str(test_json), "enabled": True}
+    ]))
+    return creds_file
+
+
+def _mock_http_client(mock_http_class: MagicMock, models: list) -> AsyncMock:
+    """
+    Make KiroHttpClient return a successful ListAvailableModels response.
+
+    Args:
+        mock_http_class: Patched KiroHttpClient class
+        models: Models to return in the response body
+
+    Returns:
+        The mocked client instance
+    """
+    mock_client = AsyncMock()
+    mock_response = Mock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"models": models}
+    mock_client.request_with_retry = AsyncMock(return_value=mock_response)
+    mock_client.close = AsyncMock()
+    mock_http_class.return_value = mock_client
+    return mock_client
+
+
+class TestAccountManagerModelListSource:
+    """
+    Tests that the model list is fetched from models_host for runtime accounts.
+
+    runtime.{region}.kiro.dev does not implement ListAvailableModels, so the
+    account's real model list must come from q.{region}.amazonaws.com while
+    generation keeps using the runtime host.
+    """
+
+    @pytest.mark.asyncio
+    async def test_runtime_account_fetches_from_models_host(self, tmp_path):
+        """
+        What it does: Verifies initialization requests ListAvailableModels on models_host.
+        Purpose: A runtime-host account must not skip the fetch or call the runtime host.
+        """
+        print("Setup: Creating runtime-host account...")
+        manager = AccountManager(
+            credentials_file=str(_write_runtime_account(tmp_path)),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = str((tmp_path / "test.json").resolve())
+
+        print("Action: Initializing account with mocked ListAvailableModels...")
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = _mock_http_client(mock_http_class, [{"modelId": "claude-sonnet-4.6"}])
+            success = await manager._initialize_account(account_id)
+
+        auth_manager = manager._accounts[account_id].auth_manager
+        called_url = mock_client.request_with_retry.call_args.kwargs["url"]
+        print(f"api_host: {auth_manager.api_host}, called_url: {called_url}")
+
+        assert success is True
+        assert auth_manager.api_host == "https://runtime.us-east-1.kiro.dev"
+        assert called_url == "https://q.us-east-1.amazonaws.com/ListAvailableModels"
+        mock_client.request_with_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_runtime_account_uses_fetched_models_not_fallback(self, tmp_path):
+        """
+        What it does: Verifies the cache holds exactly the fetched models.
+        Purpose: Models enabled by admins must appear and disabled ones must not.
+        """
+        print("Setup: Creating runtime-host account...")
+        manager = AccountManager(
+            credentials_file=str(_write_runtime_account(tmp_path)),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = str((tmp_path / "test.json").resolve())
+        fetched = [{"modelId": "claude-opus-5.5"}, {"modelId": "claude-sonnet-4.6"}]
+
+        print("Action: Initializing account...")
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            _mock_http_client(mock_http_class, fetched)
+            await manager._initialize_account(account_id)
+
+        cache = manager._accounts[account_id].model_cache
+        cached_ids = set(cache.get_all_model_ids())
+        print(f"Cached model ids: {sorted(cached_ids)}")
+
+        # A model missing from FALLBACK_MODELS is now available...
+        assert cache.is_valid_model("claude-opus-5.5")
+        # ...and a FALLBACK_MODELS entry the account does not have is absent.
+        assert not cache.is_valid_model("claude-opus-4.7")
+        assert cached_ids == {"claude-opus-5.5", "claude-sonnet-4.6"}
+
+    @pytest.mark.asyncio
+    async def test_runtime_account_falls_back_when_fetch_fails(self, tmp_path):
+        """
+        What it does: Verifies FALLBACK_MODELS is used when the fetch raises.
+        Purpose: An unreachable models_host (e.g. a region without q.*) must keep
+                 the gateway usable, matching the previous behavior.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        print("Setup: Creating runtime-host account...")
+        manager = AccountManager(
+            credentials_file=str(_write_runtime_account(tmp_path)),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = str((tmp_path / "test.json").resolve())
+
+        print("Action: Initializing account with failing ListAvailableModels...")
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = AsyncMock()
+            mock_client.request_with_retry = AsyncMock(side_effect=Exception("DNS failure"))
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+            success = await manager._initialize_account(account_id)
+
+        cache = manager._accounts[account_id].model_cache
+        expected = {model["modelId"] for model in FALLBACK_MODELS}
+        print(f"Cached model ids: {sorted(cache.get_all_model_ids())}")
+
+        assert success is True
+        assert set(cache.get_all_model_ids()) == expected
+        mock_client.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ttl_refresh_fetches_from_models_host(self, tmp_path):
+        """
+        What it does: Verifies the TTL refresh fetches and applies a new model list.
+        Purpose: The refresh must not overwrite the cache with FALLBACK_MODELS.
+        """
+        print("Setup: Initializing runtime-host account with one model...")
+        manager = AccountManager(
+            credentials_file=str(_write_runtime_account(tmp_path)),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = str((tmp_path / "test.json").resolve())
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            _mock_http_client(mock_http_class, [{"modelId": "claude-sonnet-4.6"}])
+            await manager._initialize_account(account_id)
+
+        print("Action: Refreshing with a list that adds a model...")
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = _mock_http_client(
+                mock_http_class,
+                [{"modelId": "claude-sonnet-4.6"}, {"modelId": "claude-opus-5.5"}],
+            )
+            await manager._refresh_account_models(account_id)
+
+        cache = manager._accounts[account_id].model_cache
+        called_url = mock_client.request_with_retry.call_args.kwargs["url"]
+        print(f"called_url: {called_url}, cached: {sorted(cache.get_all_model_ids())}")
+
+        assert called_url == "https://q.us-east-1.amazonaws.com/ListAvailableModels"
+        assert cache.is_valid_model("claude-opus-5.5")
+        assert not cache.is_valid_model("claude-opus-4.7")
+        assert "claude-opus-5.5" in manager._model_to_accounts
+
+    @pytest.mark.asyncio
+    async def test_ttl_refresh_failure_keeps_previous_models(self, tmp_path):
+        """
+        What it does: Verifies a failed refresh leaves the last good list in place.
+        Purpose: A transient outage must not swap real models for FALLBACK_MODELS.
+        """
+        print("Setup: Initializing runtime-host account...")
+        manager = AccountManager(
+            credentials_file=str(_write_runtime_account(tmp_path)),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        account_id = str((tmp_path / "test.json").resolve())
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            _mock_http_client(mock_http_class, [{"modelId": "claude-opus-5.5"}])
+            await manager._initialize_account(account_id)
+
+        print("Action: Refreshing with a failing request...")
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = AsyncMock()
+            mock_client.request_with_retry = AsyncMock(side_effect=Exception("Timeout"))
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+            await manager._refresh_account_models(account_id)
+
+        cache = manager._accounts[account_id].model_cache
+        print(f"Cached after failed refresh: {sorted(cache.get_all_model_ids())}")
+
+        assert cache.is_valid_model("claude-opus-5.5")
+        assert not cache.is_valid_model("claude-opus-4.7")
+
+
 class TestAccountManagerGetNextAccount:
     """
     Tests for AccountManager.get_next_account() method.

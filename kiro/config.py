@@ -181,8 +181,17 @@ AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
 # Fixed in issue #58 - codewhisperer.{region}.amazonaws.com doesn't exist for non-us-east-1 regions
 KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
-# Host for Q API (ListAvailableModels)
+# Host for Q API (MCP tools)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+
+# Host for ListAvailableModels
+# runtime.{region}.kiro.dev does not implement ListAvailableModels (it answers
+# UnknownOperationException), while q.{region}.amazonaws.com still serves it and
+# returns the models the account is actually entitled to, including models
+# enabled or disabled by organization admins. Fetching from here keeps
+# /v1/models in sync with what generateAssistantResponse accepts.
+# If the request fails, FALLBACK_MODELS is used instead.
+KIRO_MODELS_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
 
 # ==================================================================================================
 # Token Settings
@@ -578,4 +587,9 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_models_host(region: str) -> str:
+    """Return ListAvailableModels host for the specified region."""
+    return KIRO_MODELS_HOST_TEMPLATE.format(region=region)
 

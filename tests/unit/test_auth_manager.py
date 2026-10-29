@@ -65,7 +65,26 @@ class TestKiroAuthManagerInitialization:
         
         print(f"Comparing q_host: Expected 'eu-west-1' in URL, Got '{manager._q_host}'")
         assert "eu-west-1" in manager._q_host
-    
+
+        print(f"Comparing models_host: Got '{manager.models_host}'")
+        assert manager.models_host == "https://q.eu-west-1.amazonaws.com"
+
+    def test_models_host_differs_from_generation_host(self):
+        """
+        What it does: Verifies the model list host is separate from the generation host.
+        Purpose: runtime.kiro.dev lacks ListAvailableModels, so the two must not coincide.
+        """
+        print("Setup: Creating KiroAuthManager with region us-east-1...")
+        manager = KiroAuthManager(
+            refresh_token="test_token",
+            region="us-east-1"
+        )
+
+        print(f"api_host: {manager.api_host}, models_host: {manager.models_host}")
+        assert manager.api_host == "https://runtime.us-east-1.kiro.dev"
+        assert manager.models_host == "https://q.us-east-1.amazonaws.com"
+        assert manager.models_host != manager.api_host
+
     def test_initialization_generates_fingerprint(self):
         """
         What it does: Verifies unique fingerprint generation.
