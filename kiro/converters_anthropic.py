@@ -113,6 +113,50 @@ def extract_system_prompt(system: Any) -> str:
     return str(system)
 
 
+def extract_inline_system_messages(messages: List[AnthropicMessage]) -> str:
+    """
+    Hoists ``role="system"`` turns out of the conversation history.
+
+    The Anthropic specification keeps the system prompt in a dedicated
+    ``system`` field, but Claude Code also injects context as ``role="system"``
+    entries inside ``messages``. The OpenAI adapter has always collapsed such
+    turns into the system prompt (see ``convert_openai_messages_to_unified``),
+    so the Anthropic adapter mirrors that behavior.
+
+    Args:
+        messages: List of Anthropic messages
+
+    Returns:
+        Inline system text joined in conversation order. Empty string when the
+        request carries no inline system turn.
+    """
+    parts = []
+
+    for msg in messages:
+        if msg.role != "system":
+            continue
+
+        if isinstance(msg.content, list):
+            # Join blocks with a newline like extract_system_prompt() does;
+            # blind concatenation would glue adjacent words together.
+            blocks = []
+            for block in msg.content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        blocks.append(block.get("text", ""))
+                elif getattr(block, "type", None) == "text":
+                    blocks.append(getattr(block, "text", ""))
+            text = "\n".join(blocks)
+        else:
+            text = convert_anthropic_content_to_text(msg.content)
+
+        text = text.strip()
+        if text:
+            parts.append(text)
+
+    return "\n\n".join(parts)
+
+
 def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
     """
     Extracts tool results from Anthropic message content.
@@ -265,6 +309,7 @@ def convert_anthropic_messages(
     - Text content (string or list of text blocks)
     - Tool use blocks (assistant messages)
     - Tool result blocks (user messages)
+    - Inline system turns (skipped here, hoisted by extract_inline_system_messages)
 
     Args:
         messages: List of Anthropic messages
@@ -281,6 +326,12 @@ def convert_anthropic_messages(
     for msg in messages:
         role = msg.role
         content = msg.content
+
+        # Inline system turns belong to the system prompt, not to the
+        # conversation history. Sending them as history would let Kiro treat
+        # instructions as user content and would also break turn ordering.
+        if role == "system":
+            continue
 
         # Extract text content
         text_content = convert_anthropic_content_to_text(content)
@@ -448,7 +499,7 @@ def anthropic_to_kiro(
         Payload dictionary for POST request to Kiro API
 
     Raises:
-        ValueError: If there are no messages to send
+        ValueError: If there are no user or assistant messages to send
     """
     # Convert messages to unified format
     unified_messages = convert_anthropic_messages(request.messages)
@@ -459,6 +510,25 @@ def anthropic_to_kiro(
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
     system_prompt = extract_system_prompt(request.system)
+
+    # Claude Code also injects context as role="system" turns inside messages.
+    # Fold them into the system prompt, mirroring the OpenAI adapter, instead
+    # of letting them leak into Kiro's conversation history as user content.
+    inline_system_prompt = extract_inline_system_messages(request.messages)
+    if inline_system_prompt:
+        system_prompt = (
+            f"{system_prompt}\n\n{inline_system_prompt}"
+            if system_prompt
+            else inline_system_prompt
+        )
+
+    # Inline system turns were hoisted into the system prompt above, so a
+    # request made only of system turns has nothing left to send to Kiro.
+    if not unified_messages:
+        raise ValueError(
+            "No user or assistant messages to send: the request contained only "
+            "system turns"
+        )
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid

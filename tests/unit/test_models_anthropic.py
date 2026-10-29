@@ -1757,3 +1757,69 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+# ==================================================================================================
+# Tests for inline system turns inside messages
+# ==================================================================================================
+
+
+class TestAnthropicMessageSystemRole:
+    """Tests for the role="system" tolerance added for Claude Code."""
+
+    def test_accepts_system_role(self):
+        """
+        What it does: Verifies that role="system" is accepted inside messages.
+        Purpose: Claude Code injects context as system turns; rejecting them
+        caused a 422 before any Kiro call was made.
+        """
+        print("Creating AnthropicMessage with role='system'...")
+        message = AnthropicMessage(role="system", content="Context block")
+
+        print(f"Comparing role: got={message.role}")
+        assert message.role == "system"
+
+    def test_accepts_system_role_with_content_blocks(self):
+        """
+        What it does: Verifies system turns accept content-block lists.
+        Purpose: Ensure both content shapes work for the injected context.
+        """
+        print("Creating AnthropicMessage with role='system' and blocks...")
+        message = AnthropicMessage(
+            role="system",
+            content=[{"type": "text", "text": "Rule"}],
+        )
+
+        print(f"Comparing content: got={message.content}")
+        assert message.role == "system"
+        assert message.content[0].text == "Rule"
+
+    def test_rejects_unknown_role(self):
+        """
+        What it does: Verifies that still-unknown roles are rejected.
+        Purpose: Keep validation strict for genuinely malformed input.
+        """
+        print("Creating AnthropicMessage with role='developer'...")
+        with pytest.raises(ValidationError) as exc_info:
+            AnthropicMessage(role="developer", content="nope")
+
+        print(f"Caught ValidationError: {exc_info.value.error_count()} error(s)")
+        assert exc_info.value.error_count() >= 1
+
+    def test_request_accepts_inline_system_turn(self):
+        """
+        What it does: Verifies the full request model accepts a system turn.
+        Purpose: This is the exact shape that previously produced a 422.
+        """
+        print("Creating AnthropicMessagesRequest with an inline system turn...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[
+                AnthropicMessage(role="system", content="Context"),
+                AnthropicMessage(role="user", content="Question"),
+            ],
+            max_tokens=1024,
+        )
+
+        print(f"Comparing roles: {[msg.role for msg in request.messages]}")
+        assert [msg.role for msg in request.messages] == ["system", "user"]

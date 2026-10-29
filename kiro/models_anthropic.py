@@ -182,12 +182,19 @@ class AnthropicMessage(BaseModel):
     """
     Message in Anthropic format.
 
+    ``system`` is accepted inside ``messages`` even though the Anthropic
+    specification only allows ``user`` and ``assistant`` there. Claude Code
+    injects context with ``role="system"`` turns, and the OpenAI surface has
+    always tolerated them, so the two surfaces must behave alike. Such turns
+    are hoisted into the system prompt by the converter instead of being sent
+    to Kiro as conversation history.
+
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role (user, assistant, or system)
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

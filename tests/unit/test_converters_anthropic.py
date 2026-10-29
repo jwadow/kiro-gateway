@@ -18,6 +18,7 @@ from unittest.mock import patch, MagicMock
 from kiro.converters_anthropic import (
     convert_anthropic_content_to_text,
     extract_system_prompt,
+    extract_inline_system_messages,
     extract_tool_results_from_anthropic_content,
     extract_images_from_tool_results,
     extract_tool_uses_from_anthropic_content,
@@ -1884,3 +1885,309 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+# ==================================================================================================
+# Tests for inline system turns (Claude Code sends role="system" inside messages)
+# ==================================================================================================
+
+
+class TestExtractInlineSystemMessages:
+    """Tests for extract_inline_system_messages function."""
+
+    def test_returns_empty_string_when_no_system_turn(self):
+        """
+        What it does: Verifies that a plain conversation yields no inline system text.
+        Purpose: Ensure the helper never mutates the system prompt for normal requests.
+        """
+        print("Setup: Conversation without system turns...")
+        messages = [
+            AnthropicMessage(role="user", content="Hello!"),
+            AnthropicMessage(role="assistant", content="Hi there!"),
+        ]
+
+        print("Action: Extracting inline system messages...")
+        result = extract_inline_system_messages(messages)
+
+        print(f"Result: {result!r}")
+        assert result == ""
+
+    def test_extracts_string_content(self):
+        """
+        What it does: Verifies extraction from a string content system turn.
+        Purpose: Ensure the common Claude Code shape is handled.
+        """
+        print("Setup: System turn with string content...")
+        messages = [AnthropicMessage(role="system", content="Be concise.")]
+
+        print("Action: Extracting inline system messages...")
+        result = extract_inline_system_messages(messages)
+
+        print(f"Result: {result!r}")
+        assert result == "Be concise."
+
+    def test_extracts_text_from_content_blocks(self):
+        """
+        What it does: Verifies extraction from a content-block list.
+        Purpose: Ensure both Anthropic content shapes are supported.
+        """
+        print("Setup: System turn with content blocks...")
+        messages = [
+            AnthropicMessage(
+                role="system",
+                content=[
+                    {"type": "text", "text": "Rule A"},
+                    {"type": "text", "text": "Rule B"},
+                ],
+            )
+        ]
+
+        print("Action: Extracting inline system messages...")
+        result = extract_inline_system_messages(messages)
+
+        print(f"Result: {result!r}")
+        assert result == "Rule A\nRule B"
+
+    def test_joins_multiple_system_turns_in_order(self):
+        """
+        What it does: Verifies that several system turns keep their order.
+        Purpose: Ensure the merged prompt is deterministic and readable.
+        """
+        print("Setup: Two system turns separated by a user turn...")
+        messages = [
+            AnthropicMessage(role="system", content="First rule."),
+            AnthropicMessage(role="user", content="Question"),
+            AnthropicMessage(role="system", content="Second rule."),
+        ]
+
+        print("Action: Extracting inline system messages...")
+        result = extract_inline_system_messages(messages)
+
+        print(f"Result: {result!r}")
+        assert result == "First rule.\n\nSecond rule."
+
+    def test_skips_blank_system_turns(self):
+        """
+        What it does: Verifies that whitespace-only system turns are dropped.
+        Purpose: Avoid polluting the system prompt with empty separators.
+        """
+        print("Setup: Blank system turn plus a real one...")
+        messages = [
+            AnthropicMessage(role="system", content="   "),
+            AnthropicMessage(role="system", content="Real rule."),
+        ]
+
+        print("Action: Extracting inline system messages...")
+        result = extract_inline_system_messages(messages)
+
+        print(f"Result: {result!r}")
+        assert result == "Real rule."
+
+    def test_skips_non_text_content_blocks(self):
+        """
+        What it does: Verifies that non-text blocks inside a system turn are ignored.
+        Purpose: system prompts are text-only in Kiro, images must not leak into them.
+        """
+        print("Setup: System turn with text and image blocks...")
+        messages = [
+            AnthropicMessage(
+                role="system",
+                content=[
+                    {"type": "text", "text": "Rule A"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "AAAA",
+                        },
+                    },
+                ],
+            )
+        ]
+
+        print("Action: Extracting inline system messages...")
+        result = extract_inline_system_messages(messages)
+
+        print(f"Result: {result!r}")
+        assert result == "Rule A"
+
+
+class TestConvertAnthropicMessagesWithSystemTurns:
+    """Tests for convert_anthropic_messages handling of role="system" turns."""
+
+    def test_skips_system_turn_from_history(self):
+        """
+        What it does: Verifies that system turns never become conversation history.
+        Purpose: Ensure instructions are not sent to Kiro as user content.
+        """
+        print("Setup: System turn followed by a user turn...")
+        messages = [
+            AnthropicMessage(role="system", content="Context block"),
+            AnthropicMessage(role="user", content="Hello!"),
+        ]
+
+        print("Action: Converting messages...")
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0].role == "user"
+        assert result[0].content == "Hello!"
+
+    def test_preserves_order_of_remaining_turns(self):
+        """
+        What it does: Verifies that dropping system turns keeps the turn order.
+        Purpose: Ensure assistant/user alternation survives the filtering.
+        """
+        print("Setup: Interleaved system and conversation turns...")
+        messages = [
+            AnthropicMessage(role="user", content="Q1"),
+            AnthropicMessage(role="system", content="mid conversation context"),
+            AnthropicMessage(role="assistant", content="A1"),
+            AnthropicMessage(role="user", content="Q2"),
+        ]
+
+        print("Action: Converting messages...")
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result: {result}")
+        assert [msg.role for msg in result] == ["user", "assistant", "user"]
+        assert [msg.content for msg in result] == ["Q1", "A1", "Q2"]
+
+    def test_returns_empty_list_when_only_system_turns(self):
+        """
+        What it does: Verifies that a system-only request yields no messages.
+        Purpose: Document that the emptiness is caught later with a clear 400.
+        """
+        print("Setup: Only system turns...")
+        messages = [AnthropicMessage(role="system", content="Only context")]
+
+        print("Action: Converting messages...")
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result: {result}")
+        assert result == []
+
+
+class TestAnthropicToKiroInlineSystem:
+    """Tests for hoisting inline system turns into the Kiro system prompt."""
+
+    def test_inline_system_turn_reaches_current_message(self):
+        """
+        What it does: Verifies that inline system text lands in the outgoing prompt.
+        Purpose: Ensure Claude Code context is not silently discarded.
+        """
+        print("Setup: Single user turn plus an inline system turn...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                AnthropicMessage(role="system", content="Project rules apply."),
+                AnthropicMessage(role="user", content="Hello!"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        print(f"Result: {result}")
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        print(f"Current content: {current_content}")
+        assert "Project rules apply." in current_content
+        assert "Hello!" in current_content
+
+    def test_inline_system_turn_appended_after_system_field(self):
+        """
+        What it does: Verifies that the system field and inline turns are merged.
+        Purpose: Ensure neither source of instructions is lost.
+        """
+        print("Setup: Request with both system field and inline system turn...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                AnthropicMessage(role="system", content="Inline rule."),
+                AnthropicMessage(role="user", content="Hello!"),
+            ],
+            max_tokens=1024,
+            system="Top level rule.",
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        print(f"Current content: {current_content}")
+        assert "Top level rule." in current_content
+        assert "Inline rule." in current_content
+        assert current_content.index("Top level rule.") < current_content.index(
+            "Inline rule."
+        )
+
+    def test_inline_system_turn_goes_to_first_history_message(self):
+        """
+        What it does: Verifies placement when the conversation has history.
+        Purpose: Ensure the system prompt is not duplicated into every turn.
+        """
+        print("Setup: Multi-turn conversation with an inline system turn...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                AnthropicMessage(role="system", content="History rule."),
+                AnthropicMessage(role="user", content="First question"),
+                AnthropicMessage(role="assistant", content="First answer"),
+                AnthropicMessage(role="user", content="Second question"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        history = result["conversationState"]["history"]
+        print(f"History: {history}")
+        assert len(history) == 2
+        assert "History rule." in history[0]["userInputMessage"]["content"]
+        assert "History rule." not in history[1]["assistantResponseMessage"]["content"]
+
+        current_content = result["conversationState"]["currentMessage"][
+            "userInputMessage"
+        ]["content"]
+        print(f"Current content: {current_content}")
+        assert "History rule." not in current_content
+        assert "Second question" in current_content
+
+    def test_system_only_request_raises_actionable_error(self):
+        """
+        What it does: Verifies the error raised for a system-only request.
+        Purpose: Ensure the user gets a 400 explaining the problem, not a crash.
+        """
+        print("Setup: Request with only a system turn...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[AnthropicMessage(role="system", content="Only context")],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with pytest.raises(ValueError, match="only system turns"):
+            anthropic_to_kiro(request, "conv-123", "arn:aws:test")
