@@ -150,8 +150,11 @@ class TestEnhanceKiroErrorInvalidModelId:
         error_info = enhance_kiro_error(error_json)
         
         print("Verification: User message is enhanced...")
-        print(f"Comparing user_message: Expected 'Invalid model ID or insufficient subscription level to use it.', Got '{error_info.user_message}'")
-        assert error_info.user_message == "Invalid model ID or insufficient subscription level to use it."
+        print(f"Got '{error_info.user_message}'")
+        assert error_info.user_message.startswith(
+            "Invalid model ID or insufficient subscription level to use it."
+        )
+        assert "Invalid model ID. Please select a different model to continue." in error_info.user_message
         assert error_info.reason == "INVALID_MODEL_ID"
         assert error_info.original_message == "Invalid model ID. Please select a different model to continue."
     
@@ -245,8 +248,51 @@ class TestEnhanceKiroErrorInvalidModelId:
         error_info = enhance_kiro_error(error_json)
         
         print("Verification: Same enhanced message regardless of original...")
-        assert error_info.user_message == "Invalid model ID or insufficient subscription level to use it."
+        assert error_info.user_message.startswith(
+            "Invalid model ID or insufficient subscription level to use it."
+        )
+        assert "Model not found." in error_info.user_message
         assert error_info.original_message == "Model not found."
+
+    def test_admin_disabled_model_message_surfaces(self):
+        """
+        What it does: Verifies the upstream "disabled by organization admins" text is shown.
+        Purpose: Kiro uses INVALID_MODEL_ID for admin-disabled models too, and only its
+                 own message tells the user to contact the administrator.
+        """
+        print("Setup: Creating error JSON mirroring an admin-disabled model...")
+        error_json = {
+            "message": (
+                "Your current model is made unavailable by the admins in your "
+                "organization. Please restart your client (IDE/CLI) to see the new "
+                "list of available models."
+            ),
+            "reason": "INVALID_MODEL_ID",
+        }
+
+        print("Action: Enhancing error...")
+        error_info = enhance_kiro_error(error_json)
+
+        print("Verification: Admin-disabled cause is visible to the user...")
+        assert "made unavailable by the admins in your organization" in error_info.user_message
+        assert error_info.user_message.startswith(
+            "Invalid model ID or insufficient subscription level to use it."
+        )
+
+    def test_missing_original_message_falls_back_to_generic(self):
+        """
+        What it does: Verifies a None message still yields the generic text alone.
+        Purpose: Avoid appending placeholder noise when upstream sends no message.
+        """
+        print("Setup: Creating error JSON without a message...")
+        error_json = {"reason": "INVALID_MODEL_ID"}
+
+        print("Action: Enhancing error...")
+        error_info = enhance_kiro_error(error_json)
+
+        print("Verification: Only the generic message is returned...")
+        assert error_info.user_message == "Invalid model ID or insufficient subscription level to use it."
+        assert "Upstream:" not in error_info.user_message
 
 
 class TestEnhanceKiroErrorUnknown:

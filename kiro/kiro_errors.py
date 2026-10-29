@@ -110,8 +110,17 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
         user_message = "Monthly request limit exceeded. Account has reached its monthly quota."
     
     elif reason == "INVALID_MODEL_ID":
-        # Invalid model name or subscription tier insufficient
-        user_message = "Invalid model ID or insufficient subscription level to use it."
+        # Kiro uses this reason for two different causes: an unknown model name
+        # and a model its organization admins have disabled. The upstream
+        # message names the actual cause ("Your current model is made
+        # unavailable by the admins in your organization..."), which the
+        # generic text below hides, so keep the original when it says
+        # something we do not.
+        generic_message = "Invalid model ID or insufficient subscription level to use it."
+        if original_message and original_message != "Unknown error":
+            user_message = f"{generic_message} Upstream: {original_message}"
+        else:
+            user_message = generic_message
 
     elif original_message == "Improperly formed request." and reason in (None, "UNKNOWN", "null"):
         # Generic 400 error
