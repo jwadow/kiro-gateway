@@ -27,6 +27,13 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
     _process_chunk,
+    anthropic_error_type_for_status,
+    normalize_stop_sequences,
+    create_stop_sequence_matcher,
+    StopSequenceMatcher,
+    apply_stop_sequences,
+    estimate_request_tokens_offloaded,
+    first_token_timeout_for_attempt,
 )
 
 
@@ -545,7 +552,7 @@ class TestProcessChunk:
         
         print("Action: Processing chunk...")
         events = []
-        async for event in _process_chunk(mock_parser, b'chunk', None):
+        for event in _process_chunk(mock_parser, b'chunk', None):
             events.append(event)
         
         print(f"Received {len(events)} events")
@@ -565,7 +572,7 @@ class TestProcessChunk:
         
         print("Action: Processing chunk...")
         events = []
-        async for event in _process_chunk(mock_parser, b'chunk', None):
+        for event in _process_chunk(mock_parser, b'chunk', None):
             events.append(event)
         
         print(f"Received {len(events)} events")
@@ -585,7 +592,7 @@ class TestProcessChunk:
         
         print("Action: Processing chunk...")
         events = []
-        async for event in _process_chunk(mock_parser, b'chunk', None):
+        for event in _process_chunk(mock_parser, b'chunk', None):
             events.append(event)
         
         print(f"Received {len(events)} events")
@@ -609,7 +616,7 @@ class TestProcessChunk:
         
         print("Action: Processing chunk...")
         events = []
-        async for event in _process_chunk(mock_parser, b'chunk', None):
+        for event in _process_chunk(mock_parser, b'chunk', None):
             events.append(event)
         
         print(f"Received {len(events)} events")
@@ -638,7 +645,7 @@ class TestProcessChunk:
         
         print("Action: Processing chunk with thinking parser...")
         events = []
-        async for event in _process_chunk(mock_parser, b'chunk', mock_thinking_parser):
+        for event in _process_chunk(mock_parser, b'chunk', mock_thinking_parser):
             events.append(event)
         
         print(f"Received {len(events)} events")
@@ -667,7 +674,7 @@ class TestProcessChunk:
         
         print("Action: Processing chunk with thinking content...")
         events = []
-        async for event in _process_chunk(mock_parser, b'chunk', mock_thinking_parser):
+        for event in _process_chunk(mock_parser, b'chunk', mock_thinking_parser):
             events.append(event)
         
         print(f"Received {len(events)} events")
@@ -1832,3 +1839,656 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+
+
+# ==================================================================================================
+# Tests for _process_chunk() being a plain function (perf: no async generator per chunk)
+# ==================================================================================================
+
+class TestProcessChunkIsPlainFunction:
+    """Tests that _process_chunk() is synchronous and returns a list."""
+
+    def test_returns_list_not_async_generator(self, mock_parser):
+        """
+        What it does: Calls _process_chunk() without awaiting.
+        Purpose: Ensure no async generator object is created per network chunk.
+        """
+        import inspect
+        mock_parser.feed.return_value = [{"type": "content", "data": "x"}]
+
+        result = _process_chunk(mock_parser, b"chunk", None)
+
+        assert isinstance(result, list)
+        assert not inspect.isasyncgenfunction(_process_chunk)
+        assert not inspect.iscoroutinefunction(_process_chunk)
+
+    def test_returns_empty_list_for_no_events(self, mock_parser):
+        """
+        What it does: Processes a chunk that yields no parser events.
+        Purpose: Ensure an empty list (not None) is returned.
+        """
+        mock_parser.feed.return_value = []
+        assert _process_chunk(mock_parser, b"", None) == []
+
+    def test_ignores_unknown_event_types(self, mock_parser):
+        """
+        What it does: Feeds an unknown parser event type.
+        Purpose: Ensure unknown events are dropped instead of crashing.
+        """
+        mock_parser.feed.return_value = [{"type": "something_new", "data": 1}, {"type": "content", "data": "ok"}]
+        events = _process_chunk(mock_parser, b"chunk", None)
+        assert [e.type for e in events] == ["content"]
+
+    def test_preserves_event_order(self, mock_parser):
+        """
+        What it does: Processes mixed events in one chunk.
+        Purpose: Ensure the returned list keeps stream order.
+        """
+        mock_parser.feed.return_value = [
+            {"type": "content", "data": "a"},
+            {"type": "usage", "data": {"credits": 1}},
+            {"type": "content", "data": "b"},
+            {"type": "context_usage", "data": 3.5},
+        ]
+        events = _process_chunk(mock_parser, b"chunk", None)
+        assert [e.type for e in events] == ["content", "usage", "content", "context_usage"]
+        assert events[2].content == "b"
+        assert events[3].context_usage_percentage == 3.5
+
+    def test_thinking_parser_empty_processed_thinking_is_dropped(self, mock_parser):
+        """
+        What it does: Thinking parser returns thinking that process_for_output drops.
+        Purpose: Ensure no empty thinking event is produced.
+        """
+        mock_parser.feed.return_value = [{"type": "content", "data": "<thinking>x"}]
+        thinking_parser = MagicMock()
+        parse_result = MagicMock()
+        parse_result.thinking_content = "x"
+        parse_result.regular_content = ""
+        parse_result.is_first_thinking_chunk = True
+        parse_result.is_last_thinking_chunk = False
+        thinking_parser.feed.return_value = parse_result
+        thinking_parser.process_for_output.return_value = None
+
+        assert _process_chunk(mock_parser, b"chunk", thinking_parser) == []
+
+
+# ==================================================================================================
+# Tests for anthropic_error_type_for_status()
+# ==================================================================================================
+
+class TestAnthropicErrorTypeForStatus:
+    """Tests for the HTTP status -> Anthropic error type mapping."""
+
+    @pytest.mark.parametrize("status,expected", [
+        (400, "invalid_request_error"),
+        (401, "authentication_error"),
+        (403, "permission_error"),
+        (404, "not_found_error"),
+        (429, "rate_limit_error"),
+        (503, "overloaded_error"),
+        (529, "overloaded_error"),
+    ])
+    def test_maps_known_statuses(self, status, expected):
+        """
+        What it does: Maps each documented status code.
+        Purpose: Ensure Anthropic error types match the Anthropic API spec.
+        """
+        assert anthropic_error_type_for_status(status) == expected
+
+    @pytest.mark.parametrize("status", [500, 502, 504, 418, 422, 413, 200, 0, -1, 999])
+    def test_unknown_statuses_map_to_api_error(self, status):
+        """
+        What it does: Maps statuses outside the table, including nonsense values.
+        Purpose: Ensure the fallback is always api_error.
+        """
+        assert anthropic_error_type_for_status(status) == "api_error"
+
+
+# ==================================================================================================
+# Tests for stop sequence handling
+# ==================================================================================================
+
+def _feed_all(matcher, pieces):
+    """Feed pieces into matcher; return (emitted_text, matched), flushing when nothing matched."""
+    out = ""
+    matched = None
+    for piece in pieces:
+        emitted, matched = matcher.feed(piece)
+        out += emitted
+        if matched is not None:
+            return out, matched
+    return out + matcher.flush(), None
+
+
+class TestNormalizeStopSequences:
+    """Tests for normalize_stop_sequences()."""
+
+    def test_none_returns_empty(self):
+        """What it does: None input. Purpose: No stop sequences."""
+        assert normalize_stop_sequences(None) == []
+
+    def test_single_string_is_wrapped(self):
+        """What it does: OpenAI allows stop as a string. Purpose: Accept it."""
+        assert normalize_stop_sequences("END") == ["END"]
+
+    def test_empty_string_and_non_strings_dropped(self):
+        """What it does: Malformed entries. Purpose: Ignore them instead of matching everything."""
+        assert normalize_stop_sequences(["", None, 5, "A", ""]) == ["A"]
+
+    def test_duplicates_removed_order_kept(self):
+        """What it does: Duplicate sequences. Purpose: De-duplicate, keep order."""
+        assert normalize_stop_sequences(["b", "a", "b"]) == ["b", "a"]
+
+    def test_empty_list(self):
+        """What it does: Empty list. Purpose: No stop sequences."""
+        assert normalize_stop_sequences([]) == []
+
+
+class TestCreateStopSequenceMatcher:
+    """Tests for create_stop_sequence_matcher()."""
+
+    @pytest.mark.parametrize("value", [None, [], [""], ""])
+    def test_returns_none_when_nothing_to_match(self, value):
+        """
+        What it does: Creates a matcher from empty inputs.
+        Purpose: None keeps native behaviour exactly (no buffering).
+        """
+        assert create_stop_sequence_matcher(value) is None
+
+    def test_returns_matcher(self):
+        """What it does: Valid sequences. Purpose: Matcher is created."""
+        assert isinstance(create_stop_sequence_matcher(["x"]), StopSequenceMatcher)
+
+    def test_matcher_rejects_empty_list(self):
+        """What it does: Direct construction with nothing usable. Purpose: Fail loudly."""
+        with pytest.raises(ValueError):
+            StopSequenceMatcher(["", ""])
+
+
+class TestStopSequenceMatcher:
+    """Tests for StopSequenceMatcher incremental matching."""
+
+    def test_not_present_emits_everything(self):
+        """
+        What it does: Text without the sequence.
+        Purpose: All text is emitted after flush, nothing lost.
+        """
+        out, matched = _feed_all(StopSequenceMatcher(["STOP"]), ["Hello ", "wor", "ld"])
+        assert out == "Hello world"
+        assert matched is None
+
+    def test_match_in_single_chunk(self):
+        """What it does: Sequence inside one chunk. Purpose: Cut before it."""
+        out, matched = _feed_all(StopSequenceMatcher(["STOP"]), ["abcSTOPdef"])
+        assert (out, matched) == ("abc", "STOP")
+
+    def test_match_split_across_chunks(self):
+        """
+        What it does: Sequence split over three chunks.
+        Purpose: No part of the sequence leaks to the client.
+        """
+        out, matched = _feed_all(StopSequenceMatcher(["STOP"]), ["abcS", "T", "OPdef"])
+        assert (out, matched) == ("abc", "STOP")
+
+    def test_match_split_one_char_per_chunk(self):
+        """What it does: Worst-case char-by-char stream. Purpose: Still detected."""
+        out, matched = _feed_all(StopSequenceMatcher(["</end>"]), list("hello</end>tail"))
+        assert (out, matched) == ("hello", "</end>")
+
+    def test_match_at_very_start(self):
+        """What it does: Output starts with the sequence. Purpose: Nothing emitted."""
+        out, matched = _feed_all(StopSequenceMatcher(["STOP"]), ["STOP and more"])
+        assert (out, matched) == ("", "STOP")
+
+    def test_match_at_very_start_split(self):
+        """What it does: Sequence at start, split. Purpose: Nothing emitted."""
+        out, matched = _feed_all(StopSequenceMatcher(["STOP"]), ["ST", "OP"])
+        assert (out, matched) == ("", "STOP")
+
+    def test_match_at_very_end(self):
+        """What it does: Sequence is the last text. Purpose: Detected, text before kept."""
+        out, matched = _feed_all(StopSequenceMatcher(["STOP"]), ["abc", "STOP"])
+        assert (out, matched) == ("abc", "STOP")
+
+    def test_partial_prefix_at_end_is_flushed(self):
+        """
+        What it does: Stream ends with a prefix of the sequence.
+        Purpose: Held-back prefix is released by flush (not lost).
+        """
+        out, matched = _feed_all(StopSequenceMatcher(["STOP"]), ["abcST"])
+        assert (out, matched) == ("abcST", None)
+
+    def test_holdback_never_exceeds_max_len_minus_one(self):
+        """
+        What it does: Checks what is emitted before the stream ends.
+        Purpose: Latency bound - only (max_len - 1) chars are held back.
+        """
+        matcher = StopSequenceMatcher(["ABCDE"])
+        assert matcher.feed("0123456789") == ("012345", None)
+        assert matcher.flush() == "6789"
+
+    def test_single_char_sequence_has_no_holdback(self):
+        """What it does: One-char sequence. Purpose: Nothing is buffered."""
+        matcher = StopSequenceMatcher(["\n"])
+        assert matcher.feed("abc") == ("abc", None)
+        assert matcher.feed("d\ne") == ("d", "\n")
+
+    def test_multiple_sequences_earliest_wins(self):
+        """What it does: Two sequences present. Purpose: The one that completes first wins."""
+        out, matched = _feed_all(StopSequenceMatcher(["world", "lo"]), ["hello world"])
+        assert (out, matched) == ("hel", "lo")
+
+    def test_multiple_sequences_order_in_list_irrelevant(self):
+        """What it does: Same text, reversed list. Purpose: Result depends on text only."""
+        out, matched = _feed_all(StopSequenceMatcher(["lo", "world"]), ["hello world"])
+        assert (out, matched) == ("hel", "lo")
+
+    def test_multiple_sequences_result_independent_of_chunking(self):
+        """
+        What it does: Same text fed whole and char by char.
+        Purpose: Chunk boundaries never change the outcome.
+        """
+        text = "the quick brown fox ends here"
+        seqs = ["fox ends", "brown", "n f"]
+        whole = _feed_all(StopSequenceMatcher(seqs), [text])
+        chars = _feed_all(StopSequenceMatcher(seqs), list(text))
+        assert whole == chars == ("the quick ", "brown")
+
+    def test_overlapping_sequences_shorter_completing_first(self):
+        """What it does: "ab" vs "abc". Purpose: "ab" completes first and wins."""
+        out, matched = _feed_all(StopSequenceMatcher(["abc", "ab"]), ["xa", "bc"])
+        assert (out, matched) == ("x", "ab")
+
+    def test_input_after_match_is_ignored(self):
+        """What it does: Feeds after a match. Purpose: Nothing more is emitted."""
+        matcher = StopSequenceMatcher(["X"])
+        matcher.feed("aXb")
+        assert matcher.feed("more") == ("", "X")
+        assert matcher.flush() == ""
+        assert matcher.matched == "X"
+
+    def test_empty_feed_is_noop(self):
+        """What it does: Empty string fed. Purpose: No output, no state change."""
+        matcher = StopSequenceMatcher(["STOP"])
+        assert matcher.feed("") == ("", None)
+        assert matcher.matched is None
+
+    def test_unicode_sequences(self):
+        """What it does: Non-ASCII sequence split across chunks. Purpose: Works per character."""
+        out, matched = _feed_all(StopSequenceMatcher(["конец"]), ["текст ко", "нец дальше"])
+        assert (out, matched) == ("текст ", "конец")
+
+    def test_repeated_prefix_does_not_confuse(self):
+        """What it does: Text "aaab" with sequence "aab". Purpose: Overlapping prefix is handled."""
+        out, matched = _feed_all(StopSequenceMatcher(["aab"]), ["a", "a", "a", "b"])
+        assert (out, matched) == ("a", "aab")
+
+
+async def _events_from(items):
+    """Async generator yielding the given KiroEvents."""
+    for item in items:
+        yield item
+
+
+async def _collect_events(gen):
+    """Collect all events from an async generator."""
+    return [event async for event in gen]
+
+
+class TestApplyStopSequences:
+    """Tests for apply_stop_sequences() KiroEvent filter."""
+
+    @pytest.mark.asyncio
+    async def test_none_matcher_is_pass_through(self):
+        """
+        What it does: Filter with matcher=None.
+        Purpose: Default behaviour is identical (same objects, same order).
+        """
+        items = [
+            KiroEvent(type="content", content="a"),
+            KiroEvent(type="thinking", thinking_content="t"),
+            KiroEvent(type="usage", usage={"x": 1}),
+        ]
+        result = await _collect_events(apply_stop_sequences(_events_from(items), None))
+        assert result == items
+        assert all(a is b for a, b in zip(result, items))
+
+    @pytest.mark.asyncio
+    async def test_stops_stream_and_closes_upstream(self):
+        """
+        What it does: Match occurs while upstream has more events.
+        Purpose: Later events (including tool calls) are not produced; upstream is closed.
+        """
+        closed = False
+
+        async def upstream():
+            nonlocal closed
+            try:
+                yield KiroEvent(type="content", content="hello ST")
+                yield KiroEvent(type="content", content="OP world")
+                yield KiroEvent(type="tool_use", tool_use={"id": "t1"})
+            finally:
+                closed = True
+
+        matcher = StopSequenceMatcher(["STOP"])
+        result = await _collect_events(apply_stop_sequences(upstream(), matcher))
+
+        assert "".join(e.content for e in result if e.type == "content") == "hello "
+        assert not any(e.type == "tool_use" for e in result)
+        assert matcher.matched == "STOP"
+        assert closed
+
+    @pytest.mark.asyncio
+    async def test_thinking_not_matched(self):
+        """
+        What it does: Stop sequence appears in thinking content.
+        Purpose: Thinking is never cut and does not end the stream.
+        """
+        items = [
+            KiroEvent(type="thinking", thinking_content="I will say STOP now"),
+            KiroEvent(type="content", content="answer"),
+        ]
+        matcher = StopSequenceMatcher(["STOP"])
+        result = await _collect_events(apply_stop_sequences(_events_from(items), matcher))
+
+        assert result[0].thinking_content == "I will say STOP now"
+        assert "".join(e.content for e in result if e.type == "content") == "answer"
+        assert matcher.matched is None
+
+    @pytest.mark.asyncio
+    async def test_tool_use_not_matched_and_flushes_pending_text_first(self):
+        """
+        What it does: Held-back text followed by a tool call containing the sequence.
+        Purpose: Text is flushed before the tool call (order kept); tool input untouched.
+        """
+        tool = {"id": "t1", "function": {"name": "f", "arguments": '{"q": "STOP"}'}}
+        items = [
+            KiroEvent(type="content", content="abcST"),
+            KiroEvent(type="tool_use", tool_use=tool),
+        ]
+        matcher = StopSequenceMatcher(["STOP"])
+        result = await _collect_events(apply_stop_sequences(_events_from(items), matcher))
+
+        assert [e.type for e in result] == ["content", "content", "tool_use"]
+        assert result[0].content + result[1].content == "abcST"
+        assert result[2].tool_use is tool
+        assert matcher.matched is None
+
+    @pytest.mark.asyncio
+    async def test_usage_events_do_not_flush(self):
+        """
+        What it does: Usage event arrives between two halves of the sequence.
+        Purpose: Usage must not force a flush that leaks a partial sequence.
+        """
+        items = [
+            KiroEvent(type="content", content="xST"),
+            KiroEvent(type="context_usage", context_usage_percentage=1.0),
+            KiroEvent(type="content", content="OPy"),
+        ]
+        matcher = StopSequenceMatcher(["STOP"])
+        result = await _collect_events(apply_stop_sequences(_events_from(items), matcher))
+
+        assert "".join(e.content for e in result if e.type == "content") == "x"
+        assert matcher.matched == "STOP"
+
+    @pytest.mark.asyncio
+    async def test_flushes_tail_at_end(self):
+        """What it does: No match, held-back tail. Purpose: Tail emitted at end."""
+        items = [KiroEvent(type="content", content="abcS")]
+        result = await _collect_events(apply_stop_sequences(_events_from(items), StopSequenceMatcher(["STOP"])))
+        assert "".join(e.content for e in result) == "abcS"
+
+    @pytest.mark.asyncio
+    async def test_no_empty_content_events(self):
+        """What it does: Chunks fully held back. Purpose: No empty content events are produced."""
+        items = [KiroEvent(type="content", content="S"), KiroEvent(type="content", content="T")]
+        result = await _collect_events(apply_stop_sequences(_events_from(items), StopSequenceMatcher(["STOP"])))
+        assert all(e.content for e in result)
+        assert "".join(e.content for e in result) == "ST"
+
+    @pytest.mark.asyncio
+    async def test_propagates_first_token_timeout(self):
+        """What it does: Upstream raises timeout. Purpose: Retry logic still sees it."""
+        async def upstream():
+            raise FirstTokenTimeoutError("t")
+            yield  # pragma: no cover
+
+        with pytest.raises(FirstTokenTimeoutError):
+            await _collect_events(apply_stop_sequences(upstream(), StopSequenceMatcher(["x"])))
+
+
+class TestCollectStreamToResultStopSequences:
+    """Tests for stop_sequences in collect_stream_to_result()."""
+
+    @pytest.mark.asyncio
+    async def test_cuts_content_and_sets_stop_sequence(self, mock_response):
+        """
+        What it does: Non-streaming collection with a split stop sequence.
+        Purpose: Content is cut, thinking untouched, later tool calls dropped, stop_sequence set.
+        """
+        async def mock_parse(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="think END")
+            yield KiroEvent(type="content", content="Hello E")
+            yield KiroEvent(type="content", content="ND tail")
+            yield KiroEvent(type="tool_use", tool_use={"id": "late"})
+
+        with patch('kiro.streaming_core.parse_kiro_stream', mock_parse):
+            with patch('kiro.streaming_core.parse_bracket_tool_calls', return_value=[]):
+                result = await collect_stream_to_result(mock_response, stop_sequences=["END"])
+
+        assert result.content == "Hello "
+        assert result.thinking_content == "think END"
+        assert result.stop_sequence == "END"
+        assert result.tool_calls == []
+
+    @pytest.mark.asyncio
+    async def test_not_present_keeps_full_content(self, mock_response):
+        """What it does: Sequence absent. Purpose: Full content, stop_sequence None."""
+        async def mock_parse(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hello ")
+            yield KiroEvent(type="content", content="world E")
+
+        with patch('kiro.streaming_core.parse_kiro_stream', mock_parse):
+            with patch('kiro.streaming_core.parse_bracket_tool_calls', return_value=[]):
+                result = await collect_stream_to_result(mock_response, stop_sequences=["END"])
+
+        assert result.content == "Hello world E"
+        assert result.stop_sequence is None
+
+    @pytest.mark.asyncio
+    async def test_default_none_unchanged(self, mock_response):
+        """What it does: No stop_sequences. Purpose: Exactly the old behaviour."""
+        async def mock_parse(*args, **kwargs):
+            yield KiroEvent(type="content", content="a END b")
+
+        with patch('kiro.streaming_core.parse_kiro_stream', mock_parse):
+            with patch('kiro.streaming_core.parse_bracket_tool_calls', return_value=[]):
+                result = await collect_stream_to_result(mock_response)
+
+        assert result.content == "a END b"
+        assert result.stop_sequence is None
+
+
+# ==================================================================================================
+# Tests for non-blocking token estimation
+# ==================================================================================================
+
+class TestEstimateRequestTokensOffloaded:
+    """Tests for estimate_request_tokens_offloaded()."""
+
+    @pytest.mark.asyncio
+    async def test_uses_async_tokenizer_when_available(self):
+        """
+        What it does: tokenizer has estimate_request_tokens_async.
+        Purpose: The async variant is used with the same arguments.
+        """
+        fake_async = AsyncMock(return_value={"total_tokens": 7})
+        with patch('kiro.streaming_core.tokenizer_module') as tok:
+            tok.estimate_request_tokens_async = fake_async
+            result = await estimate_request_tokens_offloaded(
+                messages=[{"role": "user", "content": "hi"}], tools=None,
+                system_prompt="s", apply_claude_correction=False,
+            )
+        assert result == {"total_tokens": 7}
+        fake_async.assert_awaited_once_with(
+            messages=[{"role": "user", "content": "hi"}], tools=None,
+            system_prompt="s", apply_claude_correction=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_thread_when_async_missing(self):
+        """
+        What it does: tokenizer lacks the async variant.
+        Purpose: Sync estimator runs in a worker thread, not on the event loop thread.
+        """
+        import threading
+        loop_thread = threading.get_ident()
+        seen_thread = {}
+
+        def fake_sync(messages, tools, system_prompt, apply_claude_correction):
+            seen_thread["id"] = threading.get_ident()
+            return {"total_tokens": len(messages)}
+
+        fake_module = MagicMock(spec=["estimate_request_tokens"])
+        fake_module.estimate_request_tokens = fake_sync
+        with patch('kiro.streaming_core.tokenizer_module', fake_module):
+            result = await estimate_request_tokens_offloaded(messages=[{}, {}])
+
+        assert result == {"total_tokens": 2}
+        assert seen_thread["id"] != loop_thread
+
+    @pytest.mark.asyncio
+    async def test_real_tokenizer_matches_sync_result(self):
+        """
+        What it does: Uses the real tokenizer module.
+        Purpose: Offloading does not change the numbers.
+        """
+        from kiro.tokenizer import estimate_request_tokens
+        messages = [{"role": "user", "content": "Hello there, how are you?"}]
+        expected = estimate_request_tokens(messages, None, "sys", False)
+        result = await estimate_request_tokens_offloaded(messages, None, "sys", False)
+        assert result == expected
+
+
+# ==================================================================================================
+# Tests for progressive first token timeout (bounded retries)
+# ==================================================================================================
+
+class TestFirstTokenTimeoutForAttempt:
+    """Tests for first_token_timeout_for_attempt()."""
+
+    def test_grows_linearly(self):
+        """What it does: attempts 0..2. Purpose: timeout * (attempt + 1)."""
+        assert [first_token_timeout_for_attempt(15, a) for a in range(3)] == [15, 30, 45]
+
+    def test_capped_by_streaming_read_timeout(self):
+        """What it does: Large attempt number. Purpose: Never above STREAMING_READ_TIMEOUT."""
+        with patch('kiro.streaming_core.STREAMING_READ_TIMEOUT', 100.0):
+            assert first_token_timeout_for_attempt(40, 5) == 100.0
+
+    def test_cap_never_below_base(self):
+        """What it does: Base already above the cap. Purpose: Base is kept (no shrinking)."""
+        with patch('kiro.streaming_core.STREAMING_READ_TIMEOUT', 10.0):
+            assert first_token_timeout_for_attempt(20, 0) == 20
+            assert first_token_timeout_for_attempt(20, 3) == 20
+
+    def test_negative_attempt_treated_as_first(self):
+        """What it does: Invalid attempt. Purpose: Treated as attempt 0."""
+        assert first_token_timeout_for_attempt(15, -2) == 15
+
+
+class TestStreamWithFirstTokenRetryProgressiveTimeout:
+    """Tests for timeout_aware_processor in stream_with_first_token_retry()."""
+
+    @pytest.mark.asyncio
+    async def test_processor_receives_growing_timeouts(self):
+        """
+        What it does: Every attempt times out with a timeout-aware processor.
+        Purpose: Attempt N gets base * (N + 1); number of attempts stays max_retries.
+        """
+        seen_timeouts = []
+        make_calls = 0
+
+        async def make_request():
+            nonlocal make_calls
+            make_calls += 1
+            response = AsyncMock()
+            response.status_code = 200
+            return response
+
+        async def processor(response, attempt_timeout):
+            seen_timeouts.append(attempt_timeout)
+            raise FirstTokenTimeoutError("t")
+            yield  # pragma: no cover
+
+        with pytest.raises(Exception):
+            async for _ in stream_with_first_token_retry(
+                make_request=make_request,
+                stream_processor=processor,
+                max_retries=3,
+                first_token_timeout=10,
+                timeout_aware_processor=True,
+            ):
+                pass
+
+        assert seen_timeouts == [10, 20, 30]
+        assert make_calls == 3
+
+    @pytest.mark.asyncio
+    async def test_initial_response_counts_as_first_attempt(self):
+        """
+        What it does: initial_response given, all attempts time out.
+        Purpose: Only max_retries - 1 extra requests are made.
+        """
+        make_calls = 0
+
+        async def make_request():
+            nonlocal make_calls
+            make_calls += 1
+            response = AsyncMock()
+            response.status_code = 200
+            return response
+
+        async def processor(response, attempt_timeout):
+            raise FirstTokenTimeoutError("t")
+            yield  # pragma: no cover
+
+        initial = AsyncMock()
+        initial.status_code = 200
+        with pytest.raises(Exception):
+            async for _ in stream_with_first_token_retry(
+                make_request=make_request,
+                stream_processor=processor,
+                initial_response=initial,
+                max_retries=3,
+                first_token_timeout=5,
+                timeout_aware_processor=True,
+            ):
+                pass
+
+        assert make_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_legacy_processor_called_with_response_only(self):
+        """
+        What it does: Default timeout_aware_processor=False.
+        Purpose: Existing one-argument processors keep working.
+        """
+        calls = []
+
+        async def make_request():
+            response = AsyncMock()
+            response.status_code = 200
+            return response
+
+        async def processor(response):
+            calls.append(response)
+            yield "ok"
+
+        chunks = [c async for c in stream_with_first_token_retry(
+            make_request=make_request, stream_processor=processor, max_retries=2, first_token_timeout=5,
+        )]
+        assert chunks == ["ok"]
+        assert len(calls) == 1

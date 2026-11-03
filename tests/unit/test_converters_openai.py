@@ -1872,3 +1872,233 @@ class TestBuildKiroPayloadIntegration:
         print(f"Checking for <max_thinking_length>{expected_budget}</max_thinking_length>...")
         assert f"<max_thinking_length>{expected_budget}</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+# ==================================================================================================
+# tool_choice / parallel_tool_calls / response_format (OpenAI)
+# ==================================================================================================
+
+import json as _json
+
+from kiro.converters_core import (
+    REMOTE_IMAGE_PLACEHOLDER,
+    RAW_TOOL_ARGUMENTS_KEY,
+    TOOL_CHOICE_NONE,
+    TOOL_CHOICE_REQUIRED,
+    TOOL_CHOICE_TOOL,
+    TOOL_CHOICE_REQUIRED_INSTRUCTION,
+    TOOL_CHOICE_SINGLE_CALL_INSTRUCTION,
+    UnifiedToolChoice,
+)
+from kiro.converters_openai import (
+    JSON_OBJECT_INSTRUCTION,
+    build_response_format_instruction,
+    extract_tool_choice_from_openai,
+)
+
+
+def _openai_request(**kwargs):
+    defaults = dict(
+        model="claude-sonnet-4.5",
+        messages=[ChatMessage(role="system", content="SYS"), ChatMessage(role="user", content="Hello")],
+    )
+    defaults.update(kwargs)
+    return ChatCompletionRequest(**defaults)
+
+
+def _openai_tools(*names):
+    return [
+        Tool(type="function", function=ToolFunction(name=n, description=f"{n} tool",
+                                                    parameters={"type": "object", "properties": {}}))
+        for n in names
+    ]
+
+
+def _build_openai(request):
+    with patch("kiro.converters_openai.get_model_id_for_kiro", return_value="claude-sonnet-4.5"), \
+            patch("kiro.converters_core.FAKE_REASONING_ENABLED", False), \
+            patch("kiro.config.TRUNCATION_RECOVERY", False):
+        return build_kiro_payload(request, "conv", "arn")
+
+
+def _current_message(payload):
+    return payload["conversationState"]["currentMessage"]["userInputMessage"]
+
+
+class TestExtractToolChoiceFromOpenAI:
+    """Tests for extract_tool_choice_from_openai."""
+
+    def test_defaults_return_none(self):
+        assert extract_tool_choice_from_openai(_openai_request()) is None
+
+    def test_auto_returns_none(self):
+        assert extract_tool_choice_from_openai(_openai_request(tool_choice="auto")) is None
+
+    def test_parallel_true_returns_none(self):
+        assert extract_tool_choice_from_openai(_openai_request(parallel_tool_calls=True)) is None
+
+    def test_none_string(self):
+        assert extract_tool_choice_from_openai(_openai_request(tool_choice="none")) == \
+            UnifiedToolChoice(mode=TOOL_CHOICE_NONE)
+
+    def test_required(self):
+        assert extract_tool_choice_from_openai(_openai_request(tool_choice="required")) == \
+            UnifiedToolChoice(mode=TOOL_CHOICE_REQUIRED)
+
+    def test_named_function(self):
+        choice = {"type": "function", "function": {"name": "get_weather"}}
+        assert extract_tool_choice_from_openai(_openai_request(tool_choice=choice)) == \
+            UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="get_weather")
+
+    def test_flat_named_function(self):
+        choice = {"type": "function", "name": "get_weather"}
+        result = extract_tool_choice_from_openai(_openai_request(tool_choice=choice))
+        assert result.mode == TOOL_CHOICE_TOOL and result.tool_name == "get_weather"
+
+    def test_parallel_false(self):
+        result = extract_tool_choice_from_openai(_openai_request(parallel_tool_calls=False))
+        assert result == UnifiedToolChoice(disable_parallel=True)
+
+    def test_required_and_parallel_false(self):
+        result = extract_tool_choice_from_openai(_openai_request(tool_choice="required", parallel_tool_calls=False))
+        assert result == UnifiedToolChoice(mode=TOOL_CHOICE_REQUIRED, disable_parallel=True)
+
+    @pytest.mark.parametrize("choice", [
+        "sometimes",
+        "",
+        {"type": "function"},
+        {"type": "function", "function": {}},
+        {"type": "function", "function": {"name": ""}},
+        {"type": "function", "function": "get_weather"},
+        {"type": "allowed_tools", "tools": []},
+        {},
+    ])
+    def test_unsupported_values_fall_back_to_auto(self, choice):
+        """Malformed or unknown tool_choice must not fail the request."""
+        assert extract_tool_choice_from_openai(_openai_request(tool_choice=choice)) is None
+
+
+class TestOpenAIToolChoicePayload:
+    """End-to-end tool_choice handling for OpenAI requests (used by streaming and non-streaming alike)."""
+
+    def test_none_strips_tools(self):
+        payload = _build_openai(_openai_request(tools=_openai_tools("a", "b"), tool_choice="none"))
+        assert "userInputMessageContext" not in _current_message(payload)
+
+    def test_required_keeps_tools_and_instructs(self):
+        current = _current_message(_build_openai(_openai_request(tools=_openai_tools("a"), tool_choice="required")))
+        assert len(current["userInputMessageContext"]["tools"]) == 1
+        assert TOOL_CHOICE_REQUIRED_INSTRUCTION in current["content"]
+
+    def test_forced_tool(self):
+        request = _openai_request(tools=_openai_tools("a", "b"),
+                                  tool_choice={"type": "function", "function": {"name": "a"}})
+        current = _current_message(_build_openai(request))
+        assert [t["toolSpecification"]["name"] for t in current["userInputMessageContext"]["tools"]] == ["a"]
+        assert "You must call the tool `a`." in current["content"]
+
+    def test_forced_unknown_tool_raises(self):
+        request = _openai_request(tools=_openai_tools("a"),
+                                  tool_choice={"type": "function", "function": {"name": "missing"}})
+        with pytest.raises(ValueError, match="missing"):
+            _build_openai(request)
+
+    def test_parallel_false_instruction(self):
+        current = _current_message(_build_openai(_openai_request(tools=_openai_tools("a"), parallel_tool_calls=False)))
+        assert TOOL_CHOICE_SINGLE_CALL_INSTRUCTION in current["content"]
+
+    def test_auto_payload_identical_to_default(self):
+        default = _build_openai(_openai_request(tools=_openai_tools("a")))
+        auto = _build_openai(_openai_request(tools=_openai_tools("a"), tool_choice="auto"))
+        assert default == auto
+
+    def test_tool_choice_without_tools_is_noop(self):
+        default = _build_openai(_openai_request())
+        forced = _build_openai(_openai_request(tool_choice="required"))
+        assert default == forced
+
+
+class TestResponseFormat:
+    """Tests for response_format emulation."""
+
+    @pytest.mark.parametrize("value", [None, {"type": "text"}, {}, "json_object", 5])
+    def test_no_instruction(self, value):
+        assert build_response_format_instruction(value) == ""
+
+    def test_json_object(self):
+        assert build_response_format_instruction({"type": "json_object"}) == JSON_OBJECT_INSTRUCTION
+
+    def test_json_schema_includes_schema_and_name(self):
+        schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+        instruction = build_response_format_instruction(
+            {"type": "json_schema", "json_schema": {"name": "Answer", "schema": schema, "strict": True}}
+        )
+        assert "Answer" in instruction
+        assert _json.dumps(schema, ensure_ascii=False, indent=2) in instruction
+
+    def test_json_schema_unicode_preserved(self):
+        schema = {"description": "你好"}
+        instruction = build_response_format_instruction({"type": "json_schema", "json_schema": {"schema": schema}})
+        assert "你好" in instruction
+        assert "schema name" not in instruction
+
+    def test_json_schema_with_braces_in_schema(self):
+        """Schema text containing {placeholders} must not break str.format."""
+        schema = {"pattern": "^{name}$", "description": "{0} {x}"}
+        instruction = build_response_format_instruction({"type": "json_schema", "json_schema": {"schema": schema}})
+        assert "^{name}$" in instruction
+
+    @pytest.mark.parametrize("json_schema", [None, "schema", 3, []])
+    def test_json_schema_malformed_falls_back_to_json_object(self, json_schema):
+        assert build_response_format_instruction({"type": "json_schema", "json_schema": json_schema}) == \
+            JSON_OBJECT_INSTRUCTION
+
+    def test_json_schema_missing_schema_key(self):
+        instruction = build_response_format_instruction({"type": "json_schema", "json_schema": {"name": "x"}})
+        assert "{}" in instruction
+
+    def test_unknown_type_ignored(self):
+        assert build_response_format_instruction({"type": "xml"}) == ""
+
+    def test_payload_contains_instruction_after_system_prompt(self):
+        payload = _build_openai(_openai_request(response_format={"type": "json_object"}))
+        content = _current_message(payload)["content"]
+        assert content.startswith(f"SYS\n\n{JSON_OBJECT_INSTRUCTION}")
+        assert content.endswith("Hello")
+
+    def test_payload_without_system_prompt(self):
+        request = _openai_request(messages=[ChatMessage(role="user", content="Hi")],
+                                  response_format={"type": "json_object"})
+        content = _current_message(_build_openai(request))["content"]
+        assert content.startswith(JSON_OBJECT_INSTRUCTION)
+
+    def test_text_format_payload_identical_to_default(self):
+        assert _build_openai(_openai_request(response_format={"type": "text"})) == _build_openai(_openai_request())
+
+
+class TestOpenAIHardeningEndToEnd:
+    """Malformed tool arguments and remote images through the OpenAI adapter."""
+
+    def test_malformed_tool_call_arguments_do_not_fail(self):
+        request = _openai_request(
+            tools=_openai_tools("read"),
+            messages=[
+                ChatMessage(role="user", content="read it"),
+                ChatMessage(role="assistant", content=None, tool_calls=[
+                    {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{\"path\": "}}
+                ]),
+                ChatMessage(role="tool", tool_call_id="call_1", content="file body"),
+            ],
+        )
+        payload = _build_openai(request)
+        tool_use = payload["conversationState"]["history"][1]["assistantResponseMessage"]["toolUses"][0]
+        assert tool_use["input"] == {RAW_TOOL_ARGUMENTS_KEY: "{\"path\": "}
+
+    def test_remote_image_url_placeholder(self):
+        request = _openai_request(messages=[ChatMessage(role="user", content=[
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+        ])])
+        current = _current_message(_build_openai(request))
+        assert current["content"].endswith(f"What is in this image?\n{REMOTE_IMAGE_PLACEHOLDER}")
+        assert "images" not in current

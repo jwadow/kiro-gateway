@@ -51,6 +51,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
@@ -87,8 +88,8 @@ from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
-from kiro.exceptions import validation_exception_handler
-from kiro.debug_middleware import DebugLoggerMiddleware
+from kiro.exceptions import validation_exception_handler, http_exception_handler
+from kiro.debug_middleware import DebugLoggerMiddleware, RequestIdMiddleware
 from kiro.tokenizer import warm_up_tokenizer
 
 
@@ -557,6 +558,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error closing shared HTTP client: {e}")
 
+    # Close pooled MCP (web_search) client
+    from kiro.mcp_tools import close_mcp_http_client
+    await close_mcp_http_client()
+
 
 # --- FastAPI Application ---
 app = FastAPI(
@@ -587,8 +592,16 @@ if DEBUG_MODE != "off":
     app.add_middleware(DebugLoggerMiddleware)
 
 
-# --- Validation Error Handler Registration ---
+# --- Request ID Middleware ---
+# Pure ASGI (no BaseHTTPMiddleware), so streaming bodies are not wrapped.
+# Added last = outermost: every response, including CORS preflight and errors, gets the ids.
+app.add_middleware(RequestIdMiddleware)
+
+
+# --- Error Handler Registration ---
+# Errors are rendered in OpenAI shape, or Anthropic shape for /v1/messages paths
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
+app.add_exception_handler(StarletteHTTPException, http_exception_handler)
 
 
 # --- Route Registration ---
@@ -597,6 +610,10 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# OpenAI Responses API: /v1/responses
+from kiro.routes_responses import router as responses_router
+app.include_router(responses_router)
 
 
 # --- Uvicorn log config ---

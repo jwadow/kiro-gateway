@@ -56,6 +56,7 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
     RECOVERABLE errors (try next account):
     - 400 + INVALID_MODEL_ID: Could be invalid model or insufficient subscription
     - 402: Payment required (monthly quota exceeded, billing issues)
+    - 401: Unauthorized (invalid/revoked credentials for this account)
     - 403: Token expired/invalid
     - 429: Rate limit exceeded
     
@@ -78,6 +79,8 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
         ErrorType.RECOVERABLE
         >>> classify_error(402, "MONTHLY_REQUEST_COUNT")
         ErrorType.RECOVERABLE
+        >>> classify_error(401, None)
+        ErrorType.RECOVERABLE
         >>> classify_error(403, None)
         ErrorType.RECOVERABLE
         >>> classify_error(429, None)
@@ -96,8 +99,11 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
     if status_code == 402:
         return ErrorType.RECOVERABLE
     
-    # RECOVERABLE: Token expired/invalid
-    if status_code == 403:
+    # RECOVERABLE: Unauthorized / token expired or invalid.
+    # Both are account credential problems, never request problems, so another
+    # account may succeed. Failover stays bounded: routes exclude already-tried
+    # accounts and cap attempts, and report_failure puts this account in cooldown.
+    if status_code in (401, 403):
         return ErrorType.RECOVERABLE
     
     # RECOVERABLE: Rate limit exceeded

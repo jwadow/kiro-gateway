@@ -463,10 +463,10 @@ class TestDebugLoggerHelperMethods:
 class TestDebugLoggerJsonHandling:
     """Тесты для обработки JSON в DebugLogger."""
     
-    def test_log_request_body_formats_json_pretty(self, tmp_path):
+    def test_log_request_body_writes_json_bytes_as_is(self, tmp_path):
         """
-        Что он делает: Проверяет, что JSON форматируется красиво.
-        Цель: Убедиться, что JSON читаем в файле.
+        What it does: Verifies JSON bodies are written byte-for-byte, without re-parsing.
+        Purpose: Avoid a json.loads + indented json.dump per request in "all" mode.
         """
         print("Настройка: Режим all...")
         debug_dir = tmp_path / "debug_logs"
@@ -482,10 +482,9 @@ class TestDebugLoggerJsonHandling:
             print("Действие: Вызов log_request_body с JSON...")
             logger.log_request_body(b'{"key":"value"}')
             
-            print(f"Проверяем форматирование...")
-            content = (debug_dir / "request_body.json").read_text()
-            # Должен быть отформатирован с отступами
-            assert "  " in content or "\n" in content
+            print("Checking: file content is byte-identical to the input...")
+            content = (debug_dir / "request_body.json").read_bytes()
+            assert content == b'{"key":"value"}'
     
     def test_log_request_body_handles_invalid_json(self, tmp_path):
         """
@@ -688,3 +687,199 @@ class TestDebugLoggerAppLogsCapture:
             print(f"Проверяем, что app_logs.txt НЕ создан...")
             app_logs_file = debug_dir / "app_logs.txt"
             assert not app_logs_file.exists()
+
+
+def _fresh_debug_logger(debug_dir):
+    """Build a non-singleton DebugLogger instance pointing at debug_dir."""
+    from kiro.debug_logger import DebugLogger
+    instance = DebugLogger.__new__(DebugLogger)
+    instance._initialized = False
+    instance.__init__()
+    instance.debug_dir = debug_dir
+    return instance
+
+
+class TestDebugLoggerEnabledProperty:
+    """Tests for the public `enabled` property."""
+
+    @pytest.mark.parametrize("mode,expected", [("off", False), ("errors", True), ("all", True)])
+    def test_enabled_matches_mode(self, tmp_path, mode, expected):
+        """
+        What it does: Reads `enabled` in each DEBUG_MODE.
+        Purpose: Routes use it to skip serializing the Kiro payload when off.
+        """
+        with patch('kiro.debug_logger.DEBUG_MODE', mode):
+            instance = _fresh_debug_logger(tmp_path)
+            assert instance.enabled is expected
+
+    def test_enabled_is_read_only(self, tmp_path):
+        """
+        What it does: Tries to assign to `enabled`.
+        Purpose: Mode is driven by config, not mutable per instance.
+        """
+        instance = _fresh_debug_logger(tmp_path)
+        with pytest.raises(AttributeError):
+            instance.enabled = True
+
+
+class TestDebugLoggerRawBodies:
+    """Tests that bodies are written as-is (no json re-parse / re-indent)."""
+
+    def test_kiro_body_written_byte_identical(self, tmp_path):
+        """
+        What it does: Logs an already-indented Kiro body in "all" mode.
+        Purpose: No second json.loads/json.dump pass.
+        """
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = _fresh_debug_logger(tmp_path)
+            body = '{\n  "conversationState": {"x": "Привет"}\n}'.encode("utf-8")
+            with patch('kiro.debug_logger.json.loads', side_effect=AssertionError("re-parsed")), \
+                 patch('kiro.debug_logger.json.dump', side_effect=AssertionError("re-dumped")):
+                instance.log_kiro_request_body(body)
+            assert (tmp_path / "kiro_request_body.json").read_bytes() == body
+
+    def test_errors_mode_flush_writes_bytes_as_is(self, tmp_path):
+        """
+        What it does: Buffers bodies in "errors" mode, then flushes.
+        Purpose: Flushed files equal the logged bytes.
+        """
+        debug_dir = tmp_path / "dbg"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            instance = _fresh_debug_logger(debug_dir)
+            instance.log_request_body(b'{"a":1}')
+            instance.log_kiro_request_body(b'{"b":2}')
+            instance.flush_on_error(500, "x")
+            assert (debug_dir / "request_body.json").read_bytes() == b'{"a":1}'
+            assert (debug_dir / "kiro_request_body.json").read_bytes() == b'{"b":2}'
+
+    def test_write_failure_is_logged_not_raised(self, tmp_path):
+        """
+        What it does: Writes into a directory that does not exist.
+        Purpose: Debug logging never breaks a request.
+        """
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = _fresh_debug_logger(tmp_path / "missing" / "deeper")
+            instance.log_request_body(b'{}')  # must not raise
+
+
+class TestDebugLoggerChunkFileHandles:
+    """Tests for per-request chunk file handle reuse in "all" mode."""
+
+    def test_single_open_per_file_per_request(self, tmp_path):
+        """
+        What it does: Logs many raw and modified chunks.
+        Purpose: Each stream file is opened once, not once per chunk.
+        """
+        import builtins
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = _fresh_debug_logger(tmp_path)
+            real_open = builtins.open
+            with patch('builtins.open', side_effect=real_open) as spy:
+                for i in range(50):
+                    instance.log_raw_chunk(f"r{i}".encode())
+                    instance.log_modified_chunk(f"m{i}".encode())
+            opened = [c.args[0] for c in spy.call_args_list]
+            assert sum(1 for p in opened if str(p).endswith("response_stream_raw.txt")) == 1
+            assert sum(1 for p in opened if str(p).endswith("response_stream_modified.txt")) == 1
+            instance.discard_buffers()
+
+    def test_content_visible_while_streaming(self, tmp_path):
+        """
+        What it does: Reads the file between chunks without closing.
+        Purpose: Handle is flushed per chunk, so the file is usable during a stream.
+        """
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = _fresh_debug_logger(tmp_path)
+            instance.log_raw_chunk(b'a')
+            assert (tmp_path / "response_stream_raw.txt").read_bytes() == b'a'
+            instance.log_raw_chunk(b'b')
+            assert (tmp_path / "response_stream_raw.txt").read_bytes() == b'ab'
+            instance.discard_buffers()
+
+    def test_discard_closes_handles(self, tmp_path):
+        """
+        What it does: Finishes a successful request in "all" mode.
+        Purpose: No file handles leak across requests.
+        """
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = _fresh_debug_logger(tmp_path)
+            instance.log_raw_chunk(b'x')
+            handles = list(instance._chunk_files.values())
+            instance.discard_buffers()
+            assert instance._chunk_files == {}
+            assert all(h.closed for h in handles)
+
+    def test_flush_on_error_closes_handles(self, tmp_path):
+        """
+        What it does: Finishes a failed request in "all" mode.
+        Purpose: Handles closed before error_info is written.
+        """
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = _fresh_debug_logger(tmp_path)
+            instance.log_modified_chunk(b'x')
+            handles = list(instance._chunk_files.values())
+            instance.flush_on_error(500, "boom")
+            assert all(h.closed for h in handles)
+            assert (tmp_path / "error_info.json").exists()
+
+    def test_prepare_new_request_closes_handles_and_clears_dir(self, tmp_path):
+        """
+        What it does: Starts a new request while a previous stream left handles open.
+        Purpose: rmtree works (Windows locks open files) and old chunks don't leak in.
+        """
+        debug_dir = tmp_path / "dbg"
+        debug_dir.mkdir()
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = _fresh_debug_logger(debug_dir)
+            instance.log_raw_chunk(b'old')
+            instance.prepare_new_request()
+            assert instance._chunk_files == {}
+            instance.log_raw_chunk(b'new')
+            assert (debug_dir / "response_stream_raw.txt").read_bytes() == b'new'
+            instance.discard_buffers()
+
+    def test_reopens_after_external_close(self, tmp_path):
+        """
+        What it does: Closes a cached handle behind the logger's back.
+        Purpose: A closed handle is replaced, not written to.
+        """
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = _fresh_debug_logger(tmp_path)
+            instance.log_raw_chunk(b'1')
+            instance._chunk_files["response_stream_raw.txt"].close()
+            instance.log_raw_chunk(b'2')
+            assert (tmp_path / "response_stream_raw.txt").read_bytes() == b'12'
+            instance.discard_buffers()
+
+    def test_open_failure_is_swallowed(self, tmp_path):
+        """
+        What it does: Chunk file cannot be opened.
+        Purpose: Streaming continues even if debug writes fail.
+        """
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            instance = _fresh_debug_logger(tmp_path / "does-not-exist")
+            instance.log_raw_chunk(b'x')  # must not raise
+            assert instance._chunk_files == {}
+
+    def test_close_error_is_swallowed(self, tmp_path):
+        """
+        What it does: A handle whose close() raises OSError.
+        Purpose: Cleanup never raises into the request.
+        """
+        instance = _fresh_debug_logger(tmp_path)
+        bad = MagicMock()
+        bad.close.side_effect = OSError("disk gone")
+        instance._chunk_files = {"f": bad}
+        instance._close_chunk_files()
+        assert instance._chunk_files == {}
+
+    def test_errors_mode_does_not_open_files_per_chunk(self, tmp_path):
+        """
+        What it does: Logs chunks in "errors" mode.
+        Purpose: Buffer mode still buffers in memory (no handles).
+        """
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            instance = _fresh_debug_logger(tmp_path)
+            instance.log_raw_chunk(b'x')
+            assert instance._chunk_files == {}
+            assert bytes(instance._raw_chunks_buffer) == b'x'

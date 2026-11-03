@@ -1114,3 +1114,55 @@ class TestLifespanNonBlockingDiscovery:
         finally:
             monkeypatch.undo()
             importlib.reload(main)
+
+
+class TestMainAppWiring:
+    """main.app registers the error handlers and request-id middleware."""
+
+    def test_http_exception_handler_registered(self):
+        """
+        What it does: Inspects app.exception_handlers.
+        Purpose: HTTPException renders in OpenAI/Anthropic shape, not {"detail": ...}.
+        """
+        import main
+        from starlette.exceptions import HTTPException as StarletteHTTPException
+        from kiro.exceptions import http_exception_handler
+        assert main.app.exception_handlers[StarletteHTTPException] is http_exception_handler
+
+    def test_validation_handler_registered(self):
+        """
+        What it does: Inspects app.exception_handlers for RequestValidationError.
+        Purpose: 422 shaped and without body echo.
+        """
+        import main
+        from fastapi.exceptions import RequestValidationError
+        from kiro.exceptions import validation_exception_handler
+        assert main.app.exception_handlers[RequestValidationError] is validation_exception_handler
+
+    def test_request_id_middleware_outermost(self):
+        """
+        What it does: Checks user_middleware order.
+        Purpose: RequestIdMiddleware wraps everything (CORS, debug) so all responses get ids.
+        """
+        import main
+        from kiro.debug_middleware import RequestIdMiddleware
+        assert main.app.user_middleware[0].cls is RequestIdMiddleware
+
+    @pytest.mark.parametrize("mode", ["off", "errors", "all"])
+    def test_request_id_middleware_registered_in_every_debug_mode(self, mode, monkeypatch):
+        """
+        What it does: Reloads main under each DEBUG_MODE.
+        Purpose: Request ids do not depend on debug logging.
+        """
+        import importlib
+        import kiro.config
+        import main
+        from kiro.debug_middleware import RequestIdMiddleware
+
+        monkeypatch.setattr(kiro.config, "DEBUG_MODE", mode)
+        try:
+            reloaded = importlib.reload(main)
+            assert any(m.cls is RequestIdMiddleware for m in reloaded.app.user_middleware)
+        finally:
+            monkeypatch.undo()
+            importlib.reload(main)

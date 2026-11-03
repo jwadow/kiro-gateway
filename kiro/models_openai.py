@@ -154,6 +154,7 @@ class ChatCompletionRequest(BaseModel):
         frequency_penalty: Penalty for word repetition
         tools: List of available tools
         tool_choice: Tool selection strategy
+        response_format: Output format request (text, json_object, json_schema)
     """
     model: str
     messages: Annotated[List[ChatMessage], Field(min_length=1)]
@@ -176,7 +177,11 @@ class ChatCompletionRequest(BaseModel):
     # Tools (function calling)
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[str, Dict]] = None
-    
+
+    # Structured output ({"type": "text" | "json_object" | "json_schema", ...}).
+    # Kept permissive; emulated with a system instruction by the converter.
+    response_format: Optional[Dict[str, Any]] = None
+
     # Compatibility fields (ignored)
     stream_options: Optional[Dict[str, Any]] = None
     logit_bias: Optional[Dict[str, float]] = None

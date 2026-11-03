@@ -192,6 +192,22 @@ def get_content_truncation(content: str) -> Optional[ContentTruncationInfo]:
 
 
 
+def has_pending() -> bool:
+    """
+    Check whether any truncation info is waiting to be recovered.
+
+    Lets routes skip the per-message recovery scan entirely in the common case
+    where nothing was truncated. Reads dict sizes without taking the lock:
+    len() on a dict is atomic in CPython, and a stale answer only means one
+    request scans (or skips) an entry saved concurrently, which is then
+    handled on the next request.
+
+    Returns:
+        True if either the tool or the content truncation cache is non-empty
+    """
+    return bool(_tool_truncation_cache) or bool(_content_truncation_cache)
+
+
 def get_cache_stats() -> Dict[str, int]:
     """
     Get current cache statistics.

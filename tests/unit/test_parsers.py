@@ -5,10 +5,14 @@ Unit tests for AwsEventStreamParser and auxiliary parsing functions.
 Tests the parsing logic for AWS SSE stream from Kiro API.
 """
 
+import json
+import time
+
 import pytest
 
 from kiro.parsers import (
     AwsEventStreamParser,
+    _preview_repr,
     find_matching_brace,
     parse_bracket_tool_calls,
     deduplicate_tool_calls
@@ -1357,3 +1361,309 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+def _json_str(text: str) -> str:
+    """Serializes text as a JSON string literal without ASCII escaping."""
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _feed_in_chunks(payload: bytes, chunk_size: int):
+    """Feeds payload into a fresh parser in fixed-size chunks; returns (events, tool_calls, parser)."""
+    parser = AwsEventStreamParser()
+    events = []
+    for i in range(0, len(payload), chunk_size):
+        events.extend(parser.feed(payload[i:i + chunk_size]))
+    return events, parser.get_tool_calls(), parser
+
+
+def _build_large_tool_stream(arg_size: int) -> bytes:
+    """Builds a stream with a large tool call whose args contain braces, quotes and escapes."""
+    content = ('x{"k": "}{\\"' * (arg_size // 12 + 1))[:arg_size]
+    args = json.dumps({"path": "/tmp/f.txt", "content": content, "nested": {"a": [1, {"b": "}"}]}})
+    return (
+        b'{"content":"Writing file"}'
+        + json.dumps({"name": "write_file", "toolUseId": "tool_big", "input": args}).encode("utf-8")
+        + b'{"stop":true}{"contextUsagePercentage":42.0}'
+    )
+
+
+class TestAwsEventStreamParserUtf8Chunking:
+    """Tests for incremental UTF-8 decoding across chunk boundaries."""
+
+    @pytest.mark.parametrize("char", ["\u00e9", "\u20ac", "\u4e2d", "\U0001F600", "\U0001D11E"])
+    def test_multibyte_char_split_at_every_offset(self, char):
+        """
+        What it does: Splits a 2/3/4-byte UTF-8 character at every byte offset.
+        Goal: Ensure no character is dropped when a chunk boundary falls inside it.
+        """
+        encoded_char = char.encode("utf-8")
+        payload = b'{"content":"a' + encoded_char + b'b"}'
+        char_start = payload.index(encoded_char)
+        assert len(encoded_char) >= 2
+
+        for split in range(char_start + 1, char_start + len(encoded_char)):
+            parser = AwsEventStreamParser()
+            events = parser.feed(payload[:split]) + parser.feed(payload[split:])
+            print(f"Split at {split}: {events}")
+            assert events == [{"type": "content", "data": f"a{char}b"}]
+
+    def test_multibyte_text_fed_byte_by_byte(self):
+        """
+        What it does: Feeds mixed-width UTF-8 content one byte at a time.
+        Goal: Ensure byte-by-byte delivery produces exactly the original text.
+        """
+        text = "\u041f\u0440\u0438\u0432\u0435\u0442, \u4e16\u754c! \U0001F600 \u00e9\u20ac\U0001D11E"
+        payload = ('garbage{"content":' + _json_str(text) + '}').encode("utf-8")
+        parser = AwsEventStreamParser()
+        events = []
+        for i in range(len(payload)):
+            events.extend(parser.feed(payload[i:i + 1]))
+        assert events == [{"type": "content", "data": text}]
+
+    def test_every_split_offset_of_multi_event_stream(self):
+        """
+        What it does: Splits a multi-event stream with multibyte text at every byte offset.
+        Goal: Ensure output is identical to single-chunk feed regardless of split point.
+        """
+        payload = (
+            '{"content":"\u65e5\u672c\u8a9e"}junk{"name":"tool","toolUseId":"t1","input":{}}'
+            '{"input":"{\\"q\\": \\"\u00fc\U0001F600\\"}"}{"stop":true}{"usage":1.5}'
+        ).encode("utf-8")
+        reference = AwsEventStreamParser()
+        expected_events = reference.feed(payload)
+        expected_tools = reference.get_tool_calls()
+        assert json.loads(expected_tools[0]["function"]["arguments"]) == {"q": "\u00fc\U0001F600"}
+
+        for split in range(len(payload) + 1):
+            parser = AwsEventStreamParser()
+            events = parser.feed(payload[:split]) + parser.feed(payload[split:])
+            assert events == expected_events, f"split={split}"
+            assert parser.get_tool_calls() == expected_tools, f"split={split}"
+
+    def test_invalid_bytes_still_ignored(self, aws_event_parser):
+        """
+        What it does: Feeds invalid UTF-8 bytes split across chunks.
+        Goal: Ensure invalid bytes are dropped without breaking later events.
+        """
+        events = aws_event_parser.feed(b'\xff')
+        events += aws_event_parser.feed(b'\xfe{"content":"ok"}\xe4')
+        events += aws_event_parser.feed(b'{"usage":2}')
+        assert events == [
+            {"type": "content", "data": "ok"},
+            {"type": "usage", "data": 2},
+        ]
+
+    def test_reset_clears_pending_partial_character(self, aws_event_parser):
+        """
+        What it does: Leaves half of a multibyte char pending, then resets.
+        Goal: Ensure reset discards decoder state so it cannot corrupt the next stream.
+        """
+        aws_event_parser.feed('{"content":"\u20ac'.encode("utf-8")[:-1])
+        aws_event_parser.reset()
+        assert aws_event_parser.buffer == ""
+        events = aws_event_parser.feed(b'{"content":"fresh"}')
+        assert events == [{"type": "content", "data": "fresh"}]
+
+    def test_non_bytes_chunk_returns_empty(self, aws_event_parser):
+        """
+        What it does: Feeds a str instead of bytes.
+        Goal: Ensure the parser returns [] instead of raising (same as before).
+        """
+        assert aws_event_parser.feed("not bytes") == []
+        assert aws_event_parser.feed(b'{"usage":1}') == [{"type": "usage", "data": 1}]
+
+
+class TestAwsEventStreamParserIncrementalScan:
+    """Tests for the resumable JSON scan in feed()."""
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 64, 1024, 4096])
+    def test_large_tool_call_chunked_equals_single_feed(self, chunk_size):
+        """
+        What it does: Feeds a large tool-call stream in chunks of various sizes.
+        Goal: Ensure chunked parsing yields exactly the same events and tool calls.
+        """
+        payload = _build_large_tool_stream(20_000)
+        expected_events, expected_tools, _ = _feed_in_chunks(payload, len(payload))
+        events, tools, parser = _feed_in_chunks(payload, chunk_size)
+        assert events == expected_events
+        assert tools == expected_tools
+        assert parser.buffer == ""
+        assert len(tools) == 1
+        assert tools[0]["id"] == "tool_big"
+        assert json.loads(tools[0]["function"]["arguments"])["nested"] == {"a": [1, {"b": "}"}]}
+
+    def test_large_event_in_small_chunks_is_fast(self):
+        """
+        What it does: Feeds a ~300KB tool-call event in 1KB chunks.
+        Goal: Guard against O(n^2) rescanning of the pending event.
+        """
+        payload = _build_large_tool_stream(300_000)
+        assert len(payload) > 300_000
+        started = time.perf_counter()
+        _, tools, _ = _feed_in_chunks(payload, 1024)
+        elapsed = time.perf_counter() - started
+        print(f"Elapsed: {elapsed:.3f}s")
+        assert len(tools) == 1
+        assert elapsed < 2.0
+
+    def test_pattern_split_across_chunks_is_found(self):
+        """
+        What it does: Splits an event prefix like '{"contextUsagePercentage":' at every offset.
+        Goal: Ensure a prefix straddling the search boundary is still detected.
+        """
+        payload = b'noise' * 10 + b'{"contextUsagePercentage":12.5}'
+        for split in range(len(payload) + 1):
+            parser = AwsEventStreamParser()
+            events = parser.feed(payload[:split])
+            events += parser.feed(payload[split:])
+            assert events == [{"type": "context_usage", "data": 12.5}], f"split={split}"
+
+    def test_garbage_only_chunks_then_event(self):
+        """
+        What it does: Feeds many garbage chunks without any event, then one event.
+        Goal: Ensure garbage is kept in buffer (semantics unchanged) and the event is still parsed.
+        """
+        parser = AwsEventStreamParser()
+        for _ in range(500):
+            assert parser.feed(b'\x00\x01:message-type event ') == []
+        assert ':message-type' in parser.buffer
+        events = parser.feed(b'{"content":"after garbage"}')
+        assert events == [{"type": "content", "data": "after garbage"}]
+        assert parser.buffer == ""
+
+    def test_split_inside_escape_sequence(self):
+        """
+        What it does: Splits right after a backslash inside a JSON string.
+        Goal: Ensure escape state survives across chunks (escaped quote not treated as end).
+        """
+        payload = b'{"content":"say \\"}\\" now"}{"usage":1}'
+        split = payload.index(b'\\') + 1
+        parser = AwsEventStreamParser()
+        events = parser.feed(payload[:split]) + parser.feed(payload[split:])
+        assert events == [
+            {"type": "content", "data": 'say "}" now'},
+            {"type": "usage", "data": 1},
+        ]
+
+    def test_nested_pattern_inside_pending_event_not_rematched(self):
+        """
+        What it does: Pending event whose string contains another event prefix, split everywhere.
+        Goal: Ensure the nested prefix is not mistaken for a new event after resuming.
+        """
+        payload = b'{"content":"text {\\"usage\\": 5} more"}'
+        for split in range(1, len(payload)):
+            parser = AwsEventStreamParser()
+            events = parser.feed(payload[:split]) + parser.feed(payload[split:])
+            assert events == [{"type": "content", "data": 'text {"usage": 5} more'}], f"split={split}"
+
+    def test_external_buffer_modification_resets_scan(self, aws_event_parser):
+        """
+        What it does: Clears the buffer directly while an event is pending.
+        Goal: Ensure stale incremental state is discarded and parsing stays correct.
+        """
+        aws_event_parser.feed(b'{"content":"partial')
+        aws_event_parser.buffer = ""
+        events = aws_event_parser.feed(b'{"content":"new"}')
+        assert events == [{"type": "content", "data": "new"}]
+
+    def test_malformed_balanced_json_is_skipped(self, aws_event_parser):
+        """
+        What it does: Feeds a brace-balanced but invalid JSON event in chunks, then a valid one.
+        Goal: Ensure invalid JSON is consumed and the next event is parsed.
+        """
+        events = aws_event_parser.feed(b'{"content": bad')
+        events += aws_event_parser.feed(b'}{"usage":3}')
+        assert events == [{"type": "usage", "data": 3}]
+        assert aws_event_parser.buffer == ""
+
+    def test_find_matching_brace_negative_start(self):
+        """
+        What it does: Passes a negative start position.
+        Goal: Ensure -1 is returned rather than indexing from the end.
+        """
+        assert find_matching_brace('{"a": 1}', -1) == -1
+
+    def test_find_matching_brace_unterminated_escape_at_end(self):
+        """
+        What it does: Text ends right after a backslash inside a string.
+        Goal: Ensure -1 is returned without errors.
+        """
+        assert find_matching_brace('{"a": "x\\', 0) == -1
+
+    def test_find_matching_brace_matches_reference_loop(self):
+        """
+        What it does: Compares the regex-based scanner to the original char loop on tricky inputs.
+        Goal: Ensure identical results for escapes, nested braces and strings.
+        """
+        def reference(text, start):
+            if start >= len(text) or text[start] != '{':
+                return -1
+            depth, in_str, esc = 0, False, False
+            for i in range(start, len(text)):
+                c = text[i]
+                if esc:
+                    esc = False
+                    continue
+                if c == '\\' and in_str:
+                    esc = True
+                    continue
+                if c == '"':
+                    in_str = not in_str
+                    continue
+                if not in_str:
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            return i
+            return -1
+
+        samples = [
+            '{}', '{{}}', '{"a":"}"}', '{"a":"\\""}', '{"a":"\\\\"}x}', '{\\}',
+            '{"a":{"b":"{"}}', '{"x": "\\\\\\"}"}', '{"unterminated', '{"a":1}}}',
+            '{ "k" : [ { } , "}" ] }tail', '{"\\u007d": 1}',
+        ]
+        for sample in samples:
+            for start in range(len(sample)):
+                assert find_matching_brace(sample, start) == reference(sample, start), (sample, start)
+
+
+class TestAwsEventStreamParserLazyLogging:
+    """Tests that debug logging does not build huge argument reprs."""
+
+    def test_finalize_uses_truncated_preview(self, aws_event_parser):
+        """
+        What it does: Finalizes a tool call with huge arguments while DEBUG logging is captured.
+        Goal: Ensure the logged preview is truncated and arguments stay intact.
+        """
+        from loguru import logger as loguru_logger
+
+        big_args = '{"data": "' + "z" * 500_000 + '"}'
+        aws_event_parser.current_tool_call = {
+            "id": "t", "type": "function",
+            "function": {"name": "f", "arguments": big_args},
+        }
+        messages = []
+        sink_id = loguru_logger.add(messages.append, level="DEBUG", format="{message}")
+        try:
+            aws_event_parser._finalize_tool_call()
+        finally:
+            loguru_logger.remove(sink_id)
+
+        assert json.loads(aws_event_parser.tool_calls[0]["function"]["arguments"]) == json.loads(big_args)
+        finalize_logs = [m for m in messages if "Finalizing tool call" in m]
+        assert len(finalize_logs) == 1
+        assert len(finalize_logs[0]) < 400
+        assert any("parsed successfully: ['data']" in m for m in messages)
+
+    def test_preview_repr_truncates(self):
+        """
+        What it does: Checks _preview_repr for strings and non-strings.
+        Goal: Ensure output never exceeds the limit.
+        """
+        assert len(_preview_repr("a" * 10_000)) <= 200
+        assert _preview_repr("ab") == "'ab'"
+        assert len(_preview_repr(list(range(10_000)))) <= 200
+        assert _preview_repr(None) == "None"

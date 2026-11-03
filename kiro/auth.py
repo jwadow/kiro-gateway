@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
@@ -63,6 +64,63 @@ SQLITE_REGISTRATION_KEYS = [
     "kirocli:odic:device-registration",
     "codewhisperer:odic:device-registration",
 ]
+
+
+# Timeout for token refresh requests: fail fast on unreachable endpoints (connect)
+# while still allowing slow-but-alive auth servers to answer (read/write/pool).
+TOKEN_REFRESH_HTTP_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+
+# SQLite degraded mode: after a refresh fails with 400 while the access token is
+# still valid, skip further refresh attempts for this many seconds.
+DEGRADED_REFRESH_BACKOFF_SECONDS = 60.0
+
+# Matches a fractional-seconds part longer than 6 digits (e.g. nanoseconds).
+_EXCESS_FRACTION_RE = re.compile(r'(\.\d{6})\d+')
+
+
+def _parse_expiry(value: str) -> Optional[datetime]:
+    """
+    Parse a token expiration timestamp into a timezone-aware datetime.
+
+    Handles the formats written by Kiro IDE and kiro-cli:
+    - Trailing 'Z' (UTC designator), which Python 3.10 fromisoformat rejects
+    - More than 6 fractional-second digits (kiro-cli writes nanoseconds)
+    - Naive timestamps (no offset), which are interpreted as UTC so that
+      comparisons with aware datetimes never raise TypeError
+
+    Args:
+        value: ISO 8601 / RFC 3339 timestamp string
+
+    Returns:
+        Timezone-aware datetime, or None if the value cannot be parsed
+        (a warning is logged in that case).
+
+    Examples:
+        >>> _parse_expiry("2099-01-01T00:00:00.123456789Z").microsecond
+        123456
+        >>> _parse_expiry("2099-01-01T00:00:00").tzinfo
+        datetime.timezone.utc
+    """
+    if not isinstance(value, str) or not value.strip():
+        logger.warning(
+            f"Failed to parse token expiry: expected non-empty string, got {type(value).__name__}"
+        )
+        return None
+
+    normalized = value.strip()
+    if normalized.endswith(('Z', 'z')):
+        normalized = normalized[:-1] + '+00:00'
+    normalized = _EXCESS_FRACTION_RE.sub(r'\1', normalized)
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as e:
+        logger.warning(f"Failed to parse token expiry '{value}': {e}")
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 class AuthType(Enum):
@@ -168,7 +226,10 @@ class KiroAuthManager:
         self._access_token: Optional[str] = None
         self._expires_at: Optional[datetime] = None
         self._lock = asyncio.Lock()
-        
+
+        # SQLite degraded mode backoff: time.monotonic() deadline, 0.0 = no backoff
+        self._next_refresh_attempt: float = 0.0
+
         # Auth type will be determined after loading credentials
         self._auth_type: AuthType = AuthType.KIRO_DESKTOP
         
@@ -307,18 +368,10 @@ class KiroAuthManager:
                         self._scopes = token_data['scopes']
                     
                     # Parse expires_at (RFC3339 format)
-                    if 'expires_at' in token_data:
-                        try:
-                            expires_str = token_data['expires_at']
-                            # Handle various ISO 8601 formats
-                            if expires_str.endswith('Z'):
-                                expires_str = expires_str.replace('Z', '+00:00')
-                            # Python 3.10 fromisoformat supports max 6 decimal places (microseconds)
-                            # kiro-cli writes nanoseconds (9 digits) — truncate to 6
-                            expires_str = re.sub(r'(\.\d{6})\d+', r'\1', expires_str)
-                            self._expires_at = datetime.fromisoformat(expires_str)
-                        except Exception as e:
-                            logger.warning(f"Failed to parse expires_at from SQLite: {e}")
+                    if token_data.get('expires_at'):
+                        parsed_expiry = _parse_expiry(token_data['expires_at'])
+                        if parsed_expiry is not None:
+                            self._expires_at = parsed_expiry
             
             # Load device registration (client_id, client_secret) - try all possible keys
             registration_row = None
@@ -439,16 +492,10 @@ class KiroAuthManager:
                 self._client_secret = data['clientSecret']
             
             # Parse expiresAt
-            if 'expiresAt' in data:
-                try:
-                    expires_str = data['expiresAt']
-                    # Support for different date formats
-                    if expires_str.endswith('Z'):
-                        self._expires_at = datetime.fromisoformat(expires_str.replace('Z', '+00:00'))
-                    else:
-                        self._expires_at = datetime.fromisoformat(expires_str)
-                except Exception as e:
-                    logger.warning(f"Failed to parse expiresAt: {e}")
+            if data.get('expiresAt'):
+                parsed_expiry = _parse_expiry(data['expiresAt'])
+                if parsed_expiry is not None:
+                    self._expires_at = parsed_expiry
             
             logger.info(f"Credentials loaded from {file_path}")
             
@@ -631,6 +678,22 @@ class KiroAuthManager:
             logger.debug(f"Failed to save to key {key}: {e}")
             return False
     
+    async def _persist_credentials(self) -> None:
+        """
+        Persist refreshed credentials without blocking the event loop.
+
+        Runs the synchronous SQLite or JSON writer in a worker thread. Callers
+        hold ``self._lock``, so no other refresh mutates the fields being written.
+        """
+        if self._sqlite_db:
+            await asyncio.to_thread(self._save_credentials_to_sqlite)
+        else:
+            await asyncio.to_thread(self._save_credentials_to_file)
+
+    async def _reload_credentials_from_sqlite(self) -> None:
+        """Reload credentials from the SQLite database in a worker thread."""
+        await asyncio.to_thread(self._load_credentials_from_sqlite, self._sqlite_db)
+
     def is_token_expiring_soon(self) -> bool:
         """
         Checks if the token is expiring soon.
@@ -705,7 +768,7 @@ class KiroAuthManager:
             "User-Agent": f"KiroIDE-0.7.45-{self._fingerprint}",
         }
         
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=TOKEN_REFRESH_HTTP_TIMEOUT) as client:
             response = await client.post(self._refresh_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -716,7 +779,8 @@ class KiroAuthManager:
         new_profile_arn = data.get("profileArn")
         
         if not new_access_token:
-            raise ValueError(f"Response does not contain accessToken: {data}")
+            # Never include the body itself: it may contain a refreshToken
+            raise ValueError(f"Response does not contain accessToken (keys: {list(data.keys())})")
         
         # Update data
         self._access_token = new_access_token
@@ -734,11 +798,8 @@ class KiroAuthManager:
         
         logger.info(f"Token refreshed via Kiro Desktop Auth, expires: {self._expires_at.isoformat()}")
         
-        # Save to file or SQLite depending on configuration
-        if self._sqlite_db:
-            self._save_credentials_to_sqlite()
-        else:
-            self._save_credentials_to_file()
+        # Save to file or SQLite depending on configuration (off the event loop)
+        await self._persist_credentials()
     
     async def _refresh_token_aws_sso_oidc(self) -> None:
         """
@@ -769,7 +830,7 @@ class KiroAuthManager:
             # 400 = invalid_request, likely stale token after kiro-cli re-login
             if e.response.status_code == 400 and self._sqlite_db:
                 logger.warning("Token refresh failed with 400, reloading credentials from SQLite and retrying...")
-                self._load_credentials_from_sqlite(self._sqlite_db)
+                await self._reload_credentials_from_sqlite()
                 await self._do_aws_sso_oidc_refresh()
             else:
                 raise
@@ -822,7 +883,7 @@ class KiroAuthManager:
         logger.debug(f"AWS SSO OIDC refresh request: url={url}, sso_region={sso_region}, "
                      f"api_region={self._region}, client_id={self._client_id[:8]}...")
         
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=TOKEN_REFRESH_HTTP_TIMEOUT) as client:
             response = await client.post(url, json=payload, headers=headers)
             
             # Log response details for debugging (especially on errors)
@@ -849,7 +910,10 @@ class KiroAuthManager:
         expires_in = result.get("expiresIn", 3600)
         
         if not new_access_token:
-            raise ValueError(f"AWS SSO OIDC response does not contain accessToken: {result}")
+            # Never include the body itself: it may contain a refreshToken
+            raise ValueError(
+                f"AWS SSO OIDC response does not contain accessToken (keys: {list(result.keys())})"
+            )
         
         # Update data
         self._access_token = new_access_token
@@ -861,11 +925,8 @@ class KiroAuthManager:
         
         logger.info(f"Token refreshed via AWS SSO OIDC, expires: {self._expires_at.isoformat()}")
         
-        # Save to file or SQLite depending on configuration
-        if self._sqlite_db:
-            self._save_credentials_to_sqlite()
-        else:
-            self._save_credentials_to_file()
+        # Save to file or SQLite depending on configuration (off the event loop)
+        await self._persist_credentials()
     
     async def get_access_token(self) -> str:
         """
@@ -889,11 +950,23 @@ class KiroAuthManager:
             # Token is valid and not expiring soon - just return it
             if self._access_token and not self.is_token_expiring_soon():
                 return self._access_token
-            
+
+            # SQLite degraded mode: a recent refresh failed but the token still works.
+            # Skip refresh attempts until the backoff ends instead of retrying two
+            # failing refreshes on every request.
+            if (
+                self._sqlite_db
+                and self._access_token
+                and not self.is_token_expired()
+                and time.monotonic() < self._next_refresh_attempt
+            ):
+                logger.debug("SQLite degraded mode: refresh backoff active, using existing access_token")
+                return self._access_token
+
             # SQLite mode: reload credentials first, kiro-cli might have updated them
             if self._sqlite_db and self.is_token_expiring_soon():
                 logger.debug("SQLite mode: reloading credentials before refresh attempt")
-                self._load_credentials_from_sqlite(self._sqlite_db)
+                await self._reload_credentials_from_sqlite()
                 # Check if reloaded token is now valid
                 if self._access_token and not self.is_token_expiring_soon():
                     logger.debug("SQLite reload provided fresh token, no refresh needed")
@@ -912,8 +985,10 @@ class KiroAuthManager:
                     )
                     # Check if access_token is still usable
                     if self._access_token and not self.is_token_expired():
+                        self._next_refresh_attempt = time.monotonic() + DEGRADED_REFRESH_BACKOFF_SECONDS
                         logger.warning(
-                            "Using existing access_token until it expires. "
+                            "Using existing access_token until it expires "
+                            f"(next refresh attempt in {int(DEGRADED_REFRESH_BACKOFF_SECONDS)}s). "
                             "Run 'kiro-cli login' when convenient to refresh credentials."
                         )
                         return self._access_token
@@ -924,10 +999,10 @@ class KiroAuthManager:
                         )
                 # Non-SQLite mode or non-400 error - propagate the exception
                 raise
-            except Exception:
-                # For any other exception, propagate it
-                raise
-            
+
+            # A successful refresh ends any degraded-mode backoff
+            self._next_refresh_attempt = 0.0
+
             if not self._access_token:
                 raise ValueError("Failed to obtain access token")
             
@@ -938,12 +1013,26 @@ class KiroAuthManager:
         Forces a token refresh.
         
         Used when receiving a 403 error from the API.
-        
+
+        Concurrent callers are deduplicated: the token seen before waiting for
+        the lock is remembered, and if another caller replaced it with a new,
+        unexpired token while this one waited, that token is returned without
+        a second network refresh.
+
         Returns:
             New access token
         """
+        token_before = self._access_token
         async with self._lock:
+            if (
+                self._access_token
+                and self._access_token != token_before
+                and not self.is_token_expired()
+            ):
+                logger.debug("Token already refreshed by a concurrent request, skipping duplicate refresh")
+                return self._access_token
             await self._refresh_token_request()
+            self._next_refresh_attempt = 0.0
             return self._access_token
     
     @property

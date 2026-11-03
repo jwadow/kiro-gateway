@@ -34,9 +34,11 @@ Reference: https://docs.anthropic.com/en/api/messages-streaming
 import json
 import time
 import uuid
+from contextlib import aclosing
 from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
 
 import httpx
+from fastapi import HTTPException
 from loguru import logger
 
 from kiro.streaming_core import (
@@ -46,8 +48,13 @@ from kiro.streaming_core import (
     KiroEvent,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
+    anthropic_error_type_for_status,
+    ANTHROPIC_DEFAULT_ERROR_TYPE,
+    create_stop_sequence_matcher,
+    apply_stop_sequences,
+    estimate_request_tokens_offloaded,
 )
-from kiro.tokenizer import count_tokens, estimate_request_tokens
+from kiro.tokenizer import count_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
 
@@ -98,6 +105,116 @@ def generate_thinking_signature() -> str:
     return f"sig_{uuid.uuid4().hex[:32]}"
 
 
+class AnthropicStreamError(Exception):
+    """
+    Error raised by the Anthropic streaming layer with Anthropic error metadata.
+
+    str(error) is the Anthropic error JSON ({"type": "error", "error": {...}}),
+    exactly as before this class existed, so existing callers that parse the
+    message keep working. New callers can read status_code / error_type /
+    message directly.
+
+    Attributes:
+        status_code: HTTP status code (upstream or gateway)
+        error_type: Anthropic error type (e.g. "rate_limit_error")
+        message: Human-readable error message
+    """
+
+    def __init__(self, status_code: int, error_type: str, message: str) -> None:
+        """
+        Initialize the error.
+
+        Args:
+            status_code: HTTP status code
+            error_type: Anthropic error type
+            message: Human-readable error message
+        """
+        self.status_code = status_code
+        self.error_type = error_type
+        self.message = message
+        super().__init__(json.dumps({
+            "type": "error",
+            "error": {"type": error_type, "message": message}
+        }))
+
+
+def anthropic_error_type_for_exception(error: BaseException) -> str:
+    """
+    Pick the Anthropic error type for an exception raised mid-stream.
+
+    Uses the HTTP status carried by the exception when there is one
+    (AnthropicStreamError, FastAPI HTTPException, httpx.HTTPStatusError).
+    Anything else is an internal failure and maps to "api_error".
+
+    Args:
+        error: Exception raised while streaming
+
+    Returns:
+        Anthropic error type string
+    """
+    if isinstance(error, AnthropicStreamError):
+        return error.error_type
+    if isinstance(error, HTTPException):
+        return anthropic_error_type_for_status(error.status_code)
+    if isinstance(error, httpx.HTTPStatusError):
+        return anthropic_error_type_for_status(error.response.status_code)
+    return ANTHROPIC_DEFAULT_ERROR_TYPE
+
+
+def _resolve_stop_reason(
+    content_was_truncated: bool,
+    has_tool_use: bool,
+    matched_stop_sequence: Optional[str],
+) -> str:
+    """
+    Determine the Anthropic stop_reason (shared by streaming and non-streaming).
+
+    Priority: truncation > tool_use > stop_sequence > end_turn.
+
+    Args:
+        content_was_truncated: Upstream ended without completion signals
+        has_tool_use: At least one tool_use block was produced
+        matched_stop_sequence: Stop sequence that ended the text, if any
+
+    Returns:
+        Anthropic stop_reason value
+    """
+    if content_was_truncated:
+        return "max_tokens"
+    if has_tool_use:
+        return "tool_use"
+    if matched_stop_sequence is not None:
+        return "stop_sequence"
+    return "end_turn"
+
+
+async def _estimate_input_tokens(
+    request_messages: Optional[list],
+    request_tools: Optional[list],
+    request_system: Optional[Any],
+) -> int:
+    """
+    Estimate input tokens from the full request without blocking the event loop.
+
+    Args:
+        request_messages: Original request messages
+        request_tools: Original request tools
+        request_system: Original system prompt
+
+    Returns:
+        Estimated input token count (0 when there is nothing to count)
+    """
+    if not (request_messages or request_tools or request_system):
+        return 0
+    request_token_stats = await estimate_request_tokens_offloaded(
+        messages=request_messages or [],
+        tools=request_tools,
+        system_prompt=request_system,
+        apply_claude_correction=False
+    )
+    return request_token_stats["total_tokens"]
+
+
 def _extract_cache_usage_fields(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
     """
     Extract cache token fields from upstream usage (if present).
@@ -135,14 +252,19 @@ async def stream_kiro_to_anthropic(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    stop_sequences: Optional[List[str]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
-    
+
     Parses Kiro AWS SSE stream and converts events to Anthropic format.
     Supports thinking content blocks when FAKE_REASONING_HANDLING=as_reasoning_content.
-    
+
+    If the stream fails after message_start, an `event: error` is emitted with
+    the Anthropic error type mapped from the failure (see
+    anthropic_error_type_for_exception), then the exception is re-raised.
+
     Args:
         response: HTTP response with data stream
         model: Model name to include in response
@@ -153,10 +275,13 @@ async def stream_kiro_to_anthropic(
         request_tools: Original request tools (for token counting)
         request_system: Original system prompt (for token counting)
         conversation_id: Stable conversation ID for truncation recovery (optional)
-    
+        stop_sequences: Optional gateway-side stop sequences, applied to text only.
+                        On a match: stop_reason "stop_sequence" and stop_sequence set.
+                        None = disabled (native behaviour).
+
     Yields:
         Strings in Anthropic SSE format
-    
+
     Raises:
         FirstTokenTimeoutError: If first token not received within timeout
     """
@@ -172,16 +297,12 @@ async def stream_kiro_to_anthropic(
     # Accuracy: ~85-90% (acceptable trade-off for maintaining streaming capability).
     # See: https://docs.anthropic.com/en/api/messages-streaming
     
-    # Fallback estimation must cover messages/tools/system to avoid significant undercount
-    if request_messages or request_tools or request_system:
-        request_token_stats = estimate_request_tokens(
-            messages=request_messages or [],
-            tools=request_tools,
-            system_prompt=request_system,
-            apply_claude_correction=False
-        )
-        input_tokens = request_token_stats["total_tokens"]
-    
+    # Fallback estimation must cover messages/tools/system to avoid significant undercount.
+    # It runs off the event loop: tiktoken over a long history is CPU-bound.
+    input_tokens = await _estimate_input_tokens(request_messages, request_tools, request_system)
+
+    stop_matcher = create_stop_sequence_matcher(stop_sequences)
+
     # Track content blocks - thinking block is index 0, text block is index 1 (when thinking enabled)
     current_block_index = 0
     thinking_block_started = False
@@ -220,77 +341,15 @@ async def stream_kiro_to_anthropic(
             }
         })
         
-        async for event in parse_kiro_stream(response, first_token_timeout):
-            if event.type == "content":
-                content = event.content or ""
-                full_content += content
+        # apply_stop_sequences is a pure pass-through when stop_matcher is None
+        event_stream = apply_stop_sequences(parse_kiro_stream(response, first_token_timeout), stop_matcher)
+        async with aclosing(event_stream) as events:
+            async for event in events:
+                if event.type == "content":
+                    content = event.content or ""
+                    full_content += content
                 
-                # Close thinking block if it was open and we're now getting regular content
-                if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": thinking_block_index
-                    })
-                    thinking_block_started = False
-                    current_block_index += 1
-                
-                # Start text block if not started
-                if not text_block_started:
-                    text_block_index = current_block_index
-                    yield format_sse_event("content_block_start", {
-                        "type": "content_block_start",
-                        "index": text_block_index,
-                        "content_block": {
-                            "type": "text",
-                            "text": ""
-                        }
-                    })
-                    text_block_started = True
-                
-                # Send content delta
-                if content:
-                    yield format_sse_event("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": text_block_index,
-                        "delta": {
-                            "type": "text_delta",
-                            "text": content
-                        }
-                    })
-            
-            elif event.type == "thinking":
-                thinking_content = event.thinking_content or ""
-                full_thinking_content += thinking_content
-                
-                # Handle thinking content based on mode
-                if FAKE_REASONING_HANDLING == "as_reasoning_content":
-                    # Use native Anthropic thinking content blocks
-                    if not thinking_block_started:
-                        thinking_block_index = current_block_index
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": thinking_block_index,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": "",
-                                "signature": thinking_signature
-                            }
-                        })
-                        thinking_block_started = True
-                    
-                    if thinking_content:
-                        yield format_sse_event("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": thinking_block_index,
-                            "delta": {
-                                "type": "thinking_delta",
-                                "thinking": thinking_content
-                            }
-                        })
-                
-                elif FAKE_REASONING_HANDLING == "include_as_text":
-                    # Include thinking as regular text content
-                    # Close thinking block if it was open (shouldn't happen in this mode)
+                    # Close thinking block if it was open and we're now getting regular content
                     if thinking_block_started and thinking_block_index is not None:
                         yield format_sse_event("content_block_stop", {
                             "type": "content_block_stop",
@@ -298,7 +357,7 @@ async def stream_kiro_to_anthropic(
                         })
                         thinking_block_started = False
                         current_block_index += 1
-                    
+                
                     # Start text block if not started
                     if not text_block_started:
                         text_block_index = current_block_index
@@ -311,217 +370,282 @@ async def stream_kiro_to_anthropic(
                             }
                         })
                         text_block_started = True
-                    
-                    if thinking_content:
+                
+                    # Send content delta
+                    if content:
                         yield format_sse_event("content_block_delta", {
                             "type": "content_block_delta",
                             "index": text_block_index,
                             "delta": {
                                 "type": "text_delta",
-                                "text": thinking_content
+                                "text": content
                             }
                         })
-                # For "strip" mode, we just skip the thinking content
             
-            elif event.type == "tool_use" and event.tool_use:
-                # Close thinking block if open
-                if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": thinking_block_index
-                    })
-                    thinking_block_started = False
-                    current_block_index += 1
+                elif event.type == "thinking":
+                    thinking_content = event.thinking_content or ""
+                    full_thinking_content += thinking_content
                 
-                # Close text block if open
-                if text_block_started and text_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": text_block_index
-                    })
-                    text_block_started = False
-                    current_block_index += 1
-                
-                tool = event.tool_use
-                tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
-                tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
-                tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
-                
-                # ==============================================================================
-                # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
-                # ==============================================================================
-                
-                # INTERCEPT web_search tool calls (Path B - MCP emulation)
-                if tool_name == "web_search":
-                    from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
+                    # Handle thinking content based on mode
+                    if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                        # Use native Anthropic thinking content blocks
+                        if not thinking_block_started:
+                            thinking_block_index = current_block_index
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": thinking_block_index,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": "",
+                                    "signature": thinking_signature
+                                }
+                            })
+                            thinking_block_started = True
                     
-                    logger.info("Intercepted web_search tool call (Path B - MCP emulation)")
+                        if thinking_content:
+                            yield format_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": thinking_block_index,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": thinking_content
+                                }
+                            })
+                
+                    elif FAKE_REASONING_HANDLING == "include_as_text":
+                        # Include thinking as regular text content
+                        # Close thinking block if it was open (shouldn't happen in this mode)
+                        if thinking_block_started and thinking_block_index is not None:
+                            yield format_sse_event("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": thinking_block_index
+                            })
+                            thinking_block_started = False
+                            current_block_index += 1
                     
-                    # Parse tool_input if string
+                        # Start text block if not started
+                        if not text_block_started:
+                            text_block_index = current_block_index
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": text_block_index,
+                                "content_block": {
+                                    "type": "text",
+                                    "text": ""
+                                }
+                            })
+                            text_block_started = True
+                    
+                        if thinking_content:
+                            yield format_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": text_block_index,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": thinking_content
+                                }
+                            })
+                    # For "strip" mode, we just skip the thinking content
+            
+                elif event.type == "tool_use" and event.tool_use:
+                    # Close thinking block if open
+                    if thinking_block_started and thinking_block_index is not None:
+                        yield format_sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": thinking_block_index
+                        })
+                        thinking_block_started = False
+                        current_block_index += 1
+                
+                    # Close text block if open
+                    if text_block_started and text_block_index is not None:
+                        yield format_sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": text_block_index
+                        })
+                        text_block_started = False
+                        current_block_index += 1
+                
+                    tool = event.tool_use
+                    tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+                    tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
+                    tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
+                
+                    # ==============================================================================
+                    # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
+                    # ==============================================================================
+                
+                    # INTERCEPT web_search tool calls (Path B - MCP emulation)
+                    if tool_name == "web_search":
+                        from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
+                    
+                        logger.info("Intercepted web_search tool call (Path B - MCP emulation)")
+                    
+                        # Parse tool_input if string
+                        if isinstance(tool_input, str):
+                            try:
+                                tool_input = json.loads(tool_input)
+                            except json.JSONDecodeError:
+                                tool_input = {}
+                    
+                        # Extract query
+                        query = tool_input.get("query", "")
+                        if not query:
+                            logger.warning("web_search called without query, skipping MCP call")
+                            continue
+                    
+                        logger.debug(f"WebSearch query (Path B): {query}")
+                    
+                        # Call MCP API
+                        mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
+                    
+                        if results is None:
+                            logger.error("MCP API call failed for web_search")
+                            # Continue with normal tool_use processing (will show error to user)
+                        else:
+                            # Emit server_tool_use + web_search_tool_result + text summary
+                            # (full SSE sequence as in mcp_tools.py)
+                        
+                            # Event: content_block_start (server_tool_use)
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": current_block_index,
+                                "content_block": {
+                                    "id": mcp_tool_use_id,
+                                    "type": "server_tool_use",
+                                    "name": "web_search",
+                                    "input": {}
+                                }
+                            })
+                        
+                            # Event: content_block_delta (input_json_delta)
+                            yield format_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": current_block_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": json.dumps({"query": query})
+                                }
+                            })
+                        
+                            # Event: content_block_stop (server_tool_use)
+                            yield format_sse_event("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": current_block_index
+                            })
+                            current_block_index += 1
+                        
+                            # Event: content_block_start (web_search_tool_result)
+                            search_content = []
+                            for r in results.get("results", []):
+                                search_content.append({
+                                    "type": "web_search_result",
+                                    "title": r.get("title", ""),
+                                    "url": r.get("url", ""),
+                                    "encrypted_content": r.get("snippet", ""),
+                                    "page_age": None
+                                })
+                        
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": current_block_index,
+                                "content_block": {
+                                    "type": "web_search_tool_result",
+                                    "tool_use_id": mcp_tool_use_id,
+                                    "content": search_content
+                                }
+                            })
+                        
+                            # Event: content_block_stop (web_search_tool_result)
+                            yield format_sse_event("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": current_block_index
+                            })
+                            current_block_index += 1
+                        
+                            # Event: content_block_start (text)
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": current_block_index,
+                                "content_block": {"type": "text", "text": ""}
+                            })
+                        
+                            # Events: content_block_delta (text_delta) - stream summary
+                            summary = generate_search_summary(query, results)
+                            chunk_size = 100
+                            for i in range(0, len(summary), chunk_size):
+                                chunk = summary[i:i + chunk_size]
+                                yield format_sse_event("content_block_delta", {
+                                    "type": "content_block_delta",
+                                    "index": current_block_index,
+                                    "delta": {"type": "text_delta", "text": chunk}
+                                })
+                        
+                            # Event: content_block_stop (text)
+                            yield format_sse_event("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": current_block_index
+                            })
+                            current_block_index += 1
+                        
+                            # Skip normal tool_use processing
+                            continue
+                
+                    # Check if this tool was truncated
+                    if tool.get('_truncation_detected'):
+                        truncated_tools.append({
+                            "id": tool_id,
+                            "name": tool_name,
+                            "truncation_info": tool.get('_truncation_info', {})
+                        })
+                
+                    # Parse arguments if string
                     if isinstance(tool_input, str):
                         try:
                             tool_input = json.loads(tool_input)
                         except json.JSONDecodeError:
                             tool_input = {}
-                    
-                    # Extract query
-                    query = tool_input.get("query", "")
-                    if not query:
-                        logger.warning("web_search called without query, skipping MCP call")
-                        continue
-                    
-                    logger.debug(f"WebSearch query (Path B): {query}")
-                    
-                    # Call MCP API
-                    mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
-                    
-                    if results is None:
-                        logger.error("MCP API call failed for web_search")
-                        # Continue with normal tool_use processing (will show error to user)
-                    else:
-                        # Emit server_tool_use + web_search_tool_result + text summary
-                        # (full SSE sequence as in mcp_tools.py)
-                        
-                        # Event: content_block_start (server_tool_use)
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {
-                                "id": mcp_tool_use_id,
-                                "type": "server_tool_use",
-                                "name": "web_search",
-                                "input": {}
-                            }
-                        })
-                        
-                        # Event: content_block_delta (input_json_delta)
-                        yield format_sse_event("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": current_block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": json.dumps({"query": query})
-                            }
-                        })
-                        
-                        # Event: content_block_stop (server_tool_use)
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": current_block_index
-                        })
-                        current_block_index += 1
-                        
-                        # Event: content_block_start (web_search_tool_result)
-                        search_content = []
-                        for r in results.get("results", []):
-                            search_content.append({
-                                "type": "web_search_result",
-                                "title": r.get("title", ""),
-                                "url": r.get("url", ""),
-                                "encrypted_content": r.get("snippet", ""),
-                                "page_age": None
-                            })
-                        
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {
-                                "type": "web_search_tool_result",
-                                "tool_use_id": mcp_tool_use_id,
-                                "content": search_content
-                            }
-                        })
-                        
-                        # Event: content_block_stop (web_search_tool_result)
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": current_block_index
-                        })
-                        current_block_index += 1
-                        
-                        # Event: content_block_start (text)
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {"type": "text", "text": ""}
-                        })
-                        
-                        # Events: content_block_delta (text_delta) - stream summary
-                        summary = generate_search_summary(query, results)
-                        chunk_size = 100
-                        for i in range(0, len(summary), chunk_size):
-                            chunk = summary[i:i + chunk_size]
-                            yield format_sse_event("content_block_delta", {
-                                "type": "content_block_delta",
-                                "index": current_block_index,
-                                "delta": {"type": "text_delta", "text": chunk}
-                            })
-                        
-                        # Event: content_block_stop (text)
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": current_block_index
-                        })
-                        current_block_index += 1
-                        
-                        # Skip normal tool_use processing
-                        continue
                 
-                # Check if this tool was truncated
-                if tool.get('_truncation_detected'):
-                    truncated_tools.append({
-                        "id": tool_id,
-                        "name": tool_name,
-                        "truncation_info": tool.get('_truncation_info', {})
+                    # Send tool_use block start
+                    yield format_sse_event("content_block_start", {
+                        "type": "content_block_start",
+                        "index": current_block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": tool_name,
+                            "input": {}
+                        }
                     })
                 
-                # Parse arguments if string
-                if isinstance(tool_input, str):
-                    try:
-                        tool_input = json.loads(tool_input)
-                    except json.JSONDecodeError:
-                        tool_input = {}
+                    # Send tool input as delta
+                    input_json = json.dumps(tool_input, ensure_ascii=False)
+                    yield format_sse_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": current_block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": input_json
+                        }
+                    })
                 
-                # Send tool_use block start
-                yield format_sse_event("content_block_start", {
-                    "type": "content_block_start",
-                    "index": current_block_index,
-                    "content_block": {
-                        "type": "tool_use",
+                    # Close tool block
+                    yield format_sse_event("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": current_block_index
+                    })
+                
+                    tool_blocks.append({
                         "id": tool_id,
                         "name": tool_name,
-                        "input": {}
-                    }
-                })
-                
-                # Send tool input as delta
-                input_json = json.dumps(tool_input, ensure_ascii=False)
-                yield format_sse_event("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": current_block_index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": input_json
-                    }
-                })
-                
-                # Close tool block
-                yield format_sse_event("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": current_block_index
-                })
-                
-                tool_blocks.append({
-                    "id": tool_id,
-                    "name": tool_name,
-                    "input": tool_input
-                })
-                current_block_index += 1
+                        "input": tool_input
+                    })
+                    current_block_index += 1
             
-            elif event.type == "context_usage" and event.context_usage_percentage is not None:
-                context_usage_percentage = event.context_usage_percentage
-            elif event.type == "usage" and event.usage:
-                upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
+                elif event.type == "context_usage" and event.context_usage_percentage is not None:
+                    context_usage_percentage = event.context_usage_percentage
+                elif event.type == "usage" and event.usage:
+                    upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
         
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
@@ -606,13 +730,18 @@ async def stream_kiro_to_anthropic(
                 "index": text_block_index
             })
         
-        # Detect content truncation (missing completion signals)
+        matched_stop_sequence = stop_matcher.matched if stop_matcher is not None else None
+
+        # Detect content truncation (missing completion signals).
+        # A stop sequence match ends the stream on purpose before completion
+        # signals arrive, so it is never treated as truncation.
         content_was_truncated = (
+            matched_stop_sequence is None and
             not stream_completed_normally and
             len(full_content) > 0 and
             not tool_blocks  # Don't confuse with tool call truncation
         )
-        
+
         if content_was_truncated:
             from kiro.config import TRUNCATION_RECOVERY
             logger.error(
@@ -635,13 +764,11 @@ async def stream_kiro_to_anthropic(
                 input_tokens = prompt_tokens
         
         # Determine stop reason (truncation has highest priority)
-        if content_was_truncated:
-            stop_reason = "max_tokens"
-        elif tool_blocks:
-            stop_reason = "tool_use"
-        else:
-            stop_reason = "end_turn"
-        
+        stop_reason = _resolve_stop_reason(content_was_truncated, bool(tool_blocks), matched_stop_sequence)
+        reported_stop_sequence = matched_stop_sequence if stop_reason == "stop_sequence" else None
+        if matched_stop_sequence is not None:
+            logger.info(f"Generation ended by stop sequence {matched_stop_sequence!r} (stop_reason={stop_reason})")
+
         # Send message_delta with stop_reason and usage
         usage_payload = {
             "output_tokens": output_tokens
@@ -652,7 +779,7 @@ async def stream_kiro_to_anthropic(
             "type": "message_delta",
             "delta": {
                 "stop_reason": stop_reason,
-                "stop_sequence": None
+                "stop_sequence": reported_stop_sequence
             },
             "usage": usage_payload
         })
@@ -700,14 +827,26 @@ async def stream_kiro_to_anthropic(
     except Exception as e:
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "(empty message)"
-        logger.error(f"Error during Anthropic streaming: [{error_type}] {error_msg}", exc_info=True)
-        
-        # Send error event
+        # Positional args: loguru treats curly braces in an f-string message
+        # (e.g. an upstream JSON error body) as format fields and raises KeyError,
+        # which would prevent the error event below from being sent.
+        logger.error("Error during Anthropic streaming: [{}] {}", error_type, error_msg, exc_info=True)
+
+        # Send error event with the Anthropic error type for this failure.
+        # Errors with an HTTP status keep their message; anything else is an
+        # internal gateway failure.
+        anthropic_error_type = anthropic_error_type_for_exception(e)
+        if isinstance(e, AnthropicStreamError):
+            client_message = e.message
+        elif isinstance(e, HTTPException):
+            client_message = str(e.detail)
+        else:
+            client_message = f"Internal error: {error_msg}"
         yield format_sse_event("error", {
             "type": "error",
             "error": {
-                "type": "api_error",
-                "message": f"Internal error: {error_msg}"
+                "type": anthropic_error_type,
+                "message": client_message
             }
         })
         raise
@@ -725,13 +864,14 @@ async def collect_anthropic_response(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    stop_sequences: Optional[List[str]] = None,
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
-    
+
     Used for non-streaming mode.
-    
+
     Args:
         response: HTTP response with stream
         model: Model name
@@ -740,25 +880,24 @@ async def collect_anthropic_response(
         request_messages: Original request messages (for token counting)
         request_tools: Original request tools (for token counting)
         request_system: Original system prompt (for token counting)
-    
+        stop_sequences: Optional gateway-side stop sequences, applied to text only.
+                        On a match: stop_reason "stop_sequence" and stop_sequence set.
+                        None = disabled (native behaviour).
+
     Returns:
         Dictionary with full response in Anthropic Messages format
     """
     message_id = generate_message_id()
-    
-    # Non-streaming uses the same full-request estimation as streaming
-    input_tokens = 0
-    if request_messages or request_tools or request_system:
-        request_token_stats = estimate_request_tokens(
-            messages=request_messages or [],
-            tools=request_tools,
-            system_prompt=request_system,
-            apply_claude_correction=False
-        )
-        input_tokens = request_token_stats["total_tokens"]
-    
+
+    # Non-streaming uses the same full-request estimation as streaming (off the event loop)
+    input_tokens = await _estimate_input_tokens(request_messages, request_tools, request_system)
+
     # Collect stream result
-    result = await collect_stream_to_result(response)
+    if stop_sequences is None:
+        result = await collect_stream_to_result(response)
+    else:
+        result = await collect_stream_to_result(response, stop_sequences=stop_sequences)
+    matched_stop_sequence = result.stop_sequence
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
     
     # Build content blocks
@@ -815,9 +954,11 @@ async def collect_anthropic_response(
         if prompt_source != "unknown":
             input_tokens = prompt_tokens
     
-    # Detect content truncation (missing completion signals)
+    # Detect content truncation (missing completion signals).
+    # A stop sequence match ends collection on purpose, so it is never truncation.
     stream_completed_normally = result.context_usage_percentage is not None
     content_was_truncated = (
+        matched_stop_sequence is None and
         not stream_completed_normally and
         len(result.content) > 0 and
         not result.tool_calls  # Don't confuse with tool call truncation
@@ -832,12 +973,10 @@ async def collect_anthropic_response(
         )
     
     # Determine stop reason (truncation has highest priority)
-    if content_was_truncated:
-        stop_reason = "max_tokens"
-    elif result.tool_calls:
-        stop_reason = "tool_use"
-    else:
-        stop_reason = "end_turn"
+    stop_reason = _resolve_stop_reason(content_was_truncated, bool(result.tool_calls), matched_stop_sequence)
+    reported_stop_sequence = matched_stop_sequence if stop_reason == "stop_sequence" else None
+    if matched_stop_sequence is not None:
+        logger.info(f"Generation ended by stop sequence {matched_stop_sequence!r} (stop_reason={stop_reason})")
     
     logger.debug(
         f"[Anthropic Non-Streaming] Completed: "
@@ -858,7 +997,7 @@ async def collect_anthropic_response(
         "content": content_blocks,
         "model": model,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
+        "stop_sequence": reported_stop_sequence,
         "usage": usage_payload
     }
 
@@ -873,13 +1012,15 @@ async def stream_with_first_token_retry_anthropic(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    stop_sequences: Optional[List[str]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
     
-    If model doesn't respond within first_token_timeout seconds,
+    If model doesn't respond within the first token timeout,
     request is cancelled and a new one is made. Maximum max_retries attempts.
+    The timeout grows per attempt: first_token_timeout * (attempt + 1).
     
     This is seamless for user - they just see a delay,
     but eventually get a response (or error after all attempts).
@@ -896,48 +1037,55 @@ async def stream_with_first_token_retry_anthropic(
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
         request_system: Original system prompt (for fallback token counting)
+        stop_sequences: Optional gateway-side stop sequences (None = disabled)
     
     Yields:
         Strings in Anthropic SSE format
     
     Raises:
-        Exception with Anthropic error format after exhausting all attempts
+        AnthropicStreamError: str() is the Anthropic error JSON. Raised on an
+            upstream HTTP error (error type mapped from the status code) or after
+            exhausting all attempts (type "timeout_error", status 504).
     """
     def create_http_error(status_code: int, error_text: str) -> Exception:
         """Create exception for HTTP errors in Anthropic format."""
-        return Exception(json.dumps({
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": f"Upstream API error: {error_text}"
-            }
-        }))
+        return AnthropicStreamError(
+            status_code=status_code,
+            error_type=anthropic_error_type_for_status(status_code),
+            message=f"Upstream API error: {error_text}",
+        )
     
     def create_timeout_error(retries: int, timeout: float) -> Exception:
         """Create exception for timeout errors in Anthropic format."""
-        return Exception(json.dumps({
-            "type": "error",
-            "error": {
-                "type": "timeout_error",
-                "message": f"Model did not respond within {timeout}s after {retries} attempts. Please try again."
-            }
-        }))
+        return AnthropicStreamError(
+            status_code=504,
+            error_type="timeout_error",
+            message=f"Model did not respond within {timeout}s after {retries} attempts. Please try again.",
+        )
     
-    async def stream_processor(response: httpx.Response) -> AsyncGenerator[str, None]:
+    # Only forward stop_sequences when set, so the call stays identical to the
+    # previous one when the feature is not used.
+    extra_kwargs: Dict[str, Any] = {}
+    if stop_sequences is not None:
+        extra_kwargs["stop_sequences"] = stop_sequences
+    
+    async def stream_processor(response: httpx.Response, attempt_timeout: float) -> AsyncGenerator[str, None]:
         """Process response and yield Anthropic SSE chunks."""
-        async for chunk in stream_kiro_to_anthropic(
+        async with aclosing(stream_kiro_to_anthropic(
             response,
             model,
             model_cache,
             auth_manager,
-            first_token_timeout=first_token_timeout,
+            first_token_timeout=attempt_timeout,
             request_messages=request_messages,
             request_tools=request_tools,
             request_system=request_system,
-        ):
-            yield chunk
+            **extra_kwargs,
+        )) as chunks:
+            async for chunk in chunks:
+                yield chunk
     
-    async for chunk in stream_with_first_token_retry(
+    async with aclosing(stream_with_first_token_retry(
         make_request=make_request,
         stream_processor=stream_processor,
         initial_response=initial_response,
@@ -945,5 +1093,7 @@ async def stream_with_first_token_retry_anthropic(
         first_token_timeout=first_token_timeout,
         on_http_error=create_http_error,
         on_all_retries_failed=create_timeout_error,
-    ):
-        yield chunk
+        timeout_aware_processor=True,
+    )) as chunks:
+        async for chunk in chunks:
+            yield chunk

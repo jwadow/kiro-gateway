@@ -1117,3 +1117,180 @@ class TestWarmUpTokenizer:
         with patch('kiro.tokenizer._get_encoding', side_effect=KeyError("x")):
             with pytest.raises(KeyError):
                 warm_up_tokenizer()
+
+
+requires_tiktoken = pytest.mark.skipif(_get_encoding() is None, reason="tiktoken unavailable")
+
+
+class TestEncodeOrdinary:
+    """Tests for special-token-safe encoding and short-string caching."""
+
+    @requires_tiktoken
+    @pytest.mark.parametrize("text", [
+        "<|endoftext|>",
+        "before <|endoftext|> after",
+        "<|fim_prefix|>code<|fim_suffix|>",
+        "<|endofprompt|>",
+    ])
+    def test_special_token_text_counted_without_warning(self, text):
+        """
+        What it does: Counts text containing tiktoken special-token markers.
+        Purpose: Ensure it is tokenized as plain text (no exception, no fallback warning).
+        """
+        from loguru import logger as loguru_logger
+        encoding = _get_encoding()
+        warnings = []
+        sink_id = loguru_logger.add(warnings.append, level="WARNING", format="{message}")
+        try:
+            result = count_tokens(text, apply_claude_correction=False)
+        finally:
+            loguru_logger.remove(sink_id)
+
+        assert warnings == []
+        assert result == len(encoding.encode(text, disallowed_special=()))
+        assert result > 1
+
+    @requires_tiktoken
+    @pytest.mark.parametrize("text", [
+        "user", "assistant", "toolu_01ABCdef", "get_weather", "True", "False",
+        "a" * 64, "b" * 65, "Hello, world! " * 50, "Привет 世界 \U0001F600",
+        "  leading and trailing  ", "\n\n\t",
+    ])
+    def test_counts_equal_plain_encode(self, text):
+        """
+        What it does: Compares count_tokens to encoding.encode for ordinary text (short and long).
+        Purpose: Ensure the cached/encode_ordinary path does not change counts.
+        """
+        encoding = _get_encoding()
+        expected = len(encoding.encode(text))
+        assert count_tokens(text, apply_claude_correction=False) == expected
+        # Second call hits the cache for short strings; must be identical
+        assert count_tokens(text, apply_claude_correction=False) == expected
+        assert count_tokens(text) == int(expected * CLAUDE_CORRECTION_FACTOR)
+
+    def test_short_string_cache_keyed_by_encoding(self):
+        """
+        What it does: Counts the same short string with two different fake encodings.
+        Purpose: Ensure cached counts never leak across encodings (e.g. mocks in tests).
+        """
+        enc_a = MagicMock()
+        enc_a.encode_ordinary.return_value = [1, 2]
+        enc_b = MagicMock()
+        enc_b.encode_ordinary.return_value = [1, 2, 3, 4, 5]
+
+        with patch('kiro.tokenizer._get_encoding', return_value=enc_a):
+            assert count_tokens("cache-key-test", apply_claude_correction=False) == 2
+            assert count_tokens("cache-key-test", apply_claude_correction=False) == 2
+        with patch('kiro.tokenizer._get_encoding', return_value=enc_b):
+            assert count_tokens("cache-key-test", apply_claude_correction=False) == 5
+
+        assert enc_a.encode_ordinary.call_count == 1
+        assert enc_b.encode_ordinary.call_count == 1
+        enc_a.encode.assert_not_called()
+
+    def test_long_strings_not_cached(self):
+        """
+        What it does: Counts a string longer than the cache threshold twice.
+        Purpose: Ensure large texts are not retained in the cache.
+        """
+        from kiro.tokenizer import SHORT_STRING_CACHE_MAX_LENGTH
+        enc = MagicMock()
+        enc.encode_ordinary.return_value = [0] * 7
+        text = "x" * (SHORT_STRING_CACHE_MAX_LENGTH + 1)
+        with patch('kiro.tokenizer._get_encoding', return_value=enc):
+            count_tokens(text, apply_claude_correction=False)
+            count_tokens(text, apply_claude_correction=False)
+        assert enc.encode_ordinary.call_count == 2
+
+    def test_short_string_cache_is_bounded(self):
+        """
+        What it does: Inspects the LRU cache configuration.
+        Purpose: Ensure memory use cannot grow without bound.
+        """
+        from kiro.tokenizer import _count_short_string_tokens, SHORT_STRING_CACHE_SIZE
+        assert _count_short_string_tokens.cache_info().maxsize == SHORT_STRING_CACHE_SIZE
+        assert SHORT_STRING_CACHE_SIZE > 0
+
+    def test_encoding_error_falls_back(self):
+        """
+        What it does: Encoding raises an error.
+        Purpose: Ensure count_tokens still falls back to character estimation.
+        """
+        enc = MagicMock()
+        enc.encode_ordinary.side_effect = ValueError("boom")
+        with patch('kiro.tokenizer._get_encoding', return_value=enc):
+            assert count_tokens("fallback-text-xyz", apply_claude_correction=False) == len("fallback-text-xyz") // 4 + 1
+
+
+class TestEstimateRequestTokensAsync:
+    """Tests for estimate_request_tokens_async."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("apply_correction", [True, False])
+    async def test_async_matches_sync(self, apply_correction):
+        """
+        What it does: Compares async and sync estimates for a request with all parts.
+        Purpose: Ensure the async helper is a pure thread offload with identical results.
+        """
+        from kiro.tokenizer import estimate_request_tokens_async
+        messages = [
+            {"role": "user", "content": "Hello <|endoftext|> world"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "London"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": False, "content": "Sunny"},
+            ]},
+        ]
+        tools = [{"name": "get_weather", "description": "Weather", "input_schema": {"type": "object"}}]
+        system = [{"type": "text", "text": "Be helpful", "cache_control": {"type": "ephemeral"}}]
+
+        expected = estimate_request_tokens(messages, tools, system, apply_correction)
+        result = await estimate_request_tokens_async(messages, tools, system, apply_correction)
+        assert result == expected
+        assert result["total_tokens"] > 0
+
+    @pytest.mark.asyncio
+    async def test_async_keyword_arguments_and_defaults(self):
+        """
+        What it does: Calls the async helper with keyword args and with defaults only.
+        Purpose: Ensure its signature matches estimate_request_tokens.
+        """
+        from kiro.tokenizer import estimate_request_tokens_async
+        messages = [{"role": "user", "content": "hi"}]
+        assert await estimate_request_tokens_async(messages) == estimate_request_tokens(messages)
+        assert await estimate_request_tokens_async(
+            messages=messages, tools=None, system_prompt="sys", apply_claude_correction=False
+        ) == estimate_request_tokens(messages=messages, system_prompt="sys", apply_claude_correction=False)
+
+    @pytest.mark.asyncio
+    async def test_async_runs_in_worker_thread(self):
+        """
+        What it does: Records the thread that runs the estimate.
+        Purpose: Ensure the work is offloaded from the event loop thread.
+        """
+        import threading
+        from kiro.tokenizer import estimate_request_tokens_async
+        loop_thread = threading.get_ident()
+        seen = []
+
+        def fake_estimate(*args):
+            seen.append(threading.get_ident())
+            return {"messages_tokens": 1, "tools_tokens": 0, "system_tokens": 0, "total_tokens": 1}
+
+        with patch('kiro.tokenizer.estimate_request_tokens', side_effect=fake_estimate):
+            result = await estimate_request_tokens_async([{"role": "user", "content": "x"}])
+
+        assert result["total_tokens"] == 1
+        assert seen and seen[0] != loop_thread
+
+    @pytest.mark.asyncio
+    async def test_async_propagates_errors(self):
+        """
+        What it does: Underlying estimate raises.
+        Purpose: Ensure exceptions are not swallowed by the thread offload.
+        """
+        from kiro.tokenizer import estimate_request_tokens_async
+        with patch('kiro.tokenizer.estimate_request_tokens', side_effect=TypeError("bad")):
+            with pytest.raises(TypeError):
+                await estimate_request_tokens_async([])

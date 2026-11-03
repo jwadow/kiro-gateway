@@ -100,6 +100,49 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
 # Shared timeouts for model discovery requests (seconds). One short attempt, no retries.
 _DISCOVERY_HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
 
+# Maximum number of concurrent model probes across ALL accounts of one manager.
+# Every probe is a real inference request, so an unbounded burst at startup
+# (all accounts x all candidates) would look like abuse and trigger rate limits.
+MODEL_PROBE_CONCURRENCY = 4
+
+# Substrings (lowercase) of credential entry keys whose values must never be logged.
+_SENSITIVE_KEY_FRAGMENTS = ("token", "secret", "password", "key")
+
+# Placeholder that replaces sensitive values in logs.
+_REDACTED = "***REDACTED***"
+
+
+def _redact_entry(entry: object) -> object:
+    """
+    Return a copy of a credentials.json entry that is safe to log.
+
+    Values of keys containing 'token', 'secret', 'password' or 'key'
+    (case-insensitive) are replaced with a placeholder. Nested dicts are
+    redacted recursively. Non-dict entries are reduced to their type name,
+    because their content is unknown and may itself be a secret.
+
+    Args:
+        entry: Raw credential entry from credentials.json
+
+    Returns:
+        Redacted copy of the entry (the original is not modified).
+
+    Examples:
+        >>> _redact_entry({"type": "refresh_token", "refresh_token": "abc"})
+        {'type': 'refresh_token', 'refresh_token': '***REDACTED***'}
+    """
+    if not isinstance(entry, dict):
+        return f"<{type(entry).__name__}>"
+    redacted: Dict[str, object] = {}
+    for key, value in entry.items():
+        if any(fragment in str(key).lower() for fragment in _SENSITIVE_KEY_FRAGMENTS):
+            redacted[key] = _REDACTED
+        elif isinstance(value, dict):
+            redacted[key] = _redact_entry(value)
+        else:
+            redacted[key] = value
+    return redacted
+
 # Lowercase body fragments that mean "this model id is not known to Kiro".
 _MODEL_NOT_FOUND_INDICATORS = (
     "not found",
@@ -210,9 +253,13 @@ async def _probe_candidate_models(
     candidates: List[str],
     profile_arn: str,
     known: Iterable[str] = (),
+    semaphore: Optional[asyncio.Semaphore] = None,
 ) -> List[Dict[str, str]]:
     """
     Probe candidate models concurrently to discover which are available.
+
+    Concurrency is bounded by ``semaphore``. AccountManager passes one shared
+    semaphore so the limit applies across all accounts probing at once.
 
     Inconclusive probes (timeout, 403, 429, 5xx, network errors) never ADD a model;
     they keep previous knowledge instead: such a model is retained only if it is in
@@ -224,6 +271,8 @@ async def _probe_candidate_models(
         candidates: Model IDs to probe
         profile_arn: Profile ARN for the requests
         known: Model IDs the account currently has (kept on inconclusive probes)
+        semaphore: Shared concurrency limiter; if None, a private one with
+            MODEL_PROBE_CONCURRENCY slots is created for this call
 
     Returns:
         List of model dicts ({"modelId": "..."}); always includes "auto".
@@ -234,9 +283,8 @@ async def _probe_candidate_models(
     """
     token = await auth_manager.get_access_token()
     known_set = set(known)
-    # Semaphore covers the whole candidate list: total time is bounded by the
-    # discovery timeout instead of waves of 10 probes.
-    semaphore = asyncio.Semaphore(max(1, len(candidates)))
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(MODEL_PROBE_CONCURRENCY)
 
     async def probe(model_id: str) -> Optional[bool]:
         async with semaphore:
@@ -434,6 +482,13 @@ class AccountManager:
         self._current_account_index: int = 0  # GLOBAL sticky index for all models
         self._tasks: set = set()  # strong refs to background tasks (discovery, init)
         self._discovery_client: Optional[httpx.AsyncClient] = None
+        # Single-flight account initialization: one in-flight task per account,
+        # shared by startup, background init and lazy init on the request path.
+        self._init_tasks: Dict[str, "asyncio.Task[bool]"] = {}
+        # Shared limit for model probes across all accounts
+        self._probe_semaphore = asyncio.Semaphore(MODEL_PROBE_CONCURRENCY)
+        # Serializes state file writes (periodic saver vs. startup/shutdown saves)
+        self._save_lock = asyncio.Lock()
     
     async def load_credentials(self) -> None:
         """
@@ -467,17 +522,22 @@ class AccountManager:
             
             # Validate required fields based on type
             if not cred_type:
-                logger.warning(f"Invalid credential entry (missing type): {entry}")
+                logger.warning(f"Invalid credential entry (missing type): {_redact_entry(entry)}")
                 continue
             
             # For json/sqlite types, path is required
             if cred_type in ("json", "sqlite") and not path:
-                logger.warning(f"Invalid credential entry (type={cred_type} requires path): {entry}")
+                logger.warning(
+                    f"Invalid credential entry (type={cred_type} requires path): {_redact_entry(entry)}"
+                )
                 continue
             
             # For refresh_token type, refresh_token field is required
             if cred_type == "refresh_token" and not entry.get("refresh_token"):
-                logger.warning(f"Invalid credential entry (type=refresh_token requires refresh_token field): {entry}")
+                logger.warning(
+                    "Invalid credential entry (type=refresh_token requires refresh_token field): "
+                    f"{_redact_entry(entry)}"
+                )
                 continue
             
             # Handle refresh_token type (no path processing needed)
@@ -593,13 +653,18 @@ class AccountManager:
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
     
-    async def _save_state(self) -> None:
+    def _snapshot_state(self) -> Dict:
         """
-        Save runtime state to state.json atomically.
-        
-        Uses tmp file + rename for atomic write.
+        Build a self-contained copy of the runtime state for persistence.
+
+        Synchronous on purpose: with no ``await`` it is atomic with respect to
+        other coroutines, so the snapshot is consistent. Lists are copied so the
+        worker thread that writes the file never iterates live, mutable state.
+
+        Returns:
+            JSON-serializable state dict
         """
-        state_data = {
+        return {
             "current_account_index": self._current_account_index,
             "accounts": {
                 account_id: {
@@ -616,43 +681,123 @@ class AccountManager:
             },
             "model_to_accounts": {
                 model: {
-                    "accounts": mal.accounts
+                    "accounts": list(mal.accounts)
                 }
                 for model, mal in self._model_to_accounts.items()
             }
         }
-        
+
+    def _write_state_file(self, state_data: Dict) -> bool:
+        """
+        Write a state snapshot to state.json atomically (blocking file I/O).
+
+        Uses tmp file + rename for atomic write. Runs in a worker thread.
+
+        Args:
+            state_data: Snapshot produced by ``_snapshot_state``
+
+        Returns:
+            True if the file was written, False on failure (logged).
+        """
         state_path = Path(self._state_file)
         tmp_path = state_path.with_suffix('.json.tmp')
-        
+
         try:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(state_data, f, indent=2, ensure_ascii=False)
-            
+
             # Atomic rename
             tmp_path.replace(state_path)
             logger.debug("State saved successfully")
-        
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
-            if tmp_path.exists():
-                tmp_path.unlink()
-    
+            return True
+
+        except (OSError, TypeError, ValueError) as e:
+            logger.error(f"Failed to save state to {self._state_file}: {type(e).__name__}: {e}")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError as cleanup_error:
+                logger.debug(f"Could not remove temporary state file {tmp_path}: {cleanup_error}")
+            return False
+
+    async def _save_state(self) -> bool:
+        """
+        Save runtime state to state.json atomically without blocking the event loop.
+
+        The snapshot is taken synchronously (consistent, no lock needed), then
+        the file is written in a worker thread. ``self._lock`` is never held
+        during the write, so account selection and reporting are not blocked
+        by disk I/O. ``self._save_lock`` keeps concurrent writers from racing
+        on the temporary file.
+
+        Returns:
+            True if the state was written, False on failure.
+        """
+        state_data = self._snapshot_state()
+        async with self._save_lock:
+            return await asyncio.to_thread(self._write_state_file, state_data)
+
     async def save_state_periodically(self) -> None:
         """
         Background task for periodic state saving.
-        
+
         Saves state every STATE_SAVE_INTERVAL_SECONDS if dirty flag is set.
+        The dirty flag is cleared before writing so changes made during the
+        write are picked up by the next cycle, and restored if the write fails.
         """
         while True:
             await asyncio.sleep(STATE_SAVE_INTERVAL_SECONDS)
-            
+
             if self._dirty:
-                async with self._lock:
-                    await self._save_state()
-                    self._dirty = False
+                self._dirty = False
+                if not await self._save_state():
+                    self._dirty = True
     
     async def _initialize_account(self, account_id: str) -> bool:
+        """
+        Initialize account once, sharing a single in-flight attempt (single-flight).
+
+        Startup, background init and lazy init on the request path may all ask
+        for the same account at the same time. Only the first caller starts the
+        real work (``_do_initialize_account``); every other caller awaits the
+        same task, so the same credentials are never refreshed twice in
+        parallel. The task is shielded: a caller that is cancelled (e.g. the
+        client disconnected) does not cancel the shared initialization.
+
+        Must never be awaited while holding ``self._lock``: initialization does
+        network I/O (token refresh) that can take many seconds.
+
+        Args:
+            account_id: Account ID to initialize
+
+        Returns:
+            True if the account is (now) initialized, False otherwise
+        """
+        account = self._accounts.get(account_id)
+        if not account:
+            return False
+        if account.auth_manager is not None:
+            return True
+
+        task = self._init_tasks.get(account_id)
+        if task is None:
+            task = asyncio.create_task(
+                self._do_initialize_account(account_id), name=f"account-init-flight:{account_id}"
+            )
+            self._init_tasks[account_id] = task
+
+            def _forget(t: "asyncio.Task[bool]", aid: str = account_id) -> None:
+                if self._init_tasks.get(aid) is t:
+                    del self._init_tasks[aid]
+
+            task.add_done_callback(_forget)
+            self._track_task(task)
+        else:
+            logger.debug(f"Joining in-flight initialization for account: {account_id}")
+
+        return await asyncio.shield(task)
+
+    async def _do_initialize_account(self, account_id: str) -> bool:
         """
         Initialize account (fast path: credentials + token + static model list).
 
@@ -660,6 +805,8 @@ class AccountManager:
         HIDDEN_MODELS so the account can serve requests immediately. Real model
         discovery is NOT done here; it runs in the background via
         ``_schedule_refresh`` so neither startup nor requests wait for it.
+
+        Only called through ``_initialize_account`` (single-flight wrapper).
 
         Args:
             account_id: Account ID to initialize
@@ -764,9 +911,9 @@ class AccountManager:
 
         Synchronous on purpose: it contains no ``await``, so it is atomic with respect
         to other coroutines (``_save_state`` and get_next_account never observe a
-        half-applied update) and can be called from background tasks without
-        taking ``self._lock`` (which lazy init already holds, so locking here would
-        deadlock). No network I/O ever happens inside it.
+        half-applied update) and can be called from background tasks and from
+        initialization without taking ``self._lock``. No network I/O ever
+        happens inside it.
 
         Args:
             account: Initialized account
@@ -903,7 +1050,12 @@ class AccountManager:
         if MODEL_PROBING_ENABLED:
             known = account.model_cache.get_all_model_ids() if account.model_cache else ()
             probed = await _probe_candidate_models(
-                client, auth_manager, CANDIDATE_MODELS, auth_manager.profile_arn or "", known
+                client,
+                auth_manager,
+                CANDIDATE_MODELS,
+                auth_manager.profile_arn or "",
+                known,
+                semaphore=self._probe_semaphore,
             )
             if len(probed) > 1:  # More than just "auto"
                 logger.info(f"Account {account.id}: discovered {len(probed)} models via probing")
@@ -970,97 +1122,128 @@ class AccountManager:
         Returns:
             Account object or None if no accounts available
         """
-        async with self._lock:
-            # Special case: single account - bypass Circuit Breaker
-            # Circuit Breaker is meaningless for single account - user should see real Kiro API errors
-            # instead of generic "Account unavailable" after cooldown kicks in
-            if len(self._accounts) == 1:
-                account_id = list(self._accounts.keys())[0]
-                account = self._accounts[account_id]
-                
-                # Skip if already tried in current failover loop
-                if exclude_accounts and account_id in exclude_accounts:
-                    return None
-                
-                # Lazy initialization if needed (fast: token check only, no discovery)
-                if account.auth_manager is None:
-                    success = await self._initialize_account(account_id)
-                    if not success:
-                        return None
-                    self._schedule_refresh(account_id)
-                
+        # Accounts whose lazy init failed during THIS call. Kept local so the
+        # caller's exclude set is never mutated.
+        skipped: set = set(exclude_accounts) if exclude_accounts else set()
+        single_account = len(self._accounts) == 1
+
+        while True:
+            # Selection is synchronous and fast: the global lock is held only for it,
+            # never across network I/O.
+            async with self._lock:
+                account = self._select_account(skipped)
+            if account is None:
+                return None
+
+            if account.auth_manager is not None:
+                return account
+
+            # Lazy initialization OUTSIDE the global lock (token refresh can take
+            # seconds). Single-flight: joins any in-flight background init.
+            if await self._initialize_account(account.id):
+                self._schedule_refresh(account.id)
+                return account
+
+            if single_account:
+                # Single account: no circuit breaker, nothing to fail over to
+                return None
+
+            async with self._lock:
+                account.failures += 1
+                account.last_failure_time = time.time()  # starts the cooldown window
+                self._dirty = True
+            logger.warning(
+                f"Lazy initialization failed for account {account.id} "
+                f"(failure #{account.failures}), trying next account"
+            )
+            skipped.add(account.id)
+
+    def _select_account(self, excluded: set) -> Optional[Account]:
+        """
+        Pick the next account to use (Circuit Breaker + global sticky). No I/O.
+
+        Must be called with ``self._lock`` held. Contains no ``await``, so the
+        decision and the half-open bookkeeping are atomic.
+
+        Half-open single probe: when an account's cooldown has expired, the
+        first request to see it gets it as a trial and the cooldown clock
+        (``last_failure_time``) is restarted, so concurrent requests skip the
+        account until that trial reports back. ``report_success`` resets
+        failures; ``report_failure`` sets a new failure time. A trial that never
+        reports simply waits out one more cooldown window, so a crashed request
+        can never block the account forever.
+
+        Args:
+            excluded: Account IDs to skip (tried in this failover loop or failed init)
+
+        Returns:
+            Selected account (possibly not yet initialized), or None.
+        """
+        # Special case: single account - bypass Circuit Breaker
+        # Circuit Breaker is meaningless for single account - user should see real Kiro API errors
+        # instead of generic "Account unavailable" after cooldown kicks in
+        if len(self._accounts) == 1:
+            account_id, account = next(iter(self._accounts.items()))
+            if account_id in excluded:
+                return None
+            if account.auth_manager is not None:
                 # Stale model cache: refresh in background, never block the request
                 self._schedule_refresh_if_stale(account)
-                # # Validate model availability
-                # if account.model_resolver:
-                #     normalized_model = normalize_model_name(model)
-                #     available_models = account.model_resolver.get_available_models()
-                #     if normalized_model not in available_models:
-                #         return None
-                
-                # Always return single account (ignore cooldown/failures)
-                # No model validation - let Kiro API decide (gateway, not gatekeeper)
-                return account
-            
-            # Multi-account logic: GLOBAL sticky
-            normalized_model = normalize_model_name(model)
-            
-            # ALWAYS start from GLOBAL index (one current account for ALL models)
-            start_index = self._current_account_index
-            
-            # ALWAYS iterate over ALL accounts
-            all_account_ids = list(self._accounts.keys())
-            
-            for i in range(len(all_account_ids)):
-                current_index = (start_index + i) % len(all_account_ids)
-                account_id = all_account_ids[current_index]
-                account = self._accounts[account_id]
-                
-                # Skip accounts already tried in current failover loop
-                if exclude_accounts and account_id in exclude_accounts:
-                    continue
-                
-                # Check Circuit Breaker (Half-Open state with exponential backoff)
-                if account.failures > 0:
-                    time_since_failure = time.time() - account.last_failure_time
-                    
-                    # Exponential backoff: base * 2^(failures - 1), capped at MAX_MULTIPLIER
-                    # 1 failure: 60s, 2: 120s, 3: 240s, ..., 12+: 86400s (1 day cap)
-                    backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
-                    effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
-                    
-                    if time_since_failure < effective_timeout:
-                        # Probabilistic retry (10% chance)
-                        if random.random() > ACCOUNT_PROBABILISTIC_RETRY_CHANCE:
-                            continue
-                        else:
-                            logger.info(f"Probabilistic retry for broken account {account_id}")
-                    else:
-                        # Half-Open: recovery timeout passed
-                        logger.info(f"Half-Open state for {account_id} (recovery timeout passed, effective={effective_timeout}s)")
-                
-                # Lazy initialization (fast: token check only, no discovery)
-                if account.auth_manager is None:
-                    success = await self._initialize_account(account_id)
-                    if not success:
-                        account.failures += 1
-                        self._dirty = True
+            # Always return single account (ignore cooldown/failures)
+            # No model validation - let Kiro API decide (gateway, not gatekeeper)
+            return account
+
+        # Multi-account logic: GLOBAL sticky
+        # ALWAYS start from GLOBAL index (one current account for ALL models)
+        start_index = self._current_account_index
+
+        # ALWAYS iterate over ALL accounts
+        all_account_ids = list(self._accounts.keys())
+        now = time.time()
+
+        for i in range(len(all_account_ids)):
+            current_index = (start_index + i) % len(all_account_ids)
+            account_id = all_account_ids[current_index]
+            account = self._accounts[account_id]
+
+            # Skip accounts already tried in current failover loop
+            if account_id in excluded:
+                continue
+
+            # Check Circuit Breaker (Half-Open state with exponential backoff)
+            if account.failures > 0:
+                time_since_failure = now - account.last_failure_time
+
+                # Exponential backoff: base * 2^(failures - 1), capped at MAX_MULTIPLIER
+                # 1 failure: 60s, 2: 120s, 3: 240s, ..., 12+: 86400s (1 day cap)
+                backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
+                effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
+
+                if time_since_failure < effective_timeout:
+                    # Probabilistic retry (10% chance)
+                    if random.random() > ACCOUNT_PROBABILISTIC_RETRY_CHANCE:
                         continue
-                    self._schedule_refresh(account_id)
-                
+                    logger.info(f"Probabilistic retry for broken account {account_id}")
+                else:
+                    # Half-Open: recovery timeout passed. Hand out ONE trial and
+                    # restart the cooldown so concurrent requests skip this account.
+                    account.last_failure_time = now
+                    self._dirty = True
+                    logger.info(
+                        f"Half-Open state for {account_id} (recovery timeout passed, "
+                        f"effective={effective_timeout}s), sending a single trial request"
+                    )
+
+            if account.auth_manager is not None:
                 # Stale model cache: refresh in background, never block the request
                 self._schedule_refresh_if_stale(account)
-                # # Check if model is available on this account
-                # available_models = account.model_resolver.get_available_models()
-                # if normalized_model not in available_models:
-                #     continue
-                
-                # No model validation - let Kiro API decide (gateway, not gatekeeper)
-                # Account is suitable!
-                return account
-            
-            # All accounts unavailable
-            return None
+
+            # No model validation - let Kiro API decide (gateway, not gatekeeper)
+            # Account is suitable!
+            return account
+
+        # All accounts unavailable
+        return None
     
     async def report_success(self, account_id: str, model: str) -> None:
         """

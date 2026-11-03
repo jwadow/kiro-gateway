@@ -24,6 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -36,13 +37,176 @@ from kiro.models_anthropic import (
     AnthropicTool,
 )
 from kiro.converters_core import (
+    REMOTE_IMAGE_PLACEHOLDER,
+    TOOL_CHOICE_AUTO,
+    TOOL_CHOICE_NONE,
+    TOOL_CHOICE_REQUIRED,
+    TOOL_CHOICE_TOOL,
+    TextAccumulator,
     UnifiedMessage,
     UnifiedTool,
+    UnifiedToolChoice,
     ThinkingConfig,
     build_kiro_payload,
     extract_text_content,
+    extract_image_from_block,
     extract_images_from_content,
+    get_remote_image_url,
 )
+
+
+# Placeholder for documents the gateway cannot forward (Kiro accepts text only).
+DOCUMENT_OMITTED_TEMPLATE: str = "[document omitted: {media_type} not supported by gateway]"
+
+# Block types dropped on purpose (no Kiro equivalent, no text worth keeping).
+# - redacted_thinking: encrypted reasoning, unreadable by any other model
+# - thinking: reasoning from earlier turns, not sent back to Kiro
+_SILENTLY_DROPPED_BLOCK_TYPES = frozenset({"redacted_thinking", "thinking", "tool_reference"})
+
+# Non-text block types whose content is converted to text.
+_TEXT_BEARING_BLOCK_TYPES = frozenset({"document", "search_result"})
+
+
+def _block_type(block: Any) -> Optional[str]:
+    """
+    Returns the "type" of a content block given as a dict or a Pydantic model.
+
+    Args:
+        block: Content block
+
+    Returns:
+        Block type, or None if the block has no type
+    """
+    if isinstance(block, dict):
+        return block.get("type")
+    return getattr(block, "type", None)
+
+
+def _block_get(block: Any, key: str, default: Any = None) -> Any:
+    """
+    Reads a field from a content block given as a dict or a Pydantic model.
+
+    Works for extra fields of models with extra="allow" (e.g. GenericContentBlock).
+
+    Args:
+        block: Content block
+        key: Field name
+        default: Value returned when the field is missing
+
+    Returns:
+        Field value or default
+    """
+    if isinstance(block, dict):
+        return block.get(key, default)
+    return getattr(block, key, default)
+
+
+def _text_of_nested_blocks(blocks: Any) -> str:
+    """
+    Joins the text of nested text blocks (used by document and search_result content).
+
+    Args:
+        blocks: A string or a list of content blocks
+
+    Returns:
+        Text joined with newlines (empty string if nothing found)
+    """
+    if isinstance(blocks, str):
+        return blocks
+    if not isinstance(blocks, list):
+        return ""
+    parts: List[str] = []
+    for nested in blocks:
+        if isinstance(nested, str):
+            parts.append(nested)
+        elif _block_type(nested) == "text":
+            text = _block_get(nested, "text", "")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def convert_document_block_to_text(block: Any) -> str:
+    """
+    Converts an Anthropic document block to text for Kiro.
+
+    - source.type "text": the document text, preceded by its title if present
+    - source.type "content": text of the nested content blocks, same title rule
+    - anything else (base64 PDF, url, file id): a placeholder, since the
+      gateway cannot forward binary or remote documents to Kiro
+
+    Args:
+        block: Document content block (dict or Pydantic model)
+
+    Returns:
+        Text to include in the message
+    """
+    source = _block_get(block, "source")
+    title = _block_get(block, "title")
+    source_type = _block_get(source, "type") if source is not None else None
+
+    text: Optional[str] = None
+    if source_type == "text":
+        data = _block_get(source, "data", "")
+        text = data if isinstance(data, str) else ""
+    elif source_type == "content":
+        text = _text_of_nested_blocks(_block_get(source, "content"))
+
+    if text is not None:
+        if isinstance(title, str) and title:
+            return f"{title}\n\n{text}" if text else title
+        return text
+
+    media_type = _block_get(source, "media_type") if source is not None else None
+    if not isinstance(media_type, str) or not media_type:
+        media_type = f"{source_type} source" if source_type else "unknown document type"
+    logger.warning(
+        f"Document block with source type {source_type!r} ({media_type}) cannot be forwarded "
+        f"to Kiro; replaced with a placeholder. Send the document as text instead."
+    )
+    return DOCUMENT_OMITTED_TEMPLATE.format(media_type=media_type)
+
+
+def convert_search_result_block_to_text(block: Any) -> str:
+    """
+    Converts an Anthropic search_result block to its text content.
+
+    Args:
+        block: search_result content block (dict or Pydantic model)
+
+    Returns:
+        Text of the nested content blocks
+    """
+    return _text_of_nested_blocks(_block_get(block, "content"))
+
+
+def _add_block_text(text: TextAccumulator, block: Any, block_type: Optional[str]) -> None:
+    """
+    Adds the text contribution of one Anthropic content block.
+
+    Handles text, document, search_result and remote image blocks; tool_use,
+    tool_result and base64 images contribute no text. Other block types are
+    dropped (logged at debug level).
+
+    Args:
+        text: Accumulator receiving the text
+        block: Content block (dict or Pydantic model)
+        block_type: Pre-computed block type
+    """
+    if block_type == "text":
+        value = _block_get(block, "text", "")
+        text.add_text(value if isinstance(value, str) else str(value))
+    elif block_type == "image":
+        if get_remote_image_url(block) is not None:
+            text.add_notice(REMOTE_IMAGE_PLACEHOLDER)
+    elif block_type == "document":
+        text.add_notice(convert_document_block_to_text(block))
+    elif block_type == "search_result":
+        text.add_notice(convert_search_result_block_to_text(block))
+    elif block_type in ("tool_use", "tool_result") or block_type in _SILENTLY_DROPPED_BLOCK_TYPES:
+        return
+    else:
+        logger.debug(f"Dropping unsupported Anthropic content block type {block_type!r}")
 
 
 def convert_anthropic_content_to_text(content: Any) -> str:
@@ -52,6 +216,10 @@ def convert_anthropic_content_to_text(content: Any) -> str:
     Anthropic content can be:
     - String: "Hello, world!"
     - List of content blocks: [{"type": "text", "text": "Hello"}]
+
+    Text blocks are concatenated as-is. document and search_result blocks
+    contribute their text on separate lines; remote image URLs and
+    unsupported documents leave a placeholder notice.
 
     Args:
         content: Anthropic message content
@@ -63,14 +231,10 @@ def convert_anthropic_content_to_text(content: Any) -> str:
         return content
 
     if isinstance(content, list):
-        text_parts = []
+        text = TextAccumulator()
         for block in content:
-            if isinstance(block, dict):
-                if block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-            elif hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
-        return "".join(text_parts)
+            _add_block_text(text, block, _block_type(block))
+        return text.result()
 
     return str(content) if content else ""
 
@@ -85,6 +249,7 @@ def extract_system_prompt(system: Any) -> str:
 
     The second format is used for prompt caching with cache_control.
     We extract only the text, ignoring cache_control (not supported by Kiro).
+    Non-text blocks are ignored.
 
     Args:
         system: System prompt in string or list format
@@ -113,6 +278,102 @@ def extract_system_prompt(system: Any) -> str:
     return str(system)
 
 
+def _tool_result_content_to_text(blocks: List[Any]) -> str:
+    """
+    Converts the list content of a tool_result block to text.
+
+    Uses the core extract_text_content() rules, except that document and
+    search_result blocks (common in tool results from search tools)
+    contribute their text on separate lines.
+
+    Args:
+        blocks: Content blocks of the tool_result
+
+    Returns:
+        Text content
+    """
+    if not any(_block_type(item) in _TEXT_BEARING_BLOCK_TYPES for item in blocks):
+        return extract_text_content(blocks)
+    text = TextAccumulator()
+    for item in blocks:
+        item_type = _block_type(item)
+        if item_type == "document":
+            text.add_notice(convert_document_block_to_text(item))
+        elif item_type == "search_result":
+            text.add_notice(convert_search_result_block_to_text(item))
+        else:
+            text.add_text(extract_text_content([item]))
+    return text.result()
+
+
+def _convert_tool_result_block(block: Any) -> Optional[Dict[str, Any]]:
+    """
+    Converts one tool_result block to unified format.
+
+    Args:
+        block: tool_result content block (dict or Pydantic model)
+
+    Returns:
+        Unified tool result, or None if the block has no tool_use_id
+    """
+    tool_use_id = _block_get(block, "tool_use_id")
+    if not tool_use_id:
+        return None
+
+    result_content = _block_get(block, "content", "")
+    # Convert content to text if it's a list
+    if isinstance(result_content, list):
+        result_content = _tool_result_content_to_text(result_content)
+    elif not isinstance(result_content, str):
+        result_content = str(result_content) if result_content else ""
+
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": result_content or "(empty result)",
+    }
+
+
+def _images_of_tool_result_block(block: Any) -> List[Dict[str, Any]]:
+    """
+    Extracts images nested inside one tool_result block (e.g. browser screenshots).
+
+    Args:
+        block: tool_result content block (dict or Pydantic model)
+
+    Returns:
+        Images in unified format
+    """
+    result_content = _block_get(block, "content")
+    if isinstance(result_content, list):
+        return extract_images_from_content(result_content)
+    return []
+
+
+def _convert_tool_use_block(block: Any) -> Optional[Dict[str, Any]]:
+    """
+    Converts one tool_use block to a unified tool call.
+
+    Args:
+        block: tool_use content block (dict or Pydantic model)
+
+    Returns:
+        Unified tool call, or None if id or name is missing
+    """
+    tool_id = _block_get(block, "id")
+    tool_name = _block_get(block, "name")
+    if not tool_id or not tool_name:
+        return None
+    return {
+        "id": tool_id,
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": _block_get(block, "input", {}),
+        },
+    }
+
+
 def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
     """
     Extracts tool results from Anthropic message content.
@@ -125,40 +386,14 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
     Returns:
         List of tool results in unified format
     """
-    tool_results = []
-
     if not isinstance(content, list):
-        return tool_results
-
+        return []
+    tool_results = []
     for block in content:
-        block_type = None
-        tool_use_id = None
-        result_content = ""
-
-        if isinstance(block, dict):
-            block_type = block.get("type")
-            tool_use_id = block.get("tool_use_id")
-            result_content = block.get("content", "")
-        elif hasattr(block, "type"):
-            block_type = block.type
-            tool_use_id = getattr(block, "tool_use_id", None)
-            result_content = getattr(block, "content", "")
-
-        if block_type == "tool_result" and tool_use_id:
-            # Convert content to text if it's a list
-            if isinstance(result_content, list):
-                result_content = extract_text_content(result_content)
-            elif not isinstance(result_content, str):
-                result_content = str(result_content) if result_content else ""
-
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": result_content or "(empty result)",
-                }
-            )
-
+        if _block_type(block) == "tool_result":
+            tool_result = _convert_tool_result_block(block)
+            if tool_result is not None:
+                tool_results.append(tool_result)
     return tool_results
 
 
@@ -176,32 +411,14 @@ def extract_images_from_tool_results(content: Any) -> List[Dict[str, Any]]:
         List of images in unified format: [{"media_type": "image/jpeg", "data": "base64..."}]
     """
     images: List[Dict[str, Any]] = []
-
     if not isinstance(content, list):
         return images
-
     for block in content:
-        block_type = None
-        result_content = None
-
-        if isinstance(block, dict):
-            block_type = block.get("type")
-            result_content = block.get("content")
-        elif hasattr(block, "type"):
-            block_type = block.type
-            result_content = getattr(block, "content", None)
-
-        if block_type == "tool_result" and isinstance(result_content, list):
-            # Extract images from the tool_result's content
-            tool_result_images = extract_images_from_content(result_content)
-            images.extend(tool_result_images)
-
+        if _block_type(block) == "tool_result":
+            images.extend(_images_of_tool_result_block(block))
     if images:
         logger.debug(f"Extracted {len(images)} image(s) from tool_result content")
-
     return images
-
-    return tool_results
 
 
 def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
@@ -216,43 +433,85 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
     Returns:
         List of tool calls in unified format
     """
-    tool_calls = []
-
     if not isinstance(content, list):
-        return tool_calls
+        return []
+    tool_calls = []
+    for block in content:
+        if _block_type(block) == "tool_use":
+            tool_call = _convert_tool_use_block(block)
+            if tool_call is not None:
+                tool_calls.append(tool_call)
+    return tool_calls
+
+
+@dataclass
+class _ScannedContent:
+    """
+    Everything extracted from one Anthropic message in a single pass.
+
+    Attributes:
+        text: Text content
+        tool_calls: Unified tool calls (assistant messages)
+        tool_results: Unified tool results (user messages)
+        images: Top-level images followed by images nested in tool results (user messages)
+    """
+    text: str
+    tool_calls: List[Dict[str, Any]]
+    tool_results: List[Dict[str, Any]]
+    images: List[Dict[str, Any]]
+
+
+def _scan_anthropic_content(content: Any, role: str) -> _ScannedContent:
+    """
+    Extracts text, tool calls, tool results and images from one message in one pass.
+
+    Equivalent to calling convert_anthropic_content_to_text,
+    extract_tool_uses_from_anthropic_content (assistant only),
+    extract_tool_results_from_anthropic_content, extract_images_from_content and
+    extract_images_from_tool_results (user only), but walks the blocks once.
+
+    Args:
+        content: Anthropic message content
+        role: Message role ("user" or "assistant"; other roles extract text only)
+
+    Returns:
+        _ScannedContent with the extracted data
+    """
+    if not isinstance(content, list):
+        return _ScannedContent(convert_anthropic_content_to_text(content), [], [], [])
+
+    text = TextAccumulator()
+    tool_calls: List[Dict[str, Any]] = []
+    tool_results: List[Dict[str, Any]] = []
+    top_level_images: List[Dict[str, Any]] = []
+    tool_result_images: List[Dict[str, Any]] = []
+    is_user = role == "user"
+    is_assistant = role == "assistant"
 
     for block in content:
-        block_type = None
-        tool_id = None
-        tool_name = None
-        tool_input = {}
+        block_type = _block_type(block)
+        _add_block_text(text, block, block_type)
 
-        if isinstance(block, dict):
-            block_type = block.get("type")
-            tool_id = block.get("id")
-            tool_name = block.get("name")
-            tool_input = block.get("input", {})
-        elif hasattr(block, "type"):
-            block_type = block.type
-            tool_id = getattr(block, "id", None)
-            tool_name = getattr(block, "name", None)
-            tool_input = getattr(block, "input", {})
+        if is_assistant and block_type == "tool_use":
+            tool_call = _convert_tool_use_block(block)
+            if tool_call is not None:
+                tool_calls.append(tool_call)
+        elif is_user and block_type == "tool_result":
+            tool_result = _convert_tool_result_block(block)
+            if tool_result is not None:
+                tool_results.append(tool_result)
+            tool_result_images.extend(_images_of_tool_result_block(block))
+        elif is_user and block_type in ("image", "image_url"):
+            image = extract_image_from_block(block)
+            if image is not None:
+                top_level_images.append(image)
 
-        if block_type == "tool_use" and tool_id and tool_name:
-            tool_calls.append(
-                {
-                    "id": tool_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": tool_input
-                        if isinstance(tool_input, str)
-                        else tool_input,
-                    },
-                }
-            )
+    if top_level_images:
+        logger.debug(f"Extracted {len(top_level_images)} image(s) from content")
+    if tool_result_images:
+        logger.debug(f"Extracted {len(tool_result_images)} image(s) from tool_result content")
 
-    return tool_calls
+    return _ScannedContent(text.result(), tool_calls, tool_results, top_level_images + tool_result_images)
 
 
 def convert_anthropic_messages(
@@ -266,6 +525,9 @@ def convert_anthropic_messages(
     - Text content (string or list of text blocks)
     - Tool use blocks (assistant messages)
     - Tool result blocks (user messages)
+    - document / search_result blocks (converted to text)
+
+    Each message's content is scanned once.
 
     Args:
         messages: List of Anthropic messages
@@ -293,47 +555,17 @@ def convert_anthropic_messages(
                 inline_system_parts.append(text_content)
             continue
 
-        # Extract text content
-        text_content = convert_anthropic_content_to_text(content)
-
-        # Extract tool-related data and images based on role
-        tool_calls = None
-        tool_results = None
-        images = None
-
-        if role == "assistant":
-            # Assistant messages may contain tool_use blocks
-            tool_calls = extract_tool_uses_from_anthropic_content(content)
-            if tool_calls:
-                total_tool_calls += len(tool_calls)
-
-        elif role == "user":
-            # User messages may contain tool_result blocks and images
-            tool_results = extract_tool_results_from_anthropic_content(content)
-            if tool_results:
-                total_tool_results += len(tool_results)
-
-            # Extract images from user messages (both top-level and inside tool_results)
-            images = extract_images_from_content(content)
-
-            # Also extract images from inside tool_result content blocks
-            # (e.g., screenshots returned by browser MCP tools)
-            tool_result_images = extract_images_from_tool_results(content)
-            if tool_result_images:
-                if images:
-                    images.extend(tool_result_images)
-                else:
-                    images = tool_result_images
-
-            if images:
-                total_images += len(images)
+        scanned = _scan_anthropic_content(content, role)
+        total_tool_calls += len(scanned.tool_calls)
+        total_tool_results += len(scanned.tool_results)
+        total_images += len(scanned.images)
 
         unified_msg = UnifiedMessage(
             role=role,
-            content=text_content,
-            tool_calls=tool_calls if tool_calls else None,
-            tool_results=tool_results if tool_results else None,
-            images=images if images else None,
+            content=scanned.text,
+            tool_calls=scanned.tool_calls or None,
+            tool_results=scanned.tool_results or None,
+            images=scanned.images or None,
         )
         unified_messages.append(unified_msg)
 
@@ -444,6 +676,58 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
 
+def extract_tool_choice_from_anthropic(request: AnthropicMessagesRequest) -> Optional[UnifiedToolChoice]:
+    """
+    Converts Anthropic tool_choice to unified format.
+
+    Mapping:
+    - None / {"type": "auto"} -> auto
+    - {"type": "none"} -> none (tools removed)
+    - {"type": "any"} -> at least one tool call
+    - {"type": "tool", "name": X} -> forced tool X
+    - disable_parallel_tool_use: true (on auto/any/tool) -> at most one tool call
+    Unrecognized values are logged and treated as auto.
+
+    Args:
+        request: Anthropic MessagesRequest
+
+    Returns:
+        UnifiedToolChoice, or None when nothing deviates from the default
+    """
+    tool_choice = request.tool_choice
+    if tool_choice is None:
+        return None
+
+    if hasattr(tool_choice, "model_dump"):
+        tool_choice = tool_choice.model_dump()
+    if not isinstance(tool_choice, dict):
+        logger.warning(f"Ignoring unsupported Anthropic tool_choice {tool_choice!r}; using auto")
+        return None
+
+    choice_type = tool_choice.get("type")
+    disable_parallel = tool_choice.get("disable_parallel_tool_use") is True
+    mode = TOOL_CHOICE_AUTO
+    tool_name: Optional[str] = None
+
+    if choice_type == "none":
+        mode = TOOL_CHOICE_NONE
+    elif choice_type == "any":
+        mode = TOOL_CHOICE_REQUIRED
+    elif choice_type == "tool":
+        name = tool_choice.get("name")
+        if isinstance(name, str) and name:
+            mode = TOOL_CHOICE_TOOL
+            tool_name = name
+        else:
+            logger.warning("Ignoring Anthropic tool_choice of type 'tool' without a name; using auto")
+    elif choice_type != "auto":
+        logger.warning(f"Ignoring unsupported Anthropic tool_choice type {choice_type!r}; using auto")
+
+    if mode == TOOL_CHOICE_AUTO and not disable_parallel:
+        return None
+    return UnifiedToolChoice(mode=mode, tool_name=tool_name, disable_parallel=disable_parallel)
+
+
 def anthropic_to_kiro(
     request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
 ) -> dict:
@@ -509,6 +793,7 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        tool_choice=extract_tool_choice_from_anthropic(request),
     )
 
     return result.payload

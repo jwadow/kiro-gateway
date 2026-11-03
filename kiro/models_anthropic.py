@@ -103,7 +103,17 @@ class ToolResultContentBlock(BaseModel):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
     content: Optional[
-        Union[str, List[Union["TextContentBlock", "ImageContentBlock", "ToolReferenceContentBlock"]]]
+        Union[
+            str,
+            List[
+                Union[
+                    "TextContentBlock",
+                    "ImageContentBlock",
+                    "ToolReferenceContentBlock",
+                    "GenericContentBlock",
+                ]
+            ],
+        ]
     ] = None
     is_error: Optional[bool] = None
 
@@ -162,7 +172,28 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
-# Union type for all content blocks (including images and thinking)
+class GenericContentBlock(BaseModel):
+    """
+    Fallback for content block types without a dedicated model.
+
+    Anthropic keeps adding block types (document, redacted_thinking,
+    search_result, server_tool_use, web_search_tool_result, ...). Rejecting
+    them with 422 would break clients that replay full conversations, so any
+    block with a string "type" is accepted here and the converter decides
+    what to do with it. Must stay LAST in ContentBlock so that known types
+    still parse to their specific models.
+
+    Attributes:
+        type: Block type (any string)
+    """
+
+    type: str
+
+    model_config = {"extra": "allow"}
+
+
+# Union type for all content blocks (including images and thinking).
+# GenericContentBlock must remain last: it is the catch-all fallback.
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
@@ -170,6 +201,7 @@ ContentBlock = Union[
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    GenericContentBlock,
 ]
 
 
@@ -254,12 +286,14 @@ class ToolChoiceAuto(BaseModel):
     """Auto tool choice - model decides whether to use tools."""
 
     type: Literal["auto"] = "auto"
+    disable_parallel_tool_use: Optional[bool] = None
 
 
 class ToolChoiceAny(BaseModel):
     """Any tool choice - model must use at least one tool."""
 
     type: Literal["any"] = "any"
+    disable_parallel_tool_use: Optional[bool] = None
 
 
 class ToolChoiceTool(BaseModel):
@@ -267,9 +301,16 @@ class ToolChoiceTool(BaseModel):
 
     type: Literal["tool"] = "tool"
     name: str
+    disable_parallel_tool_use: Optional[bool] = None
 
 
-ToolChoice = Union[ToolChoiceAuto, ToolChoiceAny, ToolChoiceTool]
+class ToolChoiceNone(BaseModel):
+    """None tool choice - model must not use any tools."""
+
+    type: Literal["none"] = "none"
+
+
+ToolChoice = Union[ToolChoiceAuto, ToolChoiceAny, ToolChoiceTool, ToolChoiceNone]
 
 
 # ==================================================================================================

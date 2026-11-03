@@ -991,3 +991,32 @@ class TestOpenAIModelStableCreated:
         for name in ("ChatCompletionResponse", "ChatCompletionChunk"):
             assert not hasattr(models_openai, name)
             assert not hasattr(kiro, name)
+
+
+# ==================================================================================================
+# response_format field
+# ==================================================================================================
+
+class TestChatCompletionRequestResponseFormat:
+    """response_format is declared and permissive."""
+
+    @staticmethod
+    def _request(**kwargs):
+        return ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], **kwargs)
+
+    def test_defaults_to_none(self):
+        assert self._request().response_format is None
+
+    @pytest.mark.parametrize("value", [
+        {"type": "text"},
+        {"type": "json_object"},
+        {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}, "strict": True}},
+        {"type": "future_type", "anything": [1, 2]},
+    ])
+    def test_accepts_dicts_verbatim(self, value):
+        assert self._request(response_format=value).response_format == value
+
+    @pytest.mark.parametrize("value", ["json_object", 5, ["json_object"]])
+    def test_rejects_non_dict(self, value):
+        with pytest.raises(ValidationError):
+            self._request(response_format=value)
