@@ -390,6 +390,43 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
 # Main Entry Point
 # ==================================================================================================
 
+
+def _extract_structured_output_tool(request_data: ChatCompletionRequest):
+    """
+    Convert response_format.json_schema into a synthetic tool + forced tool_choice.
+
+    Claude does not support native structured outputs via response_format.
+    The standard workaround is to define a tool whose input_schema matches
+    the requested JSON schema, then force Claude to call it via tool_choice.
+
+    Returns (unified_tool, tool_choice_name) or (None, None) if not applicable.
+    """
+    rf = getattr(request_data, "response_format", None)
+    if not rf:
+        return None, None
+
+    fmt_type = rf.get("type", "")
+    if fmt_type != "json_schema":
+        return None, None
+
+    schema_def = rf.get("json_schema", {})
+    tool_name = schema_def.get("name", "structured_output")
+    schema = schema_def.get("schema", {})
+
+    if not schema:
+        logger.warning("response_format.json_schema has no schema — ignoring structured output")
+        return None, None
+
+    logger.debug(f"Converting response_format.json_schema to synthetic tool: {tool_name}")
+
+    tool = UnifiedTool(
+        name=tool_name,
+        description=f"Return a structured response conforming to the {tool_name} schema.",
+        input_schema=schema,
+    )
+    return tool, tool_name
+
+
 def build_kiro_payload(
     request_data: ChatCompletionRequest,
     conversation_id: str,
@@ -417,6 +454,18 @@ def build_kiro_payload(
     
     # Convert tools to unified format
     unified_tools = convert_openai_tools_to_unified(request_data.tools)
+
+    # Handle response_format.json_schema → synthetic tool for structured output
+    structured_tool, structured_tool_name = _extract_structured_output_tool(request_data)
+    if structured_tool is not None:
+        if unified_tools is None:
+            unified_tools = []
+        # Prepend so it's the primary tool
+        unified_tools = [structured_tool] + unified_tools
+        # Override tool_choice to force this tool
+        request_data = request_data.model_copy(
+            update={"tool_choice": {"type": "tool", "name": structured_tool_name}}
+        )
     
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid

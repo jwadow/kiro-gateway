@@ -38,7 +38,7 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT, RESPONSE_HEADERS_TIMEOUT
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
@@ -229,7 +229,10 @@ class KiroHttpClient:
                     headers["Connection"] = "close"
                     req = client.build_request(method, url, **request_kwargs)
                     logger.debug("Sending request to Kiro API...")
-                    response = await client.send(req, stream=True)
+                    response = await asyncio.wait_for(
+                        client.send(req, stream=True),
+                        timeout=RESPONSE_HEADERS_TIMEOUT,
+                    )
                 else:
                     logger.debug("Sending request to Kiro API...")
                     response = await client.request(method, url, **request_kwargs)
@@ -240,7 +243,11 @@ class KiroHttpClient:
                 
                 # 403 - token expired, refresh and retry
                 if response.status_code == 403:
-                    logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
+                    try:
+                        body = (await response.aread()).decode(errors='replace')[:500]
+                    except Exception:
+                        body = "<could not read>"
+                    logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES}). Response: {body}")
                     await self.auth_manager.force_refresh()
                     continue
                 
@@ -263,6 +270,22 @@ class KiroHttpClient:
                 # Other errors - return as is
                 return response
                 
+            except asyncio.TimeoutError:
+                # Wall-clock timeout waiting for response headers from upstream
+                last_error = TimeoutError(f"No response headers from upstream within {RESPONSE_HEADERS_TIMEOUT}s")
+                delay = BASE_RETRY_DELAY * (2 ** attempt)
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Response headers timeout ({RESPONSE_HEADERS_TIMEOUT}s) - "
+                        f"waiting {delay}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        f"Response headers timeout ({RESPONSE_HEADERS_TIMEOUT}s) - "
+                        f"no more retries (attempt {attempt + 1}/{max_retries})"
+                    )
+
             except httpx.TimeoutException as e:
                 last_error = e
                 

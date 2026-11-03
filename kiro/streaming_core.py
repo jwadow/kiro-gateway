@@ -43,6 +43,8 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_HANDLING,
+    STREAMING_INACTIVITY_TIMEOUT,
+    STREAMING_LOG_INTERVAL,
 )
 from kiro.thinking_parser import ThinkingParser
 
@@ -111,9 +113,48 @@ class FirstTokenTimeoutError(Exception):
     pass
 
 
+class StreamingInactivityError(Exception):
+    """Exception raised when no data is received within the inactivity timeout."""
+    pass
+
+
 # ==================================================================================================
 # Kiro Stream Parsing
 # ==================================================================================================
+
+async def _iter_with_inactivity_timeout(
+    byte_iterator: AsyncGenerator[bytes, None],
+    timeout: float,
+) -> AsyncGenerator[bytes, None]:
+    """
+    Wraps an async byte iterator with an inactivity timeout.
+
+    Unlike httpx's read timeout (which resets on any TCP-level bytes including
+    keepalives), this tracks time since the last actual data chunk from the
+    iterator.  If no chunk arrives within *timeout* seconds the generator
+    raises ``StreamingInactivityError``.
+
+    Args:
+        byte_iterator: The underlying async iterator of bytes.
+        timeout: Maximum seconds to wait between chunks.
+
+    Yields:
+        bytes chunks from the underlying iterator.
+
+    Raises:
+        StreamingInactivityError: If no chunk is received within *timeout*.
+    """
+    while True:
+        try:
+            chunk = await asyncio.wait_for(byte_iterator.__anext__(), timeout=timeout)
+            yield chunk
+        except asyncio.TimeoutError:
+            raise StreamingInactivityError(
+                f"No data received from upstream for {timeout}s — connection appears stalled"
+            )
+        except StopAsyncIteration:
+            return
+
 
 async def parse_kiro_stream(
     response: httpx.Response,
@@ -175,8 +216,18 @@ async def parse_kiro_stream(
                 first_token_received = True
             yield event
         
-        # Continue reading remaining chunks
-        async for chunk in byte_iterator:
+        # Continue reading remaining chunks with inactivity timeout
+        stream_start = asyncio.get_event_loop().time()
+        last_log_time = stream_start
+        chunks_received = 0
+        async for chunk in _iter_with_inactivity_timeout(byte_iterator, STREAMING_INACTIVITY_TIMEOUT):
+            chunks_received += 1
+            now = asyncio.get_event_loop().time()
+            if now - last_log_time >= STREAMING_LOG_INTERVAL:
+                elapsed = now - stream_start
+                logger.info(f"[StreamProgress] Streaming in progress: {elapsed:.0f}s elapsed, {chunks_received} chunks received")
+                last_log_time = now
+
             if debug_logger:
                 debug_logger.log_raw_chunk(chunk)
             
