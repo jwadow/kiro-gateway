@@ -20,11 +20,8 @@ Any attempt to make an unauthorized network call will result in immediate test f
 ### Installing Dependencies
 
 ```bash
-# Main project dependencies
-pip install -r requirements.txt
-
-# Additional testing dependencies
-pip install pytest pytest-asyncio hypothesis
+# Runtime + testing dependencies (pytest, pytest-asyncio)
+pip install -r requirements-dev.txt
 ```
 
 ### Running All Tests

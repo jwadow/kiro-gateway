@@ -18,6 +18,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+venv
 
 # Debug logs (generated when DEBUG_MODE is enabled)
 debug_logs*/

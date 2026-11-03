@@ -5,8 +5,3 @@ httpx
 loguru
 python-dotenv
 tiktoken
-
-# Testing dependencies
-pytest
-pytest-asyncio
-hypothesis

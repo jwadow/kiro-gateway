@@ -191,10 +191,6 @@ Centralized storage of all settings:
 |-------|-------------|
 | `ChatCompletionChoice` | Single response variant |
 | `ChatCompletionUsage` | Token information (prompt_tokens, completion_tokens, credits_used) |
-| `ChatCompletionResponse` | Full response (non-streaming) |
-| `ChatCompletionChunk` | Streaming chunk |
-| `ChatCompletionChunkDelta` | Delta changes in chunk |
-| `ChatCompletionChunkChoice` | Variant in streaming chunk |
 
 ### 3.4. State Management Layer
 

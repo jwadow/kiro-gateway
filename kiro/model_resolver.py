@@ -41,13 +41,6 @@ if TYPE_CHECKING:
     from kiro.cache import ModelInfoCache
 
 
-# Valid model IDs accepted by runtime.{region}.kiro.dev
-# Generated from FALLBACK_MODELS to maintain single source of truth
-from kiro.config import FALLBACK_MODELS
-
-VALID_RUNTIME_MODEL_IDS: set = {model["modelId"] for model in FALLBACK_MODELS}
-
-
 def to_runtime_model_id(normalized: str) -> str:
     """
     Pass-through function for runtime.kiro.dev model ID.
@@ -194,9 +187,10 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
     Get the model ID to send to Kiro API.
     
     This is a simple helper for converters that don't have access to the full
-    ModelResolver. It normalizes the name and checks hidden models.
+    ModelResolver. It resolves aliases, normalizes the name, and checks hidden models.
     
     For hidden models (like claude-3.7-sonnet), returns the internal Kiro ID.
+    For aliased models (like claude-sonnet-5), resolves the alias first.
     For regular models, returns the normalized name.
     
     Args:
@@ -214,7 +208,14 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
         >>> get_model_id_for_kiro("claude-3-7-sonnet", {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"})
         'CLAUDE_3_7_SONNET_20250219_V1_0'
     """
-    normalized = normalize_model_name(model_name)
+    from kiro.config import MODEL_ALIASES
+    
+    # Layer 0: Resolve alias (if exists)
+    resolved = MODEL_ALIASES.get(model_name, model_name)
+    if resolved != model_name:
+        logger.debug(f"Alias resolved in get_model_id_for_kiro: '{model_name}' → '{resolved}'")
+    
+    normalized = normalize_model_name(resolved)
     internal = hidden_models.get(normalized, normalized)
     return to_runtime_model_id(internal)
 

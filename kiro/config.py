@@ -217,8 +217,10 @@ BASE_RETRY_DELAY: float = 1.0
 # Why "hidden"? These models work but are not advertised by Kiro's /ListAvailableModels.
 # We expose them to our users because they're useful.
 HIDDEN_MODELS: Dict[str, str] = {
-    # Claude 3.7 Sonnet - legacy model, maps to "auto" on new runtime endpoint
-    # "claude-3.7-sonnet": "auto",
+    # Models that work on Kiro but aren't returned by /ListAvailableModels.
+    # Format: "display_name" → "internal_kiro_id" (use same name if no internal mapping needed)
+    "claude-sonnet-5": "claude-sonnet-5",
+    "claude-opus-4.8": "claude-opus-4.8",
 }
 
 # ==================================================================================================
@@ -266,27 +268,72 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # Fallback Models Configuration (DNS Failure Recovery)
 # ==================================================================================================
 
-# Fallback model list - used when /ListAvailableModels API is unreachable.
+# Fallback model list - used when dynamic model probing fails completely.
 # This ensures basic functionality even with DNS/network issues.
-#
-# IMPORTANT: This list represents known models at the time of this gateway version.
-# - Some models may not be available on your Kiro plan (e.g., Opus on free tier)
-# - New models released after this version won't appear here
-# - Update gateway regularly to get the latest model list
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
     {"modelId": "claude-sonnet-4"},
     {"modelId": "claude-sonnet-4.5"},
     {"modelId": "claude-sonnet-4.6"},
+    {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-haiku-4.5"},
     {"modelId": "claude-opus-4.5"},
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-4.7"},
+    {"modelId": "claude-opus-4.8"},
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
     {"modelId": "minimax-m2.1"},
     {"modelId": "minimax-m2.5"},
     {"modelId": "qwen3-coder-next"},
+]
+
+# ==================================================================================================
+# Candidate Models for Dynamic Probing
+# ==================================================================================================
+
+# Candidate models to probe at startup. The gateway sends a minimal request to each
+# model to check if it's available. Only models that respond successfully are exposed
+# in /v1/models. This allows automatic discovery of new models without code changes.
+#
+# The list should be broad — include future model versions you expect Kiro to add.
+# Non-existent models are simply filtered out (no harm in having extras).
+#
+# "auto" is always included and never probed (it's a routing alias, not a real model).
+CANDIDATE_MODELS: List[str] = [
+    # Claude Sonnet family
+    "claude-sonnet-4",
+    "claude-sonnet-4.5",
+    "claude-sonnet-4.6",
+    "claude-sonnet-5",
+    "claude-sonnet-5.5",
+    "claude-sonnet-6",
+    # Claude Haiku family
+    "claude-haiku-4.5",
+    "claude-haiku-5",
+    "claude-haiku-5.5",
+    "claude-haiku-6",
+    # Claude Opus family
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+    "claude-opus-4.7",
+    "claude-opus-4.8",
+    "claude-opus-5",
+    "claude-opus-5.5",
+    "claude-opus-6",
+    # DeepSeek
+    "deepseek-3.2",
+    "deepseek-4",
+    # GLM
+    "glm-5",
+    "glm-6",
+    # MiniMax
+    "minimax-m2.1",
+    "minimax-m2.5",
+    "minimax-m3",
+    # Qwen
+    "qwen3-coder-next",
+    "qwen4-coder",
 ]
 
 # ==================================================================================================
@@ -364,6 +411,11 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 # After exhausting all attempts, an error will be returned.
 # Default: 3 attempts
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
+
+# HTTP-level attempts per first-token retry attempt. The first-token loop already
+# retries, so the inner call only keeps one extra attempt (enough for a 403 token
+# refresh) instead of multiplying retries (3x3 = 9 upstream calls worst case).
+FIRST_TOKEN_INNER_HTTP_RETRIES: int = 2
 
 # ==================================================================================================
 # Debug Settings
@@ -543,6 +595,17 @@ ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(os.getenv("ACCOUNT_PROBABILIST
 # Model cache TTL in seconds (12 hours)
 # Cache is refreshed only when account is used (not in background)
 ACCOUNT_CACHE_TTL: int = int(os.getenv("ACCOUNT_CACHE_TTL", "43200"))
+
+# Delay (seconds) before retrying model discovery after a FAILED refresh.
+# Prevents re-running discovery on every request while Kiro is unreachable.
+ACCOUNT_CACHE_RETRY_INTERVAL: int = int(os.getenv("ACCOUNT_CACHE_RETRY_INTERVAL", "300"))
+
+# Opt-in model probing (Tier 2 discovery). Each probe is a REAL, billed inference
+# request to Kiro (one per entry in CANDIDATE_MODELS), so it is disabled by default.
+MODEL_PROBING_ENABLED: bool = os.getenv("MODEL_PROBING_ENABLED", "false").lower() in ("true", "1", "yes")
+
+# Hard cap (seconds) for one model discovery run (Tier 1 + Tier 2 together).
+MODEL_DISCOVERY_TIMEOUT: float = float(os.getenv("MODEL_DISCOVERY_TIMEOUT", "15"))
 
 # ==================================================================================================
 # State Persistence Settings

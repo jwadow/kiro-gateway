@@ -756,7 +756,7 @@ class TestAccountManagerInitializeAccount:
         account_id = str(test_json.resolve())
         
         # Mock HTTP client for ListAvailableModels
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+        with patch('kiro.account_manager.AccountManager._schedule_refresh') as mock_http_class:
             mock_client = AsyncMock()
             mock_response = Mock()  # Response is not async
             mock_response.status_code = 200
@@ -807,7 +807,7 @@ class TestAccountManagerInitializeAccount:
         account_id = str(test_json.resolve())
         
         # Mock HTTP client to fail
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+        with patch('kiro.account_manager.AccountManager._schedule_refresh') as mock_http_class:
             mock_client = AsyncMock()
             mock_client.request_with_retry = AsyncMock(side_effect=Exception("Network error"))
             mock_client.close = AsyncMock()
@@ -859,7 +859,7 @@ class TestAccountManagerGetNextAccount:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+        with patch('kiro.account_manager.AccountManager._schedule_refresh') as mock_http_class:
             mock_client = AsyncMock()
             mock_response = Mock()  # Response is not async
             mock_response.status_code = 200
@@ -919,7 +919,7 @@ class TestAccountManagerReportSuccess:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+        with patch('kiro.account_manager.AccountManager._schedule_refresh') as mock_http_class:
             mock_client = AsyncMock()
             mock_response = Mock()  # Response is not async
             mock_response.status_code = 200
@@ -972,7 +972,7 @@ class TestAccountManagerReportSuccess:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+        with patch('kiro.account_manager.AccountManager._schedule_refresh') as mock_http_class:
             mock_client = AsyncMock()
             mock_response = Mock()  # Response is not async
             mock_response.status_code = 200
@@ -1030,7 +1030,7 @@ class TestAccountManagerReportFailure:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+        with patch('kiro.account_manager.AccountManager._schedule_refresh') as mock_http_class:
             mock_client = AsyncMock()
             mock_response = Mock()  # Response is not async
             mock_response.status_code = 200
@@ -1083,7 +1083,7 @@ class TestAccountManagerReportFailure:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+        with patch('kiro.account_manager.AccountManager._schedule_refresh') as mock_http_class:
             mock_client = AsyncMock()
             mock_response = Mock()  # Response is not async
             mock_response.status_code = 200
@@ -1177,7 +1177,7 @@ class TestAccountManagerGetFirstAccount:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+        with patch('kiro.account_manager.AccountManager._schedule_refresh') as mock_http_class:
             mock_client = AsyncMock()
             mock_response = Mock()  # Response is not async
             mock_response.status_code = 200
@@ -1253,7 +1253,7 @@ class TestAccountManagerGetAllAvailableModels:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+        with patch('kiro.account_manager.AccountManager._schedule_refresh') as mock_http_class:
             mock_client = AsyncMock()
             mock_response = Mock()  # Response is not async
             mock_response.status_code = 200
@@ -1300,3 +1300,581 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+
+# =============================================================================
+# Hardening regression tests: single-flight init outside the global lock,
+# cooldown after failed lazy init, half-open single trial, shared probe
+# semaphore, credential redaction, off-loop state saving.
+# =============================================================================
+
+import threading as _threading
+
+import kiro.account_manager as _am
+from kiro.account_manager import (
+    MODEL_PROBE_CONCURRENCY,
+    _probe_candidate_models,
+    _redact_entry,
+)
+from kiro.config import ACCOUNT_RECOVERY_TIMEOUT
+
+
+async def _manager_with_accounts(tmp_path, count: int) -> AccountManager:
+    """Build a manager with ``count`` json accounts (not yet initialized)."""
+    entries = []
+    for i in range(count):
+        f = tmp_path / f"acc{i}.json"
+        f.write_text(json.dumps({
+            "refreshToken": f"t{i}",
+            "accessToken": f"a{i}",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+        }))
+        entries.append({"type": "json", "path": str(f), "enabled": True})
+    creds = tmp_path / "credentials.json"
+    creds.write_text(json.dumps(entries))
+    manager = AccountManager(str(creds), str(tmp_path / "state.json"))
+    await manager.load_credentials()
+    return manager
+
+
+class _FakeAuthFactory:
+    """
+    Stand-in for KiroAuthManager that counts constructions and token fetches.
+
+    ``gate`` (if set) blocks get_access_token until released; ``fail`` makes
+    token verification raise ValueError (bad credentials).
+    """
+
+    def __init__(self, fail: bool = False, gate: asyncio.Event = None):
+        self.fail = fail
+        self.gate = gate
+        self.constructed = 0
+        self.token_calls = 0
+        self.started = asyncio.Event()
+
+    def __call__(self, *args, **kwargs):
+        self.constructed += 1
+        factory = self
+        auth = MagicMock()
+        auth.api_host = "https://q.us-east-1.amazonaws.com"
+        auth.q_host = auth.api_host
+        auth.profile_arn = None
+
+        async def get_access_token():
+            factory.token_calls += 1
+            factory.started.set()
+            if factory.gate is not None:
+                await factory.gate.wait()
+            if factory.fail:
+                raise ValueError("bad credentials")
+            return "tok"
+
+        auth.get_access_token = get_access_token
+        return auth
+
+
+class TestSingleFlightInitialization:
+    """Concurrent init requests for one account share one in-flight task."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_initialize_refreshes_credentials_once(self, tmp_path):
+        """
+        What it does: 10 concurrent _initialize_account() calls for one account.
+        Purpose: The same credentials must never be refreshed twice in parallel.
+        """
+        manager = await _manager_with_accounts(tmp_path, 1)
+        account_id = next(iter(manager._accounts))
+        gate = asyncio.Event()
+        factory = _FakeAuthFactory(gate=gate)
+
+        with patch.object(_am, "KiroAuthManager", factory):
+            calls = [asyncio.create_task(manager._initialize_account(account_id)) for _ in range(10)]
+            await asyncio.wait_for(factory.started.wait(), 1)
+            await asyncio.sleep(0)
+            gate.set()
+            results = await asyncio.gather(*calls)
+
+        assert results == [True] * 10
+        assert factory.constructed == 1
+        assert factory.token_calls == 1
+        assert account_id not in manager._init_tasks  # cleaned up after completion
+
+    @pytest.mark.asyncio
+    async def test_background_and_lazy_init_share_one_task(self, tmp_path):
+        """
+        What it does: start_background_init() then get_next_account() for the same account.
+        Purpose: Lazy init joins the background attempt instead of starting another.
+        """
+        manager = await _manager_with_accounts(tmp_path, 2)
+        gate = asyncio.Event()
+        factory = _FakeAuthFactory(gate=gate)
+
+        with patch.object(_am, "KiroAuthManager", factory), \
+                patch.object(manager, "_refresh_account_models", AsyncMock()):
+            manager.start_background_init()
+            await asyncio.wait_for(factory.started.wait(), 1)
+            lazy = asyncio.create_task(manager.get_next_account("m"))
+            await asyncio.sleep(0.01)
+            gate.set()
+            account = await asyncio.wait_for(lazy, 1)
+            await asyncio.gather(*list(manager._tasks), return_exceptions=True)
+
+        assert account is not None and account.auth_manager is not None
+        assert factory.constructed == 2  # one per account, never two for the same one
+
+    @pytest.mark.asyncio
+    async def test_global_lock_not_held_during_initialization(self, tmp_path):
+        """
+        What it does: Blocks one account's token refresh, then reports on another account.
+        Purpose: Slow init must not block report_success/report_failure or other selections.
+        """
+        manager = await _manager_with_accounts(tmp_path, 2)
+        ids = list(manager._accounts)
+        gate = asyncio.Event()
+        factory = _FakeAuthFactory(gate=gate)
+
+        with patch.object(_am, "KiroAuthManager", factory), \
+                patch.object(manager, "_refresh_account_models", AsyncMock()):
+            pending = asyncio.create_task(manager.get_next_account("m"))
+            await asyncio.wait_for(factory.started.wait(), 1)
+
+            assert not manager._lock.locked()
+            await asyncio.wait_for(manager.report_success(ids[1], "m"), 0.5)
+            await asyncio.wait_for(
+                manager.report_failure(ids[1], "m", ErrorType.FATAL, 400, None), 0.5
+            )
+
+            gate.set()
+            await asyncio.wait_for(pending, 1)
+            await asyncio.gather(*list(manager._tasks), return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_caller_does_not_cancel_shared_init(self, tmp_path):
+        """
+        What it does: Cancels one waiter while another waits on the same init.
+        Purpose: A disconnected client must not abort initialization for everyone.
+        """
+        manager = await _manager_with_accounts(tmp_path, 1)
+        account_id = next(iter(manager._accounts))
+        gate = asyncio.Event()
+        factory = _FakeAuthFactory(gate=gate)
+
+        with patch.object(_am, "KiroAuthManager", factory):
+            first = asyncio.create_task(manager._initialize_account(account_id))
+            second = asyncio.create_task(manager._initialize_account(account_id))
+            await asyncio.wait_for(factory.started.wait(), 1)
+            first.cancel()
+            await asyncio.sleep(0)
+            gate.set()
+            assert await asyncio.wait_for(second, 1) is True
+
+        assert first.cancelled()
+        assert manager._accounts[account_id].auth_manager is not None
+        assert factory.constructed == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_init_can_be_retried(self, tmp_path):
+        """
+        What it does: Init fails, then credentials are fixed and init is retried.
+        Purpose: A failed in-flight task must not be cached forever.
+        """
+        manager = await _manager_with_accounts(tmp_path, 1)
+        account_id = next(iter(manager._accounts))
+        factory = _FakeAuthFactory(fail=True)
+
+        with patch.object(_am, "KiroAuthManager", factory):
+            assert await manager._initialize_account(account_id) is False
+            assert account_id not in manager._init_tasks
+            factory.fail = False
+            assert await manager._initialize_account(account_id) is True
+
+        assert factory.constructed == 2
+
+    @pytest.mark.asyncio
+    async def test_initialize_unknown_account_returns_false(self, tmp_path):
+        """What it does: Unknown account id. Purpose: No task is created for it."""
+        manager = await _manager_with_accounts(tmp_path, 1)
+        assert await manager._initialize_account("does-not-exist") is False
+        assert manager._init_tasks == {}
+
+
+class TestLazyInitFailureCooldown:
+    """A failed lazy init must start the circuit-breaker cooldown."""
+
+    @pytest.mark.asyncio
+    async def test_failed_lazy_init_sets_last_failure_time(self, tmp_path):
+        """
+        What it does: First account fails lazy init in multi-account mode.
+        Purpose: Previously only failures was incremented, so the cooldown never
+                 started and the dead account was retried on every request.
+        """
+        manager = await _manager_with_accounts(tmp_path, 2)
+        ids = list(manager._accounts)
+        dead_factory = _FakeAuthFactory(fail=True)
+
+        before = time.time()
+        with patch.object(_am, "KiroAuthManager", dead_factory), \
+                patch.object(_am.random, "random", return_value=1.0):
+            result = await manager.get_next_account("m")
+        after = time.time()
+
+        dead = manager._accounts[ids[0]]
+        assert result is None  # both accounts use the failing factory
+        assert dead.failures == 1
+        assert before <= dead.last_failure_time <= after
+        assert manager._dirty is True
+
+    @pytest.mark.asyncio
+    async def test_dead_account_not_retried_during_cooldown(self, tmp_path):
+        """
+        What it does: After a failed init, issues 5 more requests.
+        Purpose: The dead account's credentials are not refreshed again during cooldown.
+        """
+        manager = await _manager_with_accounts(tmp_path, 2)
+        ids = list(manager._accounts)
+        calls_per_account = {i: 0 for i in ids}
+
+        async def fake_init(account_id):
+            calls_per_account[account_id] += 1
+            if account_id == ids[0]:
+                return False
+            manager._accounts[account_id].auth_manager = MagicMock()
+            return True
+
+        with patch.object(manager, "_do_initialize_account", fake_init), \
+                patch.object(manager, "_schedule_refresh", Mock()), \
+                patch.object(_am.random, "random", return_value=1.0):
+            for _ in range(6):
+                account = await manager.get_next_account("m")
+                assert account.id == ids[1]
+
+        assert calls_per_account[ids[0]] == 1
+        assert manager._accounts[ids[0]].failures == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_lazy_init_does_not_mutate_caller_exclude_set(self, tmp_path):
+        """What it does: Passes an exclude set. Purpose: Internal skip tracking stays local."""
+        manager = await _manager_with_accounts(tmp_path, 3)
+        ids = list(manager._accounts)
+        exclude = {ids[2]}
+        with patch.object(_am, "KiroAuthManager", _FakeAuthFactory(fail=True)), \
+                patch.object(_am.random, "random", return_value=1.0):
+            assert await manager.get_next_account("m", exclude_accounts=exclude) is None
+        assert exclude == {ids[2]}
+        assert manager._accounts[ids[2]].failures == 0  # excluded account never touched
+
+    @pytest.mark.asyncio
+    async def test_single_account_failed_init_returns_none_without_penalty(self, tmp_path):
+        """
+        What it does: Single account whose init fails.
+        Purpose: Single-account mode bypasses the circuit breaker (unchanged behavior).
+        """
+        manager = await _manager_with_accounts(tmp_path, 1)
+        account_id = next(iter(manager._accounts))
+        with patch.object(_am, "KiroAuthManager", _FakeAuthFactory(fail=True)):
+            assert await manager.get_next_account("m") is None
+        assert manager._accounts[account_id].failures == 0
+
+
+class TestHalfOpenSingleTrial:
+    """After cooldown, only one request at a time may try a recovering account."""
+
+    async def _ready_manager(self, tmp_path, count: int = 2) -> AccountManager:
+        manager = await _manager_with_accounts(tmp_path, count)
+        for account in manager._accounts.values():
+            account.auth_manager = MagicMock()
+            account.models_cached_at = time.time()
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_only_first_request_gets_half_open_account(self, tmp_path):
+        """
+        What it does: Account 0 is past its cooldown; 5 requests select concurrently.
+        Purpose: Previously every concurrent request was sent to the recovering account.
+        """
+        manager = await self._ready_manager(tmp_path)
+        ids = list(manager._accounts)
+        recovering = manager._accounts[ids[0]]
+        recovering.failures = 1
+        recovering.last_failure_time = time.time() - ACCOUNT_RECOVERY_TIMEOUT - 1
+
+        with patch.object(_am.random, "random", return_value=1.0):
+            selected = await asyncio.gather(*(manager.get_next_account("m") for _ in range(5)))
+
+        picked = [a.id for a in selected]
+        assert picked.count(ids[0]) == 1
+        assert picked.count(ids[1]) == 4
+        assert time.time() - recovering.last_failure_time < 5  # cooldown restarted
+
+    @pytest.mark.asyncio
+    async def test_trial_success_reopens_account(self, tmp_path):
+        """What it does: Trial request succeeds. Purpose: Account is fully usable again."""
+        manager = await self._ready_manager(tmp_path)
+        ids = list(manager._accounts)
+        recovering = manager._accounts[ids[0]]
+        recovering.failures = 1
+        recovering.last_failure_time = time.time() - ACCOUNT_RECOVERY_TIMEOUT - 1
+
+        with patch.object(_am.random, "random", return_value=1.0):
+            trial = await manager.get_next_account("m")
+            assert trial.id == ids[0]
+            await manager.report_success(ids[0], "m")
+            again = [await manager.get_next_account("m") for _ in range(3)]
+
+        assert recovering.failures == 0
+        assert all(a.id == ids[0] for a in again)
+
+    @pytest.mark.asyncio
+    async def test_trial_failure_extends_cooldown(self, tmp_path):
+        """What it does: Trial request fails. Purpose: Backoff grows and account stays closed."""
+        manager = await self._ready_manager(tmp_path)
+        ids = list(manager._accounts)
+        recovering = manager._accounts[ids[0]]
+        recovering.failures = 1
+        recovering.last_failure_time = time.time() - ACCOUNT_RECOVERY_TIMEOUT - 1
+
+        with patch.object(_am.random, "random", return_value=1.0):
+            assert (await manager.get_next_account("m")).id == ids[0]
+            await manager.report_failure(ids[0], "m", ErrorType.RECOVERABLE, 429, None)
+            following = [await manager.get_next_account("m") for _ in range(3)]
+
+        assert recovering.failures == 2
+        assert all(a.id == ids[1] for a in following)
+
+    @pytest.mark.asyncio
+    async def test_unreported_trial_reopens_after_next_window(self, tmp_path):
+        """
+        What it does: Trial request never reports back (e.g. crashed).
+        Purpose: The account must not be blocked forever; it reopens after one window.
+        """
+        manager = await self._ready_manager(tmp_path)
+        ids = list(manager._accounts)
+        recovering = manager._accounts[ids[0]]
+        recovering.failures = 1
+        recovering.last_failure_time = time.time() - ACCOUNT_RECOVERY_TIMEOUT - 1
+
+        with patch.object(_am.random, "random", return_value=1.0):
+            assert (await manager.get_next_account("m")).id == ids[0]
+            assert (await manager.get_next_account("m")).id == ids[1]
+            recovering.last_failure_time -= ACCOUNT_RECOVERY_TIMEOUT + 1  # simulate time passing
+            assert (await manager.get_next_account("m")).id == ids[0]
+
+    @pytest.mark.asyncio
+    async def test_account_in_cooldown_is_skipped_without_probabilistic_retry(self, tmp_path):
+        """What it does: Account still cooling down. Purpose: Regression guard for normal skip."""
+        manager = await self._ready_manager(tmp_path)
+        ids = list(manager._accounts)
+        manager._accounts[ids[0]].failures = 1
+        manager._accounts[ids[0]].last_failure_time = time.time()
+        with patch.object(_am.random, "random", return_value=1.0):
+            assert (await manager.get_next_account("m")).id == ids[1]
+
+
+class TestSharedProbeSemaphore:
+    """Model probes are limited across all accounts by one shared semaphore."""
+
+    @staticmethod
+    def _tracking_probe():
+        state = {"active": 0, "peak": 0}
+
+        async def fake_probe(client, auth, token, model_id, arn):
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+            await asyncio.sleep(0.005)
+            state["active"] -= 1
+            return True
+
+        return state, fake_probe
+
+    @staticmethod
+    def _auth():
+        auth = MagicMock()
+        auth.get_access_token = AsyncMock(return_value="tok")
+        return auth
+
+    def test_limit_constant(self):
+        """What it does: Checks the named constant. Purpose: Limit is 4 as specified."""
+        assert MODEL_PROBE_CONCURRENCY == 4
+
+    @pytest.mark.asyncio
+    async def test_default_semaphore_limits_single_call(self):
+        """
+        What it does: Probes 20 candidates without passing a semaphore.
+        Purpose: Previously the semaphore equaled len(candidates), i.e. no limit.
+        """
+        state, fake_probe = self._tracking_probe()
+        candidates = [f"m{i}" for i in range(20)]
+        with patch.object(_am, "_probe_model", fake_probe):
+            out = await _probe_candidate_models(MagicMock(), self._auth(), candidates, "")
+        assert state["peak"] <= MODEL_PROBE_CONCURRENCY
+        assert len(out) == 21  # all probed, "auto" included
+
+    @pytest.mark.asyncio
+    async def test_shared_semaphore_limits_across_accounts(self):
+        """
+        What it does: Three accounts probe 10 candidates each at the same time.
+        Purpose: The limit is global, not per account.
+        """
+        state, fake_probe = self._tracking_probe()
+        shared = asyncio.Semaphore(MODEL_PROBE_CONCURRENCY)
+        candidates = [f"m{i}" for i in range(10)]
+        with patch.object(_am, "_probe_model", fake_probe):
+            await asyncio.gather(*(
+                _probe_candidate_models(MagicMock(), self._auth(), candidates, "", semaphore=shared)
+                for _ in range(3)
+            ))
+        assert state["peak"] == MODEL_PROBE_CONCURRENCY
+
+    @pytest.mark.asyncio
+    async def test_manager_passes_its_shared_semaphore(self, tmp_path):
+        """What it does: Runs _discover_models with probing on. Purpose: Manager semaphore is used."""
+        manager = await _manager_with_accounts(tmp_path, 2)
+        account = next(iter(manager._accounts.values()))
+        account.auth_manager = MagicMock()
+        account.auth_manager.api_host = "https://runtime.us-east-1.kiro.dev"
+        account.auth_manager.profile_arn = None
+        account.model_cache = None
+        probe = AsyncMock(return_value=[{"modelId": "auto"}])
+        with patch.object(_am, "MODEL_PROBING_ENABLED", True), \
+                patch.object(_am, "_probe_candidate_models", probe):
+            await manager._discover_models(account)
+            await manager.shutdown()
+        assert probe.await_args.kwargs["semaphore"] is manager._probe_semaphore
+
+
+class TestCredentialEntryRedaction:
+    """Credential entries must never be logged with secrets."""
+
+    def test_redacts_sensitive_keys(self):
+        """What it does: Redacts token/secret/password/key fields. Purpose: Core rule."""
+        entry = {
+            "type": "refresh_token",
+            "refresh_token": "RT",
+            "client_secret": "CS",
+            "password": "PW",
+            "api_key": "AK",
+            "region": "us-east-1",
+            "enabled": True,
+        }
+        redacted = _redact_entry(entry)
+        for value in ("RT", "CS", "PW", "AK"):
+            assert value not in str(redacted)
+        assert redacted["region"] == "us-east-1"
+        assert redacted["type"] == "refresh_token"
+        assert redacted["enabled"] is True
+        assert entry["refresh_token"] == "RT"  # original untouched
+
+    def test_case_insensitive_and_camel_case(self):
+        """What it does: Uses camelCase/upper keys. Purpose: Kiro JSON uses refreshToken."""
+        redacted = _redact_entry({"refreshToken": "A", "ClientSecret": "B", "ACCESS_TOKEN": "C", "KeyId": "D"})
+        assert set(redacted.values()) == {"***REDACTED***"}
+
+    def test_nested_dicts_redacted(self):
+        """What it does: Nested credential blob. Purpose: Secrets can hide one level down."""
+        redacted = _redact_entry({"type": "x", "extra": {"accessToken": "SECRET", "note": "ok"}})
+        assert "SECRET" not in str(redacted)
+        assert redacted["extra"]["note"] == "ok"
+
+    @pytest.mark.parametrize("entry", ["raw-refresh-token-string", 42, None, ["tok"]])
+    def test_non_dict_entries_reduced_to_type(self, entry):
+        """What it does: Malformed entries. Purpose: Unknown content is never echoed."""
+        result = _redact_entry(entry)
+        assert result == f"<{type(entry).__name__}>"
+
+    @pytest.mark.asyncio
+    async def test_load_credentials_warnings_do_not_leak_secrets(self, tmp_path):
+        """
+        What it does: Loads invalid entries that contain secrets.
+        Purpose: Warnings for invalid entries must show redacted entries only.
+        """
+        creds = tmp_path / "credentials.json"
+        creds.write_text(json.dumps([
+            {"refresh_token": "LEAK_1", "enabled": True},                        # missing type
+            {"type": "json", "client_secret": "LEAK_2"},                          # missing path
+            {"type": "refresh_token", "refresh_token": "", "api_key": "LEAK_3"},  # empty token
+        ]))
+        manager = AccountManager(str(creds), str(tmp_path / "state.json"))
+        with patch.object(_am.logger, "warning") as warning:
+            await manager.load_credentials()
+        logged = " ".join(str(c) for c in warning.call_args_list)
+        assert warning.call_count == 3
+        for secret in ("LEAK_1", "LEAK_2", "LEAK_3"):
+            assert secret not in logged
+        assert "***REDACTED***" in logged
+
+
+class TestSaveStateOffLoop:
+    """State is snapshotted synchronously and written in a worker thread."""
+
+    @pytest.mark.asyncio
+    async def test_write_runs_in_worker_thread_without_global_lock(self, tmp_path):
+        """What it does: Records thread + lock state during the write. Purpose: No loop/lock blocking."""
+        manager = await _manager_with_accounts(tmp_path, 1)
+        loop_thread = _threading.get_ident()
+        seen = {}
+        original = manager._write_state_file
+
+        def recording_write(data):
+            seen["thread"] = _threading.get_ident()
+            seen["locked"] = manager._lock.locked()
+            return original(data)
+
+        manager._write_state_file = recording_write
+        assert await manager._save_state() is True
+        assert seen["thread"] != loop_thread
+        assert seen["locked"] is False
+        saved = json.loads((tmp_path / "state.json").read_text())
+        assert set(saved) == {"current_account_index", "accounts", "model_to_accounts"}
+
+    @pytest.mark.asyncio
+    async def test_snapshot_is_detached_from_live_state(self, tmp_path):
+        """What it does: Mutates state after snapshot. Purpose: Writer never sees half-updated lists."""
+        manager = await _manager_with_accounts(tmp_path, 1)
+        manager._model_to_accounts["m"] = ModelAccountList(accounts=["a"])
+        snapshot = manager._snapshot_state()
+        manager._model_to_accounts["m"].accounts.append("b")
+        assert snapshot["model_to_accounts"]["m"]["accounts"] == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_write_failure_returns_false_and_cleans_tmp(self, tmp_path):
+        """What it does: State path points into a missing directory. Purpose: No crash, False result."""
+        manager = await _manager_with_accounts(tmp_path, 1)
+        manager._state_file = str(tmp_path / "missing_dir" / "state.json")
+        assert await manager._save_state() is False
+        assert not (tmp_path / "missing_dir").exists()
+
+    @pytest.mark.asyncio
+    async def test_periodic_save_restores_dirty_flag_on_failure(self, tmp_path):
+        """What it does: Periodic save fails. Purpose: Data is retried on the next cycle."""
+        manager = await _manager_with_accounts(tmp_path, 1)
+        manager._dirty = True
+        attempts = []
+
+        async def failing_save():
+            attempts.append(1)
+            return False
+
+        manager._save_state = failing_save
+        with patch.object(_am, "STATE_SAVE_INTERVAL_SECONDS", 0.001):
+            task = asyncio.create_task(manager.save_state_periodically())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert len(attempts) >= 2  # retried because dirty was restored
+        assert manager._dirty is True
+
+    @pytest.mark.asyncio
+    async def test_periodic_save_clears_dirty_on_success(self, tmp_path):
+        """What it does: Periodic save succeeds once. Purpose: No redundant rewrites."""
+        manager = await _manager_with_accounts(tmp_path, 1)
+        manager._dirty = True
+        with patch.object(_am, "STATE_SAVE_INTERVAL_SECONDS", 0.001):
+            task = asyncio.create_task(manager.save_state_periodically())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert manager._dirty is False
+        assert (tmp_path / "state.json").exists()

@@ -9,7 +9,7 @@ Kiro Gateway is a **transparent proxy** - we fix API-level issues while preservi
 ## Getting Started
 
 1. Fork and clone the repo
-2. Install dependencies: `pip install -r requirements.txt`
+2. Install dependencies: `pip install -r requirements-dev.txt`
 3. Copy `.env.example` to `.env` and configure
 4. Run tests: `pytest -v`
 

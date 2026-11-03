@@ -175,19 +175,20 @@ pytest --cov=kiro --cov-report=html
 
 ```bash
 # Install all dependencies
-pip install -r requirements.txt
+pip install -r requirements.txt          # runtime only
+pip install -r requirements-dev.txt      # runtime + pytest
 
 # Main dependencies:
 # - fastapi
-# - uvicorn[standard]
+# - uvicorn
 # - httpx
 # - loguru
 # - requests
 # - python-dotenv
 # - tiktoken
+# Dev (requirements-dev.txt):
 # - pytest
 # - pytest-asyncio
-# - hypothesis
 ```
 
 ### Docker (Containerization)
@@ -811,7 +812,8 @@ git commit -m "docs: update configuration examples"
 
 ```bash
 # Check if dependencies are installed
-pip install -r requirements.txt
+pip install -r requirements.txt          # runtime only
+pip install -r requirements-dev.txt      # runtime + pytest
 
 # Run specific test with verbose output
 pytest tests/unit/test_<module>.py::test_<name> -v -s

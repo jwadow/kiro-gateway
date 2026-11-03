@@ -980,12 +980,12 @@ class TestMessagesErrorFormat:
         print(f"Response: {response.json()}")
         assert response.status_code == 401
         
-        # Check Anthropic error format
+        # Check Anthropic error format (top-level, not wrapped in "detail")
         data = response.json()
-        assert "detail" in data
-        detail = data["detail"]
-        assert "type" in detail
-        assert "error" in detail
+        assert "detail" not in data
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "authentication_error"
+        assert data["error"]["message"]
 
 
 # =============================================================================
@@ -2333,10 +2333,9 @@ class TestCountTokensEndpoint:
         
         print("Checking: Error format is Anthropic-style...")
         data = response.json()
-        assert "detail" in data
-        detail = data["detail"]
-        assert "error" in detail
-        assert detail["error"]["type"] == "authentication_error"
+        assert "detail" not in data
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "authentication_error"
         
         print("✅ Invalid API key rejected")
     
@@ -2519,3 +2518,444 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+
+# =============================================================================
+# Hardening / API-gap tests (isolated app, no lifespan / credentials needed)
+# =============================================================================
+
+import asyncio as _asyncio
+
+import httpx as _httpx
+from fastapi import FastAPI as _FastAPI
+from fastapi.exceptions import RequestValidationError as _RequestValidationError
+from starlette.exceptions import HTTPException as _StarletteHTTPException
+
+
+_AUTH = {"x-api-key": PROXY_API_KEY, "anthropic-version": "2023-06-01"}
+_MSG = {"model": "claude-sonnet-4.5", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+_COLLECTED = {
+    "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+    "content": [{"type": "text", "text": "pong"}], "stop_reason": "end_turn", "stop_sequence": None,
+    "usage": {"input_tokens": 1, "output_tokens": 1},
+}
+
+
+def _make_account():
+    """Mock account with auth manager."""
+    auth_manager = MagicMock()
+    auth_manager.profile_arn = "arn:aws:codewhisperer:us-east-1:1:profile/x"
+    auth_manager.api_host = "https://kiro.invalid"
+    account = MagicMock(auth_manager=auth_manager, model_cache=MagicMock(), model_resolver=MagicMock())
+    account.id = f"acc-{id(account)}"
+    return account
+
+
+@pytest.fixture
+def iso_app() -> _FastAPI:
+    """App with the Anthropic router and gateway error handlers, legacy mode."""
+    from kiro.exceptions import http_exception_handler, validation_exception_handler
+
+    app = _FastAPI()
+    app.include_router(router)
+    app.add_exception_handler(_RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(_StarletteHTTPException, http_exception_handler)
+    account = _make_account()
+    manager = MagicMock()
+    manager.get_first_account.return_value = account
+    manager._accounts = {account.id: account}
+    app.state.account_system = False
+    app.state.account_manager = manager
+    app.state.http_client = MagicMock()
+    return app
+
+
+@pytest.fixture
+def iso_client(iso_app) -> TestClient:
+    """TestClient without lifespan."""
+    return TestClient(iso_app)
+
+
+def _http_client_mock(status_code: int = 200, body: bytes = b"", headers=None) -> MagicMock:
+    """KiroHttpClient mock returning a response with the given status."""
+    response = MagicMock(status_code=status_code)
+    response.aread = AsyncMock(return_value=body)
+    response.aclose = AsyncMock()
+    response.headers = _httpx.Headers(headers or {})
+    http_client = MagicMock()
+    http_client.request_with_retry = AsyncMock(return_value=response)
+    http_client.close = AsyncMock()
+    return http_client
+
+
+class TestAnthropicDebugPayloadGuard:
+    """Kiro payload serialized for debug logs only when enabled."""
+
+    @pytest.mark.parametrize("enabled,expect_calls", [(False, 0), (True, 1)])
+    def test_json_dumps_only_when_enabled(self, iso_client, enabled, expect_calls):
+        """
+        What it does: Runs a request with debug logging on/off.
+        Purpose: No payload serialization per request when DEBUG_MODE=off.
+        """
+        import kiro.routes_anthropic as ra
+        fake_logger = MagicMock()
+        type(fake_logger).enabled = property(lambda self: enabled)
+        with patch.object(ra, "debug_logger", fake_logger), \
+             patch.object(ra, "KiroHttpClient", return_value=_http_client_mock()), \
+             patch.object(ra, "collect_anthropic_response", new=AsyncMock(return_value=_COLLECTED)):
+            resp = iso_client.post("/v1/messages", headers=_AUTH, json=_MSG)
+        assert resp.status_code == 200
+        assert fake_logger.log_kiro_request_body.call_count == expect_calls
+
+
+class TestAnthropicTruncationScanSkip:
+    """Truncation scan skipped unless pending + enabled."""
+
+    def test_skipped_when_nothing_pending(self):
+        """
+        What it does: Applies recovery with no pending entries, lookups booby-trapped.
+        Purpose: No per-message work in the common case.
+        """
+        import kiro.routes_anthropic as ra
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        req = AnthropicMessagesRequest(**{**_MSG, "messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "long"}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "r"}]}]})
+        with patch("kiro.truncation_state.has_pending", return_value=False), \
+             patch("kiro.truncation_state.get_content_truncation", side_effect=AssertionError("scanned")), \
+             patch("kiro.truncation_state.get_tool_truncation", side_effect=AssertionError("scanned")):
+            ra.apply_anthropic_truncation_recovery(req)
+
+    def test_skipped_when_recovery_disabled(self):
+        """
+        What it does: Pending entry exists, recovery disabled.
+        Purpose: Messages untouched and entry not consumed.
+        """
+        import kiro.routes_anthropic as ra
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        from kiro.truncation_state import save_tool_truncation, get_tool_truncation
+        save_tool_truncation("tu_disabled", "Write", {})
+        req = AnthropicMessagesRequest(**{**_MSG, "messages": [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_disabled", "content": "r"}]}]})
+        with patch("kiro.truncation_recovery.should_inject_recovery", return_value=False):
+            ra.apply_anthropic_truncation_recovery(req)
+        assert get_tool_truncation("tu_disabled") is not None
+
+    def test_applied_when_pending(self):
+        """
+        What it does: Pending tool truncation for a tool_result block.
+        Purpose: Recovery still works via the extracted helper.
+        """
+        import kiro.routes_anthropic as ra
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        from kiro.truncation_state import save_tool_truncation
+        save_tool_truncation("tu_apply", "Write", {"reason": "x", "size_bytes": 10})
+        req = AnthropicMessagesRequest(**{**_MSG, "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "keep"},
+                {"type": "tool_result", "tool_use_id": "tu_apply", "content": "orig"}]}]})
+        ra.apply_anthropic_truncation_recovery(req)
+        blocks = req.messages[0].content
+        content = blocks[1]["content"] if isinstance(blocks[1], dict) else blocks[1].content
+        assert "Original tool result:\norig" in content
+
+    def test_content_notice_inserted(self):
+        """
+        What it does: Pending content truncation for an assistant text message.
+        Purpose: Synthetic user message inserted after it.
+        """
+        import kiro.routes_anthropic as ra
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        from kiro.truncation_state import save_content_truncation
+        save_content_truncation("cut off")
+        req = AnthropicMessagesRequest(**{**_MSG, "messages": [
+            {"role": "user", "content": "q"}, {"role": "assistant", "content": "cut off"}]})
+        ra.apply_anthropic_truncation_recovery(req)
+        assert [m.role for m in req.messages] == ["user", "assistant", "user"]
+
+
+class TestAnthropicStopSequencesForwarding:
+    """stop_sequences forwarded to stream/collect functions when supported."""
+
+    def test_non_streaming_forwards_stop_sequences(self, iso_client):
+        """
+        What it does: Non-streaming request with stop_sequences.
+        Purpose: Collect function receives the cleaned list.
+        """
+        import kiro.routes_anthropic as ra
+        seen = {}
+
+        async def collect_fn(response, model, model_cache, auth_manager, request_messages=None,
+                             request_tools=None, request_system=None, stop_sequences=None):
+            seen["stop"] = stop_sequences
+            return _COLLECTED
+
+        with patch.object(ra, "KiroHttpClient", return_value=_http_client_mock()), \
+             patch.object(ra, "collect_anthropic_response", new=collect_fn):
+            resp = iso_client.post("/v1/messages", headers=_AUTH, json={**_MSG, "stop_sequences": ["END", ""]})
+        assert resp.status_code == 200
+        assert seen["stop"] == ["END"]
+
+    def test_streaming_forwards_stop_sequences(self, iso_client):
+        """
+        What it does: Streaming request with stop_sequences.
+        Purpose: Stream function receives them.
+        """
+        import kiro.routes_anthropic as ra
+        seen = {}
+
+        async def stream_fn(make_request, model, model_cache, auth_manager, initial_response=None,
+                            request_messages=None, request_tools=None, request_system=None, stop_sequences=None):
+            seen["stop"] = stop_sequences
+            yield "event: message_stop\ndata: {}\n\n"
+
+        with patch.object(ra, "KiroHttpClient", return_value=_http_client_mock()), \
+             patch.object(ra, "stream_with_first_token_retry_anthropic", new=stream_fn):
+            resp = iso_client.post("/v1/messages", headers=_AUTH,
+                                   json={**_MSG, "stream": True, "stop_sequences": ["S"]})
+        assert resp.status_code == 200
+        assert seen["stop"] == ["S"]
+
+    def test_legacy_signature_without_stop_param(self, iso_client):
+        """
+        What it does: Target collect function without stop_sequences.
+        Purpose: Old signatures still work (kwarg not passed).
+        """
+        import kiro.routes_anthropic as ra
+
+        async def collect_fn(response, model, model_cache, auth_manager, request_messages=None,
+                             request_tools=None, request_system=None):
+            return _COLLECTED
+
+        with patch.object(ra, "KiroHttpClient", return_value=_http_client_mock()), \
+             patch.object(ra, "collect_anthropic_response", new=collect_fn):
+            resp = iso_client.post("/v1/messages", headers=_AUTH, json={**_MSG, "stop_sequences": ["X"]})
+        assert resp.status_code == 200
+
+    @pytest.mark.parametrize("value,expected", [(None, None), ([], None), (["", "a"], ["a"]), (["a", "b"], ["a", "b"])])
+    def test_normalize(self, value, expected):
+        """
+        What it does: Cleans stop_sequences.
+        Purpose: Empty entries dropped, empty list -> None.
+        """
+        from kiro.routes_anthropic import normalize_anthropic_stop_sequences
+        assert normalize_anthropic_stop_sequences(value) == expected
+
+
+class TestAnthropicUpstreamErrorTypes:
+    """Upstream error responses use the status -> type mapping and forward Retry-After."""
+
+    @pytest.mark.parametrize("status,expected_type", [
+        (400, "invalid_request_error"), (403, "permission_error"), (404, "not_found_error"),
+        (413, "request_too_large"), (429, "rate_limit_error"), (500, "api_error"),
+        (503, "overloaded_error"), (529, "overloaded_error"),
+    ])
+    def test_legacy_upstream_error_type(self, iso_client, status, expected_type):
+        """
+        What it does: Kiro returns an error status (legacy mode).
+        Purpose: Anthropic SDKs map error.type to the right exception class.
+        """
+        import kiro.routes_anthropic as ra
+        with patch.object(ra, "KiroHttpClient", return_value=_http_client_mock(status, b'{"message":"m"}')):
+            resp = iso_client.post("/v1/messages", headers=_AUTH, json=_MSG)
+        assert resp.status_code == status
+        assert resp.json()["type"] == "error"
+        assert resp.json()["error"]["type"] == expected_type
+
+    @pytest.mark.parametrize("status,forwarded", [(429, True), (503, True), (400, False), (500, False)])
+    def test_legacy_retry_after(self, iso_client, status, forwarded):
+        """
+        What it does: Kiro error carrying Retry-After.
+        Purpose: Header forwarded only on 429/503.
+        """
+        import kiro.routes_anthropic as ra
+        http_client = _http_client_mock(status, b'{"message":"m"}', {"Retry-After": "9"})
+        with patch.object(ra, "KiroHttpClient", return_value=http_client):
+            resp = iso_client.post("/v1/messages", headers=_AUTH, json=_MSG)
+        assert (resp.headers.get("retry-after") == "9") is forwarded
+
+    def test_account_system_single_429_forwards_retry_after(self, iso_app, iso_client):
+        """
+        What it does: Account system, single account, Kiro 429 (RECOVERABLE path).
+        Purpose: Final response keeps 429, rate_limit_error and Retry-After.
+        """
+        import kiro.routes_anthropic as ra
+        account = _make_account()
+        manager = iso_app.state.account_manager
+        manager._accounts = {account.id: account}
+        manager.get_next_account = AsyncMock(return_value=account)
+        manager.report_failure = AsyncMock()
+        iso_app.state.account_system = True
+        http_client = _http_client_mock(429, b'{"message":"slow"}', {"Retry-After": "5"})
+        with patch.object(ra, "KiroHttpClient", return_value=http_client):
+            resp = iso_client.post("/v1/messages", headers=_AUTH, json=_MSG)
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "5"
+        assert resp.json()["error"]["type"] == "rate_limit_error"
+
+    def test_account_system_fatal_400_type(self, iso_app, iso_client):
+        """
+        What it does: Account system, Kiro 400 (FATAL path).
+        Purpose: invalid_request_error instead of hard-coded api_error.
+        """
+        import kiro.routes_anthropic as ra
+        account = _make_account()
+        manager = iso_app.state.account_manager
+        manager._accounts = {account.id: account}
+        manager.get_next_account = AsyncMock(return_value=account)
+        manager.report_failure = AsyncMock()
+        iso_app.state.account_system = True
+        with patch.object(ra, "KiroHttpClient", return_value=_http_client_mock(400, b'{"message":"Improperly formed request."}')):
+            resp = iso_client.post("/v1/messages", headers=_AUTH, json=_MSG)
+        assert resp.status_code == 400
+        assert resp.json()["error"]["type"] == "invalid_request_error"
+
+    def test_account_system_all_unavailable_is_overloaded(self, iso_app, iso_client):
+        """
+        What it does: Multiple accounts, none available.
+        Purpose: 503 -> overloaded_error (retryable for SDKs).
+        """
+        a, b = _make_account(), _make_account()
+        manager = iso_app.state.account_manager
+        manager._accounts = {a.id: a, b.id: b}
+        manager.get_next_account = AsyncMock(return_value=None)
+        iso_app.state.account_system = True
+        resp = iso_client.post("/v1/messages", headers=_AUTH, json=_MSG)
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "overloaded_error"
+
+    def test_legacy_no_account_is_overloaded(self, iso_app, iso_client):
+        """
+        What it does: Legacy mode without an initialized account.
+        Purpose: 503 mapped to overloaded_error.
+        """
+        iso_app.state.account_manager.get_first_account.return_value.auth_manager = None
+        resp = iso_client.post("/v1/messages", headers=_AUTH, json=_MSG)
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "overloaded_error"
+
+    def test_internal_error_stays_api_error(self, iso_client):
+        """
+        What it does: Unexpected exception during the Kiro call.
+        Purpose: 500 -> api_error.
+        """
+        import kiro.routes_anthropic as ra
+        http_client = _http_client_mock()
+        http_client.request_with_retry = AsyncMock(side_effect=RuntimeError("kaboom"))
+        with patch.object(ra, "KiroHttpClient", return_value=http_client):
+            resp = iso_client.post("/v1/messages", headers=_AUTH, json=_MSG)
+        assert resp.status_code == 500
+        assert resp.json()["error"]["type"] == "api_error"
+
+    def test_network_error_http_exception_is_anthropic_shaped(self, iso_client):
+        """
+        What it does: request_with_retry raises HTTPException(504) in legacy mode.
+        Purpose: Re-raised HTTPException rendered in Anthropic shape (was {"detail": ...}).
+        """
+        import kiro.routes_anthropic as ra
+        http_client = _http_client_mock()
+        http_client.request_with_retry = AsyncMock(side_effect=HTTPException(status_code=504, detail="Server response timeout"))
+        with patch.object(ra, "KiroHttpClient", return_value=http_client):
+            resp = iso_client.post("/v1/messages", headers=_AUTH, json=_MSG)
+        assert resp.status_code == 504
+        assert resp.json() == {"type": "error", "error": {"type": "api_error", "message": "Server response timeout"}}
+
+    def test_validation_error_is_anthropic_shaped(self, iso_client):
+        """
+        What it does: Request missing max_tokens.
+        Purpose: 422 in Anthropic shape, request content not echoed.
+        """
+        resp = iso_client.post("/v1/messages", headers=_AUTH,
+                               json={"model": "m", "messages": [{"role": "user", "content": "PRIVATE-TEXT"}]})
+        assert resp.status_code == 422
+        assert resp.json()["type"] == "error"
+        assert resp.json()["error"]["type"] == "invalid_request_error"
+        assert "PRIVATE-TEXT" not in resp.text
+
+
+class TestAnthropicMidStreamError:
+    """Mid-stream failure emits an Anthropic error event."""
+
+    @pytest.mark.asyncio
+    async def test_error_event_emitted(self):
+        """
+        What it does: Stream raises after a chunk.
+        Purpose: Client gets event: error with api_error, stream ends cleanly.
+        """
+        import kiro.routes_anthropic as ra
+        from kiro.models_anthropic import AnthropicMessagesRequest
+
+        async def broken(**kwargs):
+            yield "event: ping\ndata: {}\n\n"
+            raise RuntimeError("upstream died")
+
+        http_client = _http_client_mock()
+        req = AnthropicMessagesRequest(**{**_MSG, "stream": True})
+        with patch.object(ra, "stream_with_first_token_retry_anthropic", new=broken):
+            response = await ra.build_anthropic_success_response(
+                MagicMock(), req, http_client, MagicMock(), "u", {}, MagicMock(), MagicMock(), [], None, None)
+            frames = [f async for f in response.body_iterator]
+        assert frames[0].startswith("event: ping")
+        assert frames[1].startswith("event: error\ndata: ")
+        payload = json.loads(frames[1].split("data: ", 1)[1])
+        assert payload == {"type": "error", "error": {"type": "api_error", "message": "upstream died"}}
+        http_client.close.assert_awaited()
+
+
+class TestAnthropicNonStreamingDisconnect:
+    """Non-streaming collection cancelled on client disconnect."""
+
+    @pytest.mark.asyncio
+    async def test_cancels_and_closes_upstream(self):
+        """
+        What it does: Client disconnects while the response is collected.
+        Purpose: Upstream closed, 499 returned, collection cancelled.
+        """
+        import kiro.routes_anthropic as ra
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        cancelled = _asyncio.Event()
+
+        async def slow_collect(*args, **kwargs):
+            try:
+                await _asyncio.sleep(10)
+            except _asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        original = ra.run_until_disconnected
+
+        async def fast_run(r, a, poll_interval=0.01):
+            return await original(r, a, poll_interval=0.01)
+
+        request = MagicMock()
+        request.is_disconnected = AsyncMock(return_value=True)
+        upstream = MagicMock()
+        upstream.aclose = AsyncMock()
+        http_client = _http_client_mock()
+        req = AnthropicMessagesRequest(**_MSG)
+        with patch.object(ra, "collect_anthropic_response", new=slow_collect), \
+             patch.object(ra, "run_until_disconnected", new=fast_run):
+            response = await ra.build_anthropic_success_response(
+                request, req, http_client, upstream, "u", {}, MagicMock(), MagicMock(), [], None, None)
+        assert response.status_code == ra.CLIENT_CLOSED_REQUEST_STATUS
+        assert cancelled.is_set()
+        upstream.aclose.assert_awaited()
+        http_client.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_connected_client_gets_response(self):
+        """
+        What it does: Client stays connected.
+        Purpose: Normal JSON response unchanged.
+        """
+        import kiro.routes_anthropic as ra
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        request = MagicMock()
+        request.is_disconnected = AsyncMock(return_value=False)
+        http_client = _http_client_mock()
+        with patch.object(ra, "collect_anthropic_response", new=AsyncMock(return_value=_COLLECTED)):
+            response = await ra.build_anthropic_success_response(
+                request, AnthropicMessagesRequest(**_MSG), http_client, MagicMock(), "u", {},
+                MagicMock(), MagicMock(), [], None, None)
+        assert response.status_code == 200
+        assert json.loads(response.body) == _COLLECTED

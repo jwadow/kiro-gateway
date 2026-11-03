@@ -34,6 +34,11 @@ from pydantic import BaseModel, Field
 # Models for /v1/models endpoint
 # ==================================================================================================
 
+# Stable "created" timestamp for model objects: fixed once per process so repeated
+# /v1/models calls return identical output (OpenAI clients may diff/cache the list).
+PROCESS_START_TIME: int = int(time.time())
+
+
 class OpenAIModel(BaseModel):
     """
     Data model for describing an AI model in OpenAI format.
@@ -42,7 +47,7 @@ class OpenAIModel(BaseModel):
     """
     id: str
     object: str = "model"
-    created: int = Field(default_factory=lambda: int(time.time()))
+    created: int = PROCESS_START_TIME
     owned_by: str = "anthropic"
     description: Optional[str] = None
 
@@ -149,6 +154,7 @@ class ChatCompletionRequest(BaseModel):
         frequency_penalty: Penalty for word repetition
         tools: List of available tools
         tool_choice: Tool selection strategy
+        response_format: Output format request (text, json_object, json_schema)
     """
     model: str
     messages: Annotated[List[ChatMessage], Field(min_length=1)]
@@ -171,7 +177,11 @@ class ChatCompletionRequest(BaseModel):
     # Tools (function calling)
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[str, Dict]] = None
-    
+
+    # Structured output ({"type": "text" | "json_object" | "json_schema", ...}).
+    # Kept permissive; emulated with a system instruction by the converter.
+    response_format: Optional[Dict[str, Any]] = None
+
     # Compatibility fields (ignored)
     stream_options: Optional[Dict[str, Any]] = None
     logit_bias: Optional[Dict[str, float]] = None
@@ -218,26 +228,6 @@ class ChatCompletionUsage(BaseModel):
     credits_used: Optional[float] = None
 
 
-class ChatCompletionResponse(BaseModel):
-    """
-    Full Chat Completion response (non-streaming).
-    
-    Attributes:
-        id: Unique response ID
-        object: Object type ("chat.completion")
-        created: Creation timestamp
-        model: Model used
-        choices: List of response variants
-        usage: Token usage information
-    """
-    id: str
-    object: str = "chat.completion"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
-    choices: List[ChatCompletionChoice]
-    usage: ChatCompletionUsage
-
-
 class ChatCompletionChunkDelta(BaseModel):
     """
     Delta of changes in streaming chunk.
@@ -264,23 +254,3 @@ class ChatCompletionChunkChoice(BaseModel):
     index: int = 0
     delta: ChatCompletionChunkDelta
     finish_reason: Optional[str] = None
-
-
-class ChatCompletionChunk(BaseModel):
-    """
-    Streaming chunk in OpenAI format.
-    
-    Attributes:
-        id: Unique response ID
-        object: Object type ("chat.completion.chunk")
-        created: Creation timestamp
-        model: Model used
-        choices: List of variants
-        usage: Usage information (only in last chunk)
-    """
-    id: str
-    object: str = "chat.completion.chunk"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
-    choices: List[ChatCompletionChunkChoice]
-    usage: Optional[ChatCompletionUsage] = None

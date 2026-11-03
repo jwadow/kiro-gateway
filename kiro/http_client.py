@@ -32,6 +32,7 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
+import ssl
 from typing import Optional
 
 import httpx
@@ -42,6 +43,56 @@ from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, 
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+
+
+# Process-wide SSL context shared by all per-request clients.
+# Building an SSLContext parses the whole CA bundle (certifi), which is costly
+# to repeat for every streaming request. SSLContext is safe to share.
+_shared_ssl_context: Optional[ssl.SSLContext] = None
+
+
+def get_shared_ssl_context() -> ssl.SSLContext:
+    """
+    Returns a lazily created, process-wide SSL context for per-request clients.
+
+    Uses httpx.create_ssl_context() so verification behaves exactly like an
+    httpx.AsyncClient built with default settings (certifi CA bundle, plus
+    SSL_CERT_FILE / SSL_CERT_DIR environment overrides). Proxy settings are
+    unaffected: they come from trust_env on the client, not from the SSL context.
+
+    Returns:
+        Shared ssl.SSLContext instance
+    """
+    global _shared_ssl_context
+    if _shared_ssl_context is None:
+        logger.debug("Creating shared SSL context for per-request HTTP clients")
+        _shared_ssl_context = httpx.create_ssl_context()
+    return _shared_ssl_context
+
+
+async def _discard_response(response: httpx.Response) -> None:
+    """
+    Reads and closes a response that is about to be replaced by a retry.
+
+    The body is read before closing so the response stays readable if it is
+    later returned to the caller as the last error response (callers use
+    `await response.aread()` to get the error body). Reading also releases the
+    underlying connection back to the pool / closes it.
+
+    Errors are logged and swallowed: failing to drain a discarded error
+    response must not abort the retry loop.
+
+    Args:
+        response: Response to drain and close
+    """
+    try:
+        await response.aread()
+    except (httpx.HTTPError, httpx.StreamError) as e:
+        logger.debug(f"Failed to read discarded response body: {e}")
+    try:
+        await response.aclose()
+    except (httpx.HTTPError, httpx.StreamError) as e:
+        logger.debug(f"Failed to close discarded response: {e}")
 
 
 class KiroHttpClient:
@@ -142,7 +193,14 @@ class KiroHttpClient:
                 timeout_config = httpx.Timeout(timeout=300.0)
                 logger.debug("Creating non-streaming HTTP client (timeout=300s)")
             
-            self.client = httpx.AsyncClient(timeout=timeout_config, follow_redirects=True)
+            # verify=shared context avoids re-parsing the CA bundle per client.
+            # trust_env stays at its default (True), so HTTP(S)_PROXY / ALL_PROXY
+            # from VPN_PROXY_URL keep applying exactly as before.
+            self.client = httpx.AsyncClient(
+                timeout=timeout_config,
+                follow_redirects=True,
+                verify=get_shared_ssl_context()
+            )
         return self.client
     
     async def close(self) -> None:
@@ -173,7 +231,8 @@ class KiroHttpClient:
         url: str,
         json_data: Optional[dict] = None,
         params: Optional[dict] = None,
-        stream: bool = False
+        stream: bool = False,
+        max_retries: Optional[int] = None,
     ) -> httpx.Response:
         """
         Executes an HTTP request with retry logic.
@@ -193,6 +252,8 @@ class KiroHttpClient:
             json_data: Optional JSON body (for POST/PUT/PATCH)
             params: Optional query parameters (for GET)
             stream: Use streaming (default False)
+            max_retries: Optional override of the attempt count (e.g. 1 when an
+                outer first-token retry loop already retries)
         
         Returns:
             httpx.Response with successful response
@@ -202,14 +263,20 @@ class KiroHttpClient:
         """
         # Determine the number of retry attempts
         # FIRST_TOKEN_TIMEOUT is used in streaming_openai.py, not here
-        max_retries = FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES
+        if max_retries is None:
+            max_retries = FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES
+        max_retries = max(1, max_retries)
         
         client = await self._get_client(stream=stream)
         last_error = None
         last_error_info: Optional[NetworkErrorInfo] = None
-        last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
+        last_response: Optional[httpx.Response] = None  # Last 429/5xx, returned after exhaustion
+        
+        # Serialize the body once; the bytes are reused on every retry attempt
+        body: Optional[bytes] = json.dumps(json_data).encode() if json_data is not None else None
         
         for attempt in range(max_retries):
+            is_last_attempt = attempt >= max_retries - 1
             try:
                 # Get current token
                 token = await self.auth_manager.get_access_token()
@@ -218,15 +285,18 @@ class KiroHttpClient:
                 # Build request kwargs based on parameters
                 request_kwargs = {"headers": headers}
                 
-                if json_data is not None:
-                    request_kwargs["content"] = json.dumps(json_data).encode()
+                if body is not None:
+                    request_kwargs["content"] = body
                 
                 if params is not None:
                     request_kwargs["params"] = params
                 
                 if stream:
-                    # Prevent CLOSE_WAIT connection leak (issue #38)
-                    headers["Connection"] = "close"
+                    if self._owns_client:
+                        # Prevent CLOSE_WAIT connection leak (issue #38).
+                        # Only for per-request clients: on the shared pooled client
+                        # this header would stop the pool from ever reusing connections.
+                        headers["Connection"] = "close"
                     req = client.build_request(method, url, **request_kwargs)
                     logger.debug("Sending request to Kiro API...")
                     response = await client.send(req, stream=True)
@@ -240,21 +310,25 @@ class KiroHttpClient:
                 
                 # 403 - token expired, refresh and retry
                 if response.status_code == 403:
-                    logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
+                    logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{max_retries})")
+                    await _discard_response(response)
                     await self.auth_manager.force_refresh()
                     continue
                 
-                # 429 - rate limit, wait and retry
-                if response.status_code == 429:
-                    last_response = response  # Сохраняем для возврата после exhaustion
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(delay)
-                    continue
-                
-                # 5xx - server error, wait and retry
-                if 500 <= response.status_code < 600:
-                    last_response = response  # Сохраняем для возврата после exhaustion
+                # 429 - rate limit / 5xx - server error: wait and retry
+                if response.status_code == 429 or 500 <= response.status_code < 600:
+                    # Any previously kept last_response was already drained and
+                    # closed before its backoff sleep, so it can simply be replaced.
+                    last_response = response  # Kept for return after exhaustion
+                    if is_last_attempt:
+                        logger.warning(
+                            f"Received {response.status_code}, no more retries "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        break
+                    # Read + close now so the connection is released while we sleep;
+                    # the body stays cached, so the response remains readable.
+                    await _discard_response(response)
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)

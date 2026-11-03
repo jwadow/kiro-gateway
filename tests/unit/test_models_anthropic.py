@@ -1757,3 +1757,118 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+# ==================================================================================================
+# GenericContentBlock fallback and tool_choice extensions
+# ==================================================================================================
+
+from kiro.models_anthropic import GenericContentBlock, ToolChoiceNone
+
+
+def _parse_blocks(blocks):
+    return AnthropicMessage(role="user", content=blocks).content
+
+
+class TestGenericContentBlockFallback:
+    """Unknown content block types are accepted instead of failing with 422."""
+
+    @pytest.mark.parametrize("block", [
+        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "x"}},
+        {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "d"}, "title": "T"},
+        {"type": "redacted_thinking", "data": "ENCRYPTED"},
+        {"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "x"}]},
+        {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "q"}},
+        {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []},
+        {"type": "completely_new_block"},
+    ])
+    def test_new_types_parse_to_generic_block(self, block):
+        parsed = _parse_blocks([block])[0]
+        assert isinstance(parsed, GenericContentBlock)
+        assert parsed.model_dump() == block
+
+    @pytest.mark.parametrize("block, expected_cls", [
+        ({"type": "text", "text": "hi"}, TextContentBlock),
+        ({"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}, TextContentBlock),
+        ({"type": "thinking", "thinking": "t", "signature": "s"}, ThinkingContentBlock),
+        ({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "a"}}, ImageContentBlock),
+        ({"type": "image", "source": {"type": "url", "url": "https://h/x.png"}}, ImageContentBlock),
+        ({"type": "tool_use", "id": "t", "name": "n", "input": {}}, ToolUseContentBlock),
+        ({"type": "tool_result", "tool_use_id": "t", "content": "r"}, ToolResultContentBlock),
+        ({"type": "tool_reference", "tool_name": "x"}, ToolReferenceContentBlock),
+    ])
+    def test_known_types_still_parse_to_specific_models(self, block, expected_cls):
+        """The fallback must not steal known block types (it is last in the union)."""
+        assert type(_parse_blocks([block])[0]) is expected_cls
+
+    def test_known_type_with_invalid_fields_falls_back(self):
+        """
+        What it does: A text block missing its text field.
+        Purpose: Accepted as a generic block rather than rejected; the converter drops it.
+        """
+        parsed = _parse_blocks([{"type": "text"}])[0]
+        assert isinstance(parsed, GenericContentBlock)
+
+    @pytest.mark.parametrize("block", [{"no_type": True}, {"type": 5}, {"type": None}, "bare string", 42])
+    def test_blocks_without_string_type_still_rejected(self, block):
+        """Blocks without a string type are not content blocks at all."""
+        with pytest.raises(ValidationError):
+            _parse_blocks([block])
+
+    def test_mixed_known_and_unknown_blocks(self):
+        parsed = _parse_blocks([
+            {"type": "text", "text": "a"},
+            {"type": "document", "source": {"type": "text", "data": "d"}},
+            {"type": "tool_result", "tool_use_id": "t", "content": "r"},
+        ])
+        assert [type(b) for b in parsed] == [TextContentBlock, GenericContentBlock, ToolResultContentBlock]
+
+    def test_unknown_blocks_inside_tool_result(self):
+        parsed = _parse_blocks([{"type": "tool_result", "tool_use_id": "t", "content": [
+            {"type": "text", "text": "x"},
+            {"type": "search_result", "source": "s", "title": "t", "content": []},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "a"}},
+        ]}])[0]
+        assert [type(b) for b in parsed.content] == [TextContentBlock, GenericContentBlock, ImageContentBlock]
+
+    def test_full_request_with_new_blocks_validates(self):
+        request = AnthropicMessagesRequest(model="m", max_tokens=10, messages=[
+            {"role": "user", "content": [{"type": "document", "source": {"type": "text", "data": "d"}}]},
+            {"role": "assistant", "content": [{"type": "redacted_thinking", "data": "x"},
+                                              {"type": "text", "text": "ok"}]},
+        ])
+        assert isinstance(request.messages[0].content[0], GenericContentBlock)
+
+    def test_system_accepts_non_text_blocks(self):
+        """System as a list may contain non-text blocks; they validate via the dict fallback."""
+        request = AnthropicMessagesRequest(model="m", max_tokens=10, messages=[{"role": "user", "content": "hi"}],
+                                           system=[{"type": "text", "text": "a"},
+                                                   {"type": "document", "source": {"type": "text", "data": "d"}}])
+        assert len(request.system) == 2
+
+
+class TestToolChoiceExtensions:
+    """tool_choice none and disable_parallel_tool_use are preserved by validation."""
+
+    def _request(self, tool_choice):
+        return AnthropicMessagesRequest(model="m", max_tokens=10, messages=[{"role": "user", "content": "hi"}],
+                                        tool_choice=tool_choice)
+
+    def test_none_parses(self):
+        assert isinstance(self._request({"type": "none"}).tool_choice, ToolChoiceNone)
+
+    @pytest.mark.parametrize("choice, cls", [
+        ({"type": "auto", "disable_parallel_tool_use": True}, ToolChoiceAuto),
+        ({"type": "any", "disable_parallel_tool_use": True}, ToolChoiceAny),
+        ({"type": "tool", "name": "x", "disable_parallel_tool_use": True}, ToolChoiceTool),
+    ])
+    def test_disable_parallel_preserved(self, choice, cls):
+        parsed = self._request(choice).tool_choice
+        assert isinstance(parsed, cls)
+        assert parsed.disable_parallel_tool_use is True
+
+    def test_disable_parallel_defaults_to_none(self):
+        assert self._request({"type": "auto"}).tool_choice.disable_parallel_tool_use is None
+
+    def test_unknown_tool_choice_falls_back_to_dict(self):
+        assert self._request({"type": "mystery"}).tool_choice == {"type": "mystery"}

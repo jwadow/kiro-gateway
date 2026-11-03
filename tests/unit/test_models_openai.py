@@ -8,11 +8,12 @@ Comprehensive tests for all OpenAI-compatible API models:
 - Chat messages (ChatMessage)
 - Tools (ToolFunction, Tool)
 - Requests (ChatCompletionRequest)
-- Responses (ChatCompletionChoice, ChatCompletionUsage, ChatCompletionResponse)
-- Streaming (ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta)
+- Responses (ChatCompletionChoice, ChatCompletionUsage)
+- Streaming (ChatCompletionChunkChoice, ChatCompletionChunkDelta)
 """
 
 import pytest
+from unittest.mock import patch
 from pydantic import ValidationError
 
 from kiro.models_openai import (
@@ -29,11 +30,9 @@ from kiro.models_openai import (
     # Responses
     ChatCompletionChoice,
     ChatCompletionUsage,
-    ChatCompletionResponse,
     # Streaming
     ChatCompletionChunkDelta,
     ChatCompletionChunkChoice,
-    ChatCompletionChunk,
 )
 
 
@@ -770,94 +769,6 @@ class TestChatCompletionChoice:
 
 
 # ==================================================================================================
-# Tests for ChatCompletionResponse
-# ==================================================================================================
-
-class TestChatCompletionResponse:
-    """Tests for ChatCompletionResponse Pydantic model."""
-    
-    def test_valid_response(self):
-        """
-        What it does: Verifies creation of valid ChatCompletionResponse.
-        Purpose: Ensure model accepts valid response data.
-        """
-        print("Setup: Creating ChatCompletionResponse with valid data...")
-        response = ChatCompletionResponse(
-            id="chatcmpl-123",
-            model="claude-sonnet-4-5",
-            choices=[ChatCompletionChoice(
-                message={"role": "assistant", "content": "Hello!"},
-                finish_reason="stop"
-            )],
-            usage=ChatCompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
-        )
-        
-        print(f"Result: {response}")
-        print(f"Comparing id: Expected 'chatcmpl-123', Got '{response.id}'")
-        assert response.id == "chatcmpl-123"
-        
-        print(f"Comparing object: Expected 'chat.completion', Got '{response.object}'")
-        assert response.object == "chat.completion"
-        
-        print(f"Comparing model: Expected 'claude-sonnet-4-5', Got '{response.model}'")
-        assert response.model == "claude-sonnet-4-5"
-        
-        print(f"Comparing choices length: Expected 1, Got {len(response.choices)}")
-        assert len(response.choices) == 1
-    
-    def test_object_defaults_to_chat_completion(self):
-        """
-        What it does: Verifies that object defaults to "chat.completion".
-        Purpose: Ensure default value is set correctly.
-        """
-        print("Setup: Creating ChatCompletionResponse without explicit object...")
-        response = ChatCompletionResponse(
-            id="test",
-            model="test",
-            choices=[ChatCompletionChoice(message={"role": "assistant", "content": "Hi"})],
-            usage=ChatCompletionUsage()
-        )
-        
-        print(f"Comparing object: Expected 'chat.completion', Got '{response.object}'")
-        assert response.object == "chat.completion"
-    
-    def test_created_is_auto_generated(self):
-        """
-        What it does: Verifies that created timestamp is auto-generated.
-        Purpose: Ensure timestamp is set automatically.
-        """
-        print("Setup: Creating ChatCompletionResponse without explicit created...")
-        response = ChatCompletionResponse(
-            id="test",
-            model="test",
-            choices=[ChatCompletionChoice(message={"role": "assistant", "content": "Hi"})],
-            usage=ChatCompletionUsage()
-        )
-        
-        print(f"Comparing created: Got {response.created}")
-        assert response.created > 0
-        assert isinstance(response.created, int)
-    
-    def test_requires_id(self):
-        """
-        What it does: Verifies that id is required.
-        Purpose: Ensure validation fails without id.
-        """
-        print("Setup: Attempting to create ChatCompletionResponse without id...")
-        
-        print("Action: Creating model (should raise ValidationError)...")
-        with pytest.raises(ValidationError) as exc_info:
-            ChatCompletionResponse(
-                model="test",
-                choices=[ChatCompletionChoice(message={"role": "assistant", "content": "Hi"})],
-                usage=ChatCompletionUsage()
-            )
-        
-        print(f"ValidationError raised: {exc_info.value}")
-        assert "id" in str(exc_info.value)
-
-
-# ==================================================================================================
 # Tests for Streaming Models
 # ==================================================================================================
 
@@ -978,84 +889,6 @@ class TestChatCompletionChunkChoice:
         assert choice.finish_reason == "stop"
 
 
-class TestChatCompletionChunk:
-    """Tests for ChatCompletionChunk Pydantic model."""
-    
-    def test_valid_chunk(self):
-        """
-        What it does: Verifies creation of valid chunk.
-        Purpose: Ensure model accepts valid chunk data.
-        """
-        print("Setup: Creating ChatCompletionChunk with valid data...")
-        chunk = ChatCompletionChunk(
-            id="chatcmpl-123",
-            model="claude-sonnet-4-5",
-            choices=[ChatCompletionChunkChoice(
-                delta=ChatCompletionChunkDelta(content="Hello")
-            )]
-        )
-        
-        print(f"Result: {chunk}")
-        print(f"Comparing id: Expected 'chatcmpl-123', Got '{chunk.id}'")
-        assert chunk.id == "chatcmpl-123"
-        
-        print(f"Comparing object: Expected 'chat.completion.chunk', Got '{chunk.object}'")
-        assert chunk.object == "chat.completion.chunk"
-        
-        print(f"Comparing model: Expected 'claude-sonnet-4-5', Got '{chunk.model}'")
-        assert chunk.model == "claude-sonnet-4-5"
-    
-    def test_object_defaults_to_chunk(self):
-        """
-        What it does: Verifies that object defaults to "chat.completion.chunk".
-        Purpose: Ensure default value is set correctly.
-        """
-        print("Setup: Creating ChatCompletionChunk without explicit object...")
-        chunk = ChatCompletionChunk(
-            id="test",
-            model="test",
-            choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta())]
-        )
-        
-        print(f"Comparing object: Expected 'chat.completion.chunk', Got '{chunk.object}'")
-        assert chunk.object == "chat.completion.chunk"
-    
-    def test_usage_is_optional(self):
-        """
-        What it does: Verifies that usage is optional.
-        Purpose: Ensure intermediate chunks work without usage.
-        """
-        print("Setup: Creating ChatCompletionChunk without usage...")
-        chunk = ChatCompletionChunk(
-            id="test",
-            model="test",
-            choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta())]
-        )
-        
-        print(f"Comparing usage: Expected None, Got {chunk.usage}")
-        assert chunk.usage is None
-    
-    def test_accepts_usage(self):
-        """
-        What it does: Verifies that usage is accepted.
-        Purpose: Ensure final chunk with usage works.
-        """
-        print("Setup: Creating ChatCompletionChunk with usage...")
-        chunk = ChatCompletionChunk(
-            id="test",
-            model="test",
-            choices=[ChatCompletionChunkChoice(
-                delta=ChatCompletionChunkDelta(),
-                finish_reason="stop"
-            )],
-            usage=ChatCompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
-        )
-        
-        print(f"Comparing usage: Got {chunk.usage}")
-        assert chunk.usage is not None
-        assert chunk.usage.total_tokens == 15
-
-
 # ==================================================================================================
 # Tests for Client Thinking Budget Support (Issue #111)
 # ==================================================================================================
@@ -1114,3 +947,76 @@ class TestReasoningEffort:
         except ValidationError as e:
             print(f"Correctly raised ValidationError: {e}")
             assert "reasoning_effort" in str(e).lower()
+
+
+# ==================================================================================================
+# Tests for stable OpenAIModel.created and removed dead models
+# ==================================================================================================
+
+class TestOpenAIModelStableCreated:
+    """Tests for process-stable OpenAIModel.created."""
+
+    def test_created_equals_process_start_time(self):
+        """
+        What it does: Verifies created defaults to the module-level constant.
+        Purpose: Ensure /v1/models output does not change between calls.
+        """
+        from kiro import models_openai
+        assert OpenAIModel(id="a").created == models_openai.PROCESS_START_TIME
+
+    def test_created_is_stable_across_instances_and_time(self):
+        """
+        What it does: Creates models at different times with time.time patched.
+        Purpose: Ensure default is not recomputed per object.
+        """
+        first = OpenAIModel(id="a").created
+        with patch("time.time", return_value=first + 10_000):
+            second = OpenAIModel(id="b").created
+        assert first == second
+
+    def test_explicit_created_still_overrides(self):
+        """
+        What it does: Passes explicit created.
+        Purpose: Ensure the default does not block overrides.
+        """
+        assert OpenAIModel(id="a", created=5).created == 5
+
+    def test_dead_response_models_removed(self):
+        """
+        What it does: Checks removed names are gone from the module and package.
+        Purpose: Prevent reintroducing dead code.
+        """
+        import kiro
+        from kiro import models_openai
+        for name in ("ChatCompletionResponse", "ChatCompletionChunk"):
+            assert not hasattr(models_openai, name)
+            assert not hasattr(kiro, name)
+
+
+# ==================================================================================================
+# response_format field
+# ==================================================================================================
+
+class TestChatCompletionRequestResponseFormat:
+    """response_format is declared and permissive."""
+
+    @staticmethod
+    def _request(**kwargs):
+        return ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], **kwargs)
+
+    def test_defaults_to_none(self):
+        assert self._request().response_format is None
+
+    @pytest.mark.parametrize("value", [
+        {"type": "text"},
+        {"type": "json_object"},
+        {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}, "strict": True}},
+        {"type": "future_type", "anything": [1, 2]},
+    ])
+    def test_accepts_dicts_verbatim(self, value):
+        assert self._request(response_format=value).response_format == value
+
+    @pytest.mark.parametrize("value", ["json_object", 5, ["json_object"]])
+    def test_rejects_non_dict(self, value):
+        with pytest.raises(ValidationError):
+            self._request(response_format=value)

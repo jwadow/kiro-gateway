@@ -6455,3 +6455,620 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+# ==================================================================================================
+# Hardening: merge_adjacent_messages copy semantics and parity
+# ==================================================================================================
+
+import copy as _copy
+import random as _random
+
+from kiro import converters_core as _core
+from kiro.converters_core import (
+    REMOTE_IMAGE_PLACEHOLDER,
+    RAW_TOOL_ARGUMENTS_KEY,
+    TOOL_CHOICE_AUTO,
+    TOOL_CHOICE_NONE,
+    TOOL_CHOICE_REQUIRED,
+    TOOL_CHOICE_TOOL,
+    TOOL_CHOICE_FORCED_INSTRUCTION_TEMPLATE,
+    TOOL_CHOICE_REQUIRED_INSTRUCTION,
+    TOOL_CHOICE_SINGLE_CALL_INSTRUCTION,
+    TextAccumulator,
+    UnifiedToolChoice,
+    append_system_section,
+    apply_tool_choice,
+    extract_image_from_block,
+    get_remote_image_url,
+)
+
+
+def _reference_merge(messages):
+    """
+    Original pairwise merge (minus logging), applied to deep copies.
+
+    Used as the oracle for the linear-time implementation.
+    """
+    messages = _copy.deepcopy(messages)
+    merged = []
+    for msg in messages:
+        if not merged:
+            merged.append(msg)
+            continue
+        last = merged[-1]
+        if msg.role == last.role:
+            if isinstance(last.content, list) and isinstance(msg.content, list):
+                last.content = last.content + msg.content
+            elif isinstance(last.content, list):
+                last.content = last.content + [{"type": "text", "text": extract_text_content(msg.content)}]
+            elif isinstance(msg.content, list):
+                last.content = [{"type": "text", "text": extract_text_content(last.content)}] + msg.content
+            else:
+                last.content = f"{extract_text_content(last.content)}\n{extract_text_content(msg.content)}"
+            if msg.role == "assistant" and msg.tool_calls:
+                last.tool_calls = list(last.tool_calls or []) + list(msg.tool_calls)
+            if msg.role == "user" and msg.tool_results:
+                last.tool_results = list(last.tool_results or []) + list(msg.tool_results)
+        else:
+            merged.append(msg)
+    return merged
+
+
+def _random_unified_message(rng, index):
+    role = rng.choice(["user", "user", "assistant", "assistant", "developer"])
+    kind = rng.random()
+    if kind < 0.4:
+        content = f"text {index}"
+    elif kind < 0.5:
+        content = ""
+    elif kind < 0.55:
+        content = None
+    else:
+        content = [{"type": "text", "text": f"block {index}-{k}"} for k in range(rng.randint(0, 3))]
+    tool_calls = None
+    tool_results = None
+    if role == "assistant" and rng.random() < 0.4:
+        tool_calls = [{"id": f"c{index}", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
+    if role == "user" and rng.random() < 0.4:
+        tool_results = [{"type": "tool_result", "tool_use_id": f"c{index}", "content": "ok"}]
+    images = [{"media_type": "image/png", "data": "x"}] if rng.random() < 0.1 else None
+    return UnifiedMessage(role=role, content=content, tool_calls=tool_calls, tool_results=tool_results, images=images)
+
+
+class TestMergeAdjacentMessagesHardening:
+    """merge_adjacent_messages must not mutate inputs and must match the original output."""
+
+    @pytest.mark.parametrize("seed", range(200))
+    def test_matches_reference_on_random_input(self, seed):
+        """
+        What it does: Compares the new merge with the original algorithm on random messages.
+        Purpose: The linear-time rewrite must produce identical output.
+        """
+        rng = _random.Random(seed)
+        messages = [_random_unified_message(rng, i) for i in range(rng.randint(0, 25))]
+        expected = _reference_merge(messages)
+        actual = merge_adjacent_messages(messages)
+        assert actual == expected
+
+    @pytest.mark.parametrize("seed", range(50))
+    def test_does_not_mutate_inputs(self, seed):
+        """
+        What it does: Snapshots messages before merging and compares afterwards.
+        Purpose: The caller's UnifiedMessage objects and their lists must stay untouched.
+        """
+        rng = _random.Random(500 + seed)
+        messages = [_random_unified_message(rng, i) for i in range(rng.randint(2, 25))]
+        snapshot = _copy.deepcopy(messages)
+        merge_adjacent_messages(messages)
+        assert messages == snapshot
+
+    def test_merged_message_lists_are_not_shared_with_inputs(self):
+        """
+        What it does: Mutates the merged result's lists.
+        Purpose: Ensure merged lists are new objects (no aliasing into inputs).
+        """
+        first_calls = [{"id": "a", "function": {"name": "f", "arguments": "{}"}}]
+        first_content = [{"type": "text", "text": "x"}]
+        messages = [
+            UnifiedMessage(role="assistant", content=first_content, tool_calls=first_calls),
+            UnifiedMessage(role="assistant", content=[{"type": "text", "text": "y"}],
+                           tool_calls=[{"id": "b", "function": {"name": "g", "arguments": "{}"}}]),
+        ]
+        result = merge_adjacent_messages(messages)
+        assert len(result) == 1
+        result[0].content.append({"type": "text", "text": "z"})
+        result[0].tool_calls.append({"id": "c"})
+        assert len(first_content) == 1
+        assert len(first_calls) == 1
+
+    def test_unmerged_messages_are_passed_through(self):
+        """
+        What it does: Messages with alternating roles.
+        Purpose: Single messages are returned as-is (same objects), as before.
+        """
+        messages = [UnifiedMessage(role="user", content="a"), UnifiedMessage(role="assistant", content="b")]
+        result = merge_adjacent_messages(messages)
+        assert result[0] is messages[0]
+        assert result[1] is messages[1]
+
+    def test_long_run_of_strings_joins_with_newlines(self):
+        """
+        What it does: Merges 1000 consecutive user strings.
+        Purpose: Verify the join result for a long run (the former O(k^2) case).
+        """
+        messages = [UnifiedMessage(role="user", content=str(i)) for i in range(1000)]
+        result = merge_adjacent_messages(messages)
+        assert len(result) == 1
+        assert result[0].content == "\n".join(str(i) for i in range(1000))
+
+    def test_text_then_list_then_text(self):
+        """
+        What it does: string, list, string run.
+        Purpose: Ensure the text-to-list switch happens at the first list, as in the original.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="a"),
+            UnifiedMessage(role="user", content="b"),
+            UnifiedMessage(role="user", content=[{"type": "text", "text": "c"}]),
+            UnifiedMessage(role="user", content="d"),
+        ]
+        result = merge_adjacent_messages(messages)
+        assert result[0].content == [
+            {"type": "text", "text": "a\nb"},
+            {"type": "text", "text": "c"},
+            {"type": "text", "text": "d"},
+        ]
+
+    def test_other_fields_come_from_first_message(self):
+        """
+        What it does: Second message has images; first does not.
+        Purpose: Behaviour preserved: images of later messages in a run are not merged.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="a", images=[{"media_type": "image/png", "data": "1"}]),
+            UnifiedMessage(role="user", content="b", images=[{"media_type": "image/png", "data": "2"}]),
+        ]
+        result = merge_adjacent_messages(messages)
+        assert result[0].images == [{"media_type": "image/png", "data": "1"}]
+
+
+# ==================================================================================================
+# Hardening: module-level prompt constants
+# ==================================================================================================
+
+class TestPromptConstants:
+    """Constant prompt texts are module-level and config flags are still read at call time."""
+
+    def test_thinking_addition_returns_constant(self):
+        """
+        What it does: Calls get_thinking_system_prompt_addition with fake reasoning on.
+        Purpose: Ensure it returns the module constant (built once).
+        """
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            assert _core.get_thinking_system_prompt_addition() is _core.THINKING_SYSTEM_PROMPT_ADDITION
+
+    def test_truncation_addition_reads_flag_at_call_time(self):
+        """
+        What it does: Patches kiro.config.TRUNCATION_RECOVERY back and forth.
+        Purpose: The flag must not be bound at import time.
+        """
+        with patch("kiro.config.TRUNCATION_RECOVERY", True):
+            assert _core.get_truncation_recovery_system_addition() == _core.TRUNCATION_RECOVERY_SYSTEM_ADDITION
+        with patch("kiro.config.TRUNCATION_RECOVERY", False):
+            assert _core.get_truncation_recovery_system_addition() == ""
+
+    def test_thinking_instruction_embedded_in_tags(self):
+        """
+        What it does: Injects thinking tags.
+        Purpose: The constant instruction text is placed inside <thinking_instruction>.
+        """
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True), \
+                patch("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 0):
+            result = inject_thinking_tags("Hi", ThinkingConfig(enabled=True, budget_tokens=10))
+        assert f"<thinking_instruction>{_core.THINKING_INSTRUCTION}</thinking_instruction>" in result
+        assert result.endswith("Hi")
+
+
+# ==================================================================================================
+# Hardening: malformed tool call arguments
+# ==================================================================================================
+
+class TestMalformedToolCallArguments:
+    """Malformed OpenAI tool call arguments must not fail the whole request."""
+
+    @staticmethod
+    def _call(arguments):
+        return [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": arguments}}]
+
+    @pytest.mark.parametrize("arguments", [
+        '{"a": 1',          # truncated
+        "not json",
+        "{'a': 1}",         # Python repr, not JSON
+        '{"a": 1} trailing',
+        "\x00",
+    ])
+    def test_malformed_json_is_preserved_as_raw(self, arguments):
+        """
+        What it does: Extracts tool uses from calls with invalid JSON arguments.
+        Purpose: Keep the raw string under raw_arguments instead of raising.
+        """
+        result = extract_tool_uses_from_message("", self._call(arguments))
+        assert result == [{"name": "f", "input": {RAW_TOOL_ARGUMENTS_KEY: arguments}, "toolUseId": "c1"}]
+
+    @pytest.mark.parametrize("arguments", ["[1, 2]", "42", '"text"', "null", "true"])
+    def test_non_object_json_is_wrapped(self, arguments):
+        """
+        What it does: Arguments that are valid JSON but not an object.
+        Purpose: Kiro needs an object for input; keep the original text under raw_arguments.
+        """
+        result = extract_tool_uses_from_message("", self._call(arguments))
+        assert result[0]["input"] == {RAW_TOOL_ARGUMENTS_KEY: arguments}
+
+    @pytest.mark.parametrize("arguments", ["", "   ", "\n"])
+    def test_empty_arguments_become_empty_object(self, arguments):
+        """
+        What it does: Empty or whitespace-only arguments.
+        Purpose: Treated as no arguments, as before for "".
+        """
+        assert extract_tool_uses_from_message("", self._call(arguments))[0]["input"] == {}
+
+    def test_valid_arguments_unchanged(self):
+        """
+        What it does: Valid JSON object arguments.
+        Purpose: Ensure the happy path still parses normally.
+        """
+        result = extract_tool_uses_from_message("", self._call('{"q": "x", "n": [1]}'))
+        assert result[0]["input"] == {"q": "x", "n": [1]}
+
+    def test_malformed_arguments_logged_as_warning(self):
+        """
+        What it does: Spies on logger.warning.
+        Purpose: The fallback must be visible in logs.
+        """
+        with patch("kiro.converters_core.logger") as mock_logger:
+            extract_tool_uses_from_message("", self._call("{bad"))
+        assert mock_logger.warning.called
+        assert "f" in mock_logger.warning.call_args[0][0]
+
+    def test_build_payload_with_malformed_history_tool_call_succeeds(self):
+        """
+        What it does: Builds a full payload whose history has a malformed tool call.
+        Purpose: End-to-end: the request no longer fails with an exception.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=self._call('{"path": "/tmp')),
+            UnifiedMessage(role="user", content="",
+                           tool_results=[{"type": "tool_result", "tool_use_id": "c1", "content": "ok"}]),
+        ]
+        tools = [UnifiedTool(name="f", description="d", input_schema={"type": "object"})]
+        result = build_kiro_payload(messages, "", "m", tools, "conv", "", ThinkingConfig(enabled=False))
+        history = result.payload["conversationState"]["history"]
+        tool_use = history[1]["assistantResponseMessage"]["toolUses"][0]
+        assert tool_use["input"] == {RAW_TOOL_ARGUMENTS_KEY: '{"path": "/tmp'}
+
+
+# ==================================================================================================
+# Hardening: remote image URLs leave a placeholder
+# ==================================================================================================
+
+class TestRemoteImagePlaceholder:
+    """Remote image URLs are never fetched; a placeholder tells the model an image was dropped."""
+
+    def test_openai_http_url_adds_placeholder(self):
+        """
+        What it does: OpenAI image_url with an https URL.
+        Purpose: Text gets the placeholder; no image is extracted.
+        """
+        content = [
+            {"type": "text", "text": "What is this?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        ]
+        assert extract_text_content(content) == f"What is this?\n{REMOTE_IMAGE_PLACEHOLDER}"
+        assert extract_images_from_content(content) == []
+
+    def test_anthropic_url_source_adds_placeholder(self):
+        """
+        What it does: Anthropic image with source.type url.
+        Purpose: Same placeholder for Anthropic format (API parity).
+        """
+        content = [{"type": "image", "source": {"type": "url", "url": "https://example.com/x.jpg"}}]
+        assert extract_text_content(content) == REMOTE_IMAGE_PLACEHOLDER
+        assert extract_images_from_content(content) == []
+
+    def test_data_url_has_no_placeholder(self):
+        """
+        What it does: OpenAI data URL image.
+        Purpose: Supported images are extracted and add no text.
+        """
+        content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{TEST_IMAGE_BASE64}"}}]
+        assert extract_text_content(content) == ""
+        assert len(extract_images_from_content(content)) == 1
+
+    def test_base64_anthropic_image_has_no_placeholder(self):
+        """
+        What it does: Anthropic base64 image.
+        Purpose: No placeholder for supported images.
+        """
+        content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}]
+        assert extract_text_content(content) == ""
+
+    def test_placeholder_between_texts_on_own_line(self):
+        """
+        What it does: text, remote image, text.
+        Purpose: The placeholder must not run into the user's words; texts keep their original joining.
+        """
+        content = [
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b"},
+            {"type": "image_url", "image_url": {"url": "http://h/i.png"}},
+            {"type": "text", "text": "c"},
+        ]
+        assert extract_text_content(content) == f"ab\n{REMOTE_IMAGE_PLACEHOLDER}\nc"
+
+    def test_multiple_remote_images_each_get_placeholder(self):
+        """
+        What it does: Two remote images.
+        Purpose: Each dropped image is reported.
+        """
+        content = [
+            {"type": "image_url", "image_url": {"url": "https://a/1.png"}},
+            {"type": "image_url", "image_url": {"url": "https://a/2.png"}},
+        ]
+        assert extract_text_content(content) == f"{REMOTE_IMAGE_PLACEHOLDER}\n{REMOTE_IMAGE_PLACEHOLDER}"
+
+    def test_non_http_scheme_also_dropped_with_placeholder(self):
+        """
+        What it does: image_url with ftp:// and file:// schemes.
+        Purpose: Any non-data URL is unsupported and reported (never fetched).
+        """
+        for url in ("ftp://h/x.png", "file:///etc/passwd"):
+            content = [{"type": "image_url", "image_url": {"url": url}}]
+            assert extract_text_content(content) == REMOTE_IMAGE_PLACEHOLDER
+            assert extract_images_from_content(content) == []
+
+    def test_empty_url_is_ignored(self):
+        """
+        What it does: image_url with an empty URL.
+        Purpose: Nothing to report, no crash.
+        """
+        content = [{"type": "image_url", "image_url": {"url": ""}}]
+        assert extract_text_content(content) == ""
+        assert get_remote_image_url(content[0]) is None
+
+    def test_malformed_image_url_object(self):
+        """
+        What it does: image_url values of unexpected types.
+        Purpose: Never crash on malformed input.
+        """
+        for value in (None, 42, ["x"], {"url": None}, {"url": 5}):
+            block = {"type": "image_url", "image_url": value}
+            assert extract_image_from_block(block) is None
+            extract_text_content([block])
+
+    def test_image_url_as_plain_string(self):
+        """
+        What it does: image_url given directly as a string (non-standard).
+        Purpose: Detected as remote URL and reported.
+        """
+        block = {"type": "image_url", "image_url": "https://h/x.png"}
+        assert get_remote_image_url(block) == "https://h/x.png"
+
+    def test_pydantic_url_image_block(self):
+        """
+        What it does: Anthropic ImageContentBlock with URL source (Pydantic).
+        Purpose: Placeholder for Pydantic blocks too.
+        """
+        from kiro.models_anthropic import ImageContentBlock, URLImageSource
+        block = ImageContentBlock(source=URLImageSource(url="https://h/y.png"))
+        assert extract_text_content([block]) == REMOTE_IMAGE_PLACEHOLDER
+
+    def test_remote_image_warning_logged(self):
+        """
+        What it does: Spies on logger while extracting images.
+        Purpose: A warning is logged for dropped remote images.
+        """
+        with patch("kiro.converters_core.logger") as mock_logger:
+            extract_images_from_content([{"type": "image_url", "image_url": {"url": "https://h/x.png"}}])
+        assert mock_logger.warning.called
+
+    def test_placeholder_reaches_kiro_payload(self):
+        """
+        What it does: Builds a payload from a message with a remote image.
+        Purpose: End-to-end: the current message content includes the placeholder.
+        """
+        messages = [UnifiedMessage(role="user", content=extract_text_content([
+            {"type": "text", "text": "Describe"},
+            {"type": "image_url", "image_url": {"url": "https://h/x.png"}},
+        ]))]
+        result = build_kiro_payload(messages, "", "m", None, "c", "", ThinkingConfig(enabled=False))
+        content = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert REMOTE_IMAGE_PLACEHOLDER in content
+        assert "images" not in result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+
+
+class TestTextAccumulator:
+    """Tests for TextAccumulator joining rules."""
+
+    def test_plain_texts_concatenate_without_separator(self):
+        acc = TextAccumulator()
+        for part in ("a", "", "b", "c"):
+            acc.add_text(part)
+        assert acc.result() == "abc"
+
+    def test_notice_alone(self):
+        acc = TextAccumulator()
+        acc.add_notice("[n]")
+        assert acc.result() == "[n]"
+
+    def test_notice_after_text_ending_with_newline(self):
+        acc = TextAccumulator()
+        acc.add_text("a\n")
+        acc.add_notice("[n]")
+        assert acc.result() == "a\n[n]"
+
+    def test_text_starting_with_newline_after_notice(self):
+        acc = TextAccumulator()
+        acc.add_notice("[n]")
+        acc.add_text("\nb")
+        assert acc.result() == "[n]\nb"
+
+    def test_empty_text_after_notice_adds_nothing(self):
+        acc = TextAccumulator()
+        acc.add_notice("[n]")
+        acc.add_text("")
+        assert acc.result() == "[n]"
+
+    def test_empty_notice_after_text(self):
+        """An empty notice (e.g. empty document) still separates but adds no text."""
+        acc = TextAccumulator()
+        acc.add_text("a")
+        acc.add_notice("")
+        acc.add_text("b")
+        assert acc.result() == "a\n\nb"
+
+
+# ==================================================================================================
+# tool_choice emulation (core)
+# ==================================================================================================
+
+def _tools(*names):
+    return [UnifiedTool(name=n, description=f"{n} tool", input_schema={"type": "object"}) for n in names]
+
+
+class TestApplyToolChoice:
+    """Tests for apply_tool_choice."""
+
+    def test_none_choice_returns_tools_unchanged(self):
+        tools = _tools("a")
+        assert apply_tool_choice(tools, None) == (tools, "")
+
+    def test_auto_returns_tools_unchanged(self):
+        tools = _tools("a", "b")
+        assert apply_tool_choice(tools, UnifiedToolChoice(mode=TOOL_CHOICE_AUTO)) == (tools, "")
+
+    def test_mode_none_strips_tools(self):
+        assert apply_tool_choice(_tools("a"), UnifiedToolChoice(mode=TOOL_CHOICE_NONE)) == (None, "")
+
+    def test_mode_none_ignores_disable_parallel(self):
+        choice = UnifiedToolChoice(mode=TOOL_CHOICE_NONE, disable_parallel=True)
+        assert apply_tool_choice(_tools("a"), choice) == (None, "")
+
+    def test_required_adds_instruction(self):
+        tools = _tools("a", "b")
+        result_tools, instruction = apply_tool_choice(tools, UnifiedToolChoice(mode=TOOL_CHOICE_REQUIRED))
+        assert result_tools == tools
+        assert instruction == TOOL_CHOICE_REQUIRED_INSTRUCTION
+
+    def test_forced_tool_keeps_only_that_tool(self):
+        result_tools, instruction = apply_tool_choice(
+            _tools("a", "b", "c"), UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="b")
+        )
+        assert [t.name for t in result_tools] == ["b"]
+        assert instruction == TOOL_CHOICE_FORCED_INSTRUCTION_TEMPLATE.format(tool_name="b")
+        assert "`b`" in instruction
+
+    def test_forced_unknown_tool_raises_actionable_error(self):
+        with pytest.raises(ValueError) as exc_info:
+            apply_tool_choice(_tools("a", "b"), UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="zzz"))
+        message = str(exc_info.value)
+        assert "zzz" in message and "a, b" in message
+
+    def test_disable_parallel_alone(self):
+        tools = _tools("a")
+        result_tools, instruction = apply_tool_choice(tools, UnifiedToolChoice(disable_parallel=True))
+        assert result_tools == tools
+        assert instruction == TOOL_CHOICE_SINGLE_CALL_INSTRUCTION
+
+    def test_forced_plus_disable_parallel(self):
+        _, instruction = apply_tool_choice(
+            _tools("a"), UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="a", disable_parallel=True)
+        )
+        assert instruction.split("\n") == [
+            TOOL_CHOICE_FORCED_INSTRUCTION_TEMPLATE.format(tool_name="a"),
+            TOOL_CHOICE_SINGLE_CALL_INSTRUCTION,
+        ]
+
+    def test_no_tools_makes_choice_a_noop(self):
+        """Without tools there is nothing to constrain (e.g. forced tool without tools is not an error)."""
+        assert apply_tool_choice(None, UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="x")) == (None, "")
+        assert apply_tool_choice([], UnifiedToolChoice(mode=TOOL_CHOICE_REQUIRED)) == ([], "")
+
+    def test_does_not_mutate_input_list(self):
+        tools = _tools("a", "b")
+        apply_tool_choice(tools, UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="a"))
+        assert [t.name for t in tools] == ["a", "b"]
+
+
+class TestAppendSystemSection:
+    def test_empty_section(self):
+        assert append_system_section("sys", "") == "sys"
+
+    def test_empty_prompt(self):
+        assert append_system_section("", "sec") == "sec"
+
+    def test_both(self):
+        assert append_system_section("sys", "sec") == "sys\n\nsec"
+
+
+class TestBuildKiroPayloadToolChoice:
+    """tool_choice integration in build_kiro_payload."""
+
+    @staticmethod
+    def _build(tools, tool_choice, messages=None):
+        messages = messages or [UnifiedMessage(role="user", content="hello")]
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False), \
+                patch("kiro.config.TRUNCATION_RECOVERY", False):
+            return build_kiro_payload(
+                messages, "SYS", "m", tools, "c", "", ThinkingConfig(enabled=False), tool_choice=tool_choice
+            ).payload
+
+    @staticmethod
+    def _current(payload):
+        return payload["conversationState"]["currentMessage"]["userInputMessage"]
+
+    def test_default_argument_is_backward_compatible(self):
+        """Calling without tool_choice behaves like auto."""
+        messages = [UnifiedMessage(role="user", content="hello")]
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False), \
+                patch("kiro.config.TRUNCATION_RECOVERY", False):
+            without = build_kiro_payload(messages, "SYS", "m", _tools("a"), "c", "", ThinkingConfig(enabled=False))
+        assert without.payload == self._build(_tools("a"), None)
+
+    def test_none_removes_tools_from_payload(self):
+        current = self._current(self._build(_tools("a"), UnifiedToolChoice(mode=TOOL_CHOICE_NONE)))
+        assert "userInputMessageContext" not in current
+
+    def test_none_converts_tool_history_to_text(self):
+        """With tools removed, tool history must be stripped (Kiro rejects toolResults without tools)."""
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="",
+                           tool_calls=[{"id": "c1", "function": {"name": "a", "arguments": "{}"}}]),
+            UnifiedMessage(role="user", content="",
+                           tool_results=[{"type": "tool_result", "tool_use_id": "c1", "content": "res"}]),
+        ]
+        payload = self._build(_tools("a"), UnifiedToolChoice(mode=TOOL_CHOICE_NONE), messages)
+        current = self._current(payload)
+        assert "userInputMessageContext" not in current
+        assert "res" in current["content"]
+        assert "toolUses" not in payload["conversationState"]["history"][1]["assistantResponseMessage"]
+
+    def test_forced_tool_payload(self):
+        payload = self._build(_tools("a", "b"), UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="b"))
+        current = self._current(payload)
+        names = [t["toolSpecification"]["name"] for t in current["userInputMessageContext"]["tools"]]
+        assert names == ["b"]
+        assert "You must call the tool `b`." in current["content"]
+        assert current["content"].startswith("SYS\n\n")
+
+    def test_required_instruction_in_payload(self):
+        current = self._current(self._build(_tools("a"), UnifiedToolChoice(mode=TOOL_CHOICE_REQUIRED)))
+        assert TOOL_CHOICE_REQUIRED_INSTRUCTION in current["content"]
+        assert len(current["userInputMessageContext"]["tools"]) == 1
+
+    def test_forced_unknown_tool_raises_value_error(self):
+        """Routes map ValueError to HTTP 400."""
+        with pytest.raises(ValueError):
+            self._build(_tools("a"), UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="nope"))

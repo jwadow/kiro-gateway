@@ -381,3 +381,149 @@ class TestLoggedEndpointsConstant:
         
         print(f"LOGGED_ENDPOINTS type: {type(LOGGED_ENDPOINTS)}")
         assert isinstance(LOGGED_ENDPOINTS, frozenset)
+
+
+# =============================================================================
+# RequestIdMiddleware (pure ASGI)
+# =============================================================================
+
+import re as _re
+
+from fastapi import FastAPI as _FastAPI
+from fastapi.responses import StreamingResponse as _StreamingResponse, JSONResponse as _JSONResponse
+from fastapi.testclient import TestClient as _TestClient
+
+
+REQUEST_ID_PATTERN = _re.compile(r"^req_[0-9a-f]{32}$")
+
+
+def _request_id_app() -> _FastAPI:
+    """Minimal app wrapped with RequestIdMiddleware."""
+    from kiro.debug_middleware import RequestIdMiddleware
+
+    app = _FastAPI()
+
+    @app.get("/json")
+    async def json_route(request: Request):
+        return {"seen": request.state.request_id}
+
+    @app.get("/stream")
+    async def stream_route():
+        async def gen():
+            for i in range(3):
+                yield f"data: {i}\n\n"
+        return _StreamingResponse(gen(), media_type="text/event-stream")
+
+    @app.get("/preset")
+    async def preset_route():
+        return _JSONResponse({"ok": True}, headers={"x-request-id": "upstream-id"})
+
+    @app.get("/boom")
+    async def boom_route():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=418, detail="teapot")
+
+    app.add_middleware(RequestIdMiddleware)
+    return app
+
+
+class TestRequestIdMiddleware:
+    """Tests for request-id / x-request-id response headers."""
+
+    def test_headers_present_and_equal(self):
+        """
+        What it does: Calls a JSON route.
+        Purpose: Both headers set, same id, expected format.
+        """
+        resp = _TestClient(_request_id_app()).get("/json")
+        assert REQUEST_ID_PATTERN.match(resp.headers["request-id"])
+        assert resp.headers["request-id"] == resp.headers["x-request-id"]
+
+    def test_id_exposed_on_request_state(self):
+        """
+        What it does: Route echoes request.state.request_id.
+        Purpose: Handlers can log the same id the client sees.
+        """
+        resp = _TestClient(_request_id_app()).get("/json")
+        assert resp.json()["seen"] == resp.headers["request-id"]
+
+    def test_unique_per_request(self):
+        """
+        What it does: Sends several requests.
+        Purpose: Ids never repeat.
+        """
+        client = _TestClient(_request_id_app())
+        ids = {client.get("/json").headers["request-id"] for _ in range(20)}
+        assert len(ids) == 20
+
+    def test_streaming_body_untouched(self):
+        """
+        What it does: Calls an SSE route.
+        Purpose: Headers added without buffering or altering chunks.
+        """
+        resp = _TestClient(_request_id_app()).get("/stream")
+        assert resp.text == "data: 0\n\ndata: 1\n\ndata: 2\n\n"
+        assert REQUEST_ID_PATTERN.match(resp.headers["x-request-id"])
+        assert resp.headers["content-type"].startswith("text/event-stream")
+
+    def test_existing_header_replaced_not_duplicated(self):
+        """
+        What it does: Route already sets x-request-id.
+        Purpose: Exactly one value per header (no duplicates confusing clients).
+        """
+        resp = _TestClient(_request_id_app()).get("/preset")
+        assert resp.headers.get_list("x-request-id") == [resp.headers["request-id"]]
+
+    def test_error_responses_tagged(self):
+        """
+        What it does: Route raises HTTPException; also an unknown path.
+        Purpose: Error responses carry ids for support/debugging.
+        """
+        client = _TestClient(_request_id_app())
+        assert "request-id" in client.get("/boom").headers
+        assert "request-id" in client.get("/nope").headers
+
+    @pytest.mark.asyncio
+    async def test_non_http_scope_passthrough(self):
+        """
+        What it does: Sends a lifespan scope through the middleware.
+        Purpose: Only HTTP traffic is touched.
+        """
+        from kiro.debug_middleware import RequestIdMiddleware
+        inner = AsyncMock()
+        middleware = RequestIdMiddleware(inner)
+        scope = {"type": "lifespan"}
+        receive, send = AsyncMock(), AsyncMock()
+        await middleware(scope, receive, send)
+        inner.assert_awaited_once_with(scope, receive, send)
+        assert "state" not in scope
+
+    @pytest.mark.asyncio
+    async def test_body_messages_forwarded_unchanged(self):
+        """
+        What it does: Drives the ASGI send wrapper with start + body messages.
+        Purpose: Only http.response.start is modified.
+        """
+        from kiro.debug_middleware import RequestIdMiddleware
+        sent = []
+
+        async def inner(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b"hi", "more_body": False})
+
+        async def send(message):
+            sent.append(message)
+
+        await RequestIdMiddleware(inner)({"type": "http"}, AsyncMock(), send)
+        start_headers = dict(sent[0]["headers"])
+        assert start_headers[b"content-type"] == b"text/plain"
+        assert start_headers[b"request-id"] == start_headers[b"x-request-id"]
+        assert sent[1] == {"type": "http.response.body", "body": b"hi", "more_body": False}
+
+    def test_generate_request_id_format(self):
+        """
+        What it does: Generates an id directly.
+        Purpose: Stable, header-safe format.
+        """
+        from kiro.debug_middleware import generate_request_id
+        assert REQUEST_ID_PATTERN.match(generate_request_id())

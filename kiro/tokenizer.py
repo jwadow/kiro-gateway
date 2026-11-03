@@ -32,6 +32,8 @@ empirical observations: Claude tokenizes text approximately 15%
 more than GPT-4 (cl100k_base). This is due to differences in BPE vocabularies.
 """
 
+import asyncio
+import functools
 import json
 from typing import List, Dict, Any, Optional
 from loguru import logger
@@ -43,6 +45,13 @@ _encoding = None
 # Claude tokenizes text approximately 15% more than GPT-4 (cl100k_base)
 # This is an empirical value based on comparison with context_usage from API
 CLAUDE_CORRECTION_FACTOR = 1.15
+
+# Strings up to this length (role names, tool ids, tool names, flags) repeat
+# across messages and requests, so their base token counts are memoized.
+SHORT_STRING_CACHE_MAX_LENGTH = 64
+
+# Upper bound on memoized short strings (bounded LRU, a few hundred KB at most)
+SHORT_STRING_CACHE_SIZE = 4096
 
 
 def _get_encoding():
@@ -74,6 +83,28 @@ def _get_encoding():
     return _encoding if _encoding else None
 
 
+def warm_up_tokenizer() -> None:
+    """
+    Pre-load the tiktoken cl100k_base encoding so the first count_tokens call is fast.
+
+    Loading may download the BPE file or read the tiktoken cache, which is slow and
+    blocking; call from a worker thread at startup. Never raises: if loading fails,
+    count_tokens falls back to character-based estimation.
+
+    Returns:
+        None
+    """
+    try:
+        encoding = _get_encoding()
+    except (ImportError, OSError, ValueError, RuntimeError) as e:
+        logger.warning(f"[Tokenizer] Warm-up failed, using fallback estimation: {e}")
+        return
+    if encoding is None:
+        logger.warning("[Tokenizer] Warm-up: tiktoken unavailable, using fallback estimation")
+    else:
+        logger.debug("[Tokenizer] Warm-up complete")
+
+
 def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
     """
     Counts the number of tokens in text.
@@ -91,7 +122,10 @@ def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
     encoding = _get_encoding()
     if encoding:
         try:
-            base_tokens = len(encoding.encode(text))
+            if len(text) <= SHORT_STRING_CACHE_MAX_LENGTH:
+                base_tokens = _count_short_string_tokens(encoding, text)
+            else:
+                base_tokens = _encode_ordinary_length(encoding, text)
             if apply_claude_correction:
                 return int(base_tokens * CLAUDE_CORRECTION_FACTOR)
             return base_tokens
@@ -105,6 +139,41 @@ def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
     if apply_claude_correction:
         return int(base_estimate * CLAUDE_CORRECTION_FACTOR)
     return base_estimate
+
+
+def _encode_ordinary_length(encoding: Any, text: str) -> int:
+    """
+    Counts base tokens with special-token handling disabled.
+    
+    encode_ordinary() treats text like '<|endoftext|>' as plain text instead
+    of raising, and skips the special-token scan that encode() performs.
+    
+    Args:
+        encoding: tiktoken encoding
+        text: Text to encode
+    
+    Returns:
+        Number of base tokens (without Claude correction)
+    """
+    return len(encoding.encode_ordinary(text))
+
+
+@functools.lru_cache(maxsize=SHORT_STRING_CACHE_SIZE)
+def _count_short_string_tokens(encoding: Any, text: str) -> int:
+    """
+    Memoized base token count for short, frequently repeated strings.
+    
+    The encoding is part of the cache key, so swapping the encoding (as tests
+    do) never returns counts computed with a different encoder.
+    
+    Args:
+        encoding: tiktoken encoding
+        text: Short text to encode
+    
+    Returns:
+        Number of base tokens (without Claude correction)
+    """
+    return _encode_ordinary_length(encoding, text)
 
 
 def count_message_tokens(messages: List[Dict[str, Any]], apply_claude_correction: bool = True) -> int:
@@ -325,3 +394,34 @@ def estimate_request_tokens(
         "system_tokens": system_tokens,
         "total_tokens": messages_tokens + tools_tokens + system_tokens
     }
+
+
+async def estimate_request_tokens_async(
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]] = None,
+    system_prompt: Optional[Any] = None,
+    apply_claude_correction: bool = True
+) -> Dict[str, int]:
+    """
+    Async wrapper of estimate_request_tokens that runs it in a worker thread.
+    
+    Tokenizing large requests is CPU-bound; running it via asyncio.to_thread
+    keeps the event loop responsive for other streams.
+    
+    Args:
+        messages: List of messages
+        tools: List of tools (optional)
+        system_prompt: System prompt (optional, string or Anthropic content blocks)
+        apply_claude_correction: Apply correction coefficient for Claude
+    
+    Returns:
+        Same dictionary as estimate_request_tokens (messages_tokens,
+        tools_tokens, system_tokens, total_tokens)
+    """
+    return await asyncio.to_thread(
+        estimate_request_tokens,
+        messages,
+        tools,
+        system_prompt,
+        apply_claude_correction,
+    )

@@ -486,6 +486,8 @@ class TestAccountSystemFullFlow:
         with patch.object(manager, '_refresh_account_models', side_effect=mock_refresh):
             # Act: Get account (should trigger TTL refresh)
             next_account = await manager.get_next_account("claude-opus-4.5")
+            # Refresh runs as a background task (never awaited under the lock)
+            await asyncio.gather(*manager._tasks)
         
         # Assert: Refresh was called and timestamp updated
         print(f"Refresh called: {refresh_called}")

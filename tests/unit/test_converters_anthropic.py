@@ -955,7 +955,7 @@ class TestConvertAnthropicMessages:
         messages = [AnthropicMessage(role="user", content="Hello!")]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -973,7 +973,7 @@ class TestConvertAnthropicMessages:
         messages = [AnthropicMessage(role="assistant", content="Hi there!")]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -997,7 +997,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -1025,7 +1025,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -1055,7 +1055,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 1
@@ -1077,7 +1077,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         assert len(result) == 3
@@ -1094,7 +1094,7 @@ class TestConvertAnthropicMessages:
         messages = []
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Comparing result: Expected [], Got {result}")
         assert result == []
@@ -1132,7 +1132,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
         print(f"Images: {result[0].images}")
@@ -1185,7 +1185,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(f"Result: {result}")
 
@@ -1240,7 +1240,7 @@ class TestConvertAnthropicMessages:
         ]
 
         print("Action: Converting messages...")
-        result = convert_anthropic_messages(messages)
+        _, result = convert_anthropic_messages(messages)
 
         print(
             f"Result images count: {len(result[0].images) if result[0].images else 0}"
@@ -1295,7 +1295,7 @@ class TestConvertAnthropicMessages:
 
         print("Action: Converting messages with logging enabled...")
         with caplog.at_level(logging.DEBUG):
-            result = convert_anthropic_messages(messages)
+            _, result = convert_anthropic_messages(messages)
 
         print(f"Log records: {[r.message for r in caplog.records]}")
 
@@ -1884,3 +1884,448 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+# ==================================================================================================
+# Single-pass message conversion: parity with the original multi-pass implementation
+# ==================================================================================================
+
+import random as _random
+
+from kiro.converters_anthropic import (
+    DOCUMENT_OMITTED_TEMPLATE,
+    convert_document_block_to_text,
+    convert_search_result_block_to_text,
+    extract_tool_choice_from_anthropic,
+)
+from kiro.converters_core import (
+    REMOTE_IMAGE_PLACEHOLDER,
+    TOOL_CHOICE_NONE,
+    TOOL_CHOICE_REQUIRED,
+    TOOL_CHOICE_TOOL,
+    TOOL_CHOICE_REQUIRED_INSTRUCTION,
+    TOOL_CHOICE_SINGLE_CALL_INSTRUCTION,
+    UnifiedToolChoice,
+    extract_images_from_content,
+    extract_text_content,
+)
+from kiro.models_anthropic import GenericContentBlock, ImageContentBlock, ThinkingContentBlock
+
+
+def _reference_convert_messages(messages):
+    """
+    The original multi-pass conversion (text, tool uses, tool results, images,
+    tool_result images as separate scans), for known block types.
+    """
+    def btype(b):
+        return b.get("type") if isinstance(b, dict) else getattr(b, "type", None)
+
+    def bget(b, k, d=None):
+        return b.get(k, d) if isinstance(b, dict) else getattr(b, k, d)
+
+    unified = []
+    inline = []
+    for msg in messages:
+        content = msg.content
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "".join(bget(b, "text", "") for b in content if btype(b) == "text")
+        else:
+            text = str(content) if content else ""
+        if msg.role == "system":
+            if text:
+                inline.append(text)
+            continue
+        tool_calls = tool_results = images = None
+        blocks = content if isinstance(content, list) else []
+        if msg.role == "assistant":
+            tool_calls = [
+                {"id": bget(b, "id"), "type": "function",
+                 "function": {"name": bget(b, "name"), "arguments": bget(b, "input", {})}}
+                for b in blocks if btype(b) == "tool_use" and bget(b, "id") and bget(b, "name")
+            ]
+        elif msg.role == "user":
+            tool_results = []
+            for b in blocks:
+                if btype(b) == "tool_result" and bget(b, "tool_use_id"):
+                    rc = bget(b, "content", "")
+                    if isinstance(rc, list):
+                        rc = extract_text_content(rc)
+                    elif not isinstance(rc, str):
+                        rc = str(rc) if rc else ""
+                    tool_results.append({"type": "tool_result", "tool_use_id": bget(b, "tool_use_id"),
+                                         "content": rc or "(empty result)"})
+            images = extract_images_from_content(content)
+            for b in blocks:
+                if btype(b) == "tool_result" and isinstance(bget(b, "content"), list):
+                    images.extend(extract_images_from_content(bget(b, "content")))
+        unified.append(UnifiedMessage(role=msg.role, content=text, tool_calls=tool_calls or None,
+                                      tool_results=tool_results or None, images=images or None))
+    return "\n".join(inline).strip(), unified
+
+
+def _random_block(rng, index):
+    kind = rng.choice(["text", "text", "image", "tool_use", "tool_result", "thinking", "tool_use_noid"])
+    if kind == "text":
+        return {"type": "text", "text": rng.choice(["", "hi", "café ", "line\n"]) * rng.randint(0, 3)}
+    if kind == "image":
+        return {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": f"img{index}"}}
+    if kind == "tool_use":
+        return {"type": "tool_use", "id": f"tu{index}", "name": "tool", "input": {"i": index}}
+    if kind == "tool_use_noid":
+        return {"type": "tool_use", "id": "", "name": "tool", "input": {}}
+    if kind == "thinking":
+        return {"type": "thinking", "thinking": "hmm", "signature": "s"}
+    content_kind = rng.random()
+    if content_kind < 0.3:
+        content = f"result {index}"
+    elif content_kind < 0.4:
+        content = ""
+    elif content_kind < 0.5:
+        content = None
+    else:
+        content = [{"type": "text", "text": f"r{index}"}]
+        if rng.random() < 0.5:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                        "data": f"tr{index}"}})
+        if rng.random() < 0.2:
+            content.append({"type": "tool_reference", "tool_name": "x"})
+    return {"type": "tool_result", "tool_use_id": f"tu{index}", "content": content}
+
+
+def _random_messages(rng):
+    messages = []
+    for i in range(rng.randint(1, 12)):
+        role = rng.choice(["user", "assistant", "system"]) if rng.random() < 0.2 else ("user" if i % 2 == 0 else "assistant")
+        if rng.random() < 0.3:
+            content = f"plain {i}"
+        else:
+            content = [_random_block(rng, i * 10 + k) for k in range(rng.randint(0, 5))]
+        messages.append(AnthropicMessage(role=role, content=content))
+    return messages
+
+
+class TestSinglePassConversionParity:
+    """convert_anthropic_messages must match the original 4-pass implementation."""
+
+    @pytest.mark.parametrize("seed", range(200))
+    def test_random_messages_match_reference(self, seed):
+        """
+        What it does: Converts random messages (parsed through Pydantic) with both implementations.
+        Purpose: The single-pass scan must produce identical unified messages.
+        """
+        messages = _random_messages(_random.Random(seed))
+        assert convert_anthropic_messages(messages) == _reference_convert_messages(messages)
+
+    @pytest.mark.parametrize("seed", range(50))
+    def test_raw_dict_blocks_match_reference(self, seed):
+        """
+        What it does: Same comparison with dict blocks bypassing Pydantic parsing.
+        Purpose: Both dict and model code paths must stay equivalent.
+        """
+        messages = [
+            AnthropicMessage.model_construct(role=m.role, content=m.content if isinstance(m.content, str)
+                                             else [b.model_dump() for b in m.content])
+            for m in _random_messages(_random.Random(900 + seed))
+        ]
+        assert convert_anthropic_messages(messages) == _reference_convert_messages(messages)
+
+    def test_image_order_top_level_then_tool_results(self):
+        """
+        What it does: Tool-result image appears before a top-level image in the block list.
+        Purpose: Original order is preserved: top-level images first, then tool_result images.
+        """
+        messages = [AnthropicMessage(role="user", content=[
+            {"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "NESTED"}}]},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "TOP"}},
+        ])]
+        _, unified = convert_anthropic_messages(messages)
+        assert [img["data"] for img in unified[0].images] == ["TOP", "NESTED"]
+
+    def test_assistant_images_and_tool_results_ignored(self):
+        """
+        What it does: Assistant message with an image and a tool_result block.
+        Purpose: As before, only user messages yield images/tool_results.
+        """
+        messages = [AnthropicMessage(role="assistant", content=[
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}},
+            {"type": "tool_result", "tool_use_id": "t", "content": "r"},
+        ])]
+        _, unified = convert_anthropic_messages(messages)
+        assert unified[0].images is None and unified[0].tool_results is None
+
+
+# ==================================================================================================
+# New Anthropic content block types
+# ==================================================================================================
+
+class TestNewContentBlockTypes:
+    """document, redacted_thinking, search_result and unknown block handling."""
+
+    @staticmethod
+    def _text(blocks):
+        return convert_anthropic_messages([AnthropicMessage(role="user", content=blocks)])[1][0].content
+
+    def test_text_document_with_title(self):
+        block = {"type": "document", "title": "Notes",
+                 "source": {"type": "text", "media_type": "text/plain", "data": "Doc body"}}
+        assert self._text([block]) == "Notes\n\nDoc body"
+
+    def test_text_document_without_title(self):
+        block = {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "Body"}}
+        assert self._text([block]) == "Body"
+
+    def test_document_between_texts_on_own_lines(self):
+        blocks = [
+            {"type": "text", "text": "Summarize:"},
+            {"type": "document", "source": {"type": "text", "data": "D"}},
+            {"type": "text", "text": "Thanks"},
+        ]
+        assert self._text(blocks) == "Summarize:\nD\nThanks"
+
+    def test_content_document(self):
+        block = {"type": "document", "title": "T", "source": {"type": "content", "content": [
+            {"type": "text", "text": "p1"}, {"type": "image", "source": {}}, {"type": "text", "text": "p2"}]}}
+        assert self._text([block]) == "T\n\np1\np2"
+
+    def test_text_document_with_empty_data_and_title(self):
+        block = {"type": "document", "title": "Only title", "source": {"type": "text", "data": ""}}
+        assert convert_document_block_to_text(block) == "Only title"
+
+    def test_text_document_with_non_string_data(self):
+        block = {"type": "document", "source": {"type": "text", "data": 123}}
+        assert convert_document_block_to_text(block) == ""
+
+    def test_pdf_document_placeholder_and_warning(self):
+        block = {"type": "document",
+                 "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}
+        with patch("kiro.converters_anthropic.logger") as mock_logger:
+            text = self._text([{"type": "text", "text": "Read this"}, block])
+        expected = DOCUMENT_OMITTED_TEMPLATE.format(media_type="application/pdf")
+        assert text == f"Read this\n{expected}"
+        assert mock_logger.warning.called
+        assert "JVBERi0=" not in text
+
+    def test_url_document_placeholder(self):
+        block = {"type": "document", "source": {"type": "url", "url": "https://h/doc.pdf"}}
+        assert convert_document_block_to_text(block) == DOCUMENT_OMITTED_TEMPLATE.format(media_type="url source")
+
+    @pytest.mark.parametrize("block", [
+        {"type": "document"},
+        {"type": "document", "source": None},
+        {"type": "document", "source": "text"},
+        {"type": "document", "source": {}},
+    ])
+    def test_malformed_document_gets_placeholder(self, block):
+        """Malformed document blocks must not crash."""
+        assert convert_document_block_to_text(block).startswith("[document omitted:")
+
+    def test_redacted_thinking_dropped(self):
+        blocks = [{"type": "redacted_thinking", "data": "ENCRYPTED"}, {"type": "text", "text": "after"}]
+        assert self._text(blocks) == "after"
+
+    def test_search_result_text(self):
+        block = {"type": "search_result", "source": "https://s", "title": "R",
+                 "content": [{"type": "text", "text": "fact one"}, {"type": "text", "text": "fact two"}]}
+        assert self._text([block]) == "fact one\nfact two"
+
+    @pytest.mark.parametrize("content", [None, "raw string", 5, [], [{"type": "image"}], ["bare"]])
+    def test_search_result_malformed_content(self, content):
+        result = convert_search_result_block_to_text({"type": "search_result", "content": content})
+        assert isinstance(result, str)
+
+    def test_search_result_inside_tool_result(self):
+        messages = [AnthropicMessage(role="user", content=[{"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "text", "text": "Results:"},
+            {"type": "search_result", "source": "s", "title": "x", "content": [{"type": "text", "text": "found"}]},
+        ]}])]
+        _, unified = convert_anthropic_messages(messages)
+        assert unified[0].tool_results[0]["content"] == "Results:\nfound"
+
+    def test_document_inside_tool_result(self):
+        messages = [AnthropicMessage(role="user", content=[{"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "document", "source": {"type": "text", "data": "doc text"}},
+        ]}])]
+        _, unified = convert_anthropic_messages(messages)
+        assert unified[0].tool_results[0]["content"] == "doc text"
+
+    @pytest.mark.parametrize("block_type", ["server_tool_use", "web_search_tool_result", "container_upload",
+                                            "mcp_tool_use", "brand_new_type"])
+    def test_unknown_blocks_dropped_with_debug_log(self, block_type):
+        blocks = [{"type": "text", "text": "keep"}, {"type": block_type, "id": "x", "content": {"a": 1}}]
+        with patch("kiro.converters_anthropic.logger") as mock_logger:
+            assert self._text(blocks) == "keep"
+        assert any(block_type in str(call) for call in mock_logger.debug.call_args_list)
+
+    def test_unknown_blocks_in_assistant_message(self):
+        messages = [AnthropicMessage(role="assistant", content=[
+            {"type": "server_tool_use", "id": "srv", "name": "web_search", "input": {"query": "q"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srv", "content": []},
+            {"type": "text", "text": "answer"},
+        ])]
+        _, unified = convert_anthropic_messages(messages)
+        assert unified[0].content == "answer"
+        assert unified[0].tool_calls is None
+
+    def test_remote_image_url_placeholder(self):
+        blocks = [{"type": "text", "text": "Look"},
+                  {"type": "image", "source": {"type": "url", "url": "https://h/i.png"}}]
+        _, unified = convert_anthropic_messages([AnthropicMessage(role="user", content=blocks)])
+        assert unified[0].content == f"Look\n{REMOTE_IMAGE_PLACEHOLDER}"
+        assert unified[0].images is None
+
+    def test_full_payload_with_new_blocks(self):
+        """End-to-end: a request with every new block type converts without error."""
+        request = AnthropicMessagesRequest(model="claude-sonnet-4.5", max_tokens=100, messages=[
+            AnthropicMessage(role="user", content=[
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "x"}},
+                {"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "sr"}]},
+                {"type": "text", "text": "question"},
+            ]),
+            AnthropicMessage(role="assistant", content=[
+                {"type": "redacted_thinking", "data": "zz"},
+                {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
+                {"type": "text", "text": "reply"},
+            ]),
+            AnthropicMessage(role="user", content="follow up"),
+        ])
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="m"), \
+                patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            payload = anthropic_to_kiro(request, "c", "")
+        history = payload["conversationState"]["history"]
+        assert "sr" in history[0]["userInputMessage"]["content"]
+        assert "[document omitted: application/pdf" in history[0]["userInputMessage"]["content"]
+        assert history[1]["assistantResponseMessage"]["content"] == "reply"
+
+
+# ==================================================================================================
+# tool_choice (Anthropic)
+# ==================================================================================================
+
+def _anthropic_request(**kwargs):
+    defaults = dict(model="claude-sonnet-4.5", max_tokens=100, system="SYS",
+                    messages=[AnthropicMessage(role="user", content="Hello")])
+    defaults.update(kwargs)
+    return AnthropicMessagesRequest(**defaults)
+
+
+def _anthropic_tools(*names):
+    return [AnthropicTool(name=n, description=f"{n} tool", input_schema={"type": "object", "properties": {}})
+            for n in names]
+
+
+def _build_anthropic(request):
+    with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="m"), \
+            patch("kiro.converters_core.FAKE_REASONING_ENABLED", False), \
+            patch("kiro.config.TRUNCATION_RECOVERY", False):
+        return anthropic_to_kiro(request, "c", "")
+
+
+def _anthropic_current(payload):
+    return payload["conversationState"]["currentMessage"]["userInputMessage"]
+
+
+class TestExtractToolChoiceFromAnthropic:
+    """Tests for extract_tool_choice_from_anthropic."""
+
+    def test_missing(self):
+        assert extract_tool_choice_from_anthropic(_anthropic_request()) is None
+
+    def test_auto(self):
+        assert extract_tool_choice_from_anthropic(_anthropic_request(tool_choice={"type": "auto"})) is None
+
+    def test_none(self):
+        assert extract_tool_choice_from_anthropic(_anthropic_request(tool_choice={"type": "none"})) == \
+            UnifiedToolChoice(mode=TOOL_CHOICE_NONE)
+
+    def test_any(self):
+        assert extract_tool_choice_from_anthropic(_anthropic_request(tool_choice={"type": "any"})) == \
+            UnifiedToolChoice(mode=TOOL_CHOICE_REQUIRED)
+
+    def test_tool(self):
+        result = extract_tool_choice_from_anthropic(_anthropic_request(tool_choice={"type": "tool", "name": "x"}))
+        assert result == UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="x")
+
+    @pytest.mark.parametrize("choice_type", ["auto", "any"])
+    def test_disable_parallel(self, choice_type):
+        request = _anthropic_request(tool_choice={"type": choice_type, "disable_parallel_tool_use": True})
+        assert extract_tool_choice_from_anthropic(request).disable_parallel is True
+
+    def test_disable_parallel_on_tool(self):
+        request = _anthropic_request(tool_choice={"type": "tool", "name": "x", "disable_parallel_tool_use": True})
+        assert extract_tool_choice_from_anthropic(request) == \
+            UnifiedToolChoice(mode=TOOL_CHOICE_TOOL, tool_name="x", disable_parallel=True)
+
+    def test_disable_parallel_false_is_default(self):
+        request = _anthropic_request(tool_choice={"type": "auto", "disable_parallel_tool_use": False})
+        assert extract_tool_choice_from_anthropic(request) is None
+
+    @pytest.mark.parametrize("choice", [{"type": "weird"}, {"foo": "bar"}, {"type": "tool", "name": ""}])
+    def test_unsupported_values_fall_back_to_auto(self, choice):
+        request = _anthropic_request()
+        request.tool_choice = choice
+        assert extract_tool_choice_from_anthropic(request) is None
+
+    def test_non_dict_value_falls_back(self):
+        request = _anthropic_request()
+        request.tool_choice = "any"
+        assert extract_tool_choice_from_anthropic(request) is None
+
+
+class TestAnthropicToolChoicePayload:
+    """End-to-end tool_choice handling for Anthropic requests (shared by streaming and non-streaming)."""
+
+    def test_none_strips_tools(self):
+        payload = _build_anthropic(_anthropic_request(tools=_anthropic_tools("a"), tool_choice={"type": "none"}))
+        assert "userInputMessageContext" not in _anthropic_current(payload)
+
+    def test_any_instruction(self):
+        current = _anthropic_current(_build_anthropic(
+            _anthropic_request(tools=_anthropic_tools("a"), tool_choice={"type": "any"})))
+        assert TOOL_CHOICE_REQUIRED_INSTRUCTION in current["content"]
+        assert len(current["userInputMessageContext"]["tools"]) == 1
+
+    def test_forced_tool(self):
+        current = _anthropic_current(_build_anthropic(
+            _anthropic_request(tools=_anthropic_tools("a", "b"), tool_choice={"type": "tool", "name": "b"})))
+        assert [t["toolSpecification"]["name"] for t in current["userInputMessageContext"]["tools"]] == ["b"]
+        assert "You must call the tool `b`." in current["content"]
+
+    def test_forced_unknown_tool_raises(self):
+        with pytest.raises(ValueError, match="ghost"):
+            _build_anthropic(_anthropic_request(tools=_anthropic_tools("a"),
+                                                tool_choice={"type": "tool", "name": "ghost"}))
+
+    def test_disable_parallel_instruction(self):
+        current = _anthropic_current(_build_anthropic(_anthropic_request(
+            tools=_anthropic_tools("a"), tool_choice={"type": "auto", "disable_parallel_tool_use": True})))
+        assert TOOL_CHOICE_SINGLE_CALL_INSTRUCTION in current["content"]
+
+    def test_auto_identical_to_default(self):
+        default = _build_anthropic(_anthropic_request(tools=_anthropic_tools("a")))
+        auto = _build_anthropic(_anthropic_request(tools=_anthropic_tools("a"), tool_choice={"type": "auto"}))
+        assert default == auto
+
+    def test_parity_with_openai(self):
+        """Forced tool produces the same tools and instruction on both APIs."""
+        from kiro.converters_openai import build_kiro_payload as openai_build
+        from kiro.models_openai import ChatCompletionRequest, ChatMessage, Tool, ToolFunction
+
+        openai_request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="system", content="SYS"), ChatMessage(role="user", content="Hello")],
+            tools=[Tool(type="function", function=ToolFunction(
+                name=n, description=f"{n} tool", parameters={"type": "object", "properties": {}})) for n in ("a", "b")],
+            tool_choice={"type": "function", "function": {"name": "b"}},
+            parallel_tool_calls=False,
+        )
+        with patch("kiro.converters_openai.get_model_id_for_kiro", return_value="m"), \
+                patch("kiro.converters_core.FAKE_REASONING_ENABLED", False), \
+                patch("kiro.config.TRUNCATION_RECOVERY", False):
+            openai_payload = openai_build(openai_request, "c", "")
+        anthropic_payload = _build_anthropic(_anthropic_request(
+            tools=_anthropic_tools("a", "b"),
+            tool_choice={"type": "tool", "name": "b", "disable_parallel_tool_use": True}))
+        assert _anthropic_current(openai_payload) == _anthropic_current(anthropic_payload)

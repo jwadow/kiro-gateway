@@ -63,6 +63,8 @@ class TestLifespanLegacyFallback:
         
         # Mock AccountManager to prevent actual initialization
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -114,6 +116,8 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -197,6 +201,8 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -250,6 +256,8 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -303,6 +311,8 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -385,6 +395,12 @@ class TestLifespanAccountManagerInit:
             
             async def save_state_periodically(self):
                 await asyncio.sleep(1000)
+            
+            def start_background_init(self):
+                pass
+            
+            async def shutdown(self):
+                pass
         
         with patch("main.AccountManager", MockAccountManager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -427,6 +443,8 @@ class TestLifespanAccountManagerInit:
         load_calls = {"credentials": False, "state": False}
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         
@@ -481,6 +499,8 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -525,6 +545,8 @@ class TestLifespanAccountManagerInit:
         initialized_accounts = []
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {
             "account1": MagicMock(),
             "account2": MagicMock()
@@ -580,6 +602,8 @@ class TestLifespanAccountManagerInit:
         initialized_attempts = []
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {
             "account1": MagicMock(),
             "account2": MagicMock(),
@@ -636,6 +660,8 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {}  # Empty accounts dict
         mock_manager._current_account_index = 0
         
@@ -676,6 +702,8 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {
             "account1": MagicMock(),
             "account2": MagicMock()
@@ -722,6 +750,8 @@ class TestLifespanAccountManagerInit:
         save_state_called = False
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -773,6 +803,8 @@ class TestLifespanAccountManagerInit:
         periodic_task_started = False
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -823,6 +855,8 @@ class TestLifespanAccountManagerInit:
         task_cancelled = False
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -881,6 +915,8 @@ class TestLifespanAccountManagerInit:
         save_calls = []
         
         mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager.shutdown = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -905,3 +941,228 @@ class TestLifespanAccountManagerInit:
         print(f"Save calls: {len(save_calls)}")
         assert len(save_calls) >= 2
         print("✓ Final state save was performed on shutdown")
+
+
+class TestLifespanNonBlockingDiscovery:
+    """
+    Tests for background discovery, tokenizer warm-up, conditional middleware
+    and idempotent legacy credentials.json writes.
+    """
+
+    @staticmethod
+    def _patch_common(monkeypatch, tmp_path, account_system=True):
+        monkeypatch.setattr("main.ACCOUNT_SYSTEM", account_system)
+        monkeypatch.setattr("main.REFRESH_TOKEN", "")
+        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(tmp_path / "credentials.json"))
+        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(tmp_path / "state.json"))
+
+    @staticmethod
+    def _write_account(tmp_path, name="acc.json"):
+        acc = tmp_path / name
+        acc.write_text(json.dumps({
+            "refreshToken": "t", "accessToken": "a",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+        }))
+        (tmp_path / "credentials.json").write_text(json.dumps(
+            [{"type": "json", "path": str(acc), "enabled": True}]
+        ))
+
+    @pytest.mark.asyncio
+    async def test_startup_returns_before_discovery_completes(self, tmp_path, monkeypatch):
+        """Startup yields while discovery is still blocked; shutdown cancels it."""
+        self._patch_common(monkeypatch, tmp_path)
+        self._write_account(tmp_path)
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def hanging_refresh(self, account_id):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        from kiro.account_manager import AccountManager
+        from main import lifespan, app
+
+        with patch.object(AccountManager, "_refresh_account_models", hanging_refresh), \
+                patch("main.warm_up_tokenizer"), \
+                patch("main.httpx.AsyncClient") as client_cls:
+            client_cls.return_value = AsyncMock()
+            async with lifespan(app):
+                await asyncio.wait_for(started.wait(), 2)  # discovery running in background
+                manager = app.state.account_manager
+                assert manager.get_all_available_models()  # fallback list already served
+                assert not cancelled.is_set()
+            # Assert: shutdown cancelled the in-flight discovery task
+            assert cancelled.is_set()
+            assert not manager._tasks
+
+    @pytest.mark.asyncio
+    async def test_tokenizer_warmup_runs_in_thread(self, tmp_path, monkeypatch):
+        """warm_up_tokenizer is invoked without blocking the loop."""
+        self._patch_common(monkeypatch, tmp_path)
+        self._write_account(tmp_path)
+        called = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def fake_warmup():
+            loop.call_soon_threadsafe(called.set)
+
+        from kiro.account_manager import AccountManager
+        from main import lifespan, app
+
+        with patch.object(AccountManager, "_refresh_account_models", AsyncMock()), \
+                patch("main.warm_up_tokenizer", fake_warmup), \
+                patch("main.httpx.AsyncClient") as client_cls:
+            client_cls.return_value = AsyncMock()
+            async with lifespan(app):
+                await asyncio.wait_for(called.wait(), 2)
+
+    @pytest.mark.asyncio
+    async def test_tokenizer_warmup_failure_does_not_break_startup(self, tmp_path, monkeypatch):
+        """A failing warm-up task must not prevent serving or shutdown."""
+        self._patch_common(monkeypatch, tmp_path)
+        self._write_account(tmp_path)
+
+        def broken():
+            raise RuntimeError("tiktoken offline")
+
+        from kiro.account_manager import AccountManager
+        from main import lifespan, app
+
+        with patch.object(AccountManager, "_refresh_account_models", AsyncMock()), \
+                patch("main.warm_up_tokenizer", broken), \
+                patch("main.httpx.AsyncClient") as client_cls:
+            client_cls.return_value = AsyncMock()
+            async with lifespan(app):
+                await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_legacy_mode_does_not_rewrite_unchanged_credentials(self, tmp_path, monkeypatch):
+        """Identical content on disk -> file is not touched."""
+        self._patch_common(monkeypatch, tmp_path, account_system=False)
+        monkeypatch.setattr("main.REFRESH_TOKEN", "same_token")
+        creds = tmp_path / "credentials.json"
+        creds.write_text(json.dumps([{"type": "refresh_token", "refresh_token": "same_token"}]))
+
+        mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager._accounts = {"x": MagicMock()}
+        mock_manager._current_account_index = 0
+        mock_manager._initialize_account = AsyncMock(return_value=True)
+
+        from main import lifespan, app
+        real_open = open
+        writes = []
+
+        def tracking_open(path, mode="r", *a, **k):
+            if "w" in mode and Path(path) == creds:
+                writes.append(path)
+            return real_open(path, mode, *a, **k)
+
+        with patch("main.AccountManager", return_value=mock_manager), \
+                patch("main.warm_up_tokenizer"), \
+                patch("main.httpx.AsyncClient") as client_cls, \
+                patch("builtins.open", tracking_open):
+            client_cls.return_value = AsyncMock()
+            async with lifespan(app):
+                pass
+
+        assert writes == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_mode_rewrites_when_changed_or_corrupt(self, tmp_path, monkeypatch):
+        """Different or unparsable content on disk -> file is rewritten."""
+        self._patch_common(monkeypatch, tmp_path, account_system=False)
+        monkeypatch.setattr("main.REFRESH_TOKEN", "new_token")
+        creds = tmp_path / "credentials.json"
+
+        mock_manager = AsyncMock()
+        mock_manager.start_background_init = Mock()
+        mock_manager._accounts = {"x": MagicMock()}
+        mock_manager._current_account_index = 0
+        mock_manager._initialize_account = AsyncMock(return_value=True)
+
+        from main import lifespan, app
+        for old in ('[{"type": "refresh_token", "refresh_token": "old"}]', "{not json"):
+            creds.write_text(old)
+            with patch("main.AccountManager", return_value=mock_manager), \
+                    patch("main.warm_up_tokenizer"), \
+                    patch("main.httpx.AsyncClient") as client_cls:
+                client_cls.return_value = AsyncMock()
+                async with lifespan(app):
+                    pass
+            assert json.loads(creds.read_text())[0]["refresh_token"] == "new_token"
+
+    @pytest.mark.parametrize("mode,expected", [("off", False), ("errors", True), ("all", True)])
+    def test_debug_middleware_registered_only_when_debug_enabled(self, mode, expected, monkeypatch):
+        """DebugLoggerMiddleware is added to the app only if DEBUG_MODE != 'off'."""
+        import importlib
+        import kiro.config
+        import main
+        from kiro.debug_middleware import DebugLoggerMiddleware
+
+        monkeypatch.setattr(kiro.config, "DEBUG_MODE", mode)
+        try:
+            reloaded = importlib.reload(main)
+            present = any(m.cls is DebugLoggerMiddleware for m in reloaded.app.user_middleware)
+            assert present is expected
+        finally:
+            monkeypatch.undo()
+            importlib.reload(main)
+
+
+class TestMainAppWiring:
+    """main.app registers the error handlers and request-id middleware."""
+
+    def test_http_exception_handler_registered(self):
+        """
+        What it does: Inspects app.exception_handlers.
+        Purpose: HTTPException renders in OpenAI/Anthropic shape, not {"detail": ...}.
+        """
+        import main
+        from starlette.exceptions import HTTPException as StarletteHTTPException
+        from kiro.exceptions import http_exception_handler
+        assert main.app.exception_handlers[StarletteHTTPException] is http_exception_handler
+
+    def test_validation_handler_registered(self):
+        """
+        What it does: Inspects app.exception_handlers for RequestValidationError.
+        Purpose: 422 shaped and without body echo.
+        """
+        import main
+        from fastapi.exceptions import RequestValidationError
+        from kiro.exceptions import validation_exception_handler
+        assert main.app.exception_handlers[RequestValidationError] is validation_exception_handler
+
+    def test_request_id_middleware_outermost(self):
+        """
+        What it does: Checks user_middleware order.
+        Purpose: RequestIdMiddleware wraps everything (CORS, debug) so all responses get ids.
+        """
+        import main
+        from kiro.debug_middleware import RequestIdMiddleware
+        assert main.app.user_middleware[0].cls is RequestIdMiddleware
+
+    @pytest.mark.parametrize("mode", ["off", "errors", "all"])
+    def test_request_id_middleware_registered_in_every_debug_mode(self, mode, monkeypatch):
+        """
+        What it does: Reloads main under each DEBUG_MODE.
+        Purpose: Request ids do not depend on debug logging.
+        """
+        import importlib
+        import kiro.config
+        import main
+        from kiro.debug_middleware import RequestIdMiddleware
+
+        monkeypatch.setattr(kiro.config, "DEBUG_MODE", mode)
+        try:
+            reloaded = importlib.reload(main)
+            assert any(m.cls is RequestIdMiddleware for m in reloaded.app.user_middleware)
+        finally:
+            monkeypatch.undo()
+            importlib.reload(main)

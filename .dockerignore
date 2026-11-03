@@ -25,7 +25,6 @@ ENV
 .coverage
 htmlcov
 .tox
-.hypothesis
 
 # IDE
 .vscode
@@ -54,8 +53,6 @@ pytest.ini
 # Debug logs (will be created at runtime)
 debug_logs/
 
-# Manual test script
-manual_api_test.py
 
 # CI/CD
 .clabot

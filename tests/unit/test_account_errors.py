@@ -212,21 +212,43 @@ class TestClassifyErrorEdgeCases:
         print(f"Classification result: {result}")
         assert result == ErrorType.FATAL, "Unknown status codes should default to FATAL"
     
-    def test_classify_error_401_fatal(self):
+    def test_classify_error_401_recoverable(self):
         """
-        Test that 401 (unauthorized) is FATAL.
-        
+        Test that 401 (unauthorized) is RECOVERABLE like 403.
+
         What it does: Verifies 401 classification
-        Purpose: 401 is not explicitly handled, should default to FATAL
+        Purpose: 401 means this account's credentials are bad, so failover
+                 to another account must happen instead of failing the request
         """
-        print("\n=== Test: 401 Unauthorized → FATAL ===")
-        
+        print("\n=== Test: 401 Unauthorized → RECOVERABLE ===")
+
         # Act
         result = classify_error(status_code=401, reason=None)
-        
+
         # Assert
         print(f"Classification result: {result}")
-        assert result == ErrorType.FATAL, "401 should be FATAL (not explicitly RECOVERABLE)"
+        assert result == ErrorType.RECOVERABLE, "401 should be RECOVERABLE (account credential issue)"
+
+    @pytest.mark.parametrize("reason", [None, "", "UNAUTHORIZED", "INVALID_MODEL_ID", "CONTENT_LENGTH_EXCEEDS_THRESHOLD"])
+    def test_classify_error_401_recoverable_regardless_of_reason(self, reason):
+        """
+        Test that 401 is RECOVERABLE for any reason string.
+
+        What it does: Classifies 401 with several reasons, including ones that
+                      make a 400 FATAL
+        Purpose: Ensure the reason never downgrades an auth failure to FATAL
+        """
+        assert classify_error(status_code=401, reason=reason) == ErrorType.RECOVERABLE
+
+    @pytest.mark.parametrize("status_code", [400, 404, 405, 407, 409, 413, 422, 500, 503])
+    def test_classify_error_neighbors_of_401_stay_fatal(self, status_code):
+        """
+        Test that making 401 RECOVERABLE did not widen the rule to other codes.
+
+        What it does: Classifies nearby 4xx/5xx codes without a special reason
+        Purpose: Guard against an accidental range check (e.g. 400 <= code < 410)
+        """
+        assert classify_error(status_code=status_code, reason=None) == ErrorType.FATAL
     
     def test_classify_error_with_reason_string(self):
         """
