@@ -81,7 +81,7 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
         HTTPException: 401 if key is invalid or missing
     """
     # Standard: Bearer {key}, fallback: raw key (hermes sends non-standard)
-    logger.warning(f"Auth received: {repr(auth_header[:30] if auth_header else None)}")
+    logger.debug(f"Auth received: {repr(auth_header[:30] if auth_header else None)}")
     if auth_header and (auth_header == f"Bearer {PROXY_API_KEY}" or auth_header == PROXY_API_KEY):
         return True
     logger.warning("Access attempt with invalid API key.")
