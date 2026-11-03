@@ -425,3 +425,57 @@ class TestCacheStats:
         assert stats["total"] == 2, "Total should be 2"
         
         print("✅ Test passed: Cache stats accurate")
+
+
+class TestHasPending:
+    """Tests for has_pending() fast-path check."""
+
+    def test_false_when_both_caches_empty(self):
+        """
+        What it does: Checks has_pending with empty caches.
+        Purpose: Routes skip the recovery scan in the common case.
+        """
+        from kiro.truncation_state import has_pending
+        assert has_pending() is False
+
+    def test_true_with_tool_entry_only(self):
+        """
+        What it does: Saves only a tool truncation.
+        Purpose: Either cache being non-empty triggers the scan.
+        """
+        from kiro.truncation_state import has_pending
+        save_tool_truncation("call_1", "Write", {"reason": "x"})
+        assert has_pending() is True
+
+    def test_true_with_content_entry_only(self):
+        """
+        What it does: Saves only a content truncation.
+        Purpose: Either cache being non-empty triggers the scan.
+        """
+        from kiro.truncation_state import has_pending
+        save_content_truncation("truncated text")
+        assert has_pending() is True
+
+    def test_false_again_after_entries_consumed(self):
+        """
+        What it does: Saves and then retrieves (one-time) both kinds.
+        Purpose: has_pending reflects consumption, so the fast path resumes.
+        """
+        from kiro.truncation_state import has_pending
+        save_tool_truncation("call_2", "Write", {})
+        save_content_truncation("abc")
+        assert has_pending() is True
+        assert get_tool_truncation("call_2") is not None
+        assert has_pending() is True
+        assert get_content_truncation("abc") is not None
+        assert has_pending() is False
+
+    def test_returns_bool(self):
+        """
+        What it does: Checks the return type in both states.
+        Purpose: Callers may compare with `is`.
+        """
+        from kiro.truncation_state import has_pending
+        assert isinstance(has_pending(), bool)
+        save_tool_truncation("call_3", "t", {})
+        assert isinstance(has_pending(), bool)

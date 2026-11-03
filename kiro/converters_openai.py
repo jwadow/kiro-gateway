@@ -29,6 +29,7 @@ Contains functions for:
 - Building Kiro payload from OpenAI requests
 """
 
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -43,8 +44,26 @@ from kiro.converters_core import (
     extract_images_from_content,
     UnifiedMessage,
     UnifiedTool,
+    UnifiedToolChoice,
     ThinkingConfig,
+    TOOL_CHOICE_AUTO,
+    TOOL_CHOICE_NONE,
+    TOOL_CHOICE_REQUIRED,
+    TOOL_CHOICE_TOOL,
+    append_system_section,
     build_kiro_payload as core_build_kiro_payload,
+)
+
+
+# System instructions that emulate response_format (Kiro API has no such parameter).
+JSON_OBJECT_INSTRUCTION: str = (
+    "Respond only with a single valid JSON object. "
+    "Do not include any text, explanation, or Markdown code fences outside the JSON."
+)
+JSON_SCHEMA_INSTRUCTION_TEMPLATE: str = (
+    "Respond only with a single valid JSON value that conforms to the following JSON Schema{name_part}. "
+    "Do not include any text, explanation, or Markdown code fences outside the JSON.\n\n"
+    "JSON Schema:\n{schema}"
 )
 
 
@@ -294,6 +313,99 @@ def convert_openai_tools_to_unified(tools: Optional[List[Tool]]) -> Optional[Lis
 
 
 # ==================================================================================================
+# tool_choice / response_format Emulation
+# ==================================================================================================
+
+def extract_tool_choice_from_openai(request: ChatCompletionRequest) -> Optional[UnifiedToolChoice]:
+    """
+    Converts OpenAI tool_choice and parallel_tool_calls to unified format.
+
+    Mapping:
+    - None / "auto" -> auto
+    - "none" -> none (tools removed)
+    - "required" -> at least one tool call
+    - {"type": "function", "function": {"name": X}} -> forced tool X
+      (the flat {"type": "function", "name": X} form is accepted too)
+    - parallel_tool_calls=False -> at most one tool call
+    Unrecognized values are logged and treated as auto.
+
+    Args:
+        request: OpenAI ChatCompletionRequest
+
+    Returns:
+        UnifiedToolChoice, or None when nothing deviates from the default
+    """
+    tool_choice = request.tool_choice
+    disable_parallel = request.parallel_tool_calls is False
+    mode = TOOL_CHOICE_AUTO
+    tool_name: Optional[str] = None
+
+    if isinstance(tool_choice, str):
+        if tool_choice in (TOOL_CHOICE_NONE, TOOL_CHOICE_REQUIRED, TOOL_CHOICE_AUTO):
+            mode = tool_choice
+        else:
+            logger.warning(f"Ignoring unsupported OpenAI tool_choice {tool_choice!r}; using auto")
+    elif isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        name = name or tool_choice.get("name")
+        if tool_choice.get("type") == "function" and isinstance(name, str) and name:
+            mode = TOOL_CHOICE_TOOL
+            tool_name = name
+        else:
+            logger.warning(f"Ignoring unsupported OpenAI tool_choice {tool_choice!r}; using auto")
+
+    if mode == TOOL_CHOICE_AUTO and not disable_parallel:
+        return None
+    return UnifiedToolChoice(mode=mode, tool_name=tool_name, disable_parallel=disable_parallel)
+
+
+def build_response_format_instruction(response_format: Optional[Dict[str, Any]]) -> str:
+    """
+    Builds a system instruction emulating OpenAI response_format.
+
+    Kiro API cannot constrain output format, so the requested format is
+    stated to the model instead. Output is not validated by the gateway.
+
+    - None / {"type": "text"} -> no instruction
+    - {"type": "json_object"} -> respond with a JSON object
+    - {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}
+      -> respond with JSON matching the schema (schema included verbatim)
+
+    Args:
+        response_format: response_format value from the request
+
+    Returns:
+        Instruction text, or "" when no instruction is needed
+    """
+    if not isinstance(response_format, dict):
+        return ""
+
+    format_type = response_format.get("type")
+    if format_type in (None, "text"):
+        return ""
+
+    if format_type == "json_object":
+        logger.debug("response_format=json_object: adding JSON output instruction")
+        return JSON_OBJECT_INSTRUCTION
+
+    if format_type == "json_schema":
+        json_schema = response_format.get("json_schema")
+        if not isinstance(json_schema, dict):
+            logger.warning("response_format json_schema has no json_schema object; asking for plain JSON")
+            return JSON_OBJECT_INSTRUCTION
+        schema = json_schema.get("schema", {})
+        name = json_schema.get("name")
+        name_part = f" (schema name: {name})" if isinstance(name, str) and name else ""
+        schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
+        logger.debug(f"response_format=json_schema{name_part}: adding schema instruction")
+        return JSON_SCHEMA_INSTRUCTION_TEMPLATE.format(name_part=name_part, schema=schema_text)
+
+    logger.warning(f"Ignoring unsupported response_format type {format_type!r}")
+    return ""
+
+
+# ==================================================================================================
 # Thinking Configuration Extraction
 # ==================================================================================================
 
@@ -424,7 +536,15 @@ def build_kiro_payload(
     
     # Extract thinking configuration from reasoning_effort
     thinking_config = extract_thinking_config_from_openai(request_data)
-    
+
+    # Emulate response_format with a system instruction
+    system_prompt = append_system_section(
+        system_prompt, build_response_format_instruction(request_data.response_format)
+    )
+
+    # Convert tool_choice / parallel_tool_calls to unified format
+    tool_choice = extract_tool_choice_from_openai(request_data)
+
     logger.debug(
         f"Converting OpenAI request: model={request_data.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
@@ -440,7 +560,8 @@ def build_kiro_payload(
         tools=unified_tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
-        thinking_config=thinking_config
+        thinking_config=thinking_config,
+        tool_choice=tool_choice,
     )
-    
+
     return result.payload

@@ -26,10 +26,10 @@ Reference: https://docs.anthropic.com/en/api/messages
 """
 
 import json
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Security, Header
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
@@ -53,8 +53,16 @@ from kiro.streaming_anthropic import (
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
-from kiro.config import WEB_SEARCH_ENABLED
+from kiro.config import WEB_SEARCH_ENABLED, FIRST_TOKEN_INNER_HTTP_RETRIES
 from kiro.mcp_tools import handle_native_web_search
+from kiro.exceptions import build_anthropic_error, retry_after_headers
+from kiro.routes_openai import (
+    CLIENT_CLOSED_REQUEST_STATUS,
+    ClientDisconnectedError,
+    close_upstream_response,
+    run_until_disconnected,
+    supported_kwargs,
+)
 
 # Import debug_logger
 try:
@@ -112,6 +120,318 @@ async def verify_anthropic_api_key(
     )
 
 
+def anthropic_error_response(
+    status_code: int,
+    message: str,
+    upstream_headers: Any = None,
+    error_type: Optional[str] = None,
+) -> JSONResponse:
+    """
+    Build an Anthropic-shaped error response.
+
+    The error type follows the HTTP status (429 -> rate_limit_error, 503 -> overloaded_error, ...),
+    and Retry-After is forwarded from the upstream on 429/503.
+
+    Args:
+        status_code: HTTP status
+        message: User-facing error message
+        upstream_headers: Upstream response headers (for Retry-After), if any
+        error_type: Explicit error type (derived from status when omitted)
+
+    Returns:
+        JSONResponse with {"type": "error", "error": {"type", "message"}}
+    """
+    return JSONResponse(
+        status_code=status_code,
+        content=build_anthropic_error(message, status_code, error_type),
+        headers=retry_after_headers(status_code, upstream_headers),
+    )
+
+
+def format_anthropic_stream_error(error: Exception) -> str:
+    """
+    Build an SSE error event for a mid-stream failure.
+
+    Args:
+        error: Exception that interrupted the stream
+
+    Returns:
+        "event: error" SSE frame in Anthropic error shape
+    """
+    payload = {"type": "error", "error": {"type": "api_error", "message": str(error)}}
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
+def apply_anthropic_truncation_recovery(request_data: AnthropicMessagesRequest) -> None:
+    """
+    Prepend truncation notices for tool calls/content truncated in earlier responses.
+
+    Skipped entirely when recovery is disabled or nothing is pending, so the
+    common case costs one dict-size check instead of a scan over all messages.
+
+    Args:
+        request_data: Request whose messages may be replaced in place
+    """
+    from kiro.truncation_state import get_tool_truncation, get_content_truncation, has_pending
+    from kiro.truncation_recovery import (
+        should_inject_recovery,
+        generate_truncation_tool_result,
+        generate_truncation_user_message,
+    )
+    from kiro.models_anthropic import AnthropicMessage
+
+    if not should_inject_recovery() or not has_pending():
+        return
+
+    modified_messages = []
+    tool_results_modified = 0
+    content_notices_added = 0
+
+    for msg in request_data.messages:
+        # Check if this is a user message with tool_result blocks
+        if msg.role == "user" and msg.content and isinstance(msg.content, list):
+            modified_content_blocks = []
+            has_modifications = False
+
+            for block in msg.content:
+                # Handle both dict and Pydantic objects (ToolResultContentBlock)
+                if isinstance(block, dict):
+                    block_type = block.get("type")
+                    tool_use_id = block.get("tool_use_id")
+                    original_content = block.get("content", "")
+                elif hasattr(block, "type"):
+                    block_type = block.type
+                    tool_use_id = getattr(block, "tool_use_id", None)
+                    original_content = getattr(block, "content", "")
+                else:
+                    modified_content_blocks.append(block)
+                    continue
+
+                if block_type == "tool_result" and tool_use_id:
+                    truncation_info = get_tool_truncation(tool_use_id)
+                    if truncation_info:
+                        # Modify tool_result content to include truncation notice
+                        synthetic = generate_truncation_tool_result(
+                            tool_name=truncation_info.tool_name,
+                            tool_use_id=tool_use_id,
+                            truncation_info=truncation_info.truncation_info
+                        )
+                        # Prepend truncation notice to original content
+                        modified_content = f"{synthetic['content']}\n\n---\n\nOriginal tool result:\n{original_content}"
+
+                        # Create modified block (handle both dict and Pydantic)
+                        if isinstance(block, dict):
+                            modified_block = block.copy()
+                            modified_block["content"] = modified_content
+                        else:
+                            modified_block = block.model_copy(update={"content": modified_content})
+
+                        modified_content_blocks.append(modified_block)
+                        tool_results_modified += 1
+                        has_modifications = True
+                        logger.debug(f"Modified tool_result for {tool_use_id} to include truncation notice")
+                        continue
+
+                modified_content_blocks.append(block)
+
+            # Create NEW AnthropicMessage object if modifications were made (Pydantic immutability)
+            if has_modifications:
+                modified_messages.append(msg.model_copy(update={"content": modified_content_blocks}))
+                continue
+
+        # Check if this is an assistant message with truncated content
+        if msg.role == "assistant" and msg.content:
+            # Extract text content for hash check
+            text_content = ""
+            if isinstance(msg.content, str):
+                text_content = msg.content
+            elif isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_content += block.get("text", "")
+
+            if text_content:
+                truncation_info = get_content_truncation(text_content)
+                if truncation_info:
+                    # Add this message first, then a synthetic user message about truncation
+                    modified_messages.append(msg)
+                    modified_messages.append(AnthropicMessage(
+                        role="user",
+                        content=[{"type": "text", "text": generate_truncation_user_message()}]
+                    ))
+                    content_notices_added += 1
+                    logger.debug(f"Added truncation notice after assistant message (hash: {truncation_info.message_hash})")
+                    continue
+
+        modified_messages.append(msg)
+
+    if tool_results_modified > 0 or content_notices_added > 0:
+        request_data.messages = modified_messages
+        logger.info(f"Truncation recovery: modified {tool_results_modified} tool_result(s), added {content_notices_added} content notice(s)")
+
+
+def log_kiro_payload(kiro_payload: Dict[str, Any]) -> None:
+    """
+    Serialize the Kiro payload into the debug log, only when debug logging is on.
+
+    Args:
+        kiro_payload: Payload sent to Kiro
+    """
+    if debug_logger is None or not debug_logger.enabled:
+        return
+    try:
+        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
+        debug_logger.log_kiro_request_body(kiro_request_body)
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Failed to log Kiro request: {e}")
+
+
+def normalize_anthropic_stop_sequences(stop_sequences: Optional[List[str]]) -> Optional[List[str]]:
+    """
+    Drop empty/non-string entries from Anthropic stop_sequences.
+
+    Args:
+        stop_sequences: Raw stop_sequences from the request
+
+    Returns:
+        Cleaned list, or None if empty
+    """
+    cleaned = [s for s in (stop_sequences or []) if isinstance(s, str) and s]
+    return cleaned or None
+
+
+async def build_anthropic_success_response(
+    request: Request,
+    request_data: AnthropicMessagesRequest,
+    http_client: KiroHttpClient,
+    response: httpx.Response,
+    url: str,
+    kiro_payload: Dict[str, Any],
+    model_cache: ModelInfoCache,
+    auth_manager: KiroAuthManager,
+    messages_for_tokenizer: List[Dict[str, Any]],
+    tools_for_tokenizer: Optional[List[Dict[str, Any]]],
+    system_for_tokenizer: Any,
+) -> Response:
+    """
+    Turn an accepted (200) Kiro response into the client response.
+
+    Shared by the account-system and legacy code paths so streaming and
+    non-streaming behaviour stays identical in both.
+
+    Args:
+        request: Incoming request (used for disconnect detection)
+        request_data: Parsed Anthropic request
+        http_client: Kiro HTTP client (closed when done)
+        response: Upstream 200 response
+        url: Kiro endpoint (for first-token retries)
+        kiro_payload: Payload sent to Kiro (for first-token retries)
+        model_cache: Model metadata cache
+        auth_manager: Account auth manager
+        messages_for_tokenizer: Messages as dicts for fallback token counting
+        tools_for_tokenizer: Tools as dicts for fallback token counting
+        system_for_tokenizer: System prompt for fallback token counting
+
+    Returns:
+        StreamingResponse (stream=True) or JSONResponse
+    """
+    stop_sequences = normalize_anthropic_stop_sequences(request_data.stop_sequences)
+
+    if request_data.stream:
+        stream_fn = stream_with_first_token_retry_anthropic
+        extra_kwargs = supported_kwargs(stream_fn, stop_sequences=stop_sequences)
+
+        async def stream_wrapper():
+            streaming_error = None
+            client_disconnected = False
+            try:
+                async def make_retry_request():
+                    return await http_client.request_with_retry(
+                        "POST", url, kiro_payload, stream=True, max_retries=FIRST_TOKEN_INNER_HTTP_RETRIES
+                    )
+
+                async for chunk in stream_fn(
+                    make_request=make_retry_request,
+                    model=request_data.model,
+                    model_cache=model_cache,
+                    auth_manager=auth_manager,
+                    initial_response=response,
+                    request_messages=messages_for_tokenizer,
+                    request_tools=tools_for_tokenizer,
+                    request_system=system_for_tokenizer,
+                    **extra_kwargs,
+                ):
+                    yield chunk
+            except GeneratorExit:
+                client_disconnected = True
+                logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
+            except Exception as e:
+                streaming_error = e
+                # Send error event to client, then gracefully end the stream
+                try:
+                    yield format_anthropic_stream_error(e)
+                except Exception:
+                    pass
+            finally:
+                await http_client.close()
+                if streaming_error:
+                    error_type = type(streaming_error).__name__
+                    error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
+                    logger.error(f"HTTP 500 - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
+                elif client_disconnected:
+                    logger.info("HTTP 200 - POST /v1/messages (streaming) - client disconnected")
+                else:
+                    logger.info("HTTP 200 - POST /v1/messages (streaming) - completed")
+
+                if debug_logger:
+                    if streaming_error:
+                        debug_logger.flush_on_error(500, str(streaming_error))
+                    else:
+                        debug_logger.discard_buffers()
+
+        return StreamingResponse(
+            stream_wrapper(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
+
+    # Non-streaming mode - collect entire response, abandoning it if the client leaves
+    collect_fn = collect_anthropic_response
+    collect_kwargs = supported_kwargs(collect_fn, stop_sequences=stop_sequences)
+    try:
+        anthropic_response = await run_until_disconnected(
+            request,
+            collect_fn(
+                response,
+                request_data.model,
+                model_cache,
+                auth_manager,
+                request_messages=messages_for_tokenizer,
+                request_tools=tools_for_tokenizer,
+                request_system=system_for_tokenizer,
+                **collect_kwargs,
+            ),
+        )
+    except ClientDisconnectedError:
+        await close_upstream_response(response)
+        await http_client.close()
+        logger.info("HTTP 499 - POST /v1/messages (non-streaming) - client disconnected, upstream cancelled")
+        if debug_logger:
+            debug_logger.discard_buffers()
+        return Response(status_code=CLIENT_CLOSED_REQUEST_STATUS)
+
+    await http_client.close()
+    logger.info("HTTP 200 - POST /v1/messages (non-streaming) - completed")
+
+    if debug_logger:
+        debug_logger.discard_buffers()
+
+    return JSONResponse(content=anthropic_response)
+
+
 # --- Router ---
 router = APIRouter(tags=["Anthropic API"])
 
@@ -153,101 +473,9 @@ async def messages(
     # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
     # This ensures debug logging works even for requests that fail Pydantic validation (422 errors)
     
-    # Check for truncation recovery opportunities
-    from kiro.truncation_state import get_tool_truncation, get_content_truncation
-    from kiro.truncation_recovery import generate_truncation_tool_result, generate_truncation_user_message
-    from kiro.models_anthropic import AnthropicMessage
-    
-    modified_messages = []
-    tool_results_modified = 0
-    content_notices_added = 0
-    
-    for msg in request_data.messages:
-        # Check if this is a user message with tool_result blocks
-        if msg.role == "user" and msg.content and isinstance(msg.content, list):
-            modified_content_blocks = []
-            has_modifications = False
-            
-            for block in msg.content:
-                # Handle both dict and Pydantic objects (ToolResultContentBlock)
-                if isinstance(block, dict):
-                    block_type = block.get("type")
-                    tool_use_id = block.get("tool_use_id")
-                    original_content = block.get("content", "")
-                elif hasattr(block, "type"):
-                    block_type = block.type
-                    tool_use_id = getattr(block, "tool_use_id", None)
-                    original_content = getattr(block, "content", "")
-                else:
-                    modified_content_blocks.append(block)
-                    continue
-                
-                if block_type == "tool_result" and tool_use_id:
-                    truncation_info = get_tool_truncation(tool_use_id)
-                    if truncation_info:
-                        # Modify tool_result content to include truncation notice
-                        synthetic = generate_truncation_tool_result(
-                            tool_name=truncation_info.tool_name,
-                            tool_use_id=tool_use_id,
-                            truncation_info=truncation_info.truncation_info
-                        )
-                        # Prepend truncation notice to original content
-                        modified_content = f"{synthetic['content']}\n\n---\n\nOriginal tool result:\n{original_content}"
-                        
-                        # Create modified block (handle both dict and Pydantic)
-                        if isinstance(block, dict):
-                            modified_block = block.copy()
-                            modified_block["content"] = modified_content
-                        else:
-                            # Pydantic object - use model_copy
-                            modified_block = block.model_copy(update={"content": modified_content})
-                        
-                        modified_content_blocks.append(modified_block)
-                        tool_results_modified += 1
-                        has_modifications = True
-                        logger.debug(f"Modified tool_result for {tool_use_id} to include truncation notice")
-                        continue
-                
-                modified_content_blocks.append(block)
-            
-            # Create NEW AnthropicMessage object if modifications were made (Pydantic immutability)
-            if has_modifications:
-                modified_msg = msg.model_copy(update={"content": modified_content_blocks})
-                modified_messages.append(modified_msg)
-                continue  # Skip normal append since we already added modified version
-        
-        # Check if this is an assistant message with truncated content
-        if msg.role == "assistant" and msg.content:
-            # Extract text content for hash check
-            text_content = ""
-            if isinstance(msg.content, str):
-                text_content = msg.content
-            elif isinstance(msg.content, list):
-                for block in msg.content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_content += block.get("text", "")
-            
-            if text_content:
-                truncation_info = get_content_truncation(text_content)
-                if truncation_info:
-                    # Add this message first
-                    modified_messages.append(msg)
-                    # Then add synthetic user message about truncation
-                    synthetic_user_msg = AnthropicMessage(
-                        role="user",
-                        content=[{"type": "text", "text": generate_truncation_user_message()}]
-                    )
-                    modified_messages.append(synthetic_user_msg)
-                    content_notices_added += 1
-                    logger.debug(f"Added truncation notice after assistant message (hash: {truncation_info.message_hash})")
-                    continue  # Skip normal append since we already added it
-        
-        modified_messages.append(msg)
-    
-    if tool_results_modified > 0 or content_notices_added > 0:
-        request_data.messages = modified_messages
-        logger.info(f"Truncation recovery: modified {tool_results_modified} tool_result(s), added {content_notices_added} content notice(s)")
-    
+    # Check for truncation recovery opportunities (no-op unless something is pending)
+    apply_anthropic_truncation_recovery(request_data)
+
     # ==============================================================================
     # WebSearch Support - Path B: Auto-Injection (MCP Tool Emulation)
     # ==============================================================================
@@ -294,16 +522,7 @@ async def messages(
                 account = request.app.state.account_manager.get_first_account()
                 if not account.auth_manager:
                     logger.error("No initialized accounts available for native web_search")
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": "No initialized accounts available"
-                            }
-                        }
-                    )
+                    return anthropic_error_response(503, "No initialized accounts available")
                 auth_manager = account.auth_manager
                 
                 logger.info("Detected native Anthropic web_search (Path A), routing to MCP API")
@@ -325,6 +544,7 @@ async def messages(
         
         last_error_message = None
         last_error_status = None
+        last_error_headers = None  # Retry-After from the last upstream 429/503, if any
         tried_accounts = set()  # Track tried accounts in current failover loop
         
         for attempt in range(MAX_ATTEMPTS):
@@ -338,31 +558,17 @@ async def messages(
                 # All accounts unavailable
                 if len(all_accounts) == 1:
                     # Single account - return original error with original status code
-                    return JSONResponse(
-                        status_code=last_error_status or 503,
-                        content={
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": last_error_message or "Account unavailable"
-                            }
-                        }
+                    return anthropic_error_response(
+                        last_error_status or 503,
+                        last_error_message or "Account unavailable",
+                        last_error_headers,
                     )
                 else:
                     # Multiple accounts - generic error with context
                     detail = "No available accounts for this model."
                     if last_error_message:
                         detail += f" Error from last account: {last_error_message}"
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": detail
-                            }
-                        }
-                    )
+                    return anthropic_error_response(503, detail)
             
             # Mark account as tried in current failover loop
             tried_accounts.add(account.id)
@@ -387,24 +593,10 @@ async def messages(
                 )
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "type": "error",
-                        "error": {
-                            "type": "invalid_request_error",
-                            "message": str(e)
-                        }
-                    }
-                )
+                return anthropic_error_response(400, str(e))
             
-            # Log Kiro payload
-            try:
-                kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-                if debug_logger:
-                    debug_logger.log_kiro_request_body(kiro_request_body)
-            except Exception as e:
-                logger.warning(f"Failed to log Kiro request: {e}")
+            # Log Kiro payload (serialized only when debug logging is enabled)
+            log_kiro_payload(kiro_payload)
             
             # Create HTTP client
             url = f"{auth_manager.api_host}/generateAssistantResponse"
@@ -437,83 +629,11 @@ async def messages(
                     # SUCCESS - report and return
                     await account_manager.report_success(account.id, request_data.model)
                     
-                    if request_data.stream:
-                        # Streaming mode
-                        async def stream_wrapper():
-                            streaming_error = None
-                            client_disconnected = False
-                            try:
-                                async def make_retry_request():
-                                    return await http_client.request_with_retry(
-                                        "POST", url, kiro_payload, stream=True
-                                    )
-                                
-                                async for chunk in stream_with_first_token_retry_anthropic(
-                                    make_request=make_retry_request,
-                                    model=request_data.model,
-                                    model_cache=model_cache,
-                                    auth_manager=auth_manager,
-                                    initial_response=response,
-                                    request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer,
-                                    request_system=system_for_tokenizer,
-                                ):
-                                    yield chunk
-                            except GeneratorExit:
-                                client_disconnected = True
-                                logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
-                            except Exception as e:
-                                streaming_error = e
-                                try:
-                                    error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
-                                    yield error_event
-                                except Exception:
-                                    pass
-                            finally:
-                                await http_client.close()
-                                if streaming_error:
-                                    error_type = type(streaming_error).__name__
-                                    error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                                    logger.error(f"HTTP 500 - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
-                                elif client_disconnected:
-                                    logger.info(f"HTTP 200 - POST /v1/messages (streaming) - client disconnected")
-                                else:
-                                    logger.info(f"HTTP 200 - POST /v1/messages (streaming) - completed")
-                                
-                                if debug_logger:
-                                    if streaming_error:
-                                        debug_logger.flush_on_error(500, str(streaming_error))
-                                    else:
-                                        debug_logger.discard_buffers()
-                        
-                        return StreamingResponse(
-                            stream_wrapper(),
-                            media_type="text/event-stream",
-                            headers={
-                                "Cache-Control": "no-cache",
-                                "Connection": "keep-alive",
-                            }
-                        )
-                    
-                    else:
-                        # Non-streaming mode
-                        anthropic_response = await collect_anthropic_response(
-                            response,
-                            request_data.model,
-                            model_cache,
-                            auth_manager,
-                            request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer,
-                            request_system=system_for_tokenizer,
-                        )
-                        
-                        await http_client.close()
-                        logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
-                        
-                        if debug_logger:
-                            debug_logger.discard_buffers()
-                        
-                        return JSONResponse(content=anthropic_response)
+                    return await build_anthropic_success_response(
+                        request, request_data, http_client, response, url, kiro_payload,
+                        model_cache, auth_manager,
+                        messages_for_tokenizer, tools_for_tokenizer, system_for_tokenizer,
+                    )
                 
                 else:
                     # ERROR - classify and decide
@@ -539,6 +659,10 @@ async def messages(
                         last_error_message = error_text
                         last_error_status = response.status_code
                     
+                    last_error_headers = retry_after_headers(
+                        response.status_code, getattr(response, "headers", None)
+                    )
+
                     # Classify error
                     error_type = classify_error(response.status_code, error_reason)
                     
@@ -554,15 +678,8 @@ async def messages(
                         if debug_logger:
                             debug_logger.flush_on_error(response.status_code, last_error_message)
                         
-                        return JSONResponse(
-                            status_code=response.status_code,
-                            content={
-                                "type": "error",
-                                "error": {
-                                    "type": "api_error",
-                                    "message": last_error_message
-                                }
-                            }
+                        return anthropic_error_response(
+                            response.status_code, last_error_message, getattr(response, "headers", None)
                         )
                     
                     else:  # ErrorType.RECOVERABLE
@@ -593,6 +710,7 @@ async def messages(
                     
                     last_error_message = str(e.detail)
                     last_error_status = e.status_code
+                    last_error_headers = None
                     
                     # Single account - no point in failover, break immediately
                     if len(all_accounts) == 1:
@@ -614,46 +732,19 @@ async def messages(
                 if debug_logger:
                     debug_logger.flush_on_error(500, str(e))
                 
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": f"Internal Server Error: {str(e)}"
-                        }
-                    }
-                )
+                return anthropic_error_response(500, f"Internal Server Error: {str(e)}")
         
         # All attempts exhausted
         if len(all_accounts) == 1:
             # Single account - return its original error
             # last_error_status and last_error_message are guaranteed to be set
-            return JSONResponse(
-                status_code=last_error_status,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": last_error_message
-                    }
-                }
-            )
+            return anthropic_error_response(last_error_status, last_error_message, last_error_headers)
         else:
             # Multiple accounts - generic error with context
             detail = "All accounts failed after full circle."
             if last_error_message:
                 detail += f" Error from last account: {last_error_message}"
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": detail
-                    }
-                }
-            )
+            return anthropic_error_response(503, detail)
     
     else:
         # ==============================================================================
@@ -662,16 +753,7 @@ async def messages(
         account = request.app.state.account_manager.get_first_account()
         if not account.auth_manager:
             logger.error("No initialized accounts available (legacy mode)")
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": "No initialized accounts available"
-                    }
-                }
-            )
+            return anthropic_error_response(503, "No initialized accounts available")
         auth_manager = account.auth_manager
         model_cache = account.model_cache
         model_resolver = account.model_resolver
@@ -695,24 +777,10 @@ async def messages(
         )
     except ValueError as e:
         logger.error(f"Conversion error: {e}")
-        return JSONResponse(
-            status_code=400,
-            content={
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": str(e)
-                }
-            }
-        )
+        return anthropic_error_response(400, str(e))
     
-    # Log Kiro payload
-    try:
-        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-        if debug_logger:
-            debug_logger.log_kiro_request_body(kiro_request_body)
-    except Exception as e:
-        logger.warning(f"Failed to log Kiro request: {e}")
+    # Log Kiro payload (serialized only when debug logging is enabled)
+    log_kiro_payload(kiro_payload)
     
     # Create HTTP client with retry logic
     # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)
@@ -782,98 +850,15 @@ async def messages(
                 debug_logger.flush_on_error(response.status_code, error_message)
             
             # Return error in Anthropic format
-            return JSONResponse(
-                status_code=response.status_code,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": error_message
-                    }
-                }
+            return anthropic_error_response(
+                response.status_code, error_message, getattr(response, "headers", None)
             )
         
-        if request_data.stream:
-            # Streaming mode with first token retry
-            async def stream_wrapper():
-                streaming_error = None
-                client_disconnected = False
-                try:
-                    # Create retry request function for retries
-                    async def make_retry_request():
-                        return await http_client.request_with_retry(
-                            "POST", url, kiro_payload, stream=True
-                        )
-                    
-                    # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry_anthropic(
-                        make_request=make_retry_request,
-                        model=request_data.model,
-                        model_cache=model_cache,
-                        auth_manager=auth_manager,
-                        initial_response=response,
-                        request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer,
-                        request_system=system_for_tokenizer,
-                    ):
-                        yield chunk
-                except GeneratorExit:
-                    client_disconnected = True
-                    logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
-                except Exception as e:
-                    streaming_error = e
-                    # Send error event to client, then gracefully end the stream
-                    try:
-                        error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
-                        yield error_event
-                    except Exception:
-                        pass
-                finally:
-                    await http_client.close()
-                    if streaming_error:
-                        error_type = type(streaming_error).__name__
-                        error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                        logger.error(f"HTTP 500 - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
-                    elif client_disconnected:
-                        logger.info(f"HTTP 200 - POST /v1/messages (streaming) - client disconnected")
-                    else:
-                        logger.info(f"HTTP 200 - POST /v1/messages (streaming) - completed")
-                    
-                    if debug_logger:
-                        if streaming_error:
-                            debug_logger.flush_on_error(500, str(streaming_error))
-                        else:
-                            debug_logger.discard_buffers()
-            
-            return StreamingResponse(
-                stream_wrapper(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                }
-            )
-        
-        else:
-            # Non-streaming mode - collect entire response
-            anthropic_response = await collect_anthropic_response(
-                response,
-                request_data.model,
-                model_cache,
-                auth_manager,
-                request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer,
-                request_system=system_for_tokenizer,
-            )
-            
-            await http_client.close()
-            
-            logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
-            
-            if debug_logger:
-                debug_logger.discard_buffers()
-            
-            return JSONResponse(content=anthropic_response)
+        return await build_anthropic_success_response(
+            request, request_data, http_client, response, url, kiro_payload,
+            model_cache, auth_manager,
+            messages_for_tokenizer, tools_for_tokenizer, system_for_tokenizer,
+        )
     
     except HTTPException as e:
         await http_client.close()
@@ -894,16 +879,7 @@ async def messages(
         if debug_logger:
             debug_logger.flush_on_error(500, str(e))
         
-        return JSONResponse(
-            status_code=500,
-            content={
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": f"Internal Server Error: {str(e)}"
-                }
-            }
-        )
+        return anthropic_error_response(500, f"Internal Server Error: {str(e)}")
 
 
 @router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_anthropic_api_key)])

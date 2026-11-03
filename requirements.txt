@@ -1,6 +1,6 @@
 # Prod dependencies
 fastapi
-uvicorn
+uvicorn[standard]
 httpx
 loguru
 python-dotenv

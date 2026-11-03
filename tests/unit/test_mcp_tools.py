@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import json
+import httpx
 import pytest
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 from datetime import datetime
@@ -131,10 +132,10 @@ class TestCallKiroMCPAPI:
         
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
-        mock_client.__aenter__.return_value.post = mock_post
+        mock_client.post = mock_post
         
         print("Action: Calling call_kiro_mcp_api...")
-        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+        with patch("kiro.mcp_tools.get_mcp_http_client", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
         
         print(f"Comparing tool_use_id: Got '{tool_use_id}'")
@@ -169,10 +170,10 @@ class TestCallKiroMCPAPI:
         
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
-        mock_client.__aenter__.return_value.post = mock_post
+        mock_client.post = mock_post
         
         print("Action: Calling call_kiro_mcp_api...")
-        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+        with patch("kiro.mcp_tools.get_mcp_http_client", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
         
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
@@ -193,10 +194,10 @@ class TestCallKiroMCPAPI:
         
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
-        mock_client.__aenter__.return_value.post = mock_post
+        mock_client.post = mock_post
         
         print("Action: Calling call_kiro_mcp_api...")
-        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+        with patch("kiro.mcp_tools.get_mcp_http_client", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
         
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
@@ -216,10 +217,10 @@ class TestCallKiroMCPAPI:
         
         mock_post = AsyncMock(side_effect=httpx.TimeoutException("Timeout"))
         mock_client = AsyncMock()
-        mock_client.__aenter__.return_value.post = mock_post
+        mock_client.post = mock_post
         
         print("Action: Calling call_kiro_mcp_api...")
-        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+        with patch("kiro.mcp_tools.get_mcp_http_client", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
         
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
@@ -241,10 +242,10 @@ class TestCallKiroMCPAPI:
         
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
-        mock_client.__aenter__.return_value.post = mock_post
+        mock_client.post = mock_post
         
         print("Action: Calling call_kiro_mcp_api...")
-        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+        with patch("kiro.mcp_tools.get_mcp_http_client", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
         
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
@@ -600,3 +601,224 @@ class TestOpenAISSEEmulation:
         
         print("Checking for usage information...")
         assert any('"usage"' in chunk for chunk in chunks)
+
+
+# ==================================================================================================
+# Tests for MCP client reuse and 403 retry
+# ==================================================================================================
+
+def _mcp_success_response() -> Mock:
+    """Creates a mocked successful MCP response."""
+    response = Mock()
+    response.status_code = 200
+    response.json = Mock(return_value={
+        "jsonrpc": "2.0",
+        "result": {"content": [{"type": "text", "text": json.dumps({"results": [], "totalResults": 0})}]}
+    })
+    return response
+
+
+class TestMCPHttpClientReuse:
+    """Tests for the shared MCP HTTP client."""
+
+    @pytest.mark.asyncio
+    async def test_shared_client_created_once_across_calls(self, mock_auth_manager):
+        """
+        What it does: Calls web_search twice with the real get_mcp_http_client().
+        Purpose: Only one AsyncClient must be constructed (connection reuse).
+        """
+        import kiro.mcp_tools as mcp_tools
+
+        fake_client = AsyncMock()
+        fake_client.is_closed = False
+        fake_client.post = AsyncMock(return_value=_mcp_success_response())
+
+        with patch.object(mcp_tools, "_mcp_http_client", None):
+            with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=fake_client) as client_cls:
+                r1 = await call_kiro_mcp_api("a", mock_auth_manager)
+                r2 = await call_kiro_mcp_api("b", mock_auth_manager)
+
+        assert r1[1] is not None and r2[1] is not None
+        client_cls.assert_called_once_with(timeout=mcp_tools.MCP_REQUEST_TIMEOUT)
+        assert fake_client.post.await_count == 2
+        fake_client.aclose.assert_not_called()
+
+    def test_closed_shared_client_is_recreated(self):
+        """
+        What it does: Marks the cached client closed and asks again.
+        Purpose: A closed client must never be reused.
+        """
+        import kiro.mcp_tools as mcp_tools
+
+        closed = Mock(is_closed=True)
+        fresh = Mock(is_closed=False)
+        with patch.object(mcp_tools, "_mcp_http_client", closed):
+            with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=fresh) as client_cls:
+                assert mcp_tools.get_mcp_http_client() is fresh
+                assert mcp_tools.get_mcp_http_client() is fresh
+        client_cls.assert_called_once()
+
+    def test_shared_client_keeps_env_proxy_and_timeout(self):
+        """
+        What it does: Inspects the AsyncClient constructor arguments.
+        Purpose: Timeout preserved; no trust_env/proxy override, so VPN_PROXY_URL
+        (exported as HTTP(S)_PROXY / ALL_PROXY in main.py) still applies.
+        """
+        import kiro.mcp_tools as mcp_tools
+
+        with patch.object(mcp_tools, "_mcp_http_client", None):
+            with patch("kiro.mcp_tools.httpx.AsyncClient") as client_cls:
+                client = mcp_tools.get_mcp_http_client()
+
+        assert client is client_cls.return_value
+        kwargs = client_cls.call_args.kwargs
+        assert kwargs == {"timeout": mcp_tools.MCP_REQUEST_TIMEOUT}
+        assert "trust_env" not in kwargs and "proxy" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_explicit_http_client_is_used(self, mock_auth_manager):
+        """
+        What it does: Passes an http_client explicitly.
+        Purpose: Callers can inject their own client; module client not touched.
+        """
+        injected = AsyncMock()
+        injected.post = AsyncMock(return_value=_mcp_success_response())
+
+        with patch("kiro.mcp_tools.get_mcp_http_client") as getter:
+            tool_use_id, results = await call_kiro_mcp_api("q", mock_auth_manager, http_client=injected)
+
+        getter.assert_not_called()
+        injected.post.assert_awaited_once()
+        assert results == {"results": [], "totalResults": 0}
+
+    @pytest.mark.asyncio
+    async def test_close_mcp_http_client_is_idempotent(self):
+        """
+        What it does: Closes the shared client twice.
+        Purpose: Shutdown cleanup must be safe to repeat.
+        """
+        import kiro.mcp_tools as mcp_tools
+
+        client = AsyncMock()
+        client.is_closed = False
+        with patch.object(mcp_tools, "_mcp_http_client", client):
+            await mcp_tools.close_mcp_http_client()
+            assert mcp_tools._mcp_http_client is None
+            await mcp_tools.close_mcp_http_client()
+        client.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_close_mcp_http_client_swallows_errors(self):
+        """
+        What it does: aclose() raises an httpx error.
+        Purpose: Cleanup must not propagate errors.
+        """
+        import kiro.mcp_tools as mcp_tools
+
+        client = AsyncMock()
+        client.is_closed = False
+        client.aclose.side_effect = httpx.TransportError("boom")
+        with patch.object(mcp_tools, "_mcp_http_client", client):
+            await mcp_tools.close_mcp_http_client()
+            assert mcp_tools._mcp_http_client is None
+
+
+class TestMCP403Retry:
+    """Tests for 403 handling in call_kiro_mcp_api."""
+
+    @pytest.mark.asyncio
+    async def test_403_refreshes_and_retries_once_successfully(self, mock_auth_manager):
+        """
+        What it does: First call 403, second 200.
+        Purpose: Token refreshed once and the retry uses the new token.
+        """
+        resp_403 = Mock(status_code=403, text="expired")
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=[resp_403, _mcp_success_response()])
+
+        tokens = iter(["old_token", "new_token"])
+
+        async def next_token() -> str:
+            return next(tokens)
+
+        with patch.object(mock_auth_manager, "get_access_token", side_effect=next_token):
+            with patch.object(mock_auth_manager, "force_refresh", AsyncMock(return_value="new_token")) as refresh:
+                with patch("kiro.mcp_tools.get_mcp_http_client", return_value=client):
+                    tool_use_id, results = await call_kiro_mcp_api("q", mock_auth_manager)
+
+        refresh.assert_awaited_once_with()
+        assert client.post.await_count == 2
+        first_headers = client.post.call_args_list[0].kwargs["headers"]
+        second_headers = client.post.call_args_list[1].kwargs["headers"]
+        assert "old_token" in first_headers["Authorization"]
+        assert "new_token" in second_headers["Authorization"]
+        assert second_headers["Content-Type"] == "application/json"
+        assert "x-amz-target" not in second_headers
+        assert second_headers["x-amzn-codewhisperer-optout"] == "false"
+        # Same JSON-RPC request (same id) re-sent
+        assert client.post.call_args_list[0].kwargs["json"] == client.post.call_args_list[1].kwargs["json"]
+        assert tool_use_id is not None and results is not None
+
+    @pytest.mark.asyncio
+    async def test_403_twice_gives_up_after_single_retry(self, mock_auth_manager):
+        """
+        What it does: Both calls return 403.
+        Purpose: Retry exactly once, no refresh loop.
+        """
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=[Mock(status_code=403, text="x"), Mock(status_code=403, text="x")])
+
+        with patch.object(mock_auth_manager, "force_refresh", AsyncMock(return_value="t")) as refresh:
+            with patch("kiro.mcp_tools.get_mcp_http_client", return_value=client):
+                result = await call_kiro_mcp_api("q", mock_auth_manager)
+
+        assert result == (None, None)
+        refresh.assert_awaited_once()
+        assert client.post.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [400, 401, 429, 500])
+    async def test_non_403_error_not_retried(self, mock_auth_manager, status):
+        """
+        What it does: Non-403 error statuses.
+        Purpose: Only 403 triggers refresh+retry.
+        """
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=Mock(status_code=status, text="err"))
+        with patch.object(mock_auth_manager, "force_refresh", AsyncMock()) as refresh:
+            with patch("kiro.mcp_tools.get_mcp_http_client", return_value=client):
+                result = await call_kiro_mcp_api("q", mock_auth_manager)
+        assert result == (None, None)
+        refresh.assert_not_called()
+        assert client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_403_refresh_failure_returns_none(self, mock_auth_manager):
+        """
+        What it does: force_refresh() raises during 403 handling.
+        Purpose: Refresh failure is reported as (None, None), not raised.
+        """
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=Mock(status_code=403, text="x"))
+
+        with patch.object(mock_auth_manager, "force_refresh", AsyncMock(side_effect=httpx.ConnectError("down"))):
+            with patch("kiro.mcp_tools.get_mcp_http_client", return_value=client):
+                result = await call_kiro_mcp_api("q", mock_auth_manager)
+
+        assert result == (None, None)
+        assert client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_403_retry_timeout_returns_none(self, mock_auth_manager):
+        """
+        What it does: Retry after 403 times out.
+        Purpose: Timeout on retry handled like any timeout.
+        """
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=[Mock(status_code=403, text="x"), httpx.ReadTimeout("slow")])
+
+        with patch.object(mock_auth_manager, "force_refresh", AsyncMock(return_value="t")):
+            with patch("kiro.mcp_tools.get_mcp_http_client", return_value=client):
+                result = await call_kiro_mcp_api("q", mock_auth_manager)
+
+        assert result == (None, None)

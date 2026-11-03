@@ -32,11 +32,18 @@ The middleware:
 Flush/discard operations are handled by:
 - Route handlers (for successful requests and Kiro API errors)
 - Exception handlers (for validation errors and other exceptions)
+
+Also provides RequestIdMiddleware, a pure ASGI middleware that tags every
+response with request-id / x-request-id headers.
 """
+
+import uuid
+from typing import Tuple
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from loguru import logger
 
 from kiro.config import DEBUG_MODE
@@ -47,6 +54,7 @@ from kiro.config import DEBUG_MODE
 LOGGED_ENDPOINTS = frozenset({
     "/v1/chat/completions",  # OpenAI-compatible endpoint
     "/v1/messages",          # Anthropic-compatible endpoint
+    "/v1/responses",         # OpenAI Responses API endpoint
 })
 
 
@@ -114,3 +122,67 @@ class DebugLoggerMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         
         return response
+
+
+# Response headers carrying the per-request id (Anthropic uses "request-id", OpenAI "x-request-id")
+REQUEST_ID_HEADERS: Tuple[bytes, ...] = (b"request-id", b"x-request-id")
+
+# Prefix of generated request ids (mirrors Anthropic's "req_..." format)
+REQUEST_ID_PREFIX: str = "req_"
+
+
+def generate_request_id() -> str:
+    """
+    Generate a unique request id.
+
+    Returns:
+        Id such as "req_3f2b...", 32 hex chars after the prefix
+    """
+    return f"{REQUEST_ID_PREFIX}{uuid.uuid4().hex}"
+
+
+class RequestIdMiddleware:
+    """
+    Pure ASGI middleware adding request-id and x-request-id headers to every HTTP response.
+
+    Implemented without BaseHTTPMiddleware so streaming (SSE) bodies pass through
+    untouched: only the http.response.start message is modified. The id is also
+    stored in scope["state"]["request_id"] for handlers that want to log it.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        """
+        Args:
+            app: Wrapped ASGI application
+        """
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        Handle one ASGI connection.
+
+        Args:
+            scope: ASGI scope
+            receive: ASGI receive callable
+            send: ASGI send callable
+        """
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = generate_request_id()
+        scope.setdefault("state", {})["request_id"] = request_id
+        encoded_id = request_id.encode("latin-1")
+
+        async def send_with_request_id(message: Message) -> None:
+            if message.get("type") == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() not in REQUEST_ID_HEADERS
+                ]
+                headers.extend((name, encoded_id) for name in REQUEST_ID_HEADERS)
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)

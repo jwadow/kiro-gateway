@@ -1281,3 +1281,496 @@ class TestKiroHttpClientRequestParameters:
         assert captured_kwargs["params"]["filter"] == "active"
         assert json.loads(captured_kwargs["content"])["data"] == "value"
         assert response.status_code == 200
+
+# ==================================================================================================
+# Performance hardening regression tests
+# ==================================================================================================
+
+def _make_error_response(status_code: int, body: bytes = b"error") -> AsyncMock:
+    """Creates a mocked error response with aread()/aclose() tracking."""
+    response = AsyncMock()
+    response.status_code = status_code
+    response.aread = AsyncMock(return_value=body)
+    response.aclose = AsyncMock()
+    return response
+
+
+class TestKiroHttpClientConnectionCloseOnlyForOwnedClient:
+    """Connection: close must only be sent on per-request (owned) clients."""
+
+    @pytest.mark.asyncio
+    async def test_shared_client_streaming_does_not_send_connection_close(self, mock_auth_manager_for_http):
+        """
+        What it does: Streams via a shared pooled client and captures headers.
+        Purpose: Connection: close on the shared client would disable pool reuse.
+        """
+        shared = AsyncMock()
+        shared.is_closed = False
+        captured = {}
+
+        def capture(method, url, **kwargs):
+            captured.update(kwargs["headers"])
+            return Mock()
+
+        shared.build_request = Mock(side_effect=capture)
+        ok = AsyncMock()
+        ok.status_code = 200
+        shared.send = AsyncMock(return_value=ok)
+
+        http_client = KiroHttpClient(mock_auth_manager_for_http, shared_client=shared)
+        with patch('kiro.http_client.get_kiro_headers', return_value={"Authorization": "Bearer t"}):
+            response = await http_client.request_with_retry("POST", "https://x/test", {"a": 1}, stream=True)
+
+        assert response is ok
+        assert "Connection" not in captured
+        assert captured["Authorization"] == "Bearer t"
+        shared.send.assert_called_once()
+        assert shared.send.call_args.kwargs["stream"] is True
+
+    @pytest.mark.asyncio
+    async def test_owned_client_streaming_sends_connection_close(self, mock_auth_manager_for_http):
+        """
+        What it does: Streams via a per-request client and captures headers.
+        Purpose: Keep the issue #38 CLOSE_WAIT fix for owned clients.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        assert http_client._owns_client is True
+        captured = {}
+
+        def capture(method, url, **kwargs):
+            captured.update(kwargs["headers"])
+            return Mock()
+
+        owned = AsyncMock()
+        owned.is_closed = False
+        owned.build_request = Mock(side_effect=capture)
+        ok = AsyncMock()
+        ok.status_code = 200
+        owned.send = AsyncMock(return_value=ok)
+
+        with patch.object(http_client, '_get_client', return_value=owned):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                await http_client.request_with_retry("POST", "https://x/test", {"a": 1}, stream=True)
+
+        assert captured.get("Connection") == "close"
+
+    @pytest.mark.asyncio
+    async def test_shared_client_non_streaming_does_not_send_connection_close(self, mock_auth_manager_for_http):
+        """
+        What it does: Non-streaming call through a shared client.
+        Purpose: Header must never appear on the pooled non-streaming path.
+        """
+        shared = AsyncMock()
+        shared.is_closed = False
+        ok = AsyncMock()
+        ok.status_code = 200
+        shared.request = AsyncMock(return_value=ok)
+
+        http_client = KiroHttpClient(mock_auth_manager_for_http, shared_client=shared)
+        with patch('kiro.http_client.get_kiro_headers', return_value={}):
+            await http_client.request_with_retry("POST", "https://x/test", {"a": 1})
+
+        assert "Connection" not in shared.request.call_args.kwargs["headers"]
+
+
+class TestKiroHttpClientSharedSslContext:
+    """Per-request clients reuse one process-wide SSL context."""
+
+    @pytest.mark.asyncio
+    async def test_per_request_clients_share_ssl_context(self, mock_auth_manager_for_http):
+        """
+        What it does: Builds two per-request clients and inspects verify=.
+        Purpose: CA bundle must be parsed once, not per client.
+        """
+        import kiro.http_client as http_client_module
+
+        sentinel_ctx = Mock(name="ssl_ctx")
+        with patch.object(http_client_module, "_shared_ssl_context", None):
+            with patch("kiro.http_client.httpx.create_ssl_context", return_value=sentinel_ctx) as create_ctx:
+                with patch("kiro.http_client.httpx.AsyncClient") as client_cls:
+                    client_cls.return_value.is_closed = False
+                    await KiroHttpClient(mock_auth_manager_for_http)._get_client(stream=True)
+                    await KiroHttpClient(mock_auth_manager_for_http)._get_client(stream=False)
+
+        create_ctx.assert_called_once()
+        assert client_cls.call_count == 2
+        for call in client_cls.call_args_list:
+            assert call.kwargs["verify"] is sentinel_ctx
+            assert call.kwargs["follow_redirects"] is True
+            # trust_env must stay default so VPN_PROXY_URL env vars still apply
+            assert "trust_env" not in call.kwargs
+            assert "proxy" not in call.kwargs
+
+    def test_get_shared_ssl_context_returns_real_context_and_caches(self):
+        """
+        What it does: Calls get_shared_ssl_context() twice for real.
+        Purpose: Must return a verifying ssl.SSLContext and cache it.
+        """
+        import ssl
+        import kiro.http_client as http_client_module
+
+        with patch.object(http_client_module, "_shared_ssl_context", None):
+            first = http_client_module.get_shared_ssl_context()
+            second = http_client_module.get_shared_ssl_context()
+
+        assert isinstance(first, ssl.SSLContext)
+        assert first is second
+        assert first.verify_mode == ssl.CERT_REQUIRED
+        assert first.check_hostname is True
+
+    @pytest.mark.asyncio
+    async def test_shared_client_mode_does_not_create_ssl_context(self, mock_auth_manager_for_http):
+        """
+        What it does: Uses a shared client and checks no SSL context is built.
+        Purpose: Shared client is preconfigured; nothing extra should happen.
+        """
+        import kiro.http_client as http_client_module
+
+        shared = AsyncMock()
+        with patch.object(http_client_module, "_shared_ssl_context", None):
+            with patch("kiro.http_client.httpx.create_ssl_context") as create_ctx:
+                client = await KiroHttpClient(mock_auth_manager_for_http, shared_client=shared)._get_client(stream=True)
+        assert client is shared
+        create_ctx.assert_not_called()
+
+
+class TestKiroHttpClientSerializeOnce:
+    """Request body is serialized once, then reused on every retry."""
+
+    @pytest.mark.asyncio
+    async def test_json_dumps_called_once_across_retries(self, mock_auth_manager_for_http):
+        """
+        What it does: 429, 500, then 200 with json.dumps spied.
+        Purpose: No repeated serialization of (potentially huge) payloads.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        ok = AsyncMock()
+        ok.status_code = 200
+        client = AsyncMock()
+        client.request = AsyncMock(side_effect=[_make_error_response(429), _make_error_response(500), ok])
+        payload = {"conversationState": {"text": "héllo"}}
+
+        real_dumps = json.dumps
+        with patch("kiro.http_client.json.dumps", side_effect=real_dumps) as dumps_spy:
+            with patch.object(http_client, '_get_client', return_value=client):
+                with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                    with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock):
+                        response = await http_client.request_with_retry("POST", "https://x", payload)
+
+        assert response is ok
+        assert dumps_spy.call_count == 1
+        assert client.request.call_count == 3
+        bodies = [c.kwargs["content"] for c in client.request.call_args_list]
+        assert bodies[0] is bodies[1] is bodies[2]
+        # Same format as before: default json.dumps (ensure_ascii=True) + utf-8
+        assert bodies[0] == real_dumps(payload).encode()
+
+    @pytest.mark.asyncio
+    async def test_no_body_when_json_data_none(self, mock_auth_manager_for_http):
+        """
+        What it does: GET without json_data, with retries.
+        Purpose: No content kwarg must be sent and dumps never called.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        ok = AsyncMock()
+        ok.status_code = 200
+        client = AsyncMock()
+        client.request = AsyncMock(side_effect=[_make_error_response(503), ok])
+
+        with patch("kiro.http_client.json.dumps") as dumps_spy:
+            with patch.object(http_client, '_get_client', return_value=client):
+                with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                    with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock):
+                        await http_client.request_with_retry("GET", "https://x", params={"a": "b"})
+
+        dumps_spy.assert_not_called()
+        for call in client.request.call_args_list:
+            assert "content" not in call.kwargs
+            assert call.kwargs["params"] == {"a": "b"}
+
+    @pytest.mark.asyncio
+    async def test_empty_dict_body_is_still_sent(self, mock_auth_manager_for_http):
+        """
+        What it does: json_data={} (falsy but not None).
+        Purpose: Empty dict must serialize to b"{}", not be dropped.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        ok = AsyncMock()
+        ok.status_code = 200
+        client = AsyncMock()
+        client.request = AsyncMock(return_value=ok)
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                await http_client.request_with_retry("POST", "https://x", {})
+
+        assert client.request.call_args.kwargs["content"] == b"{}"
+
+
+class TestKiroHttpClientResponseCleanup:
+    """Discarded responses are closed; the returned one stays readable."""
+
+    @pytest.mark.asyncio
+    async def test_403_response_closed_before_retry(self, mock_auth_manager_for_http):
+        """
+        What it does: 403 then 200.
+        Purpose: The 403 response must be closed before refresh/retry.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        resp_403 = _make_error_response(403)
+        ok = AsyncMock()
+        ok.status_code = 200
+        client = AsyncMock()
+        client.request = AsyncMock(side_effect=[resp_403, ok])
+
+        order = []
+        resp_403.aclose.side_effect = lambda: order.append("aclose")
+        mock_auth_manager_for_http.force_refresh.side_effect = lambda: order.append("refresh")
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                response = await http_client.request_with_retry("POST", "https://x", {"a": 1})
+
+        assert response is ok
+        resp_403.aclose.assert_awaited_once()
+        assert order == ["aclose", "refresh"]
+        ok.aclose.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_429_and_5xx_discarded_responses_closed(self, mock_auth_manager_for_http):
+        """
+        What it does: 429, 502, then 200.
+        Purpose: Each discarded error response must be closed (no leaked connections).
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        r429 = _make_error_response(429)
+        r502 = _make_error_response(502)
+        ok = AsyncMock()
+        ok.status_code = 200
+        client = AsyncMock()
+        client.request = AsyncMock(side_effect=[r429, r502, ok])
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock):
+                    response = await http_client.request_with_retry("POST", "https://x", {"a": 1})
+
+        assert response is ok
+        r429.aclose.assert_awaited_once()
+        r502.aclose.assert_awaited_once()
+        ok.aclose.assert_not_called()
+        ok.aread.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_429_no_sleep_after_final_attempt(self, mock_auth_manager_for_http):
+        """
+        What it does: Every attempt returns 429.
+        Purpose: Sleep happens between attempts only (max_retries - 1 times).
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        responses = [_make_error_response(429, f"body{i}".encode()) for i in range(MAX_RETRIES)]
+        client = AsyncMock()
+        client.request = AsyncMock(side_effect=responses)
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as sleep:
+                    response = await http_client.request_with_retry("POST", "https://x", {"a": 1})
+
+        assert sleep.await_count == MAX_RETRIES - 1
+        assert response is responses[-1]
+        assert response.status_code == 429
+        # Discarded ones closed, returned one left open and readable for the caller
+        for r in responses[:-1]:
+            r.aclose.assert_awaited_once()
+        responses[-1].aclose.assert_not_called()
+        assert await response.aread() == f"body{MAX_RETRIES - 1}".encode()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_5xx_streaming_no_sleep_after_final_attempt(self, mock_auth_manager_for_http):
+        """
+        What it does: Streaming mode, every attempt 500.
+        Purpose: Same rule for the streaming retry budget (FIRST_TOKEN_MAX_RETRIES).
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        responses = [_make_error_response(500) for _ in range(FIRST_TOKEN_MAX_RETRIES)]
+        client = AsyncMock()
+        client.build_request = Mock(return_value=Mock())
+        client.send = AsyncMock(side_effect=responses)
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as sleep:
+                    response = await http_client.request_with_retry("POST", "https://x", {"a": 1}, stream=True)
+
+        assert client.send.await_count == FIRST_TOKEN_MAX_RETRIES
+        assert sleep.await_count == FIRST_TOKEN_MAX_RETRIES - 1
+        assert response is responses[-1]
+        responses[-1].aclose.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_real_response_body_still_readable(self, mock_auth_manager_for_http):
+        """
+        What it does: Uses real httpx.Response objects (stream mode) all returning 503.
+        Purpose: The caller's `await response.aread()` must work on the returned response.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        def make_real(i: int) -> httpx.Response:
+            return httpx.Response(
+                503,
+                stream=httpx.ByteStream(('{"message":"busy %d"}' % i).encode()),
+                request=httpx.Request("POST", "https://x"),
+            )
+
+        responses = [make_real(i) for i in range(FIRST_TOKEN_MAX_RETRIES)]
+        client = AsyncMock()
+        client.build_request = Mock(return_value=Mock())
+        client.send = AsyncMock(side_effect=responses)
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock):
+                    response = await http_client.request_with_retry("POST", "https://x", {"a": 1}, stream=True)
+
+        assert response.status_code == 503
+        body = await response.aread()
+        assert body == ('{"message":"busy %d"}' % (FIRST_TOKEN_MAX_RETRIES - 1)).encode()
+        for r in responses[:-1]:
+            assert r.is_closed
+
+    @pytest.mark.asyncio
+    async def test_discard_errors_do_not_abort_retry(self, mock_auth_manager_for_http):
+        """
+        What it does: aread/aclose of a discarded 500 raise httpx errors.
+        Purpose: Cleanup failures must not break the retry loop.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        bad = _make_error_response(500)
+        bad.aread.side_effect = httpx.ReadError("reset")
+        bad.aclose.side_effect = httpx.StreamClosed()
+        ok = AsyncMock()
+        ok.status_code = 200
+        client = AsyncMock()
+        client.request = AsyncMock(side_effect=[bad, ok])
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock):
+                    response = await http_client.request_with_retry("POST", "https://x", {"a": 1})
+
+        assert response is ok
+
+    @pytest.mark.asyncio
+    async def test_429_then_400_returns_400_and_closes_429(self, mock_auth_manager_for_http):
+        """
+        What it does: 429 then a non-retryable 400.
+        Purpose: 400 is returned as-is; earlier 429 was closed, 400 stays open.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        r429 = _make_error_response(429)
+        r400 = _make_error_response(400)
+        client = AsyncMock()
+        client.request = AsyncMock(side_effect=[r429, r400])
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock):
+                    response = await http_client.request_with_retry("POST", "https://x", {"a": 1})
+
+        assert response is r400
+        r429.aclose.assert_awaited_once()
+        r400.aclose.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_all_403_falls_through_to_error(self, mock_auth_manager_for_http):
+        """
+        What it does: Every attempt returns 403.
+        Purpose: All 403 responses closed, refresh per attempt, final error raised.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        responses = [_make_error_response(403) for _ in range(MAX_RETRIES)]
+        client = AsyncMock()
+        client.request = AsyncMock(side_effect=responses)
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with pytest.raises(HTTPException) as exc_info:
+                    await http_client.request_with_retry("POST", "https://x", {"a": 1})
+
+        assert exc_info.value.status_code == 502
+        assert mock_auth_manager_for_http.force_refresh.await_count == MAX_RETRIES
+        for r in responses:
+            r.aclose.assert_awaited_once()
+
+
+class TestKiroHttpClientMaxRetriesOverride:
+    """max_retries override bounds nested retries (first-token loop x HTTP retries)."""
+
+    @staticmethod
+    def _streaming_client(responses):
+        client = AsyncMock()
+        client.build_request = Mock(return_value=Mock())
+        client.send = AsyncMock(side_effect=responses)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_max_retries_one_makes_single_attempt_without_sleep(self, mock_auth_manager_for_http):
+        """
+        What it does: Streaming 500 with max_retries=1.
+        Purpose: Outer first-token loop owns retries; inner call must not multiply them.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        responses = [_make_error_response(500)]
+        client = self._streaming_client(responses)
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as sleep:
+                    response = await http_client.request_with_retry(
+                        "POST", "https://x", {"a": 1}, stream=True, max_retries=1
+                    )
+
+        assert client.send.await_count == 1
+        sleep.assert_not_awaited()
+        assert response is responses[0]
+
+    @pytest.mark.asyncio
+    async def test_max_retries_none_keeps_default_budget(self, mock_auth_manager_for_http):
+        """
+        What it does: Streaming 500 everywhere, no override.
+        Purpose: Default behaviour unchanged (FIRST_TOKEN_MAX_RETRIES attempts).
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        responses = [_make_error_response(500) for _ in range(FIRST_TOKEN_MAX_RETRIES)]
+        client = self._streaming_client(responses)
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock):
+                    await http_client.request_with_retry(
+                        "POST", "https://x", {"a": 1}, stream=True, max_retries=None
+                    )
+
+        assert client.send.await_count == FIRST_TOKEN_MAX_RETRIES
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_value", [0, -3])
+    async def test_non_positive_max_retries_clamped_to_one(self, mock_auth_manager_for_http, bad_value):
+        """
+        What it does: max_retries <= 0.
+        Purpose: Never zero attempts (would return None / raise confusingly).
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        ok = AsyncMock()
+        ok.status_code = 200
+        client = self._streaming_client([ok])
+
+        with patch.object(http_client, '_get_client', return_value=client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                response = await http_client.request_with_retry(
+                    "POST", "https://x", {"a": 1}, stream=True, max_retries=bad_value
+                )
+
+        assert response is ok
+        assert client.send.await_count == 1

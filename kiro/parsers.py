@@ -27,13 +27,145 @@ Contains classes and functions for:
 - Content deduplication
 """
 
+import codecs
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
 from kiro.utils import generate_tool_call_id
+
+
+# Characters that matter to the brace scanner outside / inside JSON string literals.
+# Jumping between them with a compiled regex keeps scanning in C instead of a
+# per-character Python loop.
+_STRUCTURAL_CHARS_RE = re.compile(r'[{}"]')
+_STRING_SPECIAL_CHARS_RE = re.compile(r'["\\]')
+
+
+class _BraceScanState:
+    """
+    Resumable state of a brace-matching scan over a growing text buffer.
+
+    Lets the scanner continue from where it stopped when more data arrives,
+    instead of rescanning the whole pending JSON object on every chunk.
+
+    Attributes:
+        pos: Next position in the text to examine
+        depth: Current brace nesting depth
+        in_string: True if the scanner is inside a JSON string literal
+        escape_next: True if the next character is escaped (follows a backslash)
+    """
+
+    __slots__ = ("pos", "depth", "in_string", "escape_next")
+
+    def __init__(self, pos: int) -> None:
+        """
+        Initializes a fresh scan state.
+
+        Args:
+            pos: Position of the opening brace where the scan starts
+        """
+        self.pos = pos
+        self.depth = 0
+        self.in_string = False
+        self.escape_next = False
+
+    def shift(self, offset: int) -> None:
+        """
+        Rebases the scan position after the buffer prefix was dropped.
+
+        Args:
+            offset: Number of characters removed from the start of the buffer
+        """
+        self.pos -= offset
+
+
+def _scan_for_matching_brace(text: str, state: _BraceScanState) -> int:
+    """
+    Advances a brace scan over text, resuming from the saved state.
+
+    Semantics match the classic character loop: braces count only outside
+    strings, a backslash inside a string escapes the next character, and a
+    quote toggles string mode.
+
+    Args:
+        text: Text to scan (may have grown since the previous call)
+        state: Scan state, updated in place when the closing brace is not found
+
+    Returns:
+        Position of the closing brace, or -1 if the text ends before it
+    """
+    pos = state.pos
+    depth = state.depth
+    in_string = state.in_string
+    escape_next = state.escape_next
+    length = len(text)
+
+    while pos < length:
+        if escape_next:
+            escape_next = False
+            pos += 1
+            continue
+
+        if in_string:
+            match = _STRING_SPECIAL_CHARS_RE.search(text, pos)
+            if match is None:
+                pos = length
+                break
+            pos = match.start()
+            if text[pos] == '\\':
+                escape_next = True
+            else:
+                in_string = False
+            pos += 1
+            continue
+
+        match = _STRUCTURAL_CHARS_RE.search(text, pos)
+        if match is None:
+            pos = length
+            break
+        pos = match.start()
+        char = text[pos]
+        if char == '"':
+            in_string = True
+        elif char == '{':
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return pos
+        pos += 1
+
+    state.pos = pos
+    state.depth = depth
+    state.in_string = in_string
+    state.escape_next = escape_next
+    return -1
+
+
+# Maximum number of characters shown when logging raw tool arguments
+_LOG_PREVIEW_CHARS = 200
+
+
+def _preview_repr(value: Any, limit: int = _LOG_PREVIEW_CHARS) -> str:
+    """
+    Builds a short repr() preview of a possibly huge value for logging.
+    
+    Strings are truncated before repr() so the cost does not depend on the
+    full value size.
+    
+    Args:
+        value: Value to preview
+        limit: Maximum length of the returned preview
+    
+    Returns:
+        repr() of the value, at most limit characters long
+    """
+    if isinstance(value, str):
+        return repr(value[:limit])[:limit]
+    return repr(value)[:limit]
 
 
 def find_matching_brace(text: str, start_pos: int) -> int:
@@ -56,37 +188,10 @@ def find_matching_brace(text: str, start_pos: int) -> int:
         >>> find_matching_brace('{"a": "{}"}', 0)
         10
     """
-    if start_pos >= len(text) or text[start_pos] != '{':
+    if start_pos < 0 or start_pos >= len(text) or text[start_pos] != '{':
         return -1
     
-    brace_count = 0
-    in_string = False
-    escape_next = False
-    
-    for i in range(start_pos, len(text)):
-        char = text[i]
-        
-        if escape_next:
-            escape_next = False
-            continue
-        
-        if char == '\\' and in_string:
-            escape_next = True
-            continue
-        
-        if char == '"' and not escape_next:
-            in_string = not in_string
-            continue
-        
-        if not in_string:
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    return i
-    
-    return -1
+    return _scan_for_matching_brace(text, _BraceScanState(start_pos))
 
 
 def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
@@ -248,16 +353,65 @@ class AwsEventStreamParser:
         ('{"contextUsagePercentage":', 'context_usage'),
     ]
     
-    def __init__(self):
+    # Longest event prefix: a prefix that straddles the end of already-searched
+    # text can start at most this many characters minus one before the end.
+    _MAX_PATTERN_LENGTH = max(len(pattern) for pattern, _ in EVENT_PATTERNS)
+    
+    def __init__(self) -> None:
         """Initializes the parser."""
         self.buffer = ""
         self.last_content: Optional[str] = None  # For deduplicating repeating content
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
+        self._reset_stream_state()
+    
+    def _reset_stream_state(self) -> None:
+        """
+        Resets decoding and incremental scanning state.
+        
+        The incremental UTF-8 decoder keeps incomplete multibyte sequences
+        between chunks, so characters split across network chunks are not lost.
+        The scan state lets feed() resume where it stopped instead of rescanning
+        the whole buffer on every chunk.
+        """
+        self._decoder = codecs.getincrementaldecoder('utf-8')(errors='ignore')
+        # Buffer offset before which no event prefix can start
+        self._search_from = 0
+        # Start position and type of the earliest event whose JSON is incomplete
+        self._pending_start = -1
+        self._pending_type: Optional[str] = None
+        self._scan_state: Optional[_BraceScanState] = None
+        # Buffer length the incremental state was computed for
+        self._tracked_length = 0
+    
+    def _find_earliest_pattern(self, start: int) -> Tuple[int, Optional[str]]:
+        """
+        Finds the earliest event prefix in the buffer at or after start.
+        
+        Args:
+            start: Buffer offset to start searching from
+        
+        Returns:
+            Tuple of (position, event type), or (-1, None) if no prefix found
+        """
+        earliest_pos = -1
+        earliest_type = None
+        
+        for pattern, event_type in self.EVENT_PATTERNS:
+            pos = self.buffer.find(pattern, start)
+            if pos != -1 and (earliest_pos == -1 or pos < earliest_pos):
+                earliest_pos = pos
+                earliest_type = event_type
+        
+        return earliest_pos, earliest_type
     
     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
         """
         Adds chunk to buffer and returns parsed events.
+        
+        Decoding is incremental (multibyte UTF-8 characters split across chunks
+        are preserved) and JSON scanning resumes from the previous position, so
+        a large event delivered in many small chunks is processed in linear time.
         
         Args:
             chunk: Bytes of data from stream
@@ -266,34 +420,58 @@ class AwsEventStreamParser:
             List of events in {"type": str, "data": Any} format
         """
         try:
-            self.buffer += chunk.decode('utf-8', errors='ignore')
-        except Exception:
+            decoded = self._decoder.decode(chunk)
+        except (TypeError, AttributeError, UnicodeDecodeError) as e:
+            logger.warning(f"Failed to decode stream chunk ({type(chunk).__name__}): {e}")
             return []
         
+        if len(self.buffer) != self._tracked_length:
+            # Buffer was modified outside feed(); incremental state is stale
+            self._search_from = 0
+            self._pending_start = -1
+            self._pending_type = None
+            self._scan_state = None
+        
+        if decoded:
+            self.buffer += decoded
+        
         events = []
+        buffer = self.buffer
+        consumed = 0  # Offset of the first unconsumed character in buffer
         
         while True:
-            # Find nearest pattern
-            earliest_pos = -1
-            earliest_type = None
+            if self._pending_start != -1:
+                # Earliest prefix is already known; new data cannot introduce an earlier one
+                earliest_pos = self._pending_start
+                earliest_type = self._pending_type
+                state = self._scan_state
+            else:
+                earliest_pos, earliest_type = self._find_earliest_pattern(
+                    max(consumed, self._search_from)
+                )
+                if earliest_pos == -1:
+                    # Only a prefix straddling the current end can match after more data
+                    self._search_from = max(
+                        consumed, len(buffer) - (self._MAX_PATTERN_LENGTH - 1)
+                    )
+                    break
+                state = _BraceScanState(earliest_pos)
             
-            for pattern, event_type in self.EVENT_PATTERNS:
-                pos = self.buffer.find(pattern)
-                if pos != -1 and (earliest_pos == -1 or pos < earliest_pos):
-                    earliest_pos = pos
-                    earliest_type = event_type
-            
-            if earliest_pos == -1:
-                break
-            
-            # Find JSON end
-            json_end = find_matching_brace(self.buffer, earliest_pos)
+            # Find JSON end, resuming the scan where the previous chunk stopped
+            json_end = _scan_for_matching_brace(buffer, state)
             if json_end == -1:
                 # JSON not complete, wait for more data
+                self._pending_start = earliest_pos
+                self._pending_type = earliest_type
+                self._scan_state = state
                 break
             
-            json_str = self.buffer[earliest_pos:json_end + 1]
-            self.buffer = self.buffer[json_end + 1:]
+            json_str = buffer[earliest_pos:json_end + 1]
+            consumed = json_end + 1
+            self._search_from = consumed
+            self._pending_start = -1
+            self._pending_type = None
+            self._scan_state = None
             
             try:
                 data = json.loads(json_str)
@@ -303,6 +481,15 @@ class AwsEventStreamParser:
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON: {json_str[:100]}")
         
+        if consumed:
+            # Drop consumed text once and rebase stored offsets
+            self.buffer = buffer[consumed:]
+            self._search_from = max(0, self._search_from - consumed)
+            if self._pending_start != -1:
+                self._pending_start -= consumed
+                self._scan_state.shift(consumed)
+        
+        self._tracked_length = len(self.buffer)
         return events
     
     def _process_event(self, data: dict, event_type: str) -> Optional[Dict[str, Any]]:
@@ -409,7 +596,13 @@ class AwsEventStreamParser:
         args = self.current_tool_call['function']['arguments']
         tool_name = self.current_tool_call['function'].get('name', 'unknown')
         
-        logger.debug(f"Finalizing tool call '{tool_name}' with raw arguments: {repr(args)[:200]}")
+        # Lazy logging: tool arguments can be hundreds of KB, so never build
+        # their repr unless DEBUG is enabled, and truncate before repr().
+        logger.opt(lazy=True).debug(
+            "Finalizing tool call '{}' with raw arguments: {}",
+            lambda: tool_name,
+            lambda: _preview_repr(args),
+        )
         
         if isinstance(args, str):
             if args.strip():
@@ -417,7 +610,11 @@ class AwsEventStreamParser:
                     parsed = json.loads(args)
                     # Ensure result is a JSON string
                     self.current_tool_call['function']['arguments'] = json.dumps(parsed)
-                    logger.debug(f"Tool '{tool_name}' arguments parsed successfully: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
+                    logger.opt(lazy=True).debug(
+                        "Tool '{}' arguments parsed successfully: {}",
+                        lambda: tool_name,
+                        lambda: list(parsed.keys()) if isinstance(parsed, dict) else type(parsed),
+                    )
                 except json.JSONDecodeError as e:
                     # Analyze the failure to provide better diagnostics
                     truncation_info = self._diagnose_json_truncation(args)
@@ -567,3 +764,4 @@ class AwsEventStreamParser:
         self.last_content = None
         self.current_tool_call = None
         self.tool_calls = []
+        self._reset_stream_state()

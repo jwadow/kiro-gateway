@@ -40,7 +40,20 @@ import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
+from kiro.config import PROFILE_ARN
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import get_kiro_headers
+
+# Max characters of an MCP error response body written to the log
+MCP_ERROR_BODY_LOG_LIMIT = 500
+
+# Timeout (seconds) for MCP API calls
+MCP_REQUEST_TIMEOUT = 60.0
+
+# Module-level HTTP client reused across web_search calls (connection pooling).
+# Created lazily on first use so proxy env vars set from VPN_PROXY_URL in main.py
+# (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY, picked up via trust_env) are already in place.
+_mcp_http_client: Optional[httpx.AsyncClient] = None
 
 # Import debug_logger
 try:
@@ -71,12 +84,75 @@ def generate_random_id(length: int) -> str:
 
 
 # ==================================================================================================
+# MCP HTTP Client Management
+# ==================================================================================================
+
+def get_mcp_http_client() -> httpx.AsyncClient:
+    """
+    Return the shared MCP HTTP client, creating it lazily.
+
+    A new client is created if none exists yet or the previous one was closed.
+    Uses the same proxy behaviour as the rest of the gateway: httpx reads
+    HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY from the environment
+    (set from VPN_PROXY_URL in main.py) when the client is constructed.
+
+    Returns:
+        Shared httpx.AsyncClient for MCP API calls
+    """
+    global _mcp_http_client
+    if _mcp_http_client is None or _mcp_http_client.is_closed:
+        logger.debug(f"Creating shared MCP HTTP client (timeout={MCP_REQUEST_TIMEOUT}s)")
+        _mcp_http_client = httpx.AsyncClient(timeout=MCP_REQUEST_TIMEOUT)
+    return _mcp_http_client
+
+
+async def close_mcp_http_client() -> None:
+    """
+    Close the shared MCP HTTP client if it exists.
+
+    Intended for application shutdown. Safe to call multiple times. Errors
+    while closing are logged and swallowed because this runs in cleanup code.
+    """
+    global _mcp_http_client
+    client = _mcp_http_client
+    _mcp_http_client = None
+    if client is None or client.is_closed:
+        return
+    try:
+        await client.aclose()
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.warning(f"Error closing MCP HTTP client: {e}")
+
+
+def _build_mcp_headers(auth_manager, token: str) -> Dict[str, str]:
+    """
+    Build headers for a Kiro MCP API call.
+
+    /mcp needs the same Kiro client-identity headers as the chat path;
+    reuse them and override what differs (JSON-RPC, no x-amz-target).
+
+    Args:
+        auth_manager: KiroAuthManager instance
+        token: Access token
+
+    Returns:
+        Headers dict for the MCP request
+    """
+    headers = get_kiro_headers(auth_manager, token)
+    headers["Content-Type"] = "application/json"
+    headers.pop("x-amz-target", None)
+    headers["x-amzn-codewhisperer-optout"] = "false"
+    return headers
+
+
+# ==================================================================================================
 # MCP API Functions
 # ==================================================================================================
 
 async def call_kiro_mcp_api(
     query: str,
-    auth_manager
+    auth_manager,
+    http_client: Optional[httpx.AsyncClient] = None
 ) -> Tuple[Optional[str], Optional[Dict]]:
     """
     Call Kiro MCP API for web_search.
@@ -85,9 +161,14 @@ async def call_kiro_mcp_api(
     Headers: Authorization, x-amzn-codewhisperer-optout, Content-Type
     Timeout: 60 seconds
     
+    On HTTP 403 the access token is force-refreshed once and the call is
+    retried once with the new token.
+    
     Args:
         query: Search query
         auth_manager: KiroAuthManager instance
+        http_client: Optional httpx.AsyncClient to use. Defaults to the
+            module-level shared MCP client (see get_mcp_http_client()).
     
     Returns:
         Tuple of (tool_use_id, results_dict) or (None, None) on error
@@ -133,9 +214,11 @@ async def call_kiro_mcp_api(
         "params": {
             "name": "web_search",
             "arguments": {"query": query}
-        }
+        },
+        # runtime.kiro.dev rejects /mcp without profileArn (400), same as chat requests
+        "profileArn": auth_manager.profile_arn or PROFILE_ARN or ""
     }
-    
+
     # Log MCP request
     try:
         mcp_request_json = json.dumps(mcp_request, ensure_ascii=False, indent=2).encode('utf-8')
@@ -146,47 +229,50 @@ async def call_kiro_mcp_api(
     
     try:
         token = await auth_manager.get_access_token()
-        
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
-        
+        headers = _build_mcp_headers(auth_manager, token)
+
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        client = http_client if http_client is not None else get_mcp_http_client()
+        response = await client.post(mcp_url, json=mcp_request, headers=headers)
+        
+        # 403 - token likely expired/revoked: refresh once and retry once
+        if response.status_code == 403:
+            logger.warning("MCP API returned 403, refreshing token and retrying once")
+            await auth_manager.force_refresh()
+            token = await auth_manager.get_access_token()
+            headers = _build_mcp_headers(auth_manager, token)
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
-            
-            if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
-                return None, None
-            
-            mcp_response = response.json()
-            
-            # Log MCP response
-            try:
-                mcp_response_json = json.dumps(mcp_response, ensure_ascii=False, indent=2).encode('utf-8')
-                if debug_logger:
-                    debug_logger.log_raw_chunk(b"[MCP RESPONSE]\n" + mcp_response_json)
-            except Exception as e:
-                logger.warning(f"Failed to log MCP response: {e}")
-            
-            # DEBUG: Log full MCP response to see what we actually got
-            # logger.debug(f"MCP API full response: {json.dumps(mcp_response, ensure_ascii=False)}")
-            
-            if "error" in mcp_response and mcp_response["error"] is not None:
-                logger.error(f"MCP API returned error: {mcp_response['error']}")
-                return None, None
-            
-            # Parse results: result.content[0].text is JSON STRING (CRITICAL!)
-            result_text = mcp_response.get("result", {}).get("content", [{}])[0].get("text", "{}")
-            results = json.loads(result_text)  # Parse JSON string to dict
-            
-            logger.debug(f"MCP API returned {results.get('totalResults', 0)} results")
-            return tool_use_id, results
+        
+        if response.status_code != 200:
+            body = str(getattr(response, "text", ""))[:MCP_ERROR_BODY_LOG_LIMIT]
+            logger.error(f"MCP API error: {response.status_code} - {body}")
+            return None, None
+        
+        mcp_response = response.json()
+        
+        # Log MCP response
+        try:
+            mcp_response_json = json.dumps(mcp_response, ensure_ascii=False, indent=2).encode('utf-8')
+            if debug_logger:
+                debug_logger.log_raw_chunk(b"[MCP RESPONSE]\n" + mcp_response_json)
+        except Exception as e:
+            logger.warning(f"Failed to log MCP response: {e}")
+        
+        # DEBUG: Log full MCP response to see what we actually got
+        # logger.debug(f"MCP API full response: {json.dumps(mcp_response, ensure_ascii=False)}")
+        
+        if "error" in mcp_response and mcp_response["error"] is not None:
+            logger.error(f"MCP API returned error: {mcp_response['error']}")
+            return None, None
+        
+        # Parse results: result.content[0].text is JSON STRING (CRITICAL!)
+        result_text = mcp_response.get("result", {}).get("content", [{}])[0].get("text", "{}")
+        results = json.loads(result_text)  # Parse JSON string to dict
+        
+        logger.debug(f"MCP API returned {results.get('totalResults', 0)} results")
+        return tool_use_id, results
             
     except httpx.TimeoutException as e:
         logger.error(f"MCP API timeout: {e}")

@@ -36,7 +36,7 @@ import io
 import json
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO, Dict, Optional
 from loguru import logger
 
 from kiro.config import DEBUG_MODE, DEBUG_DIR
@@ -74,6 +74,23 @@ class DebugLogger:
         # Buffer for application logs (loguru)
         self._app_logs_buffer: io.StringIO = io.StringIO()
         self._loguru_sink_id: Optional[int] = None
+        
+        # Open append handles for streamed chunk files ("all" mode), keyed by file name.
+        # Kept open for the lifetime of one request instead of open/close per chunk.
+        self._chunk_files: Dict[str, BinaryIO] = {}
+    
+    @property
+    def enabled(self) -> bool:
+        """
+        Whether debug logging is active (DEBUG_MODE is "errors" or "all").
+        
+        Callers use this to skip building expensive debug payloads
+        (e.g. serializing the Kiro request) when nothing would be logged.
+        
+        Returns:
+            True if debug logging is enabled
+        """
+        return self._is_enabled()
     
     def _is_enabled(self) -> bool:
         """Checks if logging is enabled."""
@@ -83,8 +100,21 @@ class DebugLogger:
         """Checks if immediate file writing is needed (all mode)."""
         return DEBUG_MODE == "all"
     
+    def _close_chunk_files(self) -> None:
+        """Closes any chunk file handles kept open for the current request."""
+        handles = getattr(self, "_chunk_files", None)
+        if not handles:
+            return
+        for handle in handles.values():
+            try:
+                handle.close()
+            except OSError:
+                pass  # Best effort: file system errors must not break requests
+        handles.clear()
+    
     def _clear_buffers(self):
         """Clears all buffers."""
+        self._close_chunk_files()
         self._request_body_buffer = None
         self._kiro_request_body_buffer = None
         self._raw_chunks_buffer.clear()
@@ -145,6 +175,7 @@ class DebugLogger:
 
         if self._is_immediate_write():
             # "all" mode - clear folder and recreate
+            # (chunk handles were closed by _clear_buffers, so rmtree works on Windows)
             try:
                 if self.debug_dir.exists():
                     shutil.rmtree(self.debug_dir)
@@ -264,6 +295,7 @@ class DebugLogger:
         
         # In "all" mode data is already written, add error_info and app logs
         if self._is_immediate_write():
+            self._close_chunk_files()
             self.log_error_info(status_code, error_message)
             self._write_app_logs_to_file()
             self._clear_app_logs_buffer()
@@ -326,56 +358,65 @@ class DebugLogger:
             self._clear_buffers()
         elif DEBUG_MODE == "all":
             # In "all" mode save logs even for successful requests
+            self._close_chunk_files()
             self._write_app_logs_to_file()
             self._clear_app_logs_buffer()
     
     # ==================== Private file writing methods ====================
     
+    def _write_bytes_to_file(self, file_name: str, body: bytes) -> None:
+        """
+        Writes a body to a file in the debug directory as-is.
+        
+        Bodies are already JSON (client request, or the Kiro payload serialized
+        by the route), so they are not re-parsed or re-indented.
+        
+        Args:
+            file_name: Target file name inside debug_dir
+            body: Raw bytes to write
+        """
+        try:
+            with open(self.debug_dir / file_name, "wb") as f:
+                f.write(body)
+        except OSError as e:
+            logger.error(f"[DebugLogger] Error writing {file_name}: {e}")
+    
     def _write_request_body_to_file(self, body: bytes):
         """Writes request body to file."""
-        try:
-            file_path = self.debug_dir / "request_body.json"
-            try:
-                json_obj = json.loads(body)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(json_obj, f, indent=2, ensure_ascii=False)
-            except json.JSONDecodeError:
-                with open(file_path, "wb") as f:
-                    f.write(body)
-        except Exception as e:
-            logger.error(f"[DebugLogger] Error writing request_body: {e}")
+        self._write_bytes_to_file("request_body.json", body)
     
     def _write_kiro_request_body_to_file(self, body: bytes):
         """Writes Kiro request body to file."""
+        self._write_bytes_to_file("kiro_request_body.json", body)
+    
+    def _append_chunk_to_file(self, file_name: str, chunk: bytes) -> None:
+        """
+        Appends a chunk to a stream file, reusing one open handle per request.
+        
+        The handle is flushed after each chunk so the file is readable while
+        streaming; it is closed when the request finishes or a new one starts.
+        
+        Args:
+            file_name: Target file name inside debug_dir
+            chunk: Bytes to append
+        """
         try:
-            file_path = self.debug_dir / "kiro_request_body.json"
-            try:
-                json_obj = json.loads(body)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(json_obj, f, indent=2, ensure_ascii=False)
-            except json.JSONDecodeError:
-                with open(file_path, "wb") as f:
-                    f.write(body)
-        except Exception as e:
-            logger.error(f"[DebugLogger] Error writing kiro_request_body: {e}")
+            handle = self._chunk_files.get(file_name)
+            if handle is None or handle.closed:
+                handle = open(self.debug_dir / file_name, "ab")
+                self._chunk_files[file_name] = handle
+            handle.write(chunk)
+            handle.flush()
+        except OSError:
+            pass  # Debug logging must never break streaming
     
     def _append_raw_chunk_to_file(self, chunk: bytes):
         """Appends raw chunk to file."""
-        try:
-            file_path = self.debug_dir / "response_stream_raw.txt"
-            with open(file_path, "ab") as f:
-                f.write(chunk)
-        except Exception:
-            pass
+        self._append_chunk_to_file("response_stream_raw.txt", chunk)
     
     def _append_modified_chunk_to_file(self, chunk: bytes):
         """Appends modified chunk to file."""
-        try:
-            file_path = self.debug_dir / "response_stream_modified.txt"
-            with open(file_path, "ab") as f:
-                f.write(chunk)
-        except Exception:
-            pass
+        self._append_chunk_to_file("response_stream_modified.txt", chunk)
     
     def _write_app_logs_to_file(self):
         """Writes captured application logs to file."""

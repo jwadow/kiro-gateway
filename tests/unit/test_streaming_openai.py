@@ -1485,3 +1485,561 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+
+
+# ==================================================================================================
+# Helpers for new feature tests
+# ==================================================================================================
+
+def _parse_sse_chunks(chunks):
+    """Parse 'data: {...}' SSE strings into dicts (skips [DONE])."""
+    parsed = []
+    for chunk in chunks:
+        assert chunk.startswith("data: ") and chunk.endswith("\n\n")
+        body = chunk[len("data: "):].strip()
+        if body == "[DONE]":
+            continue
+        parsed.append(json.loads(body))
+    return parsed
+
+
+def _streamed_text(parsed_chunks):
+    """Concatenate delta.content across parsed chunks."""
+    text = ""
+    for chunk in parsed_chunks:
+        for choice in chunk.get("choices", []):
+            text += choice.get("delta", {}).get("content", "") or ""
+    return text
+
+
+async def _run_stream(mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, **kwargs):
+    """Run stream_kiro_to_openai over the given KiroEvents; return raw SSE chunks."""
+    async def mock_parse_kiro_stream(*args, **kw):
+        for event in events:
+            yield event
+
+    chunks = []
+    with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+        with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+            async for chunk in stream_kiro_to_openai(
+                mock_http_client, mock_response, "claude-sonnet-4",
+                mock_model_cache, mock_auth_manager, **kwargs
+            ):
+                chunks.append(chunk)
+    return chunks
+
+
+async def _run_collect(mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, **kwargs):
+    """Run collect_stream_response over the given KiroEvents."""
+    async def mock_parse_kiro_stream(*args, **kw):
+        for event in events:
+            yield event
+
+    with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+        with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+            return await collect_stream_response(
+                mock_http_client, mock_response, "claude-sonnet-4",
+                mock_model_cache, mock_auth_manager, **kwargs
+            )
+
+
+# ==================================================================================================
+# Tests for stream_options.include_usage
+# ==================================================================================================
+
+class TestStreamingOpenaiIncludeUsage:
+    """Tests for the include_usage kwarg (OpenAI stream_options.include_usage)."""
+
+    EVENTS = [
+        KiroEvent(type="content", content="Hello"),
+        KiroEvent(type="usage", usage={"credits": 0.5}),
+        KiroEvent(type="context_usage", context_usage_percentage=1.0),
+    ]
+
+    @pytest.mark.asyncio
+    async def test_default_has_no_usage_only_chunk(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams with default include_usage=False.
+        Purpose: Output is unchanged - usage only on the finish chunk, no choices=[] chunk.
+        """
+        chunks = await _run_stream(mock_http_client, mock_response, mock_model_cache, mock_auth_manager, self.EVENTS)
+        parsed = _parse_sse_chunks(chunks)
+
+        assert chunks[-1] == "data: [DONE]\n\n"
+        assert all(c["choices"] for c in parsed)
+        usage_chunks = [c for c in parsed if "usage" in c]
+        assert len(usage_chunks) == 1
+        assert usage_chunks[0]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_include_usage_adds_final_choices_empty_chunk(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams with include_usage=True.
+        Purpose: Finish chunk keeps usage (backward compat) and a choices=[] usage chunk is last before [DONE].
+        """
+        chunks = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, self.EVENTS, include_usage=True
+        )
+        parsed = _parse_sse_chunks(chunks)
+
+        assert chunks[-1] == "data: [DONE]\n\n"
+        finish_chunk, usage_chunk = parsed[-2], parsed[-1]
+        assert finish_chunk["choices"][0]["finish_reason"] == "stop"
+        assert "usage" in finish_chunk
+        assert usage_chunk["choices"] == []
+        assert usage_chunk["usage"] == finish_chunk["usage"]
+        assert usage_chunk["usage"]["credits_used"] == {"credits": 0.5}
+        assert usage_chunk["id"] == finish_chunk["id"]
+        assert usage_chunk["created"] == finish_chunk["created"]
+        assert usage_chunk["model"] == finish_chunk["model"]
+        assert usage_chunk["object"] == "chat.completion.chunk"
+
+    @pytest.mark.asyncio
+    async def test_include_usage_chunk_appears_exactly_once(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """What it does: include_usage=True. Purpose: Only one choices=[] chunk."""
+        chunks = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, self.EVENTS, include_usage=True
+        )
+        parsed = _parse_sse_chunks(chunks)
+        assert sum(1 for c in parsed if c["choices"] == []) == 1
+
+    @pytest.mark.asyncio
+    async def test_include_usage_with_tool_calls(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: include_usage=True with tool calls.
+        Purpose: Order is tool_calls chunk, finish chunk, usage chunk, [DONE].
+        """
+        events = [KiroEvent(type="tool_use", tool_use={
+            "id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}
+        })]
+        chunks = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, include_usage=True
+        )
+        parsed = _parse_sse_chunks(chunks)
+
+        assert "tool_calls" in parsed[-3]["choices"][0]["delta"]
+        assert parsed[-2]["choices"][0]["finish_reason"] == "tool_calls"
+        assert parsed[-1]["choices"] == []
+
+    @pytest.mark.asyncio
+    async def test_include_usage_not_emitted_on_error(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Stream fails mid-way with include_usage=True.
+        Purpose: No usage chunk or [DONE] is produced; error propagates.
+        """
+        async def failing(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hi")
+            raise RuntimeError("boom")
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', failing):
+            with pytest.raises(RuntimeError):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager, include_usage=True
+                ):
+                    chunks.append(chunk)
+
+        assert not any('"choices": []' in c for c in chunks)
+        assert "data: [DONE]\n\n" not in chunks
+
+    @pytest.mark.asyncio
+    async def test_retry_wrapper_forwards_include_usage(self, mock_http_client, mock_model_cache, mock_auth_manager):
+        """
+        What it does: stream_with_first_token_retry(include_usage=True).
+        Purpose: The flag reaches the stream generator.
+        """
+        response = AsyncMock()
+        response.status_code = 200
+        response.aclose = AsyncMock()
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hi")
+
+        async def make_request():
+            return response
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_with_first_token_retry(
+                    make_request, mock_http_client, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager, include_usage=True
+                ):
+                    chunks.append(chunk)
+
+        parsed = _parse_sse_chunks(chunks)
+        assert parsed[-1]["choices"] == []
+
+
+# ==================================================================================================
+# Tests for stop sequences (OpenAI)
+# ==================================================================================================
+
+class TestStreamingOpenaiStopSequences:
+    """Tests for gateway-side stop sequences in OpenAI streaming."""
+
+    @pytest.mark.asyncio
+    async def test_split_across_chunks_cut_and_finish_stop(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Stop sequence split across chunks.
+        Purpose: Text is cut before it, no part leaks, finish_reason=stop.
+        """
+        events = [
+            KiroEvent(type="content", content="Hello wor"),
+            KiroEvent(type="content", content="ld ST"),
+            KiroEvent(type="content", content="OP should not appear"),
+        ]
+        chunks = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, stop_sequences=["STOP"]
+        )
+        parsed = _parse_sse_chunks(chunks)
+
+        assert _streamed_text(parsed) == "Hello world "
+        assert "STOP" not in "".join(chunks)
+        assert parsed[-1]["choices"][0]["finish_reason"] == "stop"
+        assert chunks[-1] == "data: [DONE]\n\n"
+
+    @pytest.mark.asyncio
+    async def test_stop_without_completion_signals_is_not_length(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Stream ended by stop sequence before usage/context_usage arrived.
+        Purpose: Not misreported as truncation (finish_reason must be stop, not length).
+        """
+        events = [KiroEvent(type="content", content="abc STOP rest")]
+        chunks = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, stop_sequences=["STOP"]
+        )
+        parsed = _parse_sse_chunks(chunks)
+        assert parsed[-1]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_at_very_start_emits_no_content(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """What it does: Output starts with the sequence. Purpose: No content chunks, still a valid end."""
+        events = [KiroEvent(type="content", content="STOP everything")]
+        chunks = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, stop_sequences=["STOP"]
+        )
+        parsed = _parse_sse_chunks(chunks)
+        assert _streamed_text(parsed) == ""
+        assert parsed[-1]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_not_present_output_identical(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """What it does: Sequence absent. Purpose: Same text as without stop sequences."""
+        events = [
+            KiroEvent(type="content", content="Hello "),
+            KiroEvent(type="content", content="world"),
+            KiroEvent(type="context_usage", context_usage_percentage=1.0),
+        ]
+        with_stop = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, stop_sequences=["NOPE"]
+        )
+        assert _streamed_text(_parse_sse_chunks(with_stop)) == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_multiple_sequences_first_match_wins(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """What it does: Two sequences. Purpose: Earliest in text wins."""
+        events = [KiroEvent(type="content", content="one two three")]
+        chunks = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events,
+            stop_sequences=["three", "two"]
+        )
+        assert _streamed_text(_parse_sse_chunks(chunks)) == "one "
+
+    @pytest.mark.asyncio
+    async def test_thinking_not_affected(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Sequence inside reasoning content.
+        Purpose: Reasoning passes through untouched and does not stop the stream.
+        """
+        events = [
+            KiroEvent(type="thinking", thinking_content="maybe STOP here"),
+            KiroEvent(type="content", content="final"),
+        ]
+        with patch('kiro.streaming_openai.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+            chunks = await _run_stream(
+                mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, stop_sequences=["STOP"]
+            )
+        parsed = _parse_sse_chunks(chunks)
+        reasoning = "".join(c["choices"][0]["delta"].get("reasoning_content", "") for c in parsed if c["choices"])
+        assert reasoning == "maybe STOP here"
+        assert _streamed_text(parsed) == "final"
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_not_affected(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Tool call arguments contain the sequence.
+        Purpose: Tool calls are never matched or cut.
+        """
+        events = [
+            KiroEvent(type="content", content="Calling"),
+            KiroEvent(type="tool_use", tool_use={
+                "id": "call_1", "type": "function",
+                "function": {"name": "f", "arguments": '{"q": "STOP"}'}
+            }),
+        ]
+        chunks = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, stop_sequences=["STOP"]
+        )
+        parsed = _parse_sse_chunks(chunks)
+        tool_chunk = next(c for c in parsed if "tool_calls" in c["choices"][0]["delta"])
+        assert tool_chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == '{"q": "STOP"}'
+        assert parsed[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_collect_applies_stop_sequences(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """What it does: Non-streaming with a split sequence. Purpose: Same cut, finish_reason=stop."""
+        events = [KiroEvent(type="content", content="abc<"), KiroEvent(type="content", content="/end> tail")]
+        result = await _run_collect(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events, stop_sequences=["</end>"]
+        )
+        assert result["choices"][0]["message"]["content"] == "abc"
+        assert result["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_retry_wrapper_forwards_stop_sequences(self, mock_http_client, mock_model_cache, mock_auth_manager):
+        """What it does: stream_with_first_token_retry(stop_sequences=...). Purpose: Flag reaches the generator."""
+        response = AsyncMock()
+        response.status_code = 200
+        response.aclose = AsyncMock()
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="keep STOP drop")
+
+        async def make_request():
+            return response
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_with_first_token_retry(
+                    make_request, mock_http_client, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager, stop_sequences=["STOP"]
+                ):
+                    chunks.append(chunk)
+        assert _streamed_text(_parse_sse_chunks(chunks)) == "keep "
+
+
+# ==================================================================================================
+# Tests for collect_stream_response parity with the previous SSE round-trip implementation
+# ==================================================================================================
+
+def _legacy_collect_from_sse(sse_chunks):
+    """
+    Re-implementation of the old collect_stream_response loop (SSE -> json.loads).
+
+    Used as the reference: the new direct accumulation must produce the same
+    message, finish_reason and usage.
+    """
+    full_content = ""
+    full_reasoning_content = ""
+    final_usage = None
+    tool_calls = []
+    finish_reason = "stop"
+    for chunk_str in sse_chunks:
+        if not chunk_str.startswith("data:"):
+            continue
+        data_str = chunk_str[len("data:"):].strip()
+        if not data_str or data_str == "[DONE]":
+            continue
+        chunk_data = json.loads(data_str)
+        delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+        if "content" in delta:
+            full_content += delta["content"]
+        if "reasoning_content" in delta:
+            full_reasoning_content += delta["reasoning_content"]
+        if "tool_calls" in delta:
+            tool_calls.extend(delta["tool_calls"])
+        fr = chunk_data.get("choices", [{}])[0].get("finish_reason")
+        if fr:
+            finish_reason = fr
+        if "usage" in chunk_data:
+            final_usage = chunk_data["usage"]
+    message = {"role": "assistant", "content": full_content}
+    if full_reasoning_content:
+        message["reasoning_content"] = full_reasoning_content
+    if tool_calls:
+        message["tool_calls"] = [{
+            "id": tc.get("id"),
+            "type": tc.get("type", "function"),
+            "function": {
+                "name": (tc.get("function") or {}).get("name", ""),
+                "arguments": (tc.get("function") or {}).get("arguments", "{}"),
+            }
+        } for tc in tool_calls]
+    usage = final_usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return message, finish_reason, usage
+
+
+PARITY_SCENARIOS = {
+    "plain_text": [
+        KiroEvent(type="content", content="Hello "),
+        KiroEvent(type="content", content="мир 🌍"),
+        KiroEvent(type="usage", usage={"credits": 0.1}),
+        KiroEvent(type="context_usage", context_usage_percentage=2.5),
+    ],
+    "reasoning_and_text": [
+        KiroEvent(type="thinking", thinking_content="thinking..."),
+        KiroEvent(type="content", content="answer"),
+        KiroEvent(type="context_usage", context_usage_percentage=1.0),
+    ],
+    "tool_calls": [
+        KiroEvent(type="content", content="Let me check"),
+        KiroEvent(type="tool_use", tool_use={
+            "id": "call_1", "type": "function", "function": {"name": "a", "arguments": '{"x": 1}'}
+        }),
+        KiroEvent(type="tool_use", tool_use={
+            "id": "call_2", "type": "function", "function": {"name": "b", "arguments": None}
+        }),
+    ],
+    "truncated": [KiroEvent(type="content", content="cut off")],
+    "empty": [],
+}
+
+
+class TestCollectStreamResponseParity:
+    """collect_stream_response must equal the old SSE round-trip output."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scenario", list(PARITY_SCENARIOS))
+    @pytest.mark.parametrize("reasoning_mode", ["as_reasoning_content", "include_as_text"])
+    async def test_matches_legacy_round_trip(self, scenario, reasoning_mode, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Runs the streaming path, applies the legacy SSE parsing, and compares
+                      with the new collect_stream_response for the same events.
+        Purpose: Prove the encode/decode removal changed nothing in content, tool_calls,
+                 finish_reason or usage.
+        """
+        events = PARITY_SCENARIOS[scenario]
+        request_messages = [{"role": "user", "content": "Hi"}]
+        with patch('kiro.streaming_openai.FAKE_REASONING_HANDLING', reasoning_mode):
+            sse = await _run_stream(
+                mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events,
+                request_messages=request_messages,
+            )
+            result = await _run_collect(
+                mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events,
+                request_messages=request_messages,
+            )
+
+        legacy_message, legacy_finish, legacy_usage = _legacy_collect_from_sse(sse)
+
+        assert result["choices"][0]["message"] == legacy_message
+        assert result["choices"][0]["finish_reason"] == legacy_finish
+        assert result["usage"] == legacy_usage
+        assert result["object"] == "chat.completion"
+        assert result["id"].startswith("chatcmpl-")
+
+    @pytest.mark.asyncio
+    async def test_does_not_serialize_json(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Collects a response while json.loads is forbidden in the module.
+        Purpose: Guard against reintroducing the SSE encode/decode round-trip.
+        """
+        events = [KiroEvent(type="content", content="Hi"), KiroEvent(type="context_usage", context_usage_percentage=1.0)]
+        with patch('kiro.streaming_openai.json.loads', side_effect=AssertionError("json.loads must not be used")):
+            with patch('kiro.streaming_openai.json.dumps', side_effect=AssertionError("json.dumps must not be used")):
+                result = await _run_collect(mock_http_client, mock_response, mock_model_cache, mock_auth_manager, events)
+        assert result["choices"][0]["message"]["content"] == "Hi"
+
+    @pytest.mark.asyncio
+    async def test_closes_response(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """What it does: Collects a response. Purpose: Upstream response is always closed."""
+        await _run_collect(mock_http_client, mock_response, mock_model_cache, mock_auth_manager,
+                           [KiroEvent(type="content", content="x")])
+        mock_response.aclose.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_closes_response_on_error(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """What it does: Stream raises while collecting. Purpose: Error propagates and response is closed."""
+        async def failing(*args, **kwargs):
+            yield KiroEvent(type="content", content="x")
+            raise RuntimeError("boom")
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', failing):
+            with pytest.raises(RuntimeError):
+                await collect_stream_response(
+                    mock_http_client, mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                )
+        mock_response.aclose.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_error_with_braces_is_not_masked_by_logging(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Upstream error message contains JSON braces.
+        Purpose: Regression - loguru must not raise KeyError and hide the original error.
+        """
+        async def failing(*args, **kwargs):
+            yield KiroEvent(type="content", content="x")
+            raise RuntimeError('{"type": "error", "message": "bad"}')
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', failing):
+            with pytest.raises(RuntimeError) as exc_info:
+                async for _ in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    pass
+        assert '"type": "error"' in str(exc_info.value)
+
+
+# ==================================================================================================
+# Tests for non-blocking fallback token counting (OpenAI)
+# ==================================================================================================
+
+class TestStreamingOpenaiTokenOffload:
+    """Fallback prompt token counting must not run on the event loop."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_uses_offloaded_estimator(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: No context_usage from Kiro, request_messages given.
+        Purpose: Prompt tokens come from estimate_request_tokens_offloaded (awaited).
+        """
+        messages = [{"role": "user", "content": "Hi"}]
+        tools = [{"type": "function", "function": {"name": "f"}}]
+        with patch('kiro.streaming_openai.estimate_request_tokens_offloaded',
+                   new_callable=AsyncMock, return_value={"total_tokens": 42}) as mock_estimate:
+            chunks = await _run_stream(
+                mock_http_client, mock_response, mock_model_cache, mock_auth_manager,
+                [KiroEvent(type="content", content="ok")],
+                request_messages=messages, request_tools=tools,
+            )
+        parsed = _parse_sse_chunks(chunks)
+        assert parsed[-1]["usage"]["prompt_tokens"] == 42
+        assert parsed[-1]["usage"]["total_tokens"] == 42 + parsed[-1]["usage"]["completion_tokens"]
+        mock_estimate.assert_awaited_once_with(
+            messages=messages, tools=tools, system_prompt=None, apply_claude_correction=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_offloaded_numbers_equal_previous_sync_formula(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Real tokenizer, no context usage.
+        Purpose: Prompt tokens equal the old count_message_tokens + count_tools_tokens result.
+        """
+        from kiro.tokenizer import count_message_tokens, count_tools_tokens
+        messages = [{"role": "user", "content": "What is the weather like today in Paris?"}]
+        tools = [{"type": "function", "function": {"name": "get_weather", "description": "Get weather",
+                                                   "parameters": {"type": "object"}}}]
+        expected = count_message_tokens(messages, apply_claude_correction=False) + \
+            count_tools_tokens(tools, apply_claude_correction=False)
+
+        chunks = await _run_stream(
+            mock_http_client, mock_response, mock_model_cache, mock_auth_manager,
+            [KiroEvent(type="content", content="ok")],
+            request_messages=messages, request_tools=tools,
+        )
+        assert _parse_sse_chunks(chunks)[-1]["usage"]["prompt_tokens"] == expected
+
+    @pytest.mark.asyncio
+    async def test_no_estimation_when_context_usage_present(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """What it does: Kiro returned context_usage. Purpose: No tokenizer work at all."""
+        with patch('kiro.streaming_openai.estimate_request_tokens_offloaded', new_callable=AsyncMock) as mock_estimate:
+            await _run_stream(
+                mock_http_client, mock_response, mock_model_cache, mock_auth_manager,
+                [KiroEvent(type="content", content="ok"), KiroEvent(type="context_usage", context_usage_percentage=5.0)],
+                request_messages=[{"role": "user", "content": "Hi"}],
+            )
+        mock_estimate.assert_not_awaited()

@@ -412,6 +412,11 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 # Default: 3 attempts
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
 
+# HTTP-level attempts per first-token retry attempt. The first-token loop already
+# retries, so the inner call only keeps one extra attempt (enough for a 403 token
+# refresh) instead of multiplying retries (3x3 = 9 upstream calls worst case).
+FIRST_TOKEN_INNER_HTTP_RETRIES: int = 2
+
 # ==================================================================================================
 # Debug Settings
 # ==================================================================================================

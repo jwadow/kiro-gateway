@@ -4251,3 +4251,578 @@ class TestAPIRegionPriorityHierarchy:
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
 
+
+
+# =============================================================================
+# Hardening regression tests (expiry parsing, refresh dedupe, off-loop I/O,
+# degraded-mode backoff, secret redaction, refresh timeouts)
+# =============================================================================
+
+import sqlite3 as _sqlite3
+import threading as _threading
+
+from kiro.auth import (
+    DEGRADED_REFRESH_BACKOFF_SECONDS,
+    TOKEN_REFRESH_HTTP_TIMEOUT,
+    _parse_expiry,
+)
+
+
+def _make_sqlite_db(path, expires_at: str, access_token: str = "still_valid_access_token") -> str:
+    """Create a kiro-cli style SQLite DB with an OIDC token and device registration."""
+    conn = _sqlite3.connect(str(path))
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+    cursor.execute(
+        "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+        ("codewhisperer:odic:token", json.dumps({
+            "access_token": access_token,
+            "refresh_token": "stale_refresh_token",
+            "expires_at": expires_at,
+            "region": "us-east-1",
+        })),
+    )
+    cursor.execute(
+        "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+        ("codewhisperer:odic:device-registration", json.dumps({
+            "client_id": "test_client_id",
+            "client_secret": "test_client_secret",
+            "region": "us-east-1",
+        })),
+    )
+    conn.commit()
+    conn.close()
+    return str(path)
+
+
+def _http_error_response(status: int, body: dict) -> Mock:
+    """Build a mock httpx response whose raise_for_status raises HTTPStatusError."""
+    response = Mock()
+    response.status_code = status
+    response.text = json.dumps(body)
+    response.json = Mock(return_value=body)
+    response.raise_for_status = Mock(
+        side_effect=httpx.HTTPStatusError(f"{status}", request=Mock(), response=response)
+    )
+    return response
+
+
+def _ok_response(body: dict) -> Mock:
+    """Build a mock 200 httpx response."""
+    response = Mock()
+    response.status_code = 200
+    response.json = Mock(return_value=body)
+    response.raise_for_status = Mock()
+    return response
+
+
+def _patch_client(post):
+    """Patch kiro.auth.httpx.AsyncClient so that client.post == ``post``."""
+    patcher = patch('kiro.auth.httpx.AsyncClient')
+    mock_client_class = patcher.start()
+    mock_client = AsyncMock()
+    mock_client.post = post
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client_class.return_value = mock_client
+    return patcher, mock_client_class
+
+
+class TestParseExpiry:
+    """Tests for the shared _parse_expiry() helper."""
+
+    def test_z_suffix_is_utc(self):
+        """
+        What it does: Parses a timestamp with a 'Z' designator.
+        Purpose: Python 3.10 fromisoformat rejects 'Z'; it must map to UTC.
+        """
+        parsed = _parse_expiry("2099-01-01T00:00:00Z")
+        assert parsed == datetime(2099, 1, 1, tzinfo=timezone.utc)
+
+    def test_lowercase_z_suffix_is_utc(self):
+        """What it does: Accepts a lowercase 'z'. Purpose: RFC 3339 allows it."""
+        assert _parse_expiry("2099-01-01T00:00:00z").tzinfo is not None
+
+    def test_nanoseconds_truncated_to_microseconds(self):
+        """
+        What it does: Parses 9 fractional digits (kiro-cli format).
+        Purpose: fromisoformat supports at most 6 digits on Python 3.10.
+        """
+        parsed = _parse_expiry("2099-01-01T00:00:00.123456789Z")
+        assert parsed.microsecond == 123456
+        assert parsed.tzinfo is not None
+
+    def test_nanoseconds_with_explicit_offset(self):
+        """What it does: Truncates nanoseconds followed by an offset. Purpose: Both quirks at once."""
+        parsed = _parse_expiry("2099-01-01T05:30:00.987654321+05:30")
+        assert parsed == datetime(2099, 1, 1, 0, 0, 0, 987654, tzinfo=timezone.utc)
+
+    def test_naive_timestamp_becomes_utc(self):
+        """
+        What it does: Parses a timestamp without offset.
+        Purpose: A naive datetime would make is_token_expired raise TypeError.
+        """
+        parsed = _parse_expiry("2099-01-01T00:00:00")
+        assert parsed.tzinfo == timezone.utc
+        assert parsed == datetime(2099, 1, 1, tzinfo=timezone.utc)
+
+    def test_naive_with_nanoseconds(self):
+        """What it does: Handles naive + nanoseconds. Purpose: Combination seen in hand-edited files."""
+        parsed = _parse_expiry("2099-01-01T00:00:00.000000001")
+        assert parsed.tzinfo == timezone.utc and parsed.microsecond == 0
+
+    def test_millisecond_precision_preserved(self):
+        """What it does: Keeps 3-digit fractions untouched. Purpose: Kiro IDE format."""
+        assert _parse_expiry("2099-01-01T00:00:00.500Z").microsecond == 500000
+
+    def test_non_utc_offset_preserved(self):
+        """What it does: Keeps a non-UTC offset. Purpose: Never overwrite real tz info."""
+        parsed = _parse_expiry("2099-01-01T00:00:00+02:00")
+        assert parsed.utcoffset() == timedelta(hours=2)
+
+    def test_surrounding_whitespace_tolerated(self):
+        """What it does: Strips whitespace. Purpose: Hand-edited JSON files."""
+        assert _parse_expiry("  2099-01-01T00:00:00Z \n") is not None
+
+    @pytest.mark.parametrize("value", ["not-a-date", "2099-13-45T00:00:00Z", "Z", "", "   "])
+    def test_invalid_strings_return_none(self, value):
+        """What it does: Rejects unparsable strings. Purpose: Never raise from credential loading."""
+        assert _parse_expiry(value) is None
+
+    @pytest.mark.parametrize("value", [None, 12345, 1.5, ["2099-01-01"], {"a": 1}])
+    def test_non_string_values_return_none(self, value):
+        """What it does: Rejects non-strings. Purpose: Malformed JSON must not crash loading."""
+        assert _parse_expiry(value) is None
+
+
+class TestExpiryLoadingPaths:
+    """Both JSON and SQLite loaders must use _parse_expiry (aware datetimes)."""
+
+    @pytest.mark.parametrize("expires_at", [
+        "2099-01-01T00:00:00",                 # naive
+        "2099-01-01T00:00:00.123456789Z",      # nanoseconds + Z
+        "2099-01-01T00:00:00.123456789",       # nanoseconds + naive
+    ])
+    def test_json_file_expiry_is_aware_and_comparable(self, tmp_path, expires_at):
+        """
+        What it does: Loads expiresAt variants from a JSON creds file.
+        Purpose: Previously naive values raised TypeError in is_token_expired and
+                 nanoseconds were not truncated on the JSON path.
+        """
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"refreshToken": "r", "accessToken": "a", "expiresAt": expires_at}))
+        manager = KiroAuthManager(creds_file=str(creds))
+        assert manager._expires_at is not None
+        assert manager._expires_at.tzinfo is not None
+        assert manager.is_token_expired() is False
+        assert manager.is_token_expiring_soon() is False
+
+    def test_json_naive_past_expiry_is_expired(self, tmp_path):
+        """What it does: Naive past timestamp. Purpose: Interpreted as UTC, so it is expired."""
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"refreshToken": "r", "accessToken": "a", "expiresAt": "2000-01-01T00:00:00"}))
+        manager = KiroAuthManager(creds_file=str(creds))
+        assert manager.is_token_expired() is True
+
+    def test_json_invalid_expiry_leaves_none(self, tmp_path):
+        """What it does: Garbage expiresAt. Purpose: Treated as unknown (refresh needed), no crash."""
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"refreshToken": "r", "accessToken": "a", "expiresAt": "garbage"}))
+        manager = KiroAuthManager(creds_file=str(creds))
+        assert manager._expires_at is None
+        assert manager._refresh_token == "r"  # rest of the file still loaded
+
+    def test_sqlite_naive_expiry_is_aware(self, tmp_path):
+        """What it does: Naive expires_at in SQLite. Purpose: Same normalization as JSON path."""
+        db = _make_sqlite_db(tmp_path / "data.sqlite3", "2099-01-01T00:00:00")
+        manager = KiroAuthManager(sqlite_db=db)
+        assert manager._expires_at.tzinfo is not None
+        assert manager.is_token_expired() is False
+
+    def test_sqlite_nanosecond_expiry(self, tmp_path):
+        """What it does: kiro-cli nanosecond format. Purpose: Regression guard for existing behavior."""
+        db = _make_sqlite_db(tmp_path / "data.sqlite3", "2099-01-01T00:00:00.123456789Z")
+        manager = KiroAuthManager(sqlite_db=db)
+        assert manager._expires_at.microsecond == 123456
+
+
+class TestForceRefreshDedupe:
+    """Concurrent force_refresh() calls must perform a single network refresh."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_force_refresh_refreshes_once(self, mock_kiro_token_response):
+        """
+        What it does: Fires 10 concurrent force_refresh() calls (simulated 403 storm).
+        Purpose: Only the first caller refreshes; the rest reuse its new token.
+        """
+        manager = KiroAuthManager(refresh_token="test_refresh")
+        manager._access_token = "old_token"
+        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        calls = 0
+
+        async def post(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return _ok_response(mock_kiro_token_response(token=f"new_token_{calls}"))
+
+        patcher, _ = _patch_client(post)
+        try:
+            tokens = await asyncio.gather(*(manager.force_refresh() for _ in range(10)))
+        finally:
+            patcher.stop()
+
+        assert calls == 1
+        assert set(tokens) == {"new_token_1"}
+
+    @pytest.mark.asyncio
+    async def test_sequential_force_refresh_refreshes_every_time(self, mock_kiro_token_response):
+        """
+        What it does: Calls force_refresh() twice in sequence.
+        Purpose: Dedupe must not suppress a real second 403 after the first refresh.
+        """
+        manager = KiroAuthManager(refresh_token="test_refresh")
+        manager._access_token = "old_token"
+        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        calls = 0
+
+        async def post(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return _ok_response(mock_kiro_token_response(token=f"new_token_{calls}"))
+
+        patcher, _ = _patch_client(post)
+        try:
+            first = await manager.force_refresh()
+            second = await manager.force_refresh()
+        finally:
+            patcher.stop()
+
+        assert calls == 2
+        assert (first, second) == ("new_token_1", "new_token_2")
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_does_not_reuse_expired_concurrent_token(self, mock_kiro_token_response):
+        """
+        What it does: Token changed while waiting but is already expired.
+        Purpose: Dedupe only reuses a token that is still valid.
+        """
+        manager = KiroAuthManager(refresh_token="test_refresh")
+        manager._access_token = "old_token"
+        calls = 0
+
+        async def post(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return _ok_response(mock_kiro_token_response(token="fresh"))
+
+        patcher, _ = _patch_client(post)
+        try:
+            async with manager._lock:
+                waiter = asyncio.create_task(manager.force_refresh())
+                await asyncio.sleep(0)  # waiter captured "old_token" and is blocked on the lock
+                manager._access_token = "changed_but_expired"
+                manager._expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            token = await waiter
+        finally:
+            patcher.stop()
+
+        assert calls == 1
+        assert token == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_failure_propagates_to_all_waiters(self):
+        """
+        What it does: The refresh fails for every concurrent caller.
+        Purpose: Dedupe must never turn a failed refresh into a stale "success".
+        """
+        manager = KiroAuthManager(refresh_token="test_refresh")
+        manager._access_token = "old_token"
+        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        post = AsyncMock(return_value=_http_error_response(500, {"error": "boom"}))
+
+        patcher, _ = _patch_client(post)
+        try:
+            results = await asyncio.gather(
+                *(manager.force_refresh() for _ in range(3)), return_exceptions=True
+            )
+        finally:
+            patcher.stop()
+
+        assert all(isinstance(r, httpx.HTTPStatusError) for r in results)
+        assert post.await_count == 3  # token never changed, so each caller retried
+        assert manager._access_token == "old_token"
+
+
+class TestBlockingIoOffEventLoop:
+    """SQLite/JSON reads and writes in async paths must run in worker threads."""
+
+    @pytest.mark.asyncio
+    async def test_json_save_runs_in_worker_thread(self, tmp_path, mock_kiro_token_response):
+        """
+        What it does: Refreshes a JSON-file account and records the saving thread.
+        Purpose: File writes must not block the event loop.
+        """
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"refreshToken": "r"}))
+        manager = KiroAuthManager(creds_file=str(creds))
+        loop_thread = _threading.get_ident()
+        seen = []
+        original = manager._save_credentials_to_file
+
+        def recording_save():
+            seen.append(_threading.get_ident())
+            original()
+
+        manager._save_credentials_to_file = recording_save
+        patcher, _ = _patch_client(AsyncMock(return_value=_ok_response(mock_kiro_token_response())))
+        try:
+            await manager.get_access_token()
+        finally:
+            patcher.stop()
+
+        assert seen and seen[0] != loop_thread
+        assert json.loads(creds.read_text())["refreshToken"] == "new_refresh_token_xyz"
+
+    @pytest.mark.asyncio
+    async def test_sqlite_reload_and_save_run_in_worker_thread(self, tmp_path):
+        """
+        What it does: Expiring SQLite token triggers reload + refresh + save.
+        Purpose: sqlite3 calls must not block the event loop.
+        """
+        expiring = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        db = _make_sqlite_db(tmp_path / "data.sqlite3", expiring)
+        manager = KiroAuthManager(sqlite_db=db)
+        loop_thread = _threading.get_ident()
+        load_threads, save_threads = [], []
+        original_load = manager._load_credentials_from_sqlite
+        original_save = manager._save_credentials_to_sqlite
+
+        def recording_load(path):
+            load_threads.append(_threading.get_ident())
+            original_load(path)
+
+        def recording_save():
+            save_threads.append(_threading.get_ident())
+            original_save()
+
+        manager._load_credentials_from_sqlite = recording_load
+        manager._save_credentials_to_sqlite = recording_save
+        body = {"accessToken": "fresh", "refreshToken": "r2", "expiresIn": 3600}
+        patcher, _ = _patch_client(AsyncMock(return_value=_ok_response(body)))
+        try:
+            token = await manager.get_access_token()
+        finally:
+            patcher.stop()
+
+        assert token == "fresh"
+        assert load_threads and all(t != loop_thread for t in load_threads)
+        assert save_threads and all(t != loop_thread for t in save_threads)
+
+    @pytest.mark.asyncio
+    async def test_oidc_400_reload_runs_in_worker_thread(self, tmp_path):
+        """
+        What it does: OIDC refresh 400 triggers a SQLite reload before retry.
+        Purpose: The retry-path reload must also be off the event loop.
+        """
+        db = _make_sqlite_db(tmp_path / "data.sqlite3", "2000-01-01T00:00:00Z")
+        manager = KiroAuthManager(sqlite_db=db)
+        loop_thread = _threading.get_ident()
+        threads = []
+        original_load = manager._load_credentials_from_sqlite
+
+        def recording_load(path):
+            threads.append(_threading.get_ident())
+            original_load(path)
+
+        manager._load_credentials_from_sqlite = recording_load
+        post = AsyncMock(side_effect=[
+            _http_error_response(400, {"error": "invalid_request"}),
+            _ok_response({"accessToken": "fresh", "expiresIn": 3600}),
+        ])
+        patcher, _ = _patch_client(post)
+        try:
+            await manager._refresh_token_aws_sso_oidc()
+        finally:
+            patcher.stop()
+
+        assert threads and all(t != loop_thread for t in threads)
+        assert manager._access_token == "fresh"
+
+
+class TestSqliteDegradedModeBackoff:
+    """After a 400 refresh failure with a still-valid token, refresh is paused."""
+
+    @pytest.mark.asyncio
+    async def test_backoff_skips_refresh_on_following_requests(self, tmp_path):
+        """
+        What it does: Calls get_access_token() repeatedly after a degraded fallback.
+        Purpose: Previously every request retried two failing refreshes.
+        """
+        expiring = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        db = _make_sqlite_db(tmp_path / "data.sqlite3", expiring)
+        manager = KiroAuthManager(sqlite_db=db)
+        post = AsyncMock(return_value=_http_error_response(400, {"error": "invalid_request"}))
+
+        patcher, _ = _patch_client(post)
+        try:
+            first = await manager.get_access_token()
+            calls_after_first = post.await_count
+            for _ in range(5):
+                assert await manager.get_access_token() == "still_valid_access_token"
+        finally:
+            patcher.stop()
+
+        assert first == "still_valid_access_token"
+        assert calls_after_first == 2  # initial attempt + retry after SQLite reload
+        assert post.await_count == 2   # no further attempts during backoff
+        assert manager._next_refresh_attempt > 0
+
+    @pytest.mark.asyncio
+    async def test_backoff_window_length(self, tmp_path):
+        """What it does: Checks the deadline. Purpose: Backoff is DEGRADED_REFRESH_BACKOFF_SECONDS."""
+        expiring = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        db = _make_sqlite_db(tmp_path / "data.sqlite3", expiring)
+        manager = KiroAuthManager(sqlite_db=db)
+        patcher, _ = _patch_client(AsyncMock(return_value=_http_error_response(400, {})))
+        with patch('kiro.auth.time.monotonic', return_value=1000.0):
+            try:
+                await manager.get_access_token()
+            finally:
+                patcher.stop()
+        assert manager._next_refresh_attempt == 1000.0 + DEGRADED_REFRESH_BACKOFF_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_refresh_retried_after_backoff_expires(self, tmp_path):
+        """
+        What it does: Moves the clock past the backoff deadline.
+        Purpose: Backoff must end; recovery happens once kiro-cli fixes credentials.
+        """
+        expiring = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        db = _make_sqlite_db(tmp_path / "data.sqlite3", expiring)
+        manager = KiroAuthManager(sqlite_db=db)
+        post = AsyncMock(side_effect=[
+            _http_error_response(400, {}),
+            _http_error_response(400, {}),
+            _ok_response({"accessToken": "recovered", "expiresIn": 3600}),
+        ])
+        patcher, _ = _patch_client(post)
+        try:
+            with patch('kiro.auth.time.monotonic', return_value=1000.0):
+                await manager.get_access_token()
+            with patch('kiro.auth.time.monotonic', return_value=1000.0 + DEGRADED_REFRESH_BACKOFF_SECONDS + 1):
+                token = await manager.get_access_token()
+        finally:
+            patcher.stop()
+
+        assert token == "recovered"
+        assert post.await_count == 3
+        assert manager._next_refresh_attempt == 0.0  # success clears the backoff
+
+    @pytest.mark.asyncio
+    async def test_backoff_ignored_once_token_expired(self, tmp_path):
+        """
+        What it does: Token expires while backoff is active.
+        Purpose: An expired token must never be returned; refresh is attempted.
+        """
+        expiring = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        db = _make_sqlite_db(tmp_path / "data.sqlite3", expiring)
+        manager = KiroAuthManager(sqlite_db=db)
+        manager._next_refresh_attempt = float("inf")
+        manager._expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        manager._load_credentials_from_sqlite = Mock()  # keep the expired in-memory token
+        post = AsyncMock(return_value=_http_error_response(400, {}))
+        patcher, _ = _patch_client(post)
+        try:
+            with pytest.raises(ValueError, match="kiro-cli login"):
+                await manager.get_access_token()
+        finally:
+            patcher.stop()
+        assert post.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_backoff_not_applied_without_sqlite(self):
+        """What it does: Non-SQLite manager with a stray deadline. Purpose: Backoff is SQLite-only."""
+        manager = KiroAuthManager(refresh_token="r")
+        manager._access_token = "a"
+        manager._expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        manager._next_refresh_attempt = float("inf")
+        post = AsyncMock(return_value=_ok_response({"accessToken": "fresh", "expiresIn": 3600}))
+        patcher, _ = _patch_client(post)
+        try:
+            assert await manager.get_access_token() == "fresh"
+        finally:
+            patcher.stop()
+
+
+class TestRefreshSecretsNotLeaked:
+    """Error messages must never contain token values from the response body."""
+
+    @pytest.mark.asyncio
+    async def test_kiro_desktop_missing_access_token_hides_body(self):
+        """
+        What it does: Desktop refresh response lacks accessToken but has refreshToken.
+        Purpose: The ValueError (which gets logged) must list keys only.
+        """
+        manager = KiroAuthManager(refresh_token="r")
+        body = {"refreshToken": "SUPER_SECRET_REFRESH", "expiresIn": 3600}
+        patcher, _ = _patch_client(AsyncMock(return_value=_ok_response(body)))
+        try:
+            with pytest.raises(ValueError) as exc_info:
+                await manager._refresh_token_kiro_desktop()
+        finally:
+            patcher.stop()
+        message = str(exc_info.value)
+        assert "SUPER_SECRET_REFRESH" not in message
+        assert "refreshToken" in message and "expiresIn" in message
+
+    @pytest.mark.asyncio
+    async def test_oidc_missing_access_token_hides_body(self):
+        """What it does: Same check for AWS SSO OIDC. Purpose: Both refresh paths are covered."""
+        manager = KiroAuthManager(refresh_token="r", client_id="cid", client_secret="csecret")
+        body = {"refreshToken": "SUPER_SECRET_REFRESH", "idToken": "SECRET_ID"}
+        patcher, _ = _patch_client(AsyncMock(return_value=_ok_response(body)))
+        try:
+            with pytest.raises(ValueError) as exc_info:
+                await manager._do_aws_sso_oidc_refresh()
+        finally:
+            patcher.stop()
+        message = str(exc_info.value)
+        assert "SUPER_SECRET_REFRESH" not in message and "SECRET_ID" not in message
+        assert "refreshToken" in message
+
+
+class TestRefreshHttpTimeout:
+    """Token refresh clients use a short connect timeout."""
+
+    def test_timeout_constant_values(self):
+        """What it does: Inspects the constant. Purpose: 5s connect, 30s for the rest."""
+        assert TOKEN_REFRESH_HTTP_TIMEOUT.connect == 5.0
+        assert TOKEN_REFRESH_HTTP_TIMEOUT.read == 30.0
+        assert TOKEN_REFRESH_HTTP_TIMEOUT.write == 30.0
+        assert TOKEN_REFRESH_HTTP_TIMEOUT.pool == 30.0
+
+    @pytest.mark.asyncio
+    async def test_kiro_desktop_uses_refresh_timeout(self, mock_kiro_token_response):
+        """What it does: Captures AsyncClient kwargs. Purpose: Desktop path uses the constant."""
+        manager = KiroAuthManager(refresh_token="r")
+        patcher, client_class = _patch_client(AsyncMock(return_value=_ok_response(mock_kiro_token_response())))
+        try:
+            await manager._refresh_token_kiro_desktop()
+        finally:
+            patcher.stop()
+        assert client_class.call_args.kwargs == {"timeout": TOKEN_REFRESH_HTTP_TIMEOUT}
+
+    @pytest.mark.asyncio
+    async def test_oidc_uses_refresh_timeout(self):
+        """What it does: Captures AsyncClient kwargs. Purpose: OIDC path uses the constant."""
+        manager = KiroAuthManager(refresh_token="r", client_id="cid", client_secret="cs")
+        patcher, client_class = _patch_client(
+            AsyncMock(return_value=_ok_response({"accessToken": "a", "expiresIn": 3600}))
+        )
+        try:
+            await manager._do_aws_sso_oidc_refresh()
+        finally:
+            patcher.stop()
+        assert client_class.call_args.kwargs == {"timeout": TOKEN_REFRESH_HTTP_TIMEOUT}
