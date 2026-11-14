@@ -252,6 +252,47 @@ class TestCallKiroMCPAPI:
         assert results is None
 
 
+    @pytest.mark.asyncio
+    async def test_mcp_request_includes_profile_arn(self, mock_auth_manager):
+        """
+        What it does: Verifies the MCP request body carries the profile ARN.
+        Purpose: Enterprise (IAM Identity Center) accounts return
+        400 "profileArn is required for this request." without it.
+        """
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": "{}"}]}})
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test", mock_auth_manager)
+
+        body = mock_post.call_args.kwargs["json"]
+        print(f"Comparing profileArn: Expected {mock_auth_manager.profile_arn}, Got {body.get('profileArn')}")
+        assert body["profileArn"] == mock_auth_manager.profile_arn
+
+    @pytest.mark.asyncio
+    async def test_mcp_request_omits_profile_arn_when_absent(self, mock_auth_manager):
+        """
+        What it does: Verifies no profileArn key is sent when the account has none.
+        Purpose: Keep personal (non-enterprise) accounts unchanged.
+        """
+        mock_auth_manager._profile_arn = None
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": "{}"}]}})
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test", mock_auth_manager)
+
+        assert "profileArn" not in mock_post.call_args.kwargs["json"]
+
+
 # ==================================================================================================
 # Tests for Search Summary Generation
 # ==================================================================================================

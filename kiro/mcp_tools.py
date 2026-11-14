@@ -135,6 +135,11 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+    # Enterprise (IAM Identity Center) accounts reject MCP calls without the
+    # profile ARN in the body: 400 "profileArn is required for this request."
+    profile_arn = getattr(auth_manager, "profile_arn", None)
+    if profile_arn:
+        mcp_request["profileArn"] = profile_arn
     
     # Log MCP request
     try:
@@ -161,7 +166,7 @@ async def call_kiro_mcp_api(
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                logger.error(f"MCP API error: {response.status_code} {response.text[:200]}")
                 return None, None
             
             mcp_response = response.json()

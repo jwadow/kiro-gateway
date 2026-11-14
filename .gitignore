@@ -30,4 +30,5 @@ requests/
 # Testing
 .pytest_cache/
 .coverage
-htmlcov/
+htmlcov/.DS_Store
+.claude_consciousness.m8

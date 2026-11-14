@@ -172,6 +172,9 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[str, Dict]] = None
     
+    # Structured output
+    response_format: Optional[Dict[str, Any]] = None
+
     # Compatibility fields (ignored)
     stream_options: Optional[Dict[str, Any]] = None
     logit_bias: Optional[Dict[str, float]] = None
