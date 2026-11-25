@@ -222,6 +222,7 @@ class AwsEventStreamParser:
     - tool_stop: End of tool call
     - usage: Credit consumption information
     - context_usage: Context usage percentage
+    - metadata: Terminal stop reason and refusal details
     
     Attributes:
         buffer: Buffer for accumulating data
@@ -246,6 +247,8 @@ class AwsEventStreamParser:
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
+        ('{"stopDetails":', 'metadata'),
+        ('{"stopReason":', 'metadata'),
     ]
     
     def __init__(self):
@@ -328,8 +331,49 @@ class AwsEventStreamParser:
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
+        elif event_type == 'metadata':
+            return self._process_metadata_event(data)
         
         return None
+
+    def _process_metadata_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """
+        Processes terminal metadata emitted at the end of a response.
+        
+        Kiro may return HTTP 200 with a metadataEvent containing
+        stopReason=CONTENT_FILTERED and stopDetails.refusal.category. Preserve
+        this data so streaming adapters can surface refusal errors instead of
+        treating the empty response as a normal completion.
+        
+        Args:
+            data: Parsed metadata event payload
+        
+        Returns:
+            Normalized metadata event or None when no terminal data is present
+        """
+        stop_reason = data.get('stopReason')
+        stop_details = data.get('stopDetails')
+        if not isinstance(stop_details, dict):
+            stop_details = {}
+        
+        refusal = stop_details.get('refusal')
+        if not isinstance(refusal, dict):
+            refusal = {}
+        
+        refusal_category = refusal.get('category')
+        refusal_explanation = refusal.get('explanation')
+        
+        if not stop_reason and not refusal_category:
+            return None
+        
+        return {
+            "type": "metadata",
+            "data": {
+                "stop_reason": stop_reason,
+                "refusal_category": refusal_category,
+                "refusal_explanation": refusal_explanation,
+            },
+        }
     
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""

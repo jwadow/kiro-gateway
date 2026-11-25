@@ -61,6 +61,37 @@ except ImportError:
 # ==================================================================================================
 
 @dataclass
+class KiroTerminal:
+    """
+    Terminal metadata reported by Kiro API.
+    
+    Kiro may end an HTTP 200 stream with a metadata event that contains a stop
+    reason and, for safety refusals, a structured refusal category. This data
+    must be preserved so adapters do not mistake a refusal for a normal finish.
+    
+    Attributes:
+        stop_reason: Upstream stop reason, such as CONTENT_FILTERED
+        refusal_category: Structured refusal category, such as REASONING_EXTRACTION
+        refusal_explanation: Human-readable refusal explanation from upstream
+    """
+    stop_reason: Optional[str] = None
+    refusal_category: Optional[str] = None
+    refusal_explanation: Optional[str] = None
+    
+    def is_refusal(self) -> bool:
+        """
+        Check whether the terminal state represents a safety refusal.
+        
+        Returns:
+            True when upstream reported content filtering or a refusal category
+        """
+        return (
+            (self.stop_reason or "").upper() == "CONTENT_FILTERED"
+            or bool(self.refusal_category)
+        )
+
+
+@dataclass
 class KiroEvent:
     """
     Unified event from Kiro API stream.
@@ -68,12 +99,13 @@ class KiroEvent:
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
     
     Attributes:
-        type: Event type (content, thinking, tool_use, usage, context_usage, error)
+        type: Event type (content, thinking, tool_use, usage, context_usage, metadata)
         content: Text content (for content events)
         thinking_content: Thinking/reasoning content (for thinking events)
         tool_use: Tool use data (for tool_use events)
         usage: Usage/metering data (for usage events)
         context_usage_percentage: Context usage percentage (for context_usage events)
+        terminal: Terminal metadata (for metadata events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
         is_last_thinking_chunk: Whether this is the last thinking chunk
     """
@@ -83,6 +115,7 @@ class KiroEvent:
     tool_use: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    terminal: Optional[KiroTerminal] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
 
@@ -98,17 +131,121 @@ class StreamResult:
         tool_calls: List of tool calls
         usage: Usage information
         context_usage_percentage: Context usage percentage from Kiro API
+        terminal: Terminal metadata reported by Kiro API
     """
     content: str = ""
     thinking_content: str = ""
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    terminal: Optional[KiroTerminal] = None
 
 
 class FirstTokenTimeoutError(Exception):
     """Exception raised when first token timeout occurs."""
     pass
+
+
+class KiroStreamError(Exception):
+    """
+    Base exception for typed upstream stream failures.
+    
+    Attributes:
+        code: Stable machine-readable error code
+        status_code: HTTP status code to expose for non-streaming requests
+        terminal: Optional upstream terminal metadata
+        partial_output: Whether visible output was already sent to the client
+    """
+    
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        status_code: int,
+        terminal: Optional[KiroTerminal] = None,
+        partial_output: bool = False
+    ) -> None:
+        """
+        Initialize a typed stream error.
+        
+        Args:
+            message: User-facing error message
+            code: Stable machine-readable error code
+            status_code: HTTP status code for non-streaming responses
+            terminal: Optional upstream terminal metadata
+            partial_output: Whether visible output was already sent
+        """
+        super().__init__(message)
+        self.code: str = code
+        self.status_code: int = status_code
+        self.terminal: Optional[KiroTerminal] = terminal
+        self.partial_output: bool = partial_output
+
+
+class KiroContentFilteredError(KiroStreamError):
+    """Exception raised when Kiro refuses to continue due to content filtering."""
+    
+    def __init__(
+        self,
+        terminal: KiroTerminal,
+        *,
+        partial_output: bool = False
+    ) -> None:
+        """
+        Initialize a content-filtered stream error.
+        
+        Args:
+            terminal: Upstream terminal metadata containing refusal details
+            partial_output: Whether visible output was already sent
+        """
+        category = terminal.refusal_category or "unknown"
+        message = f"Kiro API refused to generate a response (category: {category})"
+        if terminal.refusal_explanation:
+            message += f": {terminal.refusal_explanation}"
+        if partial_output:
+            message += " Partial response content was preserved."
+        
+        super().__init__(
+            message,
+            code="kiro_content_filtered",
+            status_code=422,
+            terminal=terminal,
+            partial_output=partial_output,
+        )
+
+
+class KiroEmptyCompletionError(KiroStreamError):
+    """Exception raised when Kiro completes without any visible assistant output."""
+    
+    def __init__(self) -> None:
+        """Initialize an empty-completion stream error."""
+        super().__init__(
+            "Kiro API returned an empty assistant response "
+            "(no text, reasoning, or tool calls). Please retry the request; "
+            "if it persists, try a different model or a new conversation.",
+            code="empty_completion",
+            status_code=502,
+        )
+
+
+def raise_if_terminal_refusal(
+    terminal: Optional[KiroTerminal],
+    *,
+    partial_output: bool = False
+) -> None:
+    """
+    Raise a typed error when upstream terminal metadata represents a refusal.
+    
+    Args:
+        terminal: Upstream terminal metadata
+        partial_output: Whether visible output was already sent
+    
+    Raises:
+        KiroContentFilteredError: If upstream reported a safety refusal
+    """
+    if isinstance(terminal, KiroTerminal) and terminal.is_refusal():
+        raise KiroContentFilteredError(terminal, partial_output=partial_output)
 
 
 # ==================================================================================================
@@ -280,6 +417,17 @@ async def _process_chunk(
         
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
+        
+        elif event["type"] == "metadata":
+            data = event["data"]
+            yield KiroEvent(
+                type="metadata",
+                terminal=KiroTerminal(
+                    stop_reason=data.get("stop_reason"),
+                    refusal_category=data.get("refusal_category"),
+                    refusal_explanation=data.get("refusal_explanation"),
+                ),
+            )
 
 
 # ==================================================================================================
@@ -321,6 +469,8 @@ async def collect_stream_to_result(
             result.usage = event.usage
         elif event.type == "context_usage" and event.context_usage_percentage is not None:
             result.context_usage_percentage = event.context_usage_percentage
+        elif event.type == "metadata" and event.terminal:
+            result.terminal = event.terminal
     
     # Check for bracket-style tool calls in full content
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
@@ -376,10 +526,11 @@ async def stream_with_first_token_retry(
     on_all_retries_failed: Optional[Callable[[int, float], Exception]] = None,
 ) -> AsyncGenerator[str, None]:
     """
-    Generic streaming with automatic retry on first token timeout.
+    Generic streaming with automatic retry on pre-output failures.
     
-    If model doesn't respond within first_token_timeout seconds,
-    request is cancelled and a new one is made. Maximum max_retries attempts.
+    The function retries first-token timeouts and empty completions, but only
+    while no SSE chunk has been yielded to the client. Content-filter refusals
+    and any failure after visible output are never retried.
     
     This is seamless for user - they just see a delay,
     but eventually get a response (or error after all attempts).
@@ -421,10 +572,13 @@ async def stream_with_first_token_retry(
     
     for attempt in range(max_retries):
         response: Optional[httpx.Response] = None
+        attempt_yielded_chunk = False
         try:
             # Make request
             if attempt > 0:
-                logger.warning(f"Retry attempt {attempt + 1}/{max_retries} after first token timeout")
+                logger.warning(
+                    f"Retry attempt {attempt + 1}/{max_retries} after a retryable pre-output failure"
+                )
             
             # On first attempt, reuse initial_response if provided
             if attempt == 0 and initial_response is not None:
@@ -455,10 +609,41 @@ async def stream_with_first_token_retry(
             
             # Try to stream with first token timeout
             async for chunk in stream_processor(response):
+                attempt_yielded_chunk = True
                 yield chunk
             
             # Successfully completed - exit
             return
+        
+        except KiroEmptyCompletionError as e:
+            last_error = e
+            
+            if attempt_yielded_chunk:
+                logger.error(
+                    "Empty completion reported after output was already emitted; "
+                    "retry is unsafe"
+                )
+                if response:
+                    try:
+                        await response.aclose()
+                    except Exception:
+                        pass
+                raise
+            
+            logger.warning(
+                f"[EmptyCompletion] Attempt {attempt + 1}/{max_retries} returned no visible output"
+            )
+            
+            if response:
+                try:
+                    await response.aclose()
+                except Exception:
+                    pass
+            
+            if attempt == max_retries - 1:
+                raise
+            
+            continue
             
         except FirstTokenTimeoutError as e:
             last_error = e

@@ -49,8 +49,11 @@ from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_token
 from kiro.streaming_core import (
     parse_kiro_stream,
     FirstTokenTimeoutError,
-    KiroEvent,
+    KiroTerminal,
+    KiroStreamError,
+    KiroEmptyCompletionError,
     calculate_tokens_from_context_usage,
+    raise_if_terminal_refusal,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
 
@@ -66,7 +69,57 @@ except ImportError:
 
 
 # Re-export FirstTokenTimeoutError for backward compatibility
-__all__ = ['FirstTokenTimeoutError', 'stream_kiro_to_openai', 'stream_with_first_token_retry', 'collect_stream_response']
+__all__ = [
+    'FirstTokenTimeoutError',
+    'build_openai_error_payload',
+    'format_openai_stream_error_event',
+    'stream_kiro_to_openai',
+    'stream_with_first_token_retry',
+    'collect_stream_response',
+]
+
+
+def build_openai_error_payload(error: Exception) -> dict:
+    """
+    Build an OpenAI-compatible error payload for a stream failure.
+    
+    Args:
+        error: Typed stream error or unexpected exception
+    
+    Returns:
+        JSON-serializable OpenAI error payload
+    """
+    if isinstance(error, KiroStreamError):
+        message = str(error)
+        error_type = error.code
+        code = error.code
+        if error.terminal and error.terminal.refusal_category:
+            code = error.terminal.refusal_category
+    else:
+        message = str(error) if str(error) else "Unexpected streaming error"
+        error_type = "server_error"
+        code = "stream_error"
+    
+    return {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": code,
+        }
+    }
+
+
+def format_openai_stream_error_event(error: Exception) -> str:
+    """
+    Format a stream failure as an OpenAI SSE error event.
+    
+    Args:
+        error: Typed stream error or unexpected exception
+    
+    Returns:
+        SSE-formatted error event
+    """
+    return f"data: {json.dumps(build_openai_error_payload(error), ensure_ascii=False)}\n\n"
 
 
 async def stream_kiro_to_openai_internal(
@@ -120,8 +173,10 @@ async def stream_kiro_to_openai_internal(
     
     metering_data = None
     context_usage_percentage = None
+    terminal: Optional[KiroTerminal] = None
     full_content = ""
     full_thinking_content = ""  # Accumulated thinking content for non-streaming
+    visible_output_emitted = False
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
@@ -153,6 +208,7 @@ async def stream_kiro_to_openai_internal(
                 if debug_logger:
                     debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
                 
+                visible_output_emitted = True
                 yield chunk_text
             
             elif event.type == "thinking" and event.thinking_content:
@@ -182,6 +238,7 @@ async def stream_kiro_to_openai_internal(
                 if debug_logger:
                     debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
                 
+                visible_output_emitted = True
                 yield chunk_text
             
             elif event.type == "tool_use" and event.tool_use:
@@ -251,6 +308,7 @@ async def stream_kiro_to_openai_internal(
                                 if debug_logger:
                                     debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
                                 
+                                visible_output_emitted = True
                                 yield chunk_text
                             
                             # Accumulate for token counting
@@ -267,6 +325,9 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
+            
+            elif event.type == "metadata" and event.terminal:
+                terminal = event.terminal
         
         # Track completion signals for truncation detection
         received_usage = metering_data is not None
@@ -277,6 +338,13 @@ async def stream_kiro_to_openai_internal(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
+        
+        # A safety refusal is an explicit upstream decision, not a normal finish.
+        # Keep any already-emitted partial output but never send a success finish.
+        raise_if_terminal_refusal(terminal, partial_output=visible_output_emitted)
+        
+        if not visible_output_emitted and not all_tool_calls:
+            raise KiroEmptyCompletionError()
         
         # Detect content truncation (missing completion signals)
         content_was_truncated = (

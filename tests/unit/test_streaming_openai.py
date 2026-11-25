@@ -21,9 +21,16 @@ from kiro.streaming_openai import (
     stream_kiro_to_openai_internal,
     stream_with_first_token_retry,
     collect_stream_response,
+    build_openai_error_payload,
+    format_openai_stream_error_event,
     FirstTokenTimeoutError,
 )
-from kiro.streaming_core import KiroEvent
+from kiro.streaming_core import (
+    KiroEvent,
+    KiroTerminal,
+    KiroContentFilteredError,
+    KiroEmptyCompletionError,
+)
 
 
 # ==================================================================================================
@@ -1485,3 +1492,211 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+
+# ==================================================================================================
+# Tests for upstream refusals and empty completions
+# ==================================================================================================
+
+class TestStreamingOpenaiTerminalStates:
+    """Tests for refusal and empty-completion handling."""
+    
+    @staticmethod
+    def _refusal_terminal() -> KiroTerminal:
+        """Create a representative upstream refusal terminal."""
+        return KiroTerminal(
+            stop_reason="CONTENT_FILTERED",
+            refusal_category="REASONING_EXTRACTION",
+            refusal_explanation="The selected model cannot continue this conversation.",
+        )
+    
+    @pytest.mark.asyncio
+    async def test_refusal_without_output_raises_typed_error(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Converts a pre-output refusal into a typed error.
+        Goal: Ensure a refusal is not converted to finish_reason=stop.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="metadata",
+                terminal=self._refusal_terminal(),
+            )
+        
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroContentFilteredError) as exc_info:
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+        
+        assert chunks == []
+        assert exc_info.value.partial_output is False
+        assert exc_info.value.terminal.refusal_category == "REASONING_EXTRACTION"
+    
+    @pytest.mark.asyncio
+    async def test_refusal_after_partial_output_raises_without_finish(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Preserves partial content but raises a typed refusal.
+        Goal: Ensure no normal finish chunk is sent after a refusal.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial answer")
+            yield KiroEvent(
+                type="metadata",
+                terminal=self._refusal_terminal(),
+            )
+        
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroContentFilteredError) as exc_info:
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+        
+        assert any("Partial answer" in chunk for chunk in chunks)
+        assert not any('"finish_reason": "stop"' in chunk for chunk in chunks)
+        assert not any("[DONE]" in chunk for chunk in chunks)
+        assert exc_info.value.partial_output is True
+    
+    @pytest.mark.asyncio
+    async def test_context_usage_only_is_empty_completion(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Treats usage/context signals as metadata, not output.
+        Goal: Ensure a usage-only stream is rejected.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+            yield KiroEvent(type="usage", usage={"inputTokenCount": 10})
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroEmptyCompletionError):
+                    async for _ in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        pass
+    
+    @pytest.mark.asyncio
+    async def test_tool_only_response_completes_normally(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Treats a tool call as valid visible output.
+        Goal: Ensure tool-only responses are not rejected as empty.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use={
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "func1", "arguments": "{}"},
+            })
+        
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        assert any('"tool_calls"' in chunk for chunk in chunks)
+        assert any('"finish_reason": "tool_calls"' in chunk for chunk in chunks)
+    
+    @pytest.mark.asyncio
+    async def test_thinking_only_response_completes_normally(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Treats emitted thinking as valid visible output.
+        Goal: Ensure reasoning-only responses are not rejected as empty.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Reasoning")
+        
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_openai.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+        
+        assert any("reasoning_content" in chunk for chunk in chunks)
+        assert any('"finish_reason": "stop"' in chunk for chunk in chunks)
+    
+    @pytest.mark.asyncio
+    async def test_non_streaming_refusal_raises_typed_error(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Rejects a collected refusal in non-streaming mode.
+        Goal: Ensure both streaming and non-streaming share terminal semantics.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="metadata",
+                terminal=self._refusal_terminal(),
+            )
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroContentFilteredError):
+                    await collect_stream_response(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    )
+    
+    @pytest.mark.asyncio
+    async def test_non_streaming_usage_only_raises_empty_completion(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Rejects a collected usage-only stream.
+        Goal: Ensure non-streaming never returns an empty assistant message.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroEmptyCompletionError):
+                    await collect_stream_response(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    )
+    
+    def test_formats_typed_error_payload(self):
+        """
+        What it does: Formats a typed error for OpenAI clients.
+        Goal: Verify stable type/code and refusal category.
+        """
+        error = KiroContentFilteredError(self._refusal_terminal())
+        
+        payload = build_openai_error_payload(error)
+        event = format_openai_stream_error_event(error)
+        
+        assert payload["error"]["type"] == "kiro_content_filtered"
+        assert payload["error"]["code"] == "REASONING_EXTRACTION"
+        assert event.startswith("data: {")
+        assert "kiro_content_filtered" in event
+        assert "REASONING_EXTRACTION" in event

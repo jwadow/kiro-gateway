@@ -43,8 +43,11 @@ from kiro.streaming_core import (
     parse_kiro_stream,
     collect_stream_to_result,
     FirstTokenTimeoutError,
-    KiroEvent,
+    KiroTerminal,
+    KiroStreamError,
+    KiroEmptyCompletionError,
     calculate_tokens_from_context_usage,
+    raise_if_terminal_refusal,
     stream_with_first_token_retry,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
@@ -60,6 +63,46 @@ try:
     from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
+
+
+def build_anthropic_error_payload(error: Exception) -> Dict[str, Any]:
+    """
+    Build an Anthropic-compatible error payload for a stream failure.
+    
+    Args:
+        error: Typed stream error or unexpected exception
+    
+    Returns:
+        JSON-serializable Anthropic error payload
+    """
+    message = str(error) if str(error) else "Unexpected streaming error"
+    payload: Dict[str, Any] = {
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": message,
+        },
+    }
+    
+    if isinstance(error, KiroStreamError):
+        payload["error"]["code"] = error.code
+        if error.terminal and error.terminal.refusal_category:
+            payload["error"]["category"] = error.terminal.refusal_category
+    
+    return payload
+
+
+def format_anthropic_stream_error_event(error: Exception) -> str:
+    """
+    Format a stream failure as an Anthropic SSE error event.
+    
+    Args:
+        error: Typed stream error or unexpected exception
+    
+    Returns:
+        SSE-formatted error event
+    """
+    return format_sse_event("error", build_anthropic_error_payload(error))
 
 
 def generate_message_id() -> str:
@@ -165,6 +208,8 @@ async def stream_kiro_to_anthropic(
     output_tokens = 0
     full_content = ""
     full_thinking_content = ""
+    terminal: Optional[KiroTerminal] = None
+    visible_output_emitted = False
     
     # NOTE: Anthropic streaming spec requires input_tokens in message_start (beginning),
     # but Kiro API provides accurate context_usage at the end of stream.
@@ -181,6 +226,31 @@ async def stream_kiro_to_anthropic(
             apply_claude_correction=False
         )
         input_tokens = request_token_stats["total_tokens"]
+    
+    message_start_payload = format_sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": 0
+            }
+        }
+    })
+    message_start_sent = False
+    
+    async def emit_message_start() -> AsyncGenerator[str, None]:
+        """Emit message_start once, immediately before the first visible output."""
+        nonlocal message_start_sent
+        if not message_start_sent:
+            message_start_sent = True
+            yield message_start_payload
     
     # Track content blocks - thinking block is index 0, text block is index 1 (when thinking enabled)
     current_block_index = 0
@@ -202,24 +272,6 @@ async def stream_kiro_to_anthropic(
     truncated_tools: List[Dict[str, Any]] = []
     
     try:
-        # Send message_start event
-        yield format_sse_event("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": model,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0
-                }
-            }
-        })
-        
         async for event in parse_kiro_stream(response, first_token_timeout):
             if event.type == "content":
                 content = event.content or ""
@@ -236,6 +288,8 @@ async def stream_kiro_to_anthropic(
                 
                 # Start text block if not started
                 if not text_block_started:
+                    async for start_event in emit_message_start():
+                        yield start_event
                     text_block_index = current_block_index
                     yield format_sse_event("content_block_start", {
                         "type": "content_block_start",
@@ -257,6 +311,7 @@ async def stream_kiro_to_anthropic(
                             "text": content
                         }
                     })
+                    visible_output_emitted = True
             
             elif event.type == "thinking":
                 thinking_content = event.thinking_content or ""
@@ -266,6 +321,8 @@ async def stream_kiro_to_anthropic(
                 if FAKE_REASONING_HANDLING == "as_reasoning_content":
                     # Use native Anthropic thinking content blocks
                     if not thinking_block_started:
+                        async for start_event in emit_message_start():
+                            yield start_event
                         thinking_block_index = current_block_index
                         yield format_sse_event("content_block_start", {
                             "type": "content_block_start",
@@ -287,6 +344,7 @@ async def stream_kiro_to_anthropic(
                                 "thinking": thinking_content
                             }
                         })
+                        visible_output_emitted = True
                 
                 elif FAKE_REASONING_HANDLING == "include_as_text":
                     # Include thinking as regular text content
@@ -301,6 +359,8 @@ async def stream_kiro_to_anthropic(
                     
                     # Start text block if not started
                     if not text_block_started:
+                        async for start_event in emit_message_start():
+                            yield start_event
                         text_block_index = current_block_index
                         yield format_sse_event("content_block_start", {
                             "type": "content_block_start",
@@ -321,6 +381,7 @@ async def stream_kiro_to_anthropic(
                                 "text": thinking_content
                             }
                         })
+                        visible_output_emitted = True
                 # For "strip" mode, we just skip the thinking content
             
             elif event.type == "tool_use" and event.tool_use:
@@ -381,6 +442,8 @@ async def stream_kiro_to_anthropic(
                     else:
                         # Emit server_tool_use + web_search_tool_result + text summary
                         # (full SSE sequence as in mcp_tools.py)
+                        async for start_event in emit_message_start():
+                            yield start_event
                         
                         # Event: content_block_start (server_tool_use)
                         yield format_sse_event("content_block_start", {
@@ -463,6 +526,7 @@ async def stream_kiro_to_anthropic(
                             "index": current_block_index
                         })
                         current_block_index += 1
+                        visible_output_emitted = True
                         
                         # Skip normal tool_use processing
                         continue
@@ -483,6 +547,8 @@ async def stream_kiro_to_anthropic(
                         tool_input = {}
                 
                 # Send tool_use block start
+                async for start_event in emit_message_start():
+                    yield start_event
                 yield format_sse_event("content_block_start", {
                     "type": "content_block_start",
                     "index": current_block_index,
@@ -517,17 +583,45 @@ async def stream_kiro_to_anthropic(
                     "input": tool_input
                 })
                 current_block_index += 1
+                visible_output_emitted = True
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
+            elif event.type == "metadata" and event.terminal:
+                terminal = event.terminal
         
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
         
         # Check for bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
+        
+        # A safety refusal is an explicit upstream decision, not a normal finish.
+        # Close any open blocks so partial output is well-formed, then raise
+        # without sending message_delta/message_stop.
+        if isinstance(terminal, KiroTerminal) and terminal.is_refusal():
+            if thinking_block_started and thinking_block_index is not None:
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": thinking_block_index
+                })
+                thinking_block_started = False
+                current_block_index += 1
+            
+            if text_block_started and text_block_index is not None:
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": text_block_index
+                })
+                text_block_started = False
+            
+            raise_if_terminal_refusal(terminal, partial_output=visible_output_emitted)
+        
+        if not visible_output_emitted and not bracket_tool_calls:
+            raise KiroEmptyCompletionError()
+        
         if bracket_tool_calls:
             # Close thinking block if open
             if thinking_block_started and thinking_block_index is not None:
@@ -558,6 +652,8 @@ async def stream_kiro_to_anthropic(
                     except json.JSONDecodeError:
                         tool_input = {}
                 
+                async for start_event in emit_message_start():
+                    yield start_event
                 yield format_sse_event("content_block_start", {
                     "type": "content_block_start",
                     "index": current_block_index,
@@ -590,6 +686,7 @@ async def stream_kiro_to_anthropic(
                     "input": tool_input
                 })
                 current_block_index += 1
+                visible_output_emitted = True
         
         # Close thinking block if still open
         if thinking_block_started and thinking_block_index is not None:
@@ -701,15 +798,6 @@ async def stream_kiro_to_anthropic(
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "(empty message)"
         logger.error(f"Error during Anthropic streaming: [{error_type}] {error_msg}", exc_info=True)
-        
-        # Send error event
-        yield format_sse_event("error", {
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": f"Internal error: {error_msg}"
-            }
-        })
         raise
     finally:
         try:
@@ -761,6 +849,9 @@ async def collect_anthropic_response(
     result = await collect_stream_to_result(response)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
     
+    # Refuse to build a successful message for an explicit upstream refusal.
+    raise_if_terminal_refusal(result.terminal)
+    
     # Build content blocks
     content_blocks = []
     
@@ -802,6 +893,9 @@ async def collect_anthropic_response(
             "name": tool_name,
             "input": tool_input
         })
+    
+    if not content_blocks:
+        raise KiroEmptyCompletionError()
     
     # Calculate output tokens
     output_tokens = count_tokens(result.content + result.thinking_content)

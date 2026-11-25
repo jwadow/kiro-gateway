@@ -15,6 +15,76 @@ from kiro.parsers import (
 )
 
 
+class TestAwsEventStreamParserTerminalMetadata:
+    """Tests for terminal metadata events."""
+
+    def test_parses_content_filtered_refusal(self):
+        """
+        What it does: Parses a metadata event containing a refusal.
+        Goal: Preserve stop reason and refusal details for stream adapters.
+        """
+        parser = AwsEventStreamParser()
+        chunk = (
+            b'{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION",'
+            b'"explanation":"The selected model cannot continue."}},'
+            b'"stopReason":"CONTENT_FILTERED"}'
+        )
+
+        events = parser.feed(chunk)
+
+        assert len(events) == 1
+        assert events[0]["type"] == "metadata"
+        assert events[0]["data"]["stop_reason"] == "CONTENT_FILTERED"
+        assert events[0]["data"]["refusal_category"] == "REASONING_EXTRACTION"
+        assert events[0]["data"]["refusal_explanation"] == "The selected model cannot continue."
+
+    def test_parses_stop_reason_without_refusal_details(self):
+        """
+        What it does: Parses a metadata event with only a stop reason.
+        Goal: Ensure content filtering is still detectable without stopDetails.
+        """
+        parser = AwsEventStreamParser()
+
+        events = parser.feed(b'{"stopReason":"CONTENT_FILTERED"}')
+
+        assert len(events) == 1
+        assert events[0]["type"] == "metadata"
+        assert events[0]["data"]["stop_reason"] == "CONTENT_FILTERED"
+        assert events[0]["data"]["refusal_category"] is None
+
+    def test_handles_malformed_stop_details(self):
+        """
+        What it does: Handles non-object stopDetails/refusal values.
+        Goal: Ensure malformed metadata does not crash the parser.
+        """
+        parser = AwsEventStreamParser()
+
+        events = parser.feed(
+            b'{"stopDetails":{"refusal":"unexpected"},"stopReason":"CONTENT_FILTERED"}'
+        )
+
+        assert len(events) == 1
+        assert events[0]["data"]["refusal_category"] is None
+
+    def test_parses_metadata_split_across_chunks(self):
+        """
+        What it does: Assembles a metadata event split across chunks.
+        Goal: Ensure terminal details survive network chunk boundaries.
+        """
+        parser = AwsEventStreamParser()
+
+        first_events = parser.feed(
+            b'{"stopDetails":{"refusal":{"category":"REASONING_'
+        )
+        second_events = parser.feed(
+            b'EXTRACTION"}},"stopReason":"CONTENT_FILTERED"}'
+        )
+
+        assert first_events == []
+        assert len(second_events) == 1
+        assert second_events[0]["data"]["refusal_category"] == "REASONING_EXTRACTION"
+
+
 class TestFindMatchingBrace:
     """Tests for find_matching_brace function."""
     

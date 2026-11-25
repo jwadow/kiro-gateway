@@ -49,7 +49,10 @@ from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
+    build_anthropic_error_payload,
+    format_anthropic_stream_error_event,
 )
+from kiro.streaming_core import KiroStreamError
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
@@ -61,6 +64,21 @@ try:
     from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
+
+
+def _stream_error_status(error: Exception) -> int:
+    """
+    Return the internal status associated with a streaming failure.
+    
+    Args:
+        error: Streaming exception
+    
+    Returns:
+        Typed upstream status or 500 for unexpected errors
+    """
+    if isinstance(error, KiroStreamError):
+        return error.status_code
+    return 500
 
 
 # --- Security scheme ---
@@ -465,16 +483,16 @@ async def messages(
                             except Exception as e:
                                 streaming_error = e
                                 try:
-                                    error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
-                                    yield error_event
+                                    yield format_anthropic_stream_error_event(e)
                                 except Exception:
                                     pass
                             finally:
                                 await http_client.close()
                                 if streaming_error:
+                                    error_status = _stream_error_status(streaming_error)
                                     error_type = type(streaming_error).__name__
                                     error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                                    logger.error(f"HTTP 500 - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
+                                    logger.error(f"HTTP {error_status} - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
                                 elif client_disconnected:
                                     logger.info(f"HTTP 200 - POST /v1/messages (streaming) - client disconnected")
                                 else:
@@ -482,7 +500,7 @@ async def messages(
                                 
                                 if debug_logger:
                                     if streaming_error:
-                                        debug_logger.flush_on_error(500, str(streaming_error))
+                                        debug_logger.flush_on_error(_stream_error_status(streaming_error), str(streaming_error))
                                     else:
                                         debug_logger.discard_buffers()
                         
@@ -578,6 +596,18 @@ async def messages(
                         
                         continue  # Next iteration
             
+            except KiroStreamError as e:
+                await http_client.close()
+                logger.error(
+                    f"HTTP {e.status_code} - POST /v1/messages - "
+                    f"[{type(e).__name__}] {str(e)[:100]}"
+                )
+                if debug_logger:
+                    debug_logger.flush_on_error(e.status_code, str(e))
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content=build_anthropic_error_payload(e),
+                )
             except HTTPException as e:
                 await http_client.close()
                 
@@ -822,18 +852,18 @@ async def messages(
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                 except Exception as e:
                     streaming_error = e
-                    # Send error event to client, then gracefully end the stream
+                    # Send a single error event to the client, then end the stream.
                     try:
-                        error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
-                        yield error_event
+                        yield format_anthropic_stream_error_event(e)
                     except Exception:
                         pass
                 finally:
                     await http_client.close()
                     if streaming_error:
+                        error_status = _stream_error_status(streaming_error)
                         error_type = type(streaming_error).__name__
                         error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                        logger.error(f"HTTP 500 - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
+                        logger.error(f"HTTP {error_status} - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
                     elif client_disconnected:
                         logger.info(f"HTTP 200 - POST /v1/messages (streaming) - client disconnected")
                     else:
@@ -841,7 +871,7 @@ async def messages(
                     
                     if debug_logger:
                         if streaming_error:
-                            debug_logger.flush_on_error(500, str(streaming_error))
+                            debug_logger.flush_on_error(_stream_error_status(streaming_error), str(streaming_error))
                         else:
                             debug_logger.discard_buffers()
             
@@ -875,6 +905,18 @@ async def messages(
             
             return JSONResponse(content=anthropic_response)
     
+    except KiroStreamError as e:
+        await http_client.close()
+        logger.error(
+            f"HTTP {e.status_code} - POST /v1/messages - "
+            f"[{type(e).__name__}] {str(e)[:100]}"
+        )
+        if debug_logger:
+            debug_logger.flush_on_error(e.status_code, str(e))
+        return JSONResponse(
+            status_code=e.status_code,
+            content=build_anthropic_error_payload(e),
+        )
     except HTTPException as e:
         await http_client.close()
         

@@ -48,7 +48,14 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
-from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
+from kiro.streaming_openai import (
+    stream_kiro_to_openai,
+    collect_stream_response,
+    stream_with_first_token_retry,
+    build_openai_error_payload,
+    format_openai_stream_error_event,
+)
+from kiro.streaming_core import KiroStreamError
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
@@ -59,6 +66,21 @@ try:
     from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
+
+
+def _stream_error_status(error: Exception) -> int:
+    """
+    Return the internal status associated with a streaming failure.
+    
+    Args:
+        error: Streaming exception
+    
+    Returns:
+        Typed upstream status or 500 for unexpected errors
+    """
+    if isinstance(error, KiroStreamError):
+        return error.status_code
+    return 500
 
 
 # --- Security scheme ---
@@ -398,23 +420,24 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             except Exception as e:
                                 streaming_error = e
                                 try:
+                                    yield format_openai_stream_error_event(e)
                                     yield "data: [DONE]\n\n"
                                 except Exception:
                                     pass
-                                raise
                             finally:
                                 await http_client.close()
                                 if streaming_error:
+                                    error_status = _stream_error_status(streaming_error)
                                     error_type = type(streaming_error).__name__
                                     error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                                    logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
+                                    logger.error(f"HTTP {error_status} - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
                                 elif client_disconnected:
                                     logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
                                 else:
                                     logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
                                 if debug_logger:
                                     if streaming_error:
-                                        debug_logger.flush_on_error(500, str(streaming_error))
+                                        debug_logger.flush_on_error(_stream_error_status(streaming_error), str(streaming_error))
                                     else:
                                         debug_logger.discard_buffers()
                         
@@ -503,6 +526,18 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         
                         continue  # Next iteration
             
+            except KiroStreamError as e:
+                await http_client.close()
+                logger.error(
+                    f"HTTP {e.status_code} - POST /v1/chat/completions - "
+                    f"[{type(e).__name__}] {str(e)[:100]}"
+                )
+                if debug_logger:
+                    debug_logger.flush_on_error(e.status_code, str(e))
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content=build_openai_error_payload(e),
+                )
             except HTTPException as e:
                 await http_client.close()
                 
@@ -694,20 +729,21 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                 except Exception as e:
                     streaming_error = e
-                    # Try to send [DONE] to client before finishing
-                    # so client doesn't "hang" waiting for data
+                    # Send an error frame followed by [DONE] so the client does
+                    # not hang while still receiving a machine-readable error.
                     try:
+                        yield format_openai_stream_error_event(e)
                         yield "data: [DONE]\n\n"
                     except Exception:
                         pass  # Client already disconnected
-                    raise
                 finally:
                     await http_client.close()
                     # Log access log for streaming (success or error)
                     if streaming_error:
+                        error_status = _stream_error_status(streaming_error)
                         error_type = type(streaming_error).__name__
                         error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                        logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
+                        logger.error(f"HTTP {error_status} - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
                     elif client_disconnected:
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
                     else:
@@ -715,7 +751,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     # Write debug logs AFTER streaming completes
                     if debug_logger:
                         if streaming_error:
-                            debug_logger.flush_on_error(500, str(streaming_error))
+                            debug_logger.flush_on_error(_stream_error_status(streaming_error), str(streaming_error))
                         else:
                             debug_logger.discard_buffers()
             
@@ -745,6 +781,18 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             
             return JSONResponse(content=openai_response)
     
+    except KiroStreamError as e:
+        await http_client.close()
+        logger.error(
+            f"HTTP {e.status_code} - POST /v1/chat/completions - "
+            f"[{type(e).__name__}] {str(e)[:100]}"
+        )
+        if debug_logger:
+            debug_logger.flush_on_error(e.status_code, str(e))
+        return JSONResponse(
+            status_code=e.status_code,
+            content=build_openai_error_payload(e),
+        )
     except HTTPException as e:
         await http_client.close()
         
