@@ -20,6 +20,9 @@ from dataclasses import asdict
 
 from kiro.streaming_core import (
     KiroEvent,
+    KiroTerminal,
+    KiroContentFilteredError,
+    KiroEmptyCompletionError,
     StreamResult,
     FirstTokenTimeoutError,
     parse_kiro_stream,
@@ -1832,3 +1835,168 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+
+# ==================================================================================================
+# Tests for terminal metadata and empty-completion retry behavior
+# ==================================================================================================
+
+class TestStreamTerminalStates:
+    """Tests for terminal metadata propagation and pre-output retries."""
+    
+    @pytest.mark.asyncio
+    async def test_collects_terminal_metadata(self, mock_response):
+        """
+        What it does: Preserves terminal metadata in StreamResult.
+        Goal: Ensure refusal details reach non-streaming adapters.
+        """
+        terminal = KiroTerminal(
+            stop_reason="CONTENT_FILTERED",
+            refusal_category="REASONING_EXTRACTION",
+            refusal_explanation="The selected model cannot continue.",
+        )
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial")
+            yield KiroEvent(type="metadata", terminal=terminal)
+        
+        with patch('kiro.streaming_core.parse_kiro_stream', mock_parse_kiro_stream):
+            result = await collect_stream_to_result(mock_response)
+        
+        assert result.content == "Partial"
+        assert result.terminal is terminal
+        assert result.terminal.is_refusal()
+    
+    @pytest.mark.asyncio
+    async def test_retries_empty_completion_before_output(self):
+        """
+        What it does: Retries an empty completion before any chunk is emitted.
+        Goal: Recover from transient upstream empty responses.
+        """
+        call_count = 0
+        
+        async def mock_make_request():
+            nonlocal call_count
+            call_count += 1
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+        
+        async def mock_stream_processor(response):
+            if call_count == 1:
+                raise KiroEmptyCompletionError()
+            yield "success_chunk"
+        
+        chunks = []
+        
+        async for chunk in stream_with_first_token_retry(
+            make_request=mock_make_request,
+            stream_processor=mock_stream_processor,
+            max_retries=3,
+            first_token_timeout=30
+        ):
+            chunks.append(chunk)
+        
+        assert call_count == 2
+        assert chunks == ["success_chunk"]
+    
+    @pytest.mark.asyncio
+    async def test_does_not_retry_empty_completion_after_output(self):
+        """
+        What it does: Prevents a retry after visible output was emitted.
+        Goal: Avoid duplicating partial assistant content.
+        """
+        call_count = 0
+        
+        async def mock_make_request():
+            nonlocal call_count
+            call_count += 1
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+        
+        async def mock_stream_processor(response):
+            yield "partial_chunk"
+            raise KiroEmptyCompletionError()
+        
+        chunks = []
+        
+        with pytest.raises(KiroEmptyCompletionError):
+            async for chunk in stream_with_first_token_retry(
+                make_request=mock_make_request,
+                stream_processor=mock_stream_processor,
+                max_retries=3,
+                first_token_timeout=30
+            ):
+                chunks.append(chunk)
+        
+        assert call_count == 1
+        assert chunks == ["partial_chunk"]
+    
+    @pytest.mark.asyncio
+    async def test_does_not_retry_content_filtered_error(self):
+        """
+        What it does: Prevents retrying an explicit content-filter refusal.
+        Goal: Respect upstream safety decisions.
+        """
+        call_count = 0
+        terminal = KiroTerminal(
+            stop_reason="CONTENT_FILTERED",
+            refusal_category="REASONING_EXTRACTION",
+        )
+        
+        async def mock_make_request():
+            nonlocal call_count
+            call_count += 1
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+        
+        async def mock_stream_processor(response):
+            raise KiroContentFilteredError(terminal)
+            yield  # Make it a generator
+        
+        with pytest.raises(KiroContentFilteredError):
+            async for _ in stream_with_first_token_retry(
+                make_request=mock_make_request,
+                stream_processor=mock_stream_processor,
+                max_retries=3,
+                first_token_timeout=30
+            ):
+                pass
+        
+        assert call_count == 1
+    
+    @pytest.mark.asyncio
+    async def test_raises_empty_completion_after_retries_exhausted(self):
+        """
+        What it does: Exposes a typed error after empty retries are exhausted.
+        Goal: Ensure callers can return a 502 instead of a timeout error.
+        """
+        call_count = 0
+        
+        async def mock_make_request():
+            nonlocal call_count
+            call_count += 1
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+        
+        async def mock_stream_processor(response):
+            raise KiroEmptyCompletionError()
+            yield  # Make it a generator
+        
+        with pytest.raises(KiroEmptyCompletionError):
+            async for _ in stream_with_first_token_retry(
+                make_request=mock_make_request,
+                stream_processor=mock_stream_processor,
+                max_retries=2,
+                first_token_timeout=30
+            ):
+                pass
+        
+        assert call_count == 2

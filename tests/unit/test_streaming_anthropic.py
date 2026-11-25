@@ -20,11 +20,19 @@ from kiro.streaming_anthropic import (
     generate_message_id,
     generate_thinking_signature,
     format_sse_event,
+    build_anthropic_error_payload,
+    format_anthropic_stream_error_event,
     stream_kiro_to_anthropic,
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
 )
-from kiro.streaming_core import KiroEvent, StreamResult
+from kiro.streaming_core import (
+    KiroEvent,
+    KiroTerminal,
+    KiroContentFilteredError,
+    KiroEmptyCompletionError,
+    StreamResult,
+)
 
 
 # ==================================================================================================
@@ -222,10 +230,10 @@ class TestStreamKiroToAnthropic:
     """Tests for stream_kiro_to_anthropic() generator."""
     
     @pytest.mark.asyncio
-    async def test_yields_message_start_event(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_empty_stream_raises_without_message_start(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Yields message_start event at beginning.
-        Goal: Verify Anthropic streaming protocol.
+        What it does: Rejects an empty stream before sending message_start.
+        Goal: Ensure empty output is retryable and never exposed as success.
         """
         print("Setup: Mock empty stream...")
         
@@ -237,17 +245,16 @@ class TestStreamKiroToAnthropic:
         events = []
         
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
-            async for event in stream_kiro_to_anthropic(
-                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
-            ):
-                events.append(event)
+            with pytest.raises(KiroEmptyCompletionError):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
         
         print(f"Received {len(events)} events")
         
-        # First event should be message_start
-        assert len(events) > 0
-        assert "event: message_start" in events[0]
-        print("✓ message_start event yielded first")
+        assert events == []
+        print("✓ Empty stream raised before message_start")
     
     @pytest.mark.asyncio
     async def test_yields_content_block_start_on_first_content(self, mock_response, mock_model_cache, mock_auth_manager):
@@ -829,10 +836,10 @@ class TestCollectAnthropicResponse:
         print("✓ Invalid JSON arguments handled gracefully")
     
     @pytest.mark.asyncio
-    async def test_handles_empty_content(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_raises_empty_completion_for_empty_content(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Handles empty content in response.
-        Goal: Verify empty content is handled.
+        What it does: Rejects an empty collected response.
+        Goal: Verify empty content is not returned as a successful message.
         """
         print("Setup: Mock stream result with empty content...")
         
@@ -847,15 +854,12 @@ class TestCollectAnthropicResponse:
         print("Action: Collecting Anthropic response...")
         
         with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
-            result = await collect_anthropic_response(
-                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
-            )
+            with pytest.raises(KiroEmptyCompletionError):
+                await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                )
         
-        print(f"Result: {result}")
-        
-        # Content should be empty list
-        assert result["content"] == []
-        print("✓ Empty content handled correctly")
+        print("✓ Empty content rejected correctly")
 
 
 # ==================================================================================================
@@ -915,10 +919,10 @@ class TestStreamingAnthropicErrorHandling:
         print("✓ GeneratorExit propagated correctly")
     
     @pytest.mark.asyncio
-    async def test_yields_error_event_on_exception(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_propagates_generic_error_without_error_event(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Yields error event on exception.
-        Goal: Verify error event is sent to client.
+        What it does: Propagates unexpected errors to the route layer.
+        Goal: Ensure the route is the single owner of protocol error events.
         """
         print("Setup: Mock stream that raises RuntimeError...")
         
@@ -931,21 +935,16 @@ class TestStreamingAnthropicErrorHandling:
         
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                try:
+                with pytest.raises(RuntimeError):
                     async for event in stream_kiro_to_anthropic(
                         mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
                     ):
                         events.append(event)
-                except RuntimeError:
-                    pass
         
         print(f"Received {len(events)} events")
         
-        # Should have error event
-        error_events = [e for e in events if "event: error" in e]
-        assert len(error_events) >= 1
-        assert "Test error" in error_events[0]
-        print("✓ Error event yielded on exception")
+        assert not any("event: error" in event for event in events)
+        print("✓ Generic error propagated without duplicate error event")
     
     @pytest.mark.asyncio
     async def test_closes_response_in_finally(self, mock_response, mock_model_cache, mock_auth_manager):
@@ -1667,3 +1666,187 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+# ==================================================================================================
+# Tests for upstream refusals and empty completions
+# ==================================================================================================
+
+class TestStreamingAnthropicTerminalStates:
+    """Tests for refusal and empty-completion handling."""
+    
+    @staticmethod
+    def _refusal_terminal() -> KiroTerminal:
+        """Create a representative upstream refusal terminal."""
+        return KiroTerminal(
+            stop_reason="CONTENT_FILTERED",
+            refusal_category="REASONING_EXTRACTION",
+            refusal_explanation="The selected model cannot continue this conversation.",
+        )
+    
+    @pytest.mark.asyncio
+    async def test_refusal_without_output_raises_before_message_start(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Converts a pre-output refusal into a typed error.
+        Goal: Ensure it is not emitted as a normal empty success.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="metadata",
+                terminal=self._refusal_terminal(),
+            )
+        
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroContentFilteredError) as exc_info:
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+        
+        assert events == []
+        assert exc_info.value.terminal.refusal_category == "REASONING_EXTRACTION"
+        assert exc_info.value.partial_output is False
+    
+    @pytest.mark.asyncio
+    async def test_refusal_after_partial_output_keeps_content_without_normal_finish(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Preserves partial output but never sends a normal finish.
+        Goal: Ensure a refusal cannot look like end_turn.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial answer")
+            yield KiroEvent(
+                type="metadata",
+                terminal=self._refusal_terminal(),
+            )
+        
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroContentFilteredError) as exc_info:
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+        
+        assert any("event: message_start" in event for event in events)
+        assert any("Partial answer" in event for event in events)
+        assert not any("event: message_delta" in event for event in events)
+        assert not any("event: message_stop" in event for event in events)
+        assert exc_info.value.partial_output is True
+    
+    @pytest.mark.asyncio
+    async def test_context_usage_only_is_empty_completion(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Treats context usage as a completion signal only, not output.
+        Goal: Ensure usage-only streams are not reported as end_turn.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+            yield KiroEvent(type="usage", usage={"inputTokenCount": 10})
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroEmptyCompletionError):
+                    async for _ in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        pass
+    
+    @pytest.mark.asyncio
+    async def test_thinking_only_is_visible_output(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Allows a thinking-only response when it is emitted to the client.
+        Goal: Ensure visible reasoning counts as valid assistant output.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Reasoning")
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+        
+        events = []
+        
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+        
+        assert any("event: message_start" in event for event in events)
+        assert any("event: message_delta" in event for event in events)
+        assert any("end_turn" in event for event in events)
+    
+    @pytest.mark.asyncio
+    async def test_non_streaming_refusal_raises_typed_error(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Rejects a collected refusal instead of returning end_turn.
+        Goal: Ensure non-streaming uses the same terminal-state semantics.
+        """
+        mock_result = StreamResult(
+            content="",
+            thinking_content="",
+            tool_calls=[],
+            usage=None,
+            context_usage_percentage=5.0,
+            terminal=self._refusal_terminal(),
+        )
+        
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
+            with pytest.raises(KiroContentFilteredError):
+                await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                )
+    
+    @pytest.mark.asyncio
+    async def test_non_streaming_context_usage_only_raises_empty_completion(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Rejects a collected usage-only stream.
+        Goal: Ensure an empty assistant message is never returned.
+        """
+        mock_result = StreamResult(
+            content="",
+            thinking_content="",
+            tool_calls=[],
+            usage={"inputTokenCount": 10},
+            context_usage_percentage=5.0,
+        )
+        
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
+            with pytest.raises(KiroEmptyCompletionError):
+                await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                )
+    
+    def test_formats_typed_error_payload(self):
+        """
+        What it does: Formats a typed error for Anthropic clients.
+        Goal: Verify code and refusal category are preserved.
+        """
+        error = KiroContentFilteredError(self._refusal_terminal())
+        
+        payload = build_anthropic_error_payload(error)
+        event = format_anthropic_stream_error_event(error)
+        
+        assert payload["type"] == "error"
+        assert payload["error"]["type"] == "api_error"
+        assert payload["error"]["code"] == "kiro_content_filtered"
+        assert payload["error"]["category"] == "REASONING_EXTRACTION"
+        assert event.startswith("event: error\n")
+        assert "REASONING_EXTRACTION" in event
